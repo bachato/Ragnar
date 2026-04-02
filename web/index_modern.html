@@ -1226,7 +1226,7 @@
                     <div class="mb-4" id="wifi-password-section">
                         <label class="block text-sm font-medium mb-2">Password</label>
                         <div class="relative">
-                            <input type="password" id="wifi-connect-password"
+                            <input type="password" id="wifi-connect-password" autocomplete="off"
                                    class="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-white pr-10"
                                    placeholder="Enter Wi-Fi password">
                             <button onclick="togglePasswordVisibility()" 
@@ -1392,7 +1392,7 @@
                     </div>
                     <div>
                         <label class="text-xs uppercase tracking-wide text-gray-400">Password</label>
-                        <input id="manual-lynis-password" type="password" placeholder="Required" class="mt-1 w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-Ragnar-400">
+                        <input id="manual-lynis-password" type="password" autocomplete="off" placeholder="Required" class="mt-1 w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-Ragnar-400">
                     </div>
                 </div>
                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mt-4">
@@ -1449,7 +1449,7 @@
                                     </div>
                                     <div class="flex-1">
                                         <label class="text-xs text-gray-400">Victim PSK</label>
-                                        <input type="password" id="airsnitch-victim-psk" placeholder="password"
+                                        <input type="password" id="airsnitch-victim-psk" autocomplete="off" placeholder="password"
                                             class="w-full bg-slate-700 text-white text-xs px-2 py-1 rounded border border-slate-600 focus:outline-none focus:border-green-500 mt-1">
                                     </div>
                                 </div>
@@ -1461,7 +1461,7 @@
                                     </div>
                                     <div class="flex-1">
                                         <label class="text-xs text-gray-400">Attacker PSK</label>
-                                        <input type="password" id="airsnitch-attacker-psk" placeholder="password"
+                                        <input type="password" id="airsnitch-attacker-psk" autocomplete="off" placeholder="password"
                                             class="w-full bg-slate-700 text-white text-xs px-2 py-1 rounded border border-slate-600 focus:outline-none focus:border-green-500 mt-1">
                                     </div>
                                 </div>
@@ -3362,20 +3362,20 @@
                                 </div>
                                 <div id="zap-password-container" class="hidden">
                                     <label class="block text-xs text-gray-400 mb-1">Password</label>
-                                    <input type="password" id="zap-password" placeholder="••••••••"
+                                    <input type="password" id="zap-password" autocomplete="off" placeholder="••••••••"
                                            class="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-sm">
                                 </div>
                                 <!-- Bearer Token Field -->
                                 <div id="zap-bearer-token-container" class="hidden sm:col-span-2">
                                     <label class="block text-xs text-gray-400 mb-1">Bearer Token</label>
-                                    <input type="password" id="zap-bearer-token" placeholder="eyJhbGciOiJIUzI1NiIs..."
+                                    <input type="password" id="zap-bearer-token" autocomplete="off" placeholder="eyJhbGciOiJIUzI1NiIs..."
                                            class="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-sm font-mono">
                                     <p class="text-xs text-gray-500 mt-1">JWT or OAuth token (Authorization: Bearer)</p>
                                 </div>
                                 <!-- API Key Fields -->
                                 <div id="zap-api-key-container" class="hidden">
                                     <label class="block text-xs text-gray-400 mb-1">API Key</label>
-                                    <input type="password" id="zap-api-key" placeholder="sk-xxxxxxxxxxxx"
+                                    <input type="password" id="zap-api-key" autocomplete="off" placeholder="sk-xxxxxxxxxxxx"
                                            class="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-sm font-mono">
                                 </div>
                                 <div id="zap-api-key-header-container" class="hidden">
@@ -3425,7 +3425,7 @@
                                         </div>
                                         <div>
                                             <label class="block text-xs text-gray-400 mb-1">Client Secret</label>
-                                            <input type="password" id="zap-oauth2-client-secret" placeholder="your-client-secret"
+                                            <input type="password" id="zap-oauth2-client-secret" autocomplete="off" placeholder="your-client-secret"
                                                    class="w-full px-2 py-1 bg-slate-600 border border-slate-500 rounded text-sm font-mono">
                                         </div>
                                         <div>
@@ -3566,20 +3566,20 @@
                                 </div>
                                 <div id="cred-password-container">
                                     <label class="block text-sm text-gray-400 mb-1">Password *</label>
-                                    <input type="password" id="cred-password" placeholder="********"
+                                    <input type="password" id="cred-password" autocomplete="off" placeholder="********"
                                            class="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg focus:ring-2 focus:ring-green-500">
                                 </div>
                                 <!-- Bearer Token Field -->
                                 <div id="cred-bearer-token-container" class="hidden md:col-span-2">
                                     <label class="block text-sm text-gray-400 mb-1">Bearer Token *</label>
-                                    <input type="password" id="cred-bearer-token" placeholder="eyJhbGciOiJIUzI1NiIs..."
+                                    <input type="password" id="cred-bearer-token" autocomplete="off" placeholder="eyJhbGciOiJIUzI1NiIs..."
                                            class="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg focus:ring-2 focus:ring-green-500 font-mono text-sm">
                                     <p class="text-xs text-gray-500 mt-1">JWT or OAuth token (sent as Authorization: Bearer &lt;token&gt;)</p>
                                 </div>
                                 <!-- API Key Fields -->
                                 <div id="cred-api-key-container" class="hidden">
                                     <label class="block text-sm text-gray-400 mb-1">API Key *</label>
-                                    <input type="password" id="cred-api-key" placeholder="sk-xxxxxxxxxxxx"
+                                    <input type="password" id="cred-api-key" autocomplete="off" placeholder="sk-xxxxxxxxxxxx"
                                            class="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg focus:ring-2 focus:ring-green-500 font-mono text-sm">
                                 </div>
                                 <div id="cred-api-key-header-container" class="hidden">
@@ -4024,7 +4024,7 @@
                                 </div>
                                 <div>
                                     <label class="block text-xs text-gray-400 mb-1">Password</label>
-                                    <input id="pwn-cfg-web-pass" type="password" class="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:border-fuchsia-500 focus:outline-none" placeholder="ragnar">
+                                    <input id="pwn-cfg-web-pass" type="password" autocomplete="off" class="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:border-fuchsia-500 focus:outline-none" placeholder="ragnar">
                                 </div>
                                 <div>
                                     <label class="block text-xs text-gray-400 mb-1">Port</label>
@@ -4117,7 +4117,7 @@
                                     <div>
                                         <label for="openai-api-token" class="block text-sm font-medium text-gray-300 mb-2">OpenAI API Token</label>
                                         <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-                                            <input type="password" id="openai-api-token" placeholder="sk-..." 
+                                            <input type="password" id="openai-api-token" autocomplete="off" placeholder="sk-..."
                                                    class="flex-1 w-full bg-slate-700 border border-slate-600 text-white py-2 px-3 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent">
                                             <button onclick="saveAIToken()" class="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg transition-colors whitespace-nowrap w-full sm:w-auto">
                                                 Save Token
@@ -4172,14 +4172,14 @@
                                     <!-- User Key -->
                                     <div>
                                         <label for="pushover-user-key" class="block text-sm font-medium text-gray-300 mb-2">Pushover User Key</label>
-                                        <input type="password" id="pushover-user-key" placeholder="Your user key..."
+                                        <input type="password" id="pushover-user-key" autocomplete="off" placeholder="Your user key..."
                                                class="w-full bg-slate-700 border border-slate-600 text-white py-2 px-3 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent">
                                     </div>
                                     <!-- API Token -->
                                     <div>
                                         <label for="pushover-api-token" class="block text-sm font-medium text-gray-300 mb-2">Pushover API Token / App Key</label>
                                         <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-                                            <input type="password" id="pushover-api-token" placeholder="Your app token..."
+                                            <input type="password" id="pushover-api-token" autocomplete="off" placeholder="Your app token..."
                                                    class="flex-1 w-full bg-slate-700 border border-slate-600 text-white py-2 px-3 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:border-transparent">
                                             <button onclick="savePushoverKeys()" class="bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded-lg transition-colors whitespace-nowrap w-full sm:w-auto">
                                                 Save Keys
