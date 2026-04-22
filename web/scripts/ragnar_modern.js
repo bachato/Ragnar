@@ -8576,6 +8576,7 @@ function setManualActionHelper(message, tone = 'muted') {
 }
 
 function syncManualModeUI(isManualMode) {
+    const modeChanged = manualModeActive !== isManualMode;
     manualModeActive = isManualMode;
 
     const manualHint = document.getElementById('manual-mode-hint');
@@ -8586,7 +8587,7 @@ function syncManualModeUI(isManualMode) {
     document.querySelectorAll('.pentest-nav-btn').forEach(btn => {
         btn.classList.toggle('hidden', !isManualMode);
     });
-    if (window._updateNavMode) window._updateNavMode();
+    if (modeChanged && window._updateNavMode) window._updateNavMode();
 
     if (!isManualMode && currentTab === 'pentest') {
         showTab('dashboard');
