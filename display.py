@@ -1221,6 +1221,62 @@ class Display:
             self._draw_stat_rows(draw, y, stats)
 
     # ------------------------------------------------------------------
+    # Wardriving display page (EPD e-paper + used by other displays)
+    # ------------------------------------------------------------------
+
+    def _get_wardriving_data(self):
+        """Fetch current wardriving status from the engine (if running)."""
+        try:
+            from webapp_modern import _get_wardriving_engine
+            engine = _get_wardriving_engine()
+            status = engine.get_status()
+            return status
+        except Exception:
+            return None
+
+    def _render_wardriving_page(self, image, draw):
+        """Render a wardriving status page for EPD e-paper displays."""
+        self._draw_page_frame(draw, "WARDRIVING")
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        y = int(26 * sy)
+
+        wd = self._get_wardriving_data()
+        if not wd or not wd.get('running'):
+            stats = [
+                ("Status", "Stopped"),
+                ("Tip", "Enable in WebUI"),
+            ]
+            self._draw_stat_rows(draw, y, stats)
+            return
+
+        st = wd.get('stats', {})
+        gps = wd.get('gps', {})
+
+        # GPS status line
+        if gps.get('has_fix'):
+            pos = gps.get('position', {})
+            gps_str = f"{pos.get('lat', 0):.4f},{pos.get('lon', 0):.4f}"
+        elif gps.get('connected'):
+            gps_str = "Searching..."
+        else:
+            gps_str = "No GPS"
+
+        stats = [
+            ("Networks", str(st.get('total_networks', 0))),
+            ("Open", str(st.get('open_networks', 0))),
+            ("WEP", str(st.get('wep_networks', 0))),
+            ("WPA", str(st.get('wpa_networks', 0))),
+            ("2.4G/5G/6G", f"{st.get('band_2_4ghz', 0)}/{st.get('band_5ghz', 0)}/{st.get('band_6ghz', 0)}"),
+            ("Scans", str(wd.get('scans_completed', 0))),
+            ("GPS", gps_str),
+        ]
+        if gps.get('has_fix'):
+            stats.append(("Sats", str(gps.get('satellites', '-'))))
+
+        self._draw_stat_rows(draw, y, stats)
+
+    # ------------------------------------------------------------------
     # GC9A01 round-display renderer
     # ------------------------------------------------------------------
 
@@ -1528,11 +1584,118 @@ class Display:
             vulns   = getattr(sd, "vulnnbr",         0) or 0
             return f"T:{targets} C:{creds} V:{vulns}", C_GREEN
 
+        def _render_wd_gc9a01():
+            """Render wardriving dashboard on GC9A01 240×240 round TFT."""
+            wd = self._get_wardriving_data()
+            st = wd.get('stats', {}) if wd else {}
+            gps = wd.get('gps', {}) if wd else {}
+
+            img = _Image.new("RGB", (SIZE, SIZE), C_BG)
+            draw = _ImageDraw.Draw(img)
+
+            # Outer ring — green if GPS fix, amber if searching, red if no GPS
+            if gps.get('has_fix'):
+                ring_col = C_GREEN
+            elif gps.get('connected'):
+                ring_col = C_AMBER
+            else:
+                ring_col = C_RED
+            draw.ellipse((0, 0, SIZE - 1, SIZE - 1), outline=ring_col, width=RING_W)
+
+            # Title
+            title = "WARDRIVING"
+            try:
+                tb = font_title.getbbox(title)
+                tx = (SIZE - (tb[2] - tb[0])) // 2
+            except Exception:
+                tx = 50
+            draw.text((tx, 8), title, font=font_title, fill=C_WHITE)
+
+            # Network count — large, centered
+            total = str(st.get('total_networks', 0))
+            try:
+                nb = font_title.getbbox(total)
+                nx = (SIZE - (nb[2] - nb[0])) // 2
+            except Exception:
+                nx = 100
+            draw.text((nx, 45), total, font=font_title, fill=C_GREEN)
+            try:
+                lb = font_ssid.getbbox("networks")
+                lx = (SIZE - (lb[2] - lb[0])) // 2
+            except Exception:
+                lx = 80
+            draw.text((lx, 72), "networks", font=font_ssid, fill=C_GRAY)
+
+            # Stats rows
+            y = 98
+            line_h = 20
+            open_n = st.get('open_networks', 0)
+            wep_n = st.get('wep_networks', 0)
+            wpa_n = st.get('wpa_networks', 0)
+            draw.text((30, y), f"Open:{open_n}  WEP:{wep_n}  WPA:{wpa_n}", font=font_side, fill=C_WHITE)
+            y += line_h
+            b24 = st.get('band_2_4ghz', 0)
+            b5 = st.get('band_5ghz', 0)
+            b6 = st.get('band_6ghz', 0)
+            draw.text((30, y), f"2.4G:{b24} 5G:{b5} 6G:{b6}", font=font_side, fill=C_CYAN)
+            y += line_h
+            scans = wd.get('scans_completed', 0) if wd else 0
+            draw.text((30, y), f"Scans: {scans}", font=font_side, fill=C_GRAY)
+
+            # GPS status
+            if gps.get('has_fix'):
+                pos = gps.get('position', {})
+                gps_str = f"{pos.get('lat', 0):.4f},{pos.get('lon', 0):.4f}"
+                gps_col = C_GREEN
+            elif gps.get('connected'):
+                gps_str = "GPS searching..."
+                gps_col = C_AMBER
+            else:
+                gps_str = "No GPS"
+                gps_col = C_RED
+            try:
+                gb = font_ssid.getbbox(gps_str)
+                gx = (SIZE - (gb[2] - gb[0])) // 2
+            except Exception:
+                gx = 40
+            draw.text((gx, 182), gps_str, font=font_ssid, fill=gps_col)
+
+            # Sats info
+            sats_str = f"Sats: {gps.get('satellites', '-')}"
+            try:
+                sb = font_ssid.getbbox(sats_str)
+                sx = (SIZE - (sb[2] - sb[0])) // 2
+            except Exception:
+                sx = 80
+            draw.text((sx, 207), sats_str, font=font_ssid, fill=C_GRAY)
+
+            # Circular mask
+            result = _Image.new("RGB", (SIZE, SIZE), C_BG)
+            result.paste(img, mask=mask)
+            return result
+
         while not self.shared_data.display_should_exit:
             try:
                 wifi_on, ssid, ap_on, status_text = _text_state()
                 orch_status = getattr(self.shared_data, "ragnarorch_status", "IDLE") or "IDLE"
                 self.shared_data.update_ragnarstatus()
+
+                # Wardriving display override for GC9A01
+                if self.config.get('wardriving_display', False):
+                    wd_check = self._get_wardriving_data()
+                    if wd_check and wd_check.get('running'):
+                        output = _render_wd_gc9a01()
+                        output = output.transpose(_Image.Transpose.FLIP_LEFT_RIGHT)
+                        self.epd_helper.display_partial(output)
+                        try:
+                            web_path = os.path.join(self.shared_data.webdir, "screen.png")
+                            web_img = output.transpose(_Image.Transpose.FLIP_LEFT_RIGHT)
+                            with open(web_path, "wb") as f:
+                                web_img.save(f); f.flush(); os.fsync(f.fileno())
+                        except Exception:
+                            pass
+                        time.sleep(TICK_SLEEP)
+                        continue
 
                 # Reset animation when status changes
                 if orch_status != _last_status:
@@ -1760,6 +1923,26 @@ class Display:
                     line1 = f"Credentials: {creds}"
                 line1 = line1.ljust(16)[:16]
 
+                # — Wardriving display override for LCD1602 —
+                if self.config.get('wardriving_display', False):
+                    wd_lcd = self._get_wardriving_data()
+                    if wd_lcd and wd_lcd.get('running'):
+                        st_lcd = wd_lcd.get('stats', {})
+                        gps_lcd = wd_lcd.get('gps', {})
+                        total_n = st_lcd.get('total_networks', 0)
+                        if gps_lcd.get('has_fix'):
+                            line0 = f"WD:{total_n} GPS:OK"
+                        elif gps_lcd.get('connected'):
+                            line0 = f"WD:{total_n} GPS:..."
+                        else:
+                            line0 = f"WD:{total_n} NoGPS"
+                        line0 = line0.ljust(16)[:16]
+                        open_n = st_lcd.get('open_networks', 0)
+                        wpa_n = st_lcd.get('wpa_networks', 0)
+                        scans = wd_lcd.get('scans_completed', 0)
+                        line1 = f"O:{open_n} W:{wpa_n} S:{scans}"
+                        line1 = line1.ljust(16)[:16]
+
                 # — update web preview whenever content changes —
                 if line0 != _last_line0 or line1 != _last_line1:
                     _render_lcd_preview(line0, line1)
@@ -1922,11 +2105,54 @@ class Display:
 
             return img
 
+        def _render_wd():
+            """Render wardriving dashboard on SSD1306 128x64."""
+            wd = self._get_wardriving_data()
+            st = wd.get('stats', {}) if wd else {}
+            gps = wd.get('gps', {}) if wd else {}
+
+            total = st.get('total_networks', 0)
+            open_n = st.get('open_networks', 0)
+            wpa_n = st.get('wpa_networks', 0)
+            scans = wd.get('scans_completed', 0) if wd else 0
+
+            if gps.get('has_fix'):
+                pos = gps.get('position', {})
+                gps_str = f"{pos.get('lat', 0):.4f},{pos.get('lon', 0):.4f}"
+            elif gps.get('connected'):
+                gps_str = "GPS searching..."
+            else:
+                gps_str = "No GPS"
+
+            img = _Image.new("1", (W, H), 0)
+            draw = _ImageDraw.Draw(img)
+
+            # Header bar
+            draw.rectangle((0, 0, W - 1, 12), fill=255)
+            draw.text((2, 1), "WARDRIVING", font=font_hdr, fill=0)
+
+            # Body
+            draw.text((0, 15), f"Networks: {total}", font=font_body, fill=255)
+            draw.text((0, 26), f"Open:{open_n} WPA:{wpa_n}", font=font_body, fill=255)
+            draw.text((0, 37), f"Scans: {scans}", font=font_body, fill=255)
+            draw.text((0, 48), gps_str[:22], font=font_body, fill=255)
+
+            return img
+
         # ── Main loop ───────────────────────────────────────────────────
         while not self.shared_data.display_should_exit:
             try:
                 self.shared_data.update_ragnarstatus()
-                img = _render(_scroll_pos)
+
+                # Wardriving display override
+                if self.config.get('wardriving_display', False):
+                    wd_data = self._get_wardriving_data()
+                    if wd_data and wd_data.get('running'):
+                        img = _render_wd()
+                    else:
+                        img = _render(_scroll_pos)
+                else:
+                    img = _render(_scroll_pos)
                 epd.init()
                 buf = epd.getbuffer(img)
                 epd.displayPartial(buf)
@@ -2086,6 +2312,20 @@ class Display:
         _msg_refresh_every = 200  # refresh message list every 200 ticks (~20s)
 
         def _build_messages():
+            # Wardriving display override for MAX7219
+            if self.config.get('wardriving_display', False):
+                wd_max = self._get_wardriving_data()
+                if wd_max and wd_max.get('running'):
+                    st_max = wd_max.get('stats', {})
+                    gps_max = wd_max.get('gps', {})
+                    total_n = st_max.get('total_networks', 0)
+                    gps_str = "FIX" if gps_max.get('has_fix') else ("..." if gps_max.get('connected') else "NO")
+                    return [
+                        "* WARDRIVING *",
+                        f"NETWORKS: {total_n}",
+                        f"GPS: {gps_str}",
+                        f"SCANS: {wd_max.get('scans_completed', 0)}",
+                    ]
             return [
                 "* RAGNAR *",
                 _get_targets(),
@@ -2192,20 +2432,29 @@ class Display:
                 if self.button_listener and self.button_listener.available:
                     current_page = self.button_listener.current_page
 
-                if current_page == PAGE_NETWORK:
-                    self._render_network_page(image, draw)
-                elif current_page == PAGE_VULN:
-                    self._render_vuln_page(image, draw)
-                elif current_page == PAGE_DISCOVERED:
-                    self._render_discovered_page(image, draw)
-                elif current_page == PAGE_ADVANCED:
-                    self._render_advanced_page(image, draw)
-                elif current_page == PAGE_TRAFFIC:
-                    self._render_traffic_page(image, draw)
-                else:
-                    pass  # Fall through to main page rendering below
+                # Wardriving display override: replace main page when enabled
+                _wd_override = False
+                if current_page == PAGE_MAIN and self.config.get('wardriving_display', False):
+                    wd_data = self._get_wardriving_data()
+                    if wd_data and wd_data.get('running'):
+                        self._render_wardriving_page(image, draw)
+                        _wd_override = True
 
-                if current_page != PAGE_MAIN:
+                if not _wd_override:
+                    if current_page == PAGE_NETWORK:
+                        self._render_network_page(image, draw)
+                    elif current_page == PAGE_VULN:
+                        self._render_vuln_page(image, draw)
+                    elif current_page == PAGE_DISCOVERED:
+                        self._render_discovered_page(image, draw)
+                    elif current_page == PAGE_ADVANCED:
+                        self._render_advanced_page(image, draw)
+                    elif current_page == PAGE_TRAFFIC:
+                        self._render_traffic_page(image, draw)
+                    else:
+                        pass  # Fall through to main page rendering below
+
+                if current_page != PAGE_MAIN or _wd_override:
                     # Non-main pages are fully rendered above, skip to display
                     epd_img = _apply_epd_rotation(image, self.screen_reversed)
                     self.epd_helper.display_partial(epd_img)

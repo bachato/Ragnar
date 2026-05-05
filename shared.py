@@ -736,6 +736,7 @@ class SharedData:
 
             "__title_wardriving__": "Wardriving",
             "wardriving_enabled": False,
+            "wardriving_display": False,
             "wardriving_scan_interval": 2,
             "wardriving_gps_port": "auto",
             "wardriving_gps_baudrate": 9600,

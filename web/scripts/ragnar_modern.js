@@ -485,6 +485,10 @@ const configMetadata = {
         label: "Enable Wardriving",
         description: "Enable the wardriving tab for WiFi network discovery with GPS mapping. Requires a USB GPS module for location data."
     },
+    wardriving_display: {
+        label: "Wardriving on Display",
+        description: "Replace the normal Ragnar display with a wardriving dashboard while a session is running. Works on all displays: e-paper, GC9A01 TFT, SSD1306 OLED, LCD1602, and MAX7219 LED matrix."
+    },
     wardriving_scan_interval: {
         label: "Scan Interval (s)",
         description: "Seconds between WiFi scans during wardriving. Lower values capture more networks but use more CPU. Default: 2."
@@ -10141,7 +10145,7 @@ function displayConfigForm(config) {
         'Wardriving': ['wardriving_enabled', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_auto_export']
     };
     
-    const knownBooleans = ['manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_auto_export'];
+    const knownBooleans = ['manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export'];
     const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate']);
     const fallbackValues = {
         network_max_failed_pings: 15,
