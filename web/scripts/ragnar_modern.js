@@ -14739,7 +14739,7 @@ async function loadWardrivingNetworks() {
 
         const networks = data.networks || [];
         if (networks.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">No networks yet.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">No networks yet.</td></tr>';
             return;
         }
 
@@ -14749,6 +14749,10 @@ async function loadWardrivingNetworks() {
             const sigColor = n.best_rssi > -50 ? 'text-emerald-400' :
                              n.best_rssi > -70 ? 'text-yellow-400' : 'text-red-400';
             const ssid = n.ssid || '<hidden>';
+            const hasGps = n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0;
+            const gpsIcon = hasGps
+                ? `<span title="${n.best_lat.toFixed(5)}, ${n.best_lon.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
             return `<tr class="hover:bg-slate-800/50">
                 <td class="px-3 py-1.5 font-mono text-xs">${escapeHtml(ssid)}</td>
                 <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${n.bssid}</td>
@@ -14756,6 +14760,7 @@ async function loadWardrivingNetworks() {
                 <td class="px-3 py-1.5 text-xs text-center">${n.channel || '-'}</td>
                 <td class="px-3 py-1.5 text-xs">${n.band || '-'}</td>
                 <td class="px-3 py-1.5 text-xs ${sigColor}">${n.best_rssi} dBm</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
                 <td class="px-3 py-1.5 text-xs text-gray-400">${n.scan_count || 1}x</td>
             </tr>`;
         }).join('');
