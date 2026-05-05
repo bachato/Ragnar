@@ -2993,7 +2993,7 @@ def update_config():
         # Reflect orientation changes immediately for both hardware and screenshots
         from shared import normalize_rotation
         shared_data.screen_reversed = normalize_rotation(shared_data.config.get('screen_reversed', 0))
-        shared_data.web_screen_reversed = shared_data.screen_reversed
+        shared_data.web_screen_reversed = normalize_rotation(shared_data.config.get('web_screen_reversed', 0))
         
         # Reload AI service if ai_enabled was changed
         if 'ai_enabled' in data:

@@ -102,7 +102,6 @@ class EPDButtonListener:
         idx = _rotations.index(current) if current in _rotations else 0
         new_rotation = _rotations[(idx + 1) % len(_rotations)]
         self.shared_data.screen_reversed = new_rotation
-        self.shared_data.web_screen_reversed = new_rotation
         logger.info(f"Button KEY2: Display rotation set to {new_rotation}°")
 
     def _on_key3(self):

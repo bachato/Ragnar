@@ -181,7 +181,7 @@ class SharedData:
         self.config.setdefault('epd_type', DEFAULT_EPD_TYPE)
         self.apply_display_profile(self.config['epd_type'], set_orientation_if_missing=True, persist=not self._pager_mode)
         self.screen_reversed = normalize_rotation(self.config.get('screen_reversed', 0))
-        self.web_screen_reversed = self.screen_reversed
+        self.web_screen_reversed = normalize_rotation(self.config.get('web_screen_reversed', 0))
 
         # Check if auth is configured and DB might be encrypted
         if not self._pager_mode:
