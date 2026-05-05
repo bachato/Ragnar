@@ -9510,7 +9510,10 @@ async function handleAutomationToggle() {
 function updateElement(id, value) {
     const element = document.getElementById(id);
     if (element) {
-        element.textContent = value;
+        const str = String(value ?? '');
+        if (element.textContent !== str) {
+            element.textContent = str;
+        }
     }
 }
 
@@ -9533,24 +9536,29 @@ function scaleStatNumber(elementId, value, options = {}) {
     const safeValue = Number.isFinite(numericValue) ? Math.trunc(numericValue) : 0;
     const digitCount = Math.abs(safeValue).toString().length;
 
-    element.classList.remove(config.baseClass, config.mediumClass, config.smallClass);
-
+    let targetClass;
     if (digitCount >= config.largeDigits) {
-        element.classList.add(config.smallClass);
+        targetClass = config.smallClass;
     } else if (digitCount >= config.mediumDigits) {
-        element.classList.add(config.mediumClass);
+        targetClass = config.mediumClass;
     } else {
-        element.classList.add(config.baseClass);
+        targetClass = config.baseClass;
+    }
+
+    if (!element.classList.contains(targetClass)) {
+        element.classList.remove(config.baseClass, config.mediumClass, config.smallClass);
+        element.classList.add(targetClass);
     }
 }
 
 function updateConnectivityIndicator(id, active, ssid = null, apMode = false) {
     const element = document.getElementById(id);
     if (element) {
-        if (active) {
-            element.className = 'w-3 h-3 bg-green-500 rounded-full pulse-glow';
-        } else {
-            element.className = 'w-3 h-3 bg-gray-600 rounded-full';
+        const targetClass = active
+            ? 'w-3 h-3 bg-green-500 rounded-full pulse-glow'
+            : 'w-3 h-3 bg-gray-600 rounded-full';
+        if (element.className !== targetClass) {
+            element.className = targetClass;
         }
     }
     
@@ -9558,16 +9566,19 @@ function updateConnectivityIndicator(id, active, ssid = null, apMode = false) {
     if (id === 'wifi-status') {
         const ssidDisplay = document.getElementById('wifi-ssid-display');
         if (ssidDisplay) {
+            let text, cls;
             if (apMode) {
-                ssidDisplay.textContent = ssid ? `AP Mode: ${ssid}` : 'AP Mode';
-                ssidDisplay.className = 'text-xs text-blue-400 truncate';
+                text = ssid ? `AP Mode: ${ssid}` : 'AP Mode';
+                cls = 'text-xs text-blue-400 truncate';
             } else if (active && ssid) {
-                ssidDisplay.textContent = ssid;
-                ssidDisplay.className = 'text-xs text-gray-400 truncate';
+                text = ssid;
+                cls = 'text-xs text-gray-400 truncate';
             } else {
-                ssidDisplay.textContent = 'Not connected';
-                ssidDisplay.className = 'text-xs text-gray-500 truncate';
+                text = 'Not connected';
+                cls = 'text-xs text-gray-500 truncate';
             }
+            if (ssidDisplay.textContent !== text) ssidDisplay.textContent = text;
+            if (ssidDisplay.className !== cls) ssidDisplay.className = cls;
         }
     }
 }
@@ -9578,18 +9589,23 @@ function updateLanIndicator(data) {
     if (!dot && !info) return;
 
     if (data.ethernet_connected) {
-        if (dot) dot.className = 'w-3 h-3 bg-green-500 rounded-full pulse-glow';
+        const targetClass = 'w-3 h-3 bg-green-500 rounded-full pulse-glow';
+        if (dot && dot.className !== targetClass) dot.className = targetClass;
         if (info) {
             const iface = data.ethernet_interface || 'eth0';
             const ip = data.ethernet_ip || '';
-            info.textContent = ip ? `${iface}: ${ip}` : iface;
-            info.className = 'text-xs text-green-400 truncate';
+            const text = ip ? `${iface}: ${ip}` : iface;
+            const cls = 'text-xs text-green-400 truncate';
+            if (info.textContent !== text) info.textContent = text;
+            if (info.className !== cls) info.className = cls;
         }
     } else {
-        if (dot) dot.className = 'w-3 h-3 bg-gray-600 rounded-full';
+        const targetClass = 'w-3 h-3 bg-gray-600 rounded-full';
+        if (dot && dot.className !== targetClass) dot.className = targetClass;
         if (info) {
-            info.textContent = 'Not connected';
-            info.className = 'text-xs text-gray-500 truncate';
+            if (info.textContent !== 'Not connected') info.textContent = 'Not connected';
+            const cls = 'text-xs text-gray-500 truncate';
+            if (info.className !== cls) info.className = cls;
         }
     }
 }
@@ -9598,6 +9614,7 @@ function updateLanIndicator(data) {
  * Update the primary connection card on the dashboard.
  * Priority: Ethernet > WiFi > USB/PAN > Bluetooth
  */
+let _lastPrimaryConnectionKey = null;
 function updatePrimaryConnectionCard(data) {
     const label = document.getElementById('primary-connection-label');
     const name = document.getElementById('primary-connection-name');
@@ -9606,6 +9623,22 @@ function updatePrimaryConnectionCard(data) {
     const icon = document.getElementById('primary-connection-icon');
 
     if (!label) return;
+
+    // Determine connection type key to avoid redundant DOM updates
+    let connKey;
+    if (data.ethernet_connected) {
+        connKey = `lan:${data.ethernet_interface || ''}:${data.ethernet_ip || ''}`;
+    } else if (data.wifi_connected) {
+        connKey = `wifi:${data.current_ssid || ''}:${data.ap_mode_active ? 1 : 0}:${data.ap_ssid || ''}`;
+    } else if (data.pan_connected) {
+        connKey = 'pan';
+    } else if (data.bluetooth_active) {
+        connKey = 'bt';
+    } else {
+        connKey = 'none';
+    }
+    if (connKey === _lastPrimaryConnectionKey) return;
+    _lastPrimaryConnectionKey = connKey;
 
     const lanIcon = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2"></path></svg>';
     const wifiIcon = '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"></path></svg>';
