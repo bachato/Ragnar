@@ -6035,6 +6035,186 @@ def reset_vulnerability_scan_history():
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
+# WARDRIVING ENDPOINTS
+# ============================================================================
+
+_wardriving_engine = None
+
+def _get_wardriving_engine():
+    global _wardriving_engine
+    if _wardriving_engine is None:
+        from wardriving import WardrivingEngine
+        _wardriving_engine = WardrivingEngine(shared_data)
+    return _wardriving_engine
+
+@app.route('/api/wardriving/status')
+def wardriving_status():
+    """Get wardriving engine status."""
+    try:
+        if not shared_data.config.get('wardriving_enabled', False):
+            return jsonify({'enabled': False, 'running': False})
+        engine = _get_wardriving_engine()
+        status = engine.get_status()
+        status['enabled'] = True
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Wardriving status error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/start', methods=['POST'])
+def wardriving_start():
+    """Start a wardriving session."""
+    try:
+        if not shared_data.config.get('wardriving_enabled', False):
+            return jsonify({'error': 'Wardriving not enabled in config'}), 400
+        data = request.get_json(silent=True) or {}
+        interfaces = data.get('interfaces')  # optional list
+        gps_port = data.get('gps_port')      # optional
+        engine = _get_wardriving_engine()
+        engine.scan_interval = shared_data.config.get('wardriving_scan_interval', 2)
+        result = engine.start(interfaces=interfaces, gps_port=gps_port)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Wardriving start error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/stop', methods=['POST'])
+def wardriving_stop():
+    """Stop the current wardriving session."""
+    try:
+        engine = _get_wardriving_engine()
+        result = engine.stop()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Wardriving stop error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/networks')
+def wardriving_networks():
+    """Get discovered networks from current/specified session."""
+    try:
+        engine = _get_wardriving_engine()
+        session_id = request.args.get('session_id')
+        limit = min(int(request.args.get('limit', 500)), 2000)
+        offset = int(request.args.get('offset', 0))
+        sort_by = request.args.get('sort', 'best_rssi')
+        order = request.args.get('order', 'DESC')
+
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            # Load a past session
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'networks': [], 'total': 0})
+
+        networks = session.get_networks(limit=limit, offset=offset, sort_by=sort_by, order=order)
+        stats = session.get_stats()
+        return jsonify({
+            'networks': networks,
+            'total': stats.get('total_networks', 0),
+            'session_id': session.session_id
+        })
+    except Exception as e:
+        logger.error(f"Wardriving networks error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/sessions')
+def wardriving_sessions():
+    """List all wardriving sessions."""
+    try:
+        engine = _get_wardriving_engine()
+        sessions = engine.get_session_list()
+        return jsonify({'sessions': sessions})
+    except Exception as e:
+        logger.error(f"Wardriving sessions error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/export/<session_id>')
+def wardriving_export(session_id):
+    """Export a wardriving session as WiGLE CSV or KML."""
+    try:
+        # Validate session_id to prevent path traversal
+        if not re.match(r'^[A-Za-z0-9_-]+$', session_id):
+            return jsonify({'error': 'Invalid session ID'}), 400
+
+        fmt = request.args.get('format', 'wigle')
+        engine = _get_wardriving_engine()
+
+        from wardriving import WardrivingSession
+        session = WardrivingSession(engine.data_dir, session_id=session_id)
+
+        if fmt == 'kml':
+            content = session.export_kml()
+            return app.response_class(
+                content, mimetype='application/vnd.google-earth.kml+xml',
+                headers={'Content-Disposition': f'attachment; filename=ragnar_wardriving_{session_id}.kml'}
+            )
+        else:
+            content = session.export_wigle_csv()
+            return app.response_class(
+                content, mimetype='text/csv',
+                headers={'Content-Disposition': f'attachment; filename=ragnar_wardriving_{session_id}.csv'}
+            )
+    except Exception as e:
+        logger.error(f"Wardriving export error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/gps')
+def wardriving_gps():
+    """Get current GPS status and position."""
+    try:
+        engine = _get_wardriving_engine()
+        if engine._gps:
+            return jsonify(engine._gps.get_status())
+        return jsonify({'connected': False, 'error': 'GPS not initialized'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/track')
+def wardriving_track():
+    """Get GPS track for current session (for map display)."""
+    try:
+        engine = _get_wardriving_engine()
+        session_id = request.args.get('session_id')
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'track': []})
+        return jsonify({'track': session.get_gps_track()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/interfaces')
+def wardriving_interfaces():
+    """List available WiFi interfaces for wardriving."""
+    try:
+        engine = _get_wardriving_engine()
+        interfaces = engine._detect_wifi_interfaces()
+        result = []
+        for iface in interfaces:
+            info = {'name': iface, 'type': 'wifi'}
+            # Try to get driver/chipset info
+            try:
+                driver_path = f'/sys/class/net/{iface}/device/driver'
+                if os.path.islink(driver_path):
+                    info['driver'] = os.path.basename(os.readlink(driver_path))
+                phy_path = f'/sys/class/net/{iface}/phy80211/name'
+                if os.path.exists(phy_path):
+                    with open(phy_path) as f:
+                        info['phy'] = f.read().strip()
+            except Exception:
+                pass
+            result.append(info)
+        return jsonify({'interfaces': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
 # REAL-TIME SCANNING ENDPOINTS
 # ============================================================================
 
@@ -12710,7 +12890,8 @@ def get_server_capabilities_api():
                 'advanced_vuln_assessment': False,
                 'parallel_scanning': False,
                 'local_ai': False,
-                'large_dictionaries': False
+                'large_dictionaries': False,
+                'wardriving_enabled': shared_data.config.get('wardriving_enabled', False)
             }
         })
     except Exception as e:

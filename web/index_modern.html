@@ -297,6 +297,15 @@
                             <span>Adv Scan</span>
                         </span>
                     </button>
+                    <button onclick="showTab('wardriving')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap wardriving-feature hidden" data-tab="wardriving">
+                        <span class="flex items-center space-x-1">
+                            <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                            </svg>
+                            <span>Wardriving</span>
+                        </span>
+                    </button>
                     <button onclick="showTab('epaper')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap requires-display" data-tab="epaper">
                         Display
                     </button>
@@ -344,6 +353,7 @@
                 <button onclick="showTab('threat-intel')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Threat Intel</button>
                 <button onclick="showTab('traffic')" data-tab="traffic" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 server-mode-feature hidden">Traffic Analysis</button>
                 <button onclick="showTab('adv-vuln')" data-tab="adv-vuln" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 server-mode-feature hidden">Adv Scan</button>
+                <button onclick="showTab('wardriving')" data-tab="wardriving" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 wardriving-feature hidden">Wardriving</button>
                 <button onclick="showTab('epaper')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 requires-display">Display</button>
                 <button onclick="showTab('files')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Files</button>
                 <button onclick="showTab('system')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">System</button>
@@ -3649,6 +3659,111 @@
                                 This feature provides Nuclei, Nikto, SQLMap, and other enterprise-grade scanners.
                             </p>
                         </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Wardriving Tab -->
+        <div id="wardriving-tab" class="tab-content hidden">
+            <div class="glass rounded-xl p-4 sm:p-6">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
+                    <div class="flex items-center space-x-3">
+                        <h2 class="text-lg sm:text-2xl font-bold">Wardriving</h2>
+                        <span id="wd-status-badge" class="px-2 py-1 bg-gray-600 bg-opacity-30 text-gray-400 text-xs rounded-full">Stopped</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <button id="wd-start-btn" onclick="startWardriving()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg transition-colors text-sm">
+                            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            Start
+                        </button>
+                        <button id="wd-stop-btn" onclick="stopWardriving()" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg transition-colors text-sm hidden">
+                            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"></path>
+                            </svg>
+                            Stop
+                        </button>
+                        <button onclick="loadWardrivingData()" class="refresh-btn bg-slate-700 hover:bg-slate-600 text-white px-3 py-2 rounded-lg transition-colors text-sm">
+                            <svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- GPS + Stats Row -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <!-- GPS Status Card -->
+                    <div class="bg-slate-800/50 rounded-lg p-4">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">GPS</div>
+                        <div id="wd-gps-status" class="text-lg font-bold text-red-400">No Fix</div>
+                        <div id="wd-gps-coords" class="text-xs text-gray-500 mt-1">-</div>
+                        <div id="wd-gps-sats" class="text-xs text-gray-500">Sats: -</div>
+                    </div>
+                    <!-- Total Networks -->
+                    <div class="bg-slate-800/50 rounded-lg p-4">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Networks</div>
+                        <div id="wd-total-networks" class="text-2xl font-bold text-emerald-400">0</div>
+                        <div id="wd-networks-per-scan" class="text-xs text-gray-500 mt-1">0 per scan</div>
+                    </div>
+                    <!-- Security Breakdown -->
+                    <div class="bg-slate-800/50 rounded-lg p-4">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Security</div>
+                        <div class="flex flex-wrap gap-2 mt-1">
+                            <span class="text-xs"><span class="text-green-400" id="wd-open-count">0</span> Open</span>
+                            <span class="text-xs"><span class="text-yellow-400" id="wd-wep-count">0</span> WEP</span>
+                            <span class="text-xs"><span class="text-blue-400" id="wd-wpa-count">0</span> WPA</span>
+                        </div>
+                    </div>
+                    <!-- Bands -->
+                    <div class="bg-slate-800/50 rounded-lg p-4">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Bands</div>
+                        <div class="flex flex-wrap gap-2 mt-1">
+                            <span class="text-xs"><span class="text-cyan-400" id="wd-band24">0</span> 2.4G</span>
+                            <span class="text-xs"><span class="text-purple-400" id="wd-band5">0</span> 5G</span>
+                            <span class="text-xs"><span class="text-pink-400" id="wd-band6">0</span> 6G</span>
+                        </div>
+                        <div id="wd-scans-done" class="text-xs text-gray-500 mt-1">Scans: 0</div>
+                    </div>
+                </div>
+
+                <!-- Interfaces Info -->
+                <div id="wd-interfaces-bar" class="bg-slate-800/30 rounded-lg px-4 py-2 mb-4 text-xs text-gray-400 hidden">
+                    Interfaces: <span id="wd-interfaces-list">-</span>
+                </div>
+
+                <!-- Network Table -->
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm text-left">
+                        <thead class="text-xs uppercase text-gray-400 border-b border-gray-700">
+                            <tr>
+                                <th class="px-3 py-2">SSID</th>
+                                <th class="px-3 py-2">BSSID</th>
+                                <th class="px-3 py-2">Security</th>
+                                <th class="px-3 py-2">Ch</th>
+                                <th class="px-3 py-2">Band</th>
+                                <th class="px-3 py-2">Signal</th>
+                                <th class="px-3 py-2">Seen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="wd-network-table" class="divide-y divide-gray-800">
+                            <tr><td colspan="7" class="text-center text-gray-500 py-8">No networks yet. Press Start to begin wardriving.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="wd-table-info" class="text-xs text-gray-500 mt-2 text-right hidden">
+                    Showing <span id="wd-showing">0</span> of <span id="wd-total">0</span> networks
+                </div>
+
+                <!-- Session History -->
+                <div class="mt-8">
+                    <h3 class="text-md font-semibold mb-3 text-gray-300">Session History</h3>
+                    <div id="wd-sessions-list" class="space-y-2">
+                        <p class="text-gray-500 text-sm">No previous sessions.</p>
                     </div>
                 </div>
             </div>

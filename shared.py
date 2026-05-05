@@ -732,7 +732,15 @@ class SharedData:
             "pwnagotchi_installed": False,
             "pwnagotchi_mode": "ragnar",
             "pwnagotchi_last_switch": "",
-            "pwnagotchi_last_status": "Not installed"
+            "pwnagotchi_last_status": "Not installed",
+
+            "__title_wardriving__": "Wardriving",
+            "wardriving_enabled": False,
+            "wardriving_scan_interval": 2,
+            "wardriving_gps_port": "auto",
+            "wardriving_gps_baudrate": 9600,
+            "wardriving_interfaces": [],
+            "wardriving_auto_export": True
         }
 
     def apply_display_profile(self, epd_type=None, set_orientation_if_missing=False, persist=False):

@@ -273,6 +273,7 @@ class ServerCapabilities:
             'parallel_scanning': caps.parallel_scanning_enabled,
             'local_ai': caps.local_ai_enabled,
             'large_dictionaries': caps.large_dictionaries_enabled,
+            'wardriving_enabled': self.shared_data.config.get('wardriving_enabled', False) if self.shared_data else False,
         }
     
     def get_missing_tools(self, feature: str) -> List[str]:
