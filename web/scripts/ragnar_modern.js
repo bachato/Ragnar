@@ -14810,29 +14810,20 @@ async function toggleWardriving() {
         const data = await res.json();
         if (data.error) {
             showToast(data.error, 'error');
-            return;
-        }
-        _wardrivingRunning = !_wardrivingRunning;
-        updateWardrivingToggleButton();
-        if (_wardrivingRunning) {
-            showToast(`Wardriving started! Session: ${data.session_id}`, 'success');
-            if (!_wardrivingInterval) {
-                _wardrivingInterval = setInterval(refreshWardrivingStatus, 3000);
-            }
-        } else {
-            showToast(`Wardriving stopped. ${data.stats?.total_networks || 0} networks found.`, 'success');
-            if (_wardrivingInterval) {
-                clearInterval(_wardrivingInterval);
-                _wardrivingInterval = null;
+        } else if (data.success) {
+            if (!_wardrivingRunning) {
+                showToast(`Wardriving started! Session: ${data.session_id}`, 'success');
+            } else {
+                showToast(`Wardriving stopped. ${data.stats?.total_networks || 0} networks found.`, 'success');
             }
         }
-        await loadWardrivingData();
     } catch (e) {
         showToast('Failed to toggle wardriving', 'error');
-    } finally {
-        _wardrivingBusy = false;
-        if (btn) { btn.disabled = false; btn.classList.remove('opacity-50', 'pointer-events-none'); }
     }
+    // Always refresh state from server regardless of success/failure
+    await loadWardrivingData();
+    _wardrivingBusy = false;
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50', 'pointer-events-none'); }
 }
 
 function updateWardrivingToggleButton() {

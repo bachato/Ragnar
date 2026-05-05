@@ -1681,21 +1681,20 @@ class Display:
                 self.shared_data.update_ragnarstatus()
 
                 # Wardriving display override for GC9A01
-                if self.config.get('wardriving_display', False):
-                    wd_check = self._get_wardriving_data()
-                    if wd_check and wd_check.get('running'):
-                        output = _render_wd_gc9a01()
-                        output = output.transpose(_Image.Transpose.FLIP_LEFT_RIGHT)
-                        self.epd_helper.display_partial(output)
-                        try:
-                            web_path = os.path.join(self.shared_data.webdir, "screen.png")
-                            web_img = output.transpose(_Image.Transpose.FLIP_LEFT_RIGHT)
-                            with open(web_path, "wb") as f:
-                                web_img.save(f); f.flush(); os.fsync(f.fileno())
-                        except Exception:
-                            pass
-                        time.sleep(TICK_SLEEP)
-                        continue
+                wd_check = self._get_wardriving_data()
+                if wd_check and wd_check.get('running'):
+                    output = _render_wd_gc9a01()
+                    output = output.transpose(_Image.Transpose.FLIP_LEFT_RIGHT)
+                    self.epd_helper.display_partial(output)
+                    try:
+                        web_path = os.path.join(self.shared_data.webdir, "screen.png")
+                        web_img = output.transpose(_Image.Transpose.FLIP_LEFT_RIGHT)
+                        with open(web_path, "wb") as f:
+                            web_img.save(f); f.flush(); os.fsync(f.fileno())
+                    except Exception:
+                        pass
+                    time.sleep(TICK_SLEEP)
+                    continue
 
                 # Reset animation when status changes
                 if orch_status != _last_status:
@@ -1924,24 +1923,23 @@ class Display:
                 line1 = line1.ljust(16)[:16]
 
                 # — Wardriving display override for LCD1602 —
-                if self.config.get('wardriving_display', False):
-                    wd_lcd = self._get_wardriving_data()
-                    if wd_lcd and wd_lcd.get('running'):
-                        st_lcd = wd_lcd.get('stats', {})
-                        gps_lcd = wd_lcd.get('gps', {})
-                        total_n = st_lcd.get('total_networks', 0)
-                        if gps_lcd.get('has_fix'):
-                            line0 = f"WD:{total_n} GPS:OK"
-                        elif gps_lcd.get('connected'):
-                            line0 = f"WD:{total_n} GPS:..."
-                        else:
-                            line0 = f"WD:{total_n} NoGPS"
-                        line0 = line0.ljust(16)[:16]
-                        open_n = st_lcd.get('open_networks', 0)
-                        wpa_n = st_lcd.get('wpa_networks', 0)
-                        scans = wd_lcd.get('scans_completed', 0)
-                        line1 = f"O:{open_n} W:{wpa_n} S:{scans}"
-                        line1 = line1.ljust(16)[:16]
+                wd_lcd = self._get_wardriving_data()
+                if wd_lcd and wd_lcd.get('running'):
+                    st_lcd = wd_lcd.get('stats', {})
+                    gps_lcd = wd_lcd.get('gps', {})
+                    total_n = st_lcd.get('total_networks', 0)
+                    if gps_lcd.get('has_fix'):
+                        line0 = f"WD:{total_n} GPS:OK"
+                    elif gps_lcd.get('connected'):
+                        line0 = f"WD:{total_n} GPS:..."
+                    else:
+                        line0 = f"WD:{total_n} NoGPS"
+                    line0 = line0.ljust(16)[:16]
+                    open_n = st_lcd.get('open_networks', 0)
+                    wpa_n = st_lcd.get('wpa_networks', 0)
+                    scans = wd_lcd.get('scans_completed', 0)
+                    line1 = f"O:{open_n} W:{wpa_n} S:{scans}"
+                    line1 = line1.ljust(16)[:16]
 
                 # — update web preview whenever content changes —
                 if line0 != _last_line0 or line1 != _last_line1:
@@ -2145,12 +2143,9 @@ class Display:
                 self.shared_data.update_ragnarstatus()
 
                 # Wardriving display override
-                if self.config.get('wardriving_display', False):
-                    wd_data = self._get_wardriving_data()
-                    if wd_data and wd_data.get('running'):
-                        img = _render_wd()
-                    else:
-                        img = _render(_scroll_pos)
+                wd_data = self._get_wardriving_data()
+                if wd_data and wd_data.get('running'):
+                    img = _render_wd()
                 else:
                     img = _render(_scroll_pos)
                 epd.init()
@@ -2313,19 +2308,18 @@ class Display:
 
         def _build_messages():
             # Wardriving display override for MAX7219
-            if self.config.get('wardriving_display', False):
-                wd_max = self._get_wardriving_data()
-                if wd_max and wd_max.get('running'):
-                    st_max = wd_max.get('stats', {})
-                    gps_max = wd_max.get('gps', {})
-                    total_n = st_max.get('total_networks', 0)
-                    gps_str = "FIX" if gps_max.get('has_fix') else ("..." if gps_max.get('connected') else "NO")
-                    return [
-                        "* WARDRIVING *",
-                        f"NETWORKS: {total_n}",
-                        f"GPS: {gps_str}",
-                        f"SCANS: {wd_max.get('scans_completed', 0)}",
-                    ]
+            wd_max = self._get_wardriving_data()
+            if wd_max and wd_max.get('running'):
+                st_max = wd_max.get('stats', {})
+                gps_max = wd_max.get('gps', {})
+                total_n = st_max.get('total_networks', 0)
+                gps_str = "FIX" if gps_max.get('has_fix') else ("..." if gps_max.get('connected') else "NO")
+                return [
+                    "* WARDRIVING *",
+                    f"NETWORKS: {total_n}",
+                    f"GPS: {gps_str}",
+                    f"SCANS: {wd_max.get('scans_completed', 0)}",
+                ]
             return [
                 "* RAGNAR *",
                 _get_targets(),
@@ -2432,9 +2426,9 @@ class Display:
                 if self.button_listener and self.button_listener.available:
                     current_page = self.button_listener.current_page
 
-                # Wardriving display override: replace main page when enabled
+                # Wardriving display override: replace main page when wardriving is running
                 _wd_override = False
-                if current_page == PAGE_MAIN and self.config.get('wardriving_display', False):
+                if current_page == PAGE_MAIN:
                     wd_data = self._get_wardriving_data()
                     if wd_data and wd_data.get('running'):
                         self._render_wardriving_page(image, draw)
