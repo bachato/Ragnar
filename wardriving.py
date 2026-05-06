@@ -621,7 +621,7 @@ class WardrivingSession:
     def import_wigle_csv(self, csv_path_or_stream):
         """Import a WiGLE-format CSV file into this session.
 
-        Supports Piglet, GhostESP, and standard WiGLE CSV exports.
+        Supports Piglet, HuginnESP, and standard WiGLE CSV exports.
         Returns dict with counts of imported records.
         """
         imported_wifi = 0
@@ -828,10 +828,10 @@ class WardrivingEngine:
         self._serial_port = None
         self.serial_connected = False
         self.serial_networks = 0
-        self._serial_entry_buffer = {}  # Buffer for multi-line GhostESP entries
-        self._current_ghost_mode = 'wifi'
-        self._ghost_ble_count = 0
-        self._ghost_stations = []
+        self._serial_entry_buffer = {}  # Buffer for multi-line HuginnESP entries
+        self._current_esp_mode = 'wifi'
+        self._esp_ble_count = 0
+        self._esp_stations = []
 
     def start(self, interfaces=None, gps_port=None, device_name=None):
         """Start a wardriving session."""
@@ -882,7 +882,7 @@ class WardrivingEngine:
         self._cell_thread = threading.Thread(target=self._cell_scan_loop, daemon=True, name="wardriving-cell")
         self._cell_thread.start()
 
-        # Start serial ESP32 listener (Piglet/GhostESP) - auto-detect or use configured port
+        # Start serial ESP32 listener (Piglet/HuginnESP) - auto-detect or use configured port
         serial_port = self.shared_data.config.get('wardriving_serial_port', '')
         if not serial_port:
             serial_port = self._detect_esp32_serial()
@@ -891,7 +891,7 @@ class WardrivingEngine:
             self.shared_data.config['wardriving_serial_port'] = serial_port
             self._serial_thread = threading.Thread(target=self._serial_listen_loop, daemon=True, name="wardriving-serial")
             self._serial_thread.start()
-            logger.info(f"GhostESP/Piglet auto-detected on {serial_port}")
+            logger.info(f"HuginnESP/Piglet auto-detected on {serial_port}")
 
         logger.info(f"Wardriving started: interfaces={self.interfaces}, GPS={gps_ok}, device={self.device_name}")
         return {
@@ -992,9 +992,9 @@ class WardrivingEngine:
             'serial_connected': self.serial_connected,
             'serial_port': self._serial_port or '',
             'serial_networks': self.serial_networks,
-            'ghost_mode': getattr(self, '_current_ghost_mode', ''),
-            'ghost_ble_count': getattr(self, '_ghost_ble_count', 0),
-            'ghost_alerts': getattr(self, '_ghost_alerts', [])[-5:],  # Last 5 alerts
+            'esp_mode': getattr(self, '_current_esp_mode', ''),
+            'esp_ble_count': getattr(self, '_esp_ble_count', 0),
+            'esp_alerts': getattr(self, '_esp_alerts', [])[-5:],  # Last 5 alerts
         }
         if self.session:
             result['stats'] = self.session.get_stats()
@@ -1506,13 +1506,13 @@ class WardrivingEngine:
         return towers
 
     # ------------------------------------------------------------------
-    # Serial ESP32 listener (Piglet / GhostESP)
+    # Serial ESP32 listener (Piglet / HuginnESP)
     # ------------------------------------------------------------------
 
     def _serial_listen_loop(self):
-        """Listen for wardriving data from a USB-connected ESP32 (Piglet/GhostESP).
+        """Listen for wardriving data from a USB-connected ESP32 (Piglet/HuginnESP).
 
-        Rotates through GhostESP commands to maximize data collection:
+        Rotates through HuginnESP commands to maximize data collection:
         - scanap: WiFi network scanning (primary)
         - blescan -f: Find Flipper devices
         - blescan -a: AirTag scanner
@@ -1551,7 +1551,7 @@ class WardrivingEngine:
                 while self._running:
                     # Send next scan command
                     cmd, duration, scan_type = scan_cycle[cycle_index % len(scan_cycle)]
-                    self._current_ghost_mode = scan_type
+                    self._current_esp_mode = scan_type
                     try:
                         ser.write(b"stop\r\n")
                         time.sleep(0.3)
@@ -1561,7 +1561,7 @@ class WardrivingEngine:
                             time.sleep(0.2)
                         ser.reset_input_buffer()
                         ser.write(cmd)
-                        logger.debug(f"GhostESP cmd: {cmd.strip()}")
+                        logger.debug(f"HuginnESP cmd: {cmd.strip()}")
                     except Exception:
                         break
 
@@ -1615,8 +1615,8 @@ class WardrivingEngine:
         gps_lon = pos['lon'] if pos else None
         gps_alt = pos.get('alt') if pos else None
 
-        # Skip GhostESP prompt and status lines
-        if line.startswith('ghost-cli>') or line.startswith('Wardrive:') or line.startswith('Registered') or line.startswith('Unsupported'):
+        # Skip HuginnESP prompt and status lines
+        if line.startswith('huginn>') or line.startswith('Wardrive:') or line.startswith('Registered') or line.startswith('Unsupported'):
             return
         # Skip scan status messages, help text, and BLE init lines
         skip_prefixes = ('WiFi scan', 'Started', 'Stopped', 'Usage:', 'Scanning started',
@@ -1628,17 +1628,17 @@ class WardrivingEngine:
 
         # === Pineapple / Evil Twin / Skimmer detection ===
         if 'Pineapple detected' in line or 'POTENTIAL SKIMMER' in line or 'Evil Twin' in line:
-            logger.warning(f"[GhostESP ALERT] {line}")
-            if not hasattr(self, '_ghost_alerts'):
-                self._ghost_alerts = []
-            self._ghost_alerts.append({'time': time.time(), 'alert': line})
+            logger.warning(f"[HuginnESP ALERT] {line}")
+            if not hasattr(self, '_esp_alerts'):
+                self._esp_alerts = []
+            self._esp_alerts.append({'time': time.time(), 'alert': line})
             # Start buffering multi-line alert details
-            self._ghost_alert_buffer = {'type': 'pineap' if 'Pineapple' in line else ('evil_twin' if 'Evil Twin' in line else 'skimmer')}
+            self._esp_alert_buffer = {'type': 'pineap' if 'Pineapple' in line else ('evil_twin' if 'Evil Twin' in line else 'skimmer')}
             return
 
         # Buffer continuation lines for alert details (BSSID:, Channel:, Device Name:, MAC Address:, etc.)
-        if hasattr(self, '_ghost_alert_buffer') and self._ghost_alert_buffer:
-            buf = self._ghost_alert_buffer
+        if hasattr(self, '_esp_alert_buffer') and self._esp_alert_buffer:
+            buf = self._esp_alert_buffer
             if line.startswith('BSSID:'):
                 buf['bssid'] = line.split(':', 1)[1].strip()
             elif line.startswith('Channel:'):
@@ -1659,47 +1659,47 @@ class WardrivingEngine:
                         buf['mac'], buf.get('name', ''), buf.get('rssi', -80),
                         'Skimmer', gps_lat, gps_lon, gps_alt
                     )
-                    self._ghost_ble_count += 1
-                    logger.warning(f"[GhostESP] Skimmer: {buf.get('name','')} @ {buf['mac']}")
-                self._ghost_alert_buffer = {}
+                    self._esp_ble_count += 1
+                    logger.warning(f"[HuginnESP] Skimmer: {buf.get('name','')} @ {buf['mac']}")
+                self._esp_alert_buffer = {}
                 return
             else:
                 # Unrecognized line — flush buffer
-                self._ghost_alert_buffer = {}
+                self._esp_alert_buffer = {}
                 # Fall through to normal parsing
-            if self._ghost_alert_buffer:
+            if self._esp_alert_buffer:
                 return
 
         # === AirTag detection (multi-line) ===
         if line.startswith('AirTag found'):
-            self._ghost_airtag_buffer = {}
+            self._esp_airtag_buffer = {}
             return
-        if hasattr(self, '_ghost_airtag_buffer') and self._ghost_airtag_buffer is not None:
+        if hasattr(self, '_esp_airtag_buffer') and self._esp_airtag_buffer is not None:
             if line.startswith('Tag:'):
-                self._ghost_airtag_buffer['tag'] = line.split(':', 1)[1].strip()
+                self._esp_airtag_buffer['tag'] = line.split(':', 1)[1].strip()
                 return
             elif line.startswith('MAC Address:'):
-                self._ghost_airtag_buffer['mac'] = line.split(':', 1)[1].strip().upper()
+                self._esp_airtag_buffer['mac'] = line.split(':', 1)[1].strip().upper()
                 return
             elif line.startswith('RSSI:'):
                 rssi_val = re.search(r'-?\d+', line)
-                self._ghost_airtag_buffer['rssi'] = int(rssi_val.group()) if rssi_val else -80
+                self._esp_airtag_buffer['rssi'] = int(rssi_val.group()) if rssi_val else -80
                 # Flush AirTag to DB
-                mac = self._ghost_airtag_buffer.get('mac', '')
+                mac = self._esp_airtag_buffer.get('mac', '')
                 if mac:
                     self.session.upsert_bluetooth(
-                        mac, f"AirTag #{self._ghost_airtag_buffer.get('tag', '?')}",
-                        self._ghost_airtag_buffer.get('rssi', -80),
+                        mac, f"AirTag #{self._esp_airtag_buffer.get('tag', '?')}",
+                        self._esp_airtag_buffer.get('rssi', -80),
                         'AirTag', gps_lat, gps_lon, gps_alt
                     )
-                    self._ghost_ble_count += 1
-                    logger.info(f"[GhostESP] AirTag found: {mac}")
-                self._ghost_airtag_buffer = None
+                    self._esp_ble_count += 1
+                    logger.info(f"[HuginnESP] AirTag found: {mac}")
+                self._esp_airtag_buffer = None
                 return
             elif line.startswith('Payload'):
                 return  # Skip payload data line
             else:
-                self._ghost_airtag_buffer = None
+                self._esp_airtag_buffer = None
 
         # === Flipper detection ===
         # Format: "Found White Flipper Device: \nMAC: xx:xx:xx:xx:xx:xx, \nName: xxx, \nRSSI: -70"
@@ -1708,36 +1708,36 @@ class WardrivingEngine:
             line
         )
         if flipper_match:
-            self._ghost_flipper_buffer = {'color': flipper_match.group(1)}
+            self._esp_flipper_buffer = {'color': flipper_match.group(1)}
             return
-        if hasattr(self, '_ghost_flipper_buffer') and self._ghost_flipper_buffer:
+        if hasattr(self, '_esp_flipper_buffer') and self._esp_flipper_buffer:
             if line.startswith('MAC:'):
-                self._ghost_flipper_buffer['mac'] = line.split(':', 1)[1].strip().rstrip(',').upper()
+                self._esp_flipper_buffer['mac'] = line.split(':', 1)[1].strip().rstrip(',').upper()
                 return
             elif line.startswith('Name:'):
-                self._ghost_flipper_buffer['name'] = line.split(':', 1)[1].strip().rstrip(',')
+                self._esp_flipper_buffer['name'] = line.split(':', 1)[1].strip().rstrip(',')
                 return
             elif line.startswith('RSSI:'):
                 rssi_val = re.search(r'-?\d+', line)
                 rssi = int(rssi_val.group()) if rssi_val else -80
-                buf = self._ghost_flipper_buffer
+                buf = self._esp_flipper_buffer
                 mac = buf.get('mac', '')
                 if mac:
                     name = f"Flipper {buf.get('color', '')} {buf.get('name', '')}".strip()
                     self.session.upsert_bluetooth(mac, name, rssi, 'Flipper', gps_lat, gps_lon, gps_alt)
-                    self._ghost_ble_count += 1
-                    logger.info(f"[GhostESP] Flipper found: {name} @ {mac}")
-                self._ghost_flipper_buffer = {}
+                    self._esp_ble_count += 1
+                    logger.info(f"[HuginnESP] Flipper found: {name} @ {mac}")
+                self._esp_flipper_buffer = {}
                 return
             else:
-                self._ghost_flipper_buffer = {}
+                self._esp_flipper_buffer = {}
 
         # === BLE spam detection ===
         if 'BLE Spam detected' in line:
-            logger.warning(f"[GhostESP] {line}")
-            if not hasattr(self, '_ghost_alerts'):
-                self._ghost_alerts = []
-            self._ghost_alerts.append({'time': time.time(), 'alert': line})
+            logger.warning(f"[HuginnESP] {line}")
+            if not hasattr(self, '_esp_alerts'):
+                self._esp_alerts = []
+            self._esp_alerts.append({'time': time.time(), 'alert': line})
             return
 
         # === Generic BLE line (MAC: ... Name: ... RSSI: ...) ===
@@ -1751,10 +1751,10 @@ class WardrivingEngine:
             rssi_str = ble_match.group(3)
             rssi = int(rssi_str) if rssi_str else -80
             self.session.upsert_bluetooth(mac, name, rssi, 'BLE', gps_lat, gps_lon, gps_alt)
-            self._ghost_ble_count += 1
+            self._esp_ble_count += 1
             return
 
-        # Try JSON format first (GhostESP style)
+        # Try JSON format first (HuginnESP style)
         if line.startswith('{'):
             try:
                 data = json.loads(line)
@@ -1794,7 +1794,7 @@ class WardrivingEngine:
             except (json.JSONDecodeError, ValueError):
                 pass
 
-        # Try GhostESP multi-line text format:
+        # Try HuginnESP multi-line text format:
         # [N] SSID: Name,
         #      BSSID: AA:BB:CC:DD:EE:FF,
         #      RSSI: -70,
@@ -1875,7 +1875,7 @@ class WardrivingEngine:
                     self.serial_networks += 1
 
     def _flush_serial_entry(self, gps_lat, gps_lon, gps_alt):
-        """Flush a buffered GhostESP multi-line entry to the session."""
+        """Flush a buffered HuginnESP multi-line entry to the session."""
         buf = self._serial_entry_buffer
         bssid = buf.get('bssid', '').upper()
         if not bssid or len(bssid) < 12:

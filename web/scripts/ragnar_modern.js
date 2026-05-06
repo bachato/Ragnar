@@ -14756,42 +14756,42 @@ function updateWardrivingUI(status) {
         if (ifInfo) ifInfo.textContent = `Interfaces: ${status.interfaces.join(', ')}`;
     }
 
-    // GhostESP status bar
-    const ghostBar = document.getElementById('wd-ghost-bar');
-    if (ghostBar) {
+    // HuginnESP status bar
+    const espBar = document.getElementById('wd-esp-bar');
+    if (espBar) {
         if (status.serial_connected || status.serial_port) {
-            ghostBar.classList.remove('hidden');
-            const dot = document.getElementById('wd-ghost-status-dot');
+            espBar.classList.remove('hidden');
+            const dot = document.getElementById('wd-esp-status-dot');
             if (status.serial_connected) {
                 if (dot) dot.className = 'w-2 h-2 rounded-full bg-green-500 animate-pulse';
             } else {
                 if (dot) dot.className = 'w-2 h-2 rounded-full bg-yellow-500';
             }
-            updateElement('wd-ghost-port', status.serial_port || '');
-            updateElement('wd-ghost-net-count', String(status.serial_networks || 0));
-            updateElement('wd-ghost-unique', String(status.serial_unique || 0));
+            updateElement('wd-esp-port', status.serial_port || '');
+            updateElement('wd-esp-net-count', String(status.serial_networks || 0));
+            updateElement('wd-esp-unique', String(status.serial_unique || 0));
             // Show current scan mode and BLE count
-            const modeEl = document.getElementById('wd-ghost-mode');
+            const modeEl = document.getElementById('wd-esp-mode');
             if (modeEl) {
                 const modeLabels = {
                     wifi: 'WiFi', 'ble-flipper': '🐬 Flipper',
                     'ble-airtag': '🏷️ AirTag', 'ble-skimmer': '💳 Skimmer',
                     pineap: '🍍 PineAP', ble: 'BLE', stations: 'Stations'
                 };
-                modeEl.textContent = modeLabels[status.ghost_mode] || status.ghost_mode || '';
+                modeEl.textContent = modeLabels[status.esp_mode] || status.esp_mode || '';
             }
-            updateElement('wd-ghost-ble-count', String(status.ghost_ble_count || 0));
+            updateElement('wd-esp-ble-count', String(status.esp_ble_count || 0));
             // Show alerts
-            const alertEl = document.getElementById('wd-ghost-alerts');
-            if (alertEl && status.ghost_alerts && status.ghost_alerts.length > 0) {
-                const latest = status.ghost_alerts[status.ghost_alerts.length - 1];
+            const alertEl = document.getElementById('wd-esp-alerts');
+            if (alertEl && status.esp_alerts && status.esp_alerts.length > 0) {
+                const latest = status.esp_alerts[status.esp_alerts.length - 1];
                 alertEl.textContent = '⚠️ ' + latest.alert;
                 alertEl.classList.remove('hidden');
             } else if (alertEl) {
                 alertEl.classList.add('hidden');
             }
         } else {
-            ghostBar.classList.add('hidden');
+            espBar.classList.add('hidden');
         }
     }
 
