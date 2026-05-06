@@ -178,13 +178,29 @@ class WardrivingSession:
                                   lat, lon, alt, speed, hdop,
                                   now, rssi, lat, lon, count, interface, band, bssid))
                         else:
-                            conn.execute("""
-                                UPDATE networks SET
-                                    ssid = COALESCE(NULLIF(?, ''), ssid),
-                                    security = COALESCE(NULLIF(?, ''), security),
-                                    rssi = ?, last_seen = ?, scan_count = ?
-                                WHERE bssid = ?
-                            """, (ssid, security, rssi, now, count, bssid))
+                            # Update GPS if we have coords now but didn't before
+                            if lat and lon:
+                                conn.execute("""
+                                    UPDATE networks SET
+                                        ssid = COALESCE(NULLIF(?, ''), ssid),
+                                        security = COALESCE(NULLIF(?, ''), security),
+                                        rssi = ?, last_seen = ?, scan_count = ?,
+                                        latitude = COALESCE(latitude, ?),
+                                        longitude = COALESCE(longitude, ?),
+                                        altitude = COALESCE(altitude, ?),
+                                        best_lat = COALESCE(best_lat, ?),
+                                        best_lon = COALESCE(best_lon, ?)
+                                    WHERE bssid = ?
+                                """, (ssid, security, rssi, now, count,
+                                      lat, lon, alt, lat, lon, bssid))
+                            else:
+                                conn.execute("""
+                                    UPDATE networks SET
+                                        ssid = COALESCE(NULLIF(?, ''), ssid),
+                                        security = COALESCE(NULLIF(?, ''), security),
+                                        rssi = ?, last_seen = ?, scan_count = ?
+                                    WHERE bssid = ?
+                                """, (ssid, security, rssi, now, count, bssid))
                     else:
                         conn.execute("""
                             INSERT INTO networks

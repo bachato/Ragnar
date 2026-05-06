@@ -14799,6 +14799,95 @@ function renderWardrivingSessions(sessions) {
     `).join('');
 }
 
+// ============================================================================
+// WARDRIVING MAP
+// ============================================================================
+let _wdMap = null;
+let _wdMapVisible = false;
+let _wdMapMarkers = [];
+
+function toggleWardrivingMap() {
+    const container = document.getElementById('wd-map-container');
+    if (!container) return;
+    _wdMapVisible = !_wdMapVisible;
+    container.classList.toggle('hidden', !_wdMapVisible);
+    const btn = document.getElementById('wd-map-btn');
+    if (btn) {
+        if (_wdMapVisible) {
+            btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-700');
+            btn.classList.add('bg-indigo-800', 'hover:bg-indigo-900');
+        } else {
+            btn.classList.remove('bg-indigo-800', 'hover:bg-indigo-900');
+            btn.classList.add('bg-indigo-600', 'hover:bg-indigo-700');
+        }
+    }
+    if (_wdMapVisible) {
+        if (!_wdMap) {
+            _wdMap = L.map('wd-map', { zoomControl: true }).setView([59.33, 18.07], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; OpenStreetMap'
+            }).addTo(_wdMap);
+        }
+        setTimeout(() => { _wdMap.invalidateSize(); }, 200);
+        loadWardrivingMapData();
+    }
+}
+
+async function loadWardrivingMapData() {
+    if (!_wdMap) return;
+    try {
+        const res = await fetch('/api/wardriving/networks?limit=2000');
+        const data = await res.json();
+        const networks = (data.networks || []).filter(n => n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0);
+
+        // Clear old markers
+        _wdMapMarkers.forEach(m => _wdMap.removeLayer(m));
+        _wdMapMarkers = [];
+
+        if (networks.length === 0) {
+            document.getElementById('wd-map-info').textContent = 'No GPS-tagged networks yet.';
+            return;
+        }
+
+        const bounds = [];
+        networks.forEach(n => {
+            const lat = n.best_lat;
+            const lon = n.best_lon;
+            bounds.push([lat, lon]);
+
+            const color = !n.security || n.security === 'Open' ? '#10b981' :
+                          n.security.includes('WEP') ? '#f59e0b' : '#3b82f6';
+            const marker = L.circleMarker([lat, lon], {
+                radius: 7,
+                fillColor: color,
+                color: '#1e293b',
+                weight: 1,
+                fillOpacity: 0.85
+            }).addTo(_wdMap);
+
+            const ssid = n.ssid || '&lt;hidden&gt;';
+            marker.bindPopup(`
+                <div style="font-family: monospace; min-width: 180px;">
+                    <b style="font-size: 13px;">${ssid}</b><br>
+                    <span style="color: #888;">BSSID:</span> ${n.bssid}<br>
+                    <span style="color: #888;">Security:</span> <span style="color:${color}">${n.security || 'Open'}</span><br>
+                    <span style="color: #888;">Channel:</span> ${n.channel || '-'} (${n.band || '-'})<br>
+                    <span style="color: #888;">Signal:</span> ${n.best_rssi} dBm<br>
+                    <span style="color: #888;">Seen:</span> ${n.scan_count || 1}x<br>
+                    <span style="color: #888;">Position:</span> ${lat.toFixed(5)}, ${lon.toFixed(5)}
+                </div>
+            `);
+            _wdMapMarkers.push(marker);
+        });
+
+        _wdMap.fitBounds(bounds, { padding: [30, 30] });
+        document.getElementById('wd-map-info').textContent = `${networks.length} networks with GPS position`;
+    } catch (e) {
+        console.error('[Wardriving] Map error:', e);
+    }
+}
+
 let _wardrivingRunning = false;
 let _wardrivingBusy = false;
 

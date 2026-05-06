@@ -225,6 +225,8 @@
         #map-ai-toggle-track.active #map-ai-toggle-knob { transform: translateX(16px); }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 </head>
 
 <body class="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white min-h-screen">
@@ -3685,6 +3687,12 @@
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
                             </svg>
                         </button>
+                        <button onclick="toggleWardrivingMap()" id="wd-map-btn" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition-colors text-sm">
+                            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"></path>
+                            </svg>
+                            Map
+                        </button>
                     </div>
                 </div>
 
@@ -3727,6 +3735,12 @@
                 <!-- Interfaces Info -->
                 <div id="wd-interfaces-bar" class="bg-slate-800/30 rounded-lg px-4 py-2 mb-4 text-xs text-gray-400 hidden">
                     Interfaces: <span id="wd-interfaces-list">-</span>
+                </div>
+
+                <!-- Map Container (hidden by default) -->
+                <div id="wd-map-container" class="hidden mb-6">
+                    <div id="wd-map" style="height: 450px; border-radius: 0.75rem; z-index: 1;"></div>
+                    <div class="text-xs text-gray-500 mt-1 text-right" id="wd-map-info"></div>
                 </div>
 
                 <!-- Network Table -->
