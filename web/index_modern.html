@@ -3758,9 +3758,16 @@
                     </div>
                 </div>
 
-                <!-- Interfaces Info -->
-                <div id="wd-interfaces-bar" class="bg-slate-800/30 rounded-lg px-4 py-2 mb-4 text-xs text-gray-400 hidden">
-                    Interfaces: <span id="wd-interfaces-list">-</span>
+                <!-- Table Type Selector -->
+                <div class="bg-slate-800/30 rounded-lg px-4 py-2 mb-4 flex items-center gap-3">
+                    <label class="text-xs text-gray-400">View:</label>
+                    <select id="wd-table-type" onchange="loadWardrivingTableByType()" class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600">
+                        <option value="wifi" selected>📶 WiFi Networks</option>
+                        <option value="bluetooth">🔵 Bluetooth Devices</option>
+                        <option value="cell">📶 Cell Towers</option>
+                        <option value="cameras">📷 Cameras</option>
+                    </select>
+                    <span id="wd-interfaces-info" class="text-xs text-gray-500 ml-auto"></span>
                 </div>
 
                 <!-- Map Container (hidden by default) -->
@@ -3799,7 +3806,7 @@
                 <!-- Network Table -->
                 <div class="overflow-x-auto">
                     <table class="w-full text-sm text-left">
-                        <thead class="text-xs uppercase text-gray-400 border-b border-gray-700">
+                        <thead id="wd-table-head" class="text-xs uppercase text-gray-400 border-b border-gray-700">
                             <tr>
                                 <th class="px-3 py-2">SSID</th>
                                 <th class="px-3 py-2">BSSID</th>

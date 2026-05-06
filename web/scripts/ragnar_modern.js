@@ -14643,14 +14643,14 @@ async function loadWardrivingData() {
             if (!_wardrivingInterval) {
                 _wardrivingInterval = setInterval(refreshWardrivingStatus, 3000);
             }
-            await loadWardrivingNetworks();
+            await loadWardrivingTableByType();
         } else {
             if (_wardrivingInterval) {
                 clearInterval(_wardrivingInterval);
                 _wardrivingInterval = null;
             }
             // Still load networks to show previous session data
-            await loadWardrivingNetworks();
+            await loadWardrivingTableByType();
         }
     } catch (e) {
         console.error('[Wardriving] Load error:', e);
@@ -14663,7 +14663,7 @@ async function refreshWardrivingStatus() {
         const status = await res.json();
         updateWardrivingUI(status);
         if (status.running) {
-            loadWardrivingNetworks();
+            loadWardrivingTableByType();
         } else if (_wardrivingInterval) {
             clearInterval(_wardrivingInterval);
             _wardrivingInterval = null;
@@ -14750,11 +14750,9 @@ function updateWardrivingUI(status) {
     updateElement('wd-camera-count', String(stats.cameras || 0));
 
     // Interfaces
-    const ifBar = document.getElementById('wd-interfaces-bar');
-    const ifList = document.getElementById('wd-interfaces-list');
+    const ifInfo = document.getElementById('wd-interfaces-info');
     if (status.interfaces && status.interfaces.length > 0) {
-        if (ifBar) ifBar.classList.remove('hidden');
-        if (ifList) updateElement('wd-interfaces-list', status.interfaces.join(', '));
+        if (ifInfo) ifInfo.textContent = `Interfaces: ${status.interfaces.join(', ')}`;
     }
 }
 
@@ -14770,7 +14768,28 @@ async function saveWardrivingDeviceName(name) {
     }
 }
 
+function loadWardrivingTableByType() {
+    const type = document.getElementById('wd-table-type')?.value || 'wifi';
+    if (type === 'wifi') loadWardrivingNetworks();
+    else if (type === 'bluetooth') _loadWardrivingBluetooth();
+    else if (type === 'cell') _loadWardrivingCellTable();
+    else if (type === 'cameras') _loadWardrivingCameras();
+}
+
+const _WD_HEADERS = {
+    wifi: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">📷</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
+    bluetooth: '<tr><th class="px-3 py-2">Name</th><th class="px-3 py-2">MAC</th><th class="px-3 py-2">Type</th><th class="px-3 py-2">RSSI</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">First Seen</th><th class="px-3 py-2">Seen</th></tr>',
+    cell: '<tr><th class="px-3 py-2">Provider</th><th class="px-3 py-2">Tech</th><th class="px-3 py-2">Cell ID</th><th class="px-3 py-2">MCC/MNC</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2">Band</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
+    cameras: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>'
+};
+
+function _setWdTableHeaders(type) {
+    const thead = document.getElementById('wd-table-head');
+    if (thead) thead.innerHTML = _WD_HEADERS[type] || _WD_HEADERS.wifi;
+}
+
 async function loadWardrivingNetworks() {
+    _setWdTableHeaders('wifi');
     try {
         const res = await fetch('/api/wardriving/networks?limit=200');
         const data = await res.json();
@@ -14814,6 +14833,121 @@ async function loadWardrivingNetworks() {
         updateElement('wd-total', String(data.total || networks.length));
     } catch (e) {
         console.error('[Wardriving] Networks error:', e);
+    }
+}
+
+async function _loadWardrivingBluetooth() {
+    _setWdTableHeaders('bluetooth');
+    const tbody = document.getElementById('wd-network-table');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/api/wardriving/bluetooth');
+        const data = await res.json();
+        const devices = data.devices || [];
+        if (devices.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">No Bluetooth devices found yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = devices.map(d => {
+            const hasGps = d.latitude && d.longitude;
+            const gpsIcon = hasGps
+                ? `<span title="${d.latitude.toFixed(5)}, ${d.longitude.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            const sigColor = d.rssi > -50 ? 'text-emerald-400' : d.rssi > -70 ? 'text-yellow-400' : 'text-red-400';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 font-mono text-xs">${escapeHtml(d.name || '(unknown)')}</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${d.mac}</td>
+                <td class="px-3 py-1.5 text-xs text-orange-400">${d.device_type || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}">${d.rssi || '-'} dBm</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${d.first_seen || '-'}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${d.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(devices.length));
+        updateElement('wd-total', String(data.total || devices.length));
+    } catch (e) {
+        console.error('[Wardriving] BT table error:', e);
+    }
+}
+
+async function _loadWardrivingCellTable() {
+    _setWdTableHeaders('cell');
+    const tbody = document.getElementById('wd-network-table');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/api/wardriving/cells');
+        const data = await res.json();
+        const towers = data.towers || [];
+        if (towers.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">No cell towers found yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = towers.map(t => {
+            const hasGps = t.latitude && t.longitude;
+            const gpsIcon = hasGps
+                ? `<span title="${t.latitude.toFixed(5)}, ${t.longitude.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            const sigColor = t.signal_dbm > -70 ? 'text-emerald-400' : t.signal_dbm > -90 ? 'text-yellow-400' : 'text-red-400';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 text-xs text-fuchsia-400">${escapeHtml(t.provider || '-')}</td>
+                <td class="px-3 py-1.5 text-xs">${t.tech || '-'}</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${t.cell_id || '-'}</td>
+                <td class="px-3 py-1.5 text-xs">${t.mcc || '-'}/${t.mnc || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}">${t.signal_dbm || '-'} dBm</td>
+                <td class="px-3 py-1.5 text-xs">${t.band_freq || '-'}</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${t.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(towers.length));
+        updateElement('wd-total', String(data.total || towers.length));
+    } catch (e) {
+        console.error('[Wardriving] Cell table error:', e);
+    }
+}
+
+async function _loadWardrivingCameras() {
+    _setWdTableHeaders('cameras');
+    const tbody = document.getElementById('wd-network-table');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/api/wardriving/networks?limit=2000');
+        const data = await res.json();
+        const cameras = (data.networks || []).filter(n => n.is_camera);
+        if (cameras.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">No cameras detected yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = cameras.map(n => {
+            const secColor = !n.security || n.security === '--' ? 'text-green-400' :
+                             n.security.includes('WEP') ? 'text-yellow-400' : 'text-blue-400';
+            const sigColor = n.best_rssi > -50 ? 'text-emerald-400' : n.best_rssi > -70 ? 'text-yellow-400' : 'text-red-400';
+            const hasGps = n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0;
+            const gpsIcon = hasGps
+                ? `<span title="${n.best_lat.toFixed(5)}, ${n.best_lon.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 font-mono text-xs text-pink-400">${escapeHtml(n.ssid || '<hidden>')} 📷</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${n.bssid}</td>
+                <td class="px-3 py-1.5 text-xs ${secColor}">${n.security || 'Open'}</td>
+                <td class="px-3 py-1.5 text-xs text-center">${n.channel || '-'}</td>
+                <td class="px-3 py-1.5 text-xs">${n.band || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}">${n.best_rssi} dBm</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${n.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(cameras.length));
+        updateElement('wd-total', String(cameras.length));
+    } catch (e) {
+        console.error('[Wardriving] Camera table error:', e);
     }
 }
 
