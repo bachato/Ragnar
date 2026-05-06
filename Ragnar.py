@@ -78,6 +78,13 @@ class Ragnar:
         
         # Main loop to keep Ragnar running
         logger.info("Entering main Ragnar loop...")
+
+        # Check if wardriving-on-boot is enabled
+        if self.shared_data.config.get('wardriving_on_boot', False):
+            logger.info("Wardriving-on-boot enabled. Starting wardriving, orchestrator will be suppressed.")
+            self.shared_data.manual_mode = True
+            self._start_wardriving_on_boot()
+
         loop_count = 0
         while not self.shared_data.should_exit:
             loop_count += 1
@@ -146,6 +153,20 @@ class Ragnar:
             self.shared_data.ragnarorch_status = "IDLE"
             self.shared_data.ragnarstatustext2 = ""
             self.shared_data.manual_mode = True
+
+    def _start_wardriving_on_boot(self):
+        """Auto-start wardriving engine at boot (called when wardriving_on_boot is True)."""
+        try:
+            from wardriving import WardrivingEngine
+            self._wd_engine = WardrivingEngine(self.shared_data)
+            device_name = self.shared_data.config.get('wardriving_device_name', 'Ragnar')
+            result = self._wd_engine.start(device_name=device_name)
+            logger.info(f"Wardriving auto-started on boot: {result}")
+            # Store reference so webapp can find it
+            import webapp_modern
+            webapp_modern._wardriving_engine = self._wd_engine
+        except Exception as e:
+            logger.error(f"Failed to auto-start wardriving on boot: {e}")
         else:
             logger.info("Orchestrator thread is not running.")
 

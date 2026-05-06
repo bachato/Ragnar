@@ -14638,6 +14638,7 @@ async function loadWardrivingData() {
 
         updateWardrivingUI(status);
         renderWardrivingSessions(sessionsData.sessions || []);
+        loadWardrivingOnBootState();
 
         if (status.running) {
             if (!_wardrivingInterval) {
@@ -14766,6 +14767,34 @@ async function saveWardrivingDeviceName(name) {
     } catch (e) {
         console.error('[Wardriving] Save device name error:', e);
     }
+}
+
+async function toggleWardrivingOnBoot() {
+    const cb = document.getElementById('wardriving-on-boot');
+    if (!cb) return;
+    try {
+        const res = await fetch('/api/wardriving/on_boot', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: cb.checked})
+        });
+        const data = await res.json();
+        if (!data.success) {
+            cb.checked = !cb.checked;
+        }
+    } catch (e) {
+        console.error('[Wardriving] on_boot toggle error:', e);
+        cb.checked = !cb.checked;
+    }
+}
+
+async function loadWardrivingOnBootState() {
+    try {
+        const res = await fetch('/api/wardriving/on_boot');
+        const data = await res.json();
+        const cb = document.getElementById('wardriving-on-boot');
+        if (cb) cb.checked = !!data.wardriving_on_boot;
+    } catch (e) { /* silent */ }
 }
 
 function loadWardrivingTableByType() {

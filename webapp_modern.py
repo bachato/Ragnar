@@ -6077,6 +6077,25 @@ def wardriving_status():
         logger.error(f"Wardriving status error: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/wardriving/on_boot', methods=['GET', 'POST'])
+def wardriving_on_boot():
+    """Get or set wardriving-on-boot setting."""
+    try:
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            enabled = bool(data.get('enabled', False))
+            shared_data.config['wardriving_on_boot'] = enabled
+            # If enabling wardriving on boot, also ensure wardriving is enabled
+            if enabled:
+                shared_data.config['wardriving_enabled'] = True
+            shared_data.save_config()
+            return jsonify({'success': True, 'wardriving_on_boot': enabled})
+        else:
+            return jsonify({'wardriving_on_boot': shared_data.config.get('wardriving_on_boot', False)})
+    except Exception as e:
+        logger.error(f"Wardriving on_boot error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/wardriving/start', methods=['POST'])
 def wardriving_start():
     """Start a wardriving session."""
