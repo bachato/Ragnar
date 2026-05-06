@@ -462,6 +462,27 @@ class WardrivingEngine:
 
     def get_status(self):
         """Get current wardriving status."""
+        # GPS status: use live GPS if running, otherwise probe for device (cached)
+        if self._gps:
+            gps_status = self._gps.get_status()
+        else:
+            now = time.time()
+            if not hasattr(self, '_gps_probe_cache') or now - self._gps_probe_time > 15:
+                from gps_manager import detect_gps_device
+                try:
+                    detected = detect_gps_device()
+                except Exception:
+                    detected = None
+                self._gps_probe_cache = detected
+                self._gps_probe_time = now
+            detected = self._gps_probe_cache
+            gps_status = {
+                'connected': bool(detected),
+                'port': detected,
+                'has_fix': False,
+                'error': None if detected else 'No GPS device detected',
+            }
+
         result = {
             'running': self._running,
             'session_id': self.session.session_id if self.session else None,
@@ -471,7 +492,7 @@ class WardrivingEngine:
             'total_networks': self.total_networks,
             'last_scan_time': self.last_scan_time,
             'error': self.error,
-            'gps': self._gps.get_status() if self._gps else {'connected': False},
+            'gps': gps_status,
         }
         if self.session:
             result['stats'] = self.session.get_stats()

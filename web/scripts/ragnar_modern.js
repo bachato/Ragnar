@@ -14695,9 +14695,12 @@ function updateWardrivingUI(status) {
         if (gps.has_fix) {
             gpsStatus.textContent = 'Fix OK';
             gpsStatus.className = 'text-lg font-bold text-emerald-400';
-        } else if (gps.connected) {
+        } else if (gps.connected && status.running) {
             gpsStatus.textContent = 'Searching...';
             gpsStatus.className = 'text-lg font-bold text-yellow-400';
+        } else if (gps.connected) {
+            gpsStatus.textContent = 'Connected';
+            gpsStatus.className = 'text-lg font-bold text-cyan-400';
         } else {
             gpsStatus.textContent = 'No GPS';
             gpsStatus.className = 'text-lg font-bold text-red-400';
