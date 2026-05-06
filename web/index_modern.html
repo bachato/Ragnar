@@ -3699,23 +3699,34 @@
                     </div>
                 </div>
 
-                <!-- GPS + Stats Row -->
-                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <!-- Device Name + GPS + Stats Row -->
+                <div class="flex flex-wrap gap-3 items-center mb-4 bg-slate-800/30 rounded-lg px-4 py-2">
+                    <label class="text-xs text-gray-400">Device Name:</label>
+                    <input type="text" id="wd-device-name" placeholder="e.g. RagnarPi-01" maxlength="64"
+                        class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600 w-40"
+                        onchange="saveWardrivingDeviceName(this.value)">
+                    <span id="wd-speed-display" class="text-xs text-gray-400 ml-auto">
+                        <span class="text-gray-500">Speed:</span> <span id="wd-speed-val">—</span>
+                        <span class="text-gray-500 ml-2">Heading:</span> <span id="wd-heading-val">—</span>
+                    </span>
+                </div>
+
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
                     <!-- GPS Status Card -->
-                    <div class="bg-slate-800/50 rounded-lg p-4">
+                    <div class="bg-slate-800/50 rounded-lg p-3">
                         <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">GPS</div>
-                        <div id="wd-gps-status" class="text-lg font-bold text-red-400">No Fix</div>
+                        <div id="wd-gps-status" class="text-sm font-bold text-red-400">No Fix</div>
                         <div id="wd-gps-coords" class="text-xs text-gray-500 mt-1">-</div>
                         <div id="wd-gps-sats" class="text-xs text-gray-500">Sats: -</div>
                     </div>
                     <!-- Total Networks -->
-                    <div class="bg-slate-800/50 rounded-lg p-4">
-                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Networks</div>
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">WiFi</div>
                         <div id="wd-total-networks" class="text-2xl font-bold text-emerald-400">0</div>
                         <div id="wd-networks-per-scan" class="text-xs text-gray-500 mt-1">0 per scan</div>
                     </div>
                     <!-- Security Breakdown -->
-                    <div class="bg-slate-800/50 rounded-lg p-4">
+                    <div class="bg-slate-800/50 rounded-lg p-3">
                         <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Security</div>
                         <div class="flex flex-wrap gap-2 mt-1">
                             <span class="text-xs"><span class="text-green-400" id="wd-open-count">0</span> Open</span>
@@ -3723,13 +3734,25 @@
                             <span class="text-xs"><span class="text-blue-400" id="wd-wpa-count">0</span> WPA</span>
                         </div>
                     </div>
-                    <!-- Bands -->
-                    <div class="bg-slate-800/50 rounded-lg p-4">
-                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Bands</div>
+                    <!-- Bluetooth -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Bluetooth</div>
+                        <div id="wd-bt-count" class="text-2xl font-bold text-orange-400">0</div>
+                        <div class="text-xs text-gray-500 mt-1">devices</div>
+                    </div>
+                    <!-- Cell Towers -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Cell</div>
+                        <div id="wd-cell-count" class="text-2xl font-bold text-fuchsia-400">0</div>
+                        <div class="text-xs text-gray-500 mt-1">towers</div>
+                    </div>
+                    <!-- Cameras + Bands -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">More</div>
                         <div class="flex flex-wrap gap-2 mt-1">
+                            <span class="text-xs">📷 <span class="text-pink-400" id="wd-camera-count">0</span></span>
                             <span class="text-xs"><span class="text-cyan-400" id="wd-band24">0</span> 2.4G</span>
                             <span class="text-xs"><span class="text-purple-400" id="wd-band5">0</span> 5G</span>
-                            <span class="text-xs"><span class="text-pink-400" id="wd-band6">0</span> 6G</span>
                         </div>
                         <div id="wd-scans-done" class="text-xs text-gray-500 mt-1">Scans: 0</div>
                     </div>
@@ -3744,6 +3767,14 @@
                 <div id="wd-map-container" class="hidden mb-6">
                     <!-- Map Filters -->
                     <div class="flex flex-wrap gap-3 items-center mb-3 bg-slate-800/50 rounded-lg px-4 py-2">
+                        <label class="text-xs text-gray-400">Show:</label>
+                        <select id="wd-map-filter-type" onchange="applyWardrivingMapFilters()" class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600">
+                            <option value="all">All</option>
+                            <option value="wifi" selected>WiFi</option>
+                            <option value="bluetooth">Bluetooth</option>
+                            <option value="cell">Cell Towers</option>
+                            <option value="cameras">Cameras</option>
+                        </select>
                         <label class="text-xs text-gray-400">Security:</label>
                         <select id="wd-map-filter-security" onchange="applyWardrivingMapFilters()" class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600">
                             <option value="all">All</option>
@@ -3776,12 +3807,13 @@
                                 <th class="px-3 py-2">Ch</th>
                                 <th class="px-3 py-2">Band</th>
                                 <th class="px-3 py-2">Signal</th>
+                                <th class="px-3 py-2 text-center">📷</th>
                                 <th class="px-3 py-2 text-center">GPS</th>
                                 <th class="px-3 py-2">Seen</th>
                             </tr>
                         </thead>
                         <tbody id="wd-network-table" class="divide-y divide-gray-800">
-                            <tr><td colspan="8" class="text-center text-gray-500 py-8">No networks yet. Press Start to begin wardriving.</td></tr>
+                            <tr><td colspan="9" class="text-center text-gray-500 py-8">No networks yet. Press Start to begin wardriving.</td></tr>
                         </tbody>
                     </table>
                 </div>

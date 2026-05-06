@@ -23,6 +23,19 @@ WIGLE_HEADER = [
     'CurrentLatitude', 'CurrentLongitude', 'AltitudeMeters', 'AccuracyMeters', 'Type'
 ]
 
+# Common camera manufacturer MAC OUI prefixes (first 3 bytes)
+_CAMERA_OUI = {
+    '00:80:F0', '00:62:6E', 'C0:56:E3', '28:57:BE', 'AC:CC:8E',  # Axis
+    '00:0F:7C', 'B0:C5:54', '7C:11:CB', '30:71:B2', '4C:BD:8F',  # ACTi, Hikvision
+    '44:47:CC', '54:C4:15', 'E0:50:8B', 'C0:06:0C',               # Hikvision
+    'A0:BD:1D', '3C:EF:8C', '48:EA:63', 'BC:AD:28', 'DC:B8:08',  # Dahua
+    '00:30:53', '00:04:7D', '00:E0:8F', '60:38:E0',               # Vivotek, Bosch
+    '78:A5:04', '78:B2:13', 'CC:2D:21', '00:18:AE',               # Samsung, TVT
+    '00:09:89', '00:12:9B', '00:14:95',                            # Geovision, Arecont
+    '00:1A:07', '00:1C:F0', '00:24:B5', '64:16:66',               # Reolink, Amcrest
+    '9C:8E:CD', 'D4:6D:6D', 'EC:71:DB',                            # TP-Link cameras, Foscam
+}
+
 # Encryption mapping
 _SECURITY_MAP = {
     'WPA3': '[WPA3][ESS]',
@@ -105,11 +118,51 @@ class WardrivingSession:
                     best_lon REAL,
                     scan_count INTEGER DEFAULT 1,
                     interface TEXT DEFAULT '',
-                    band TEXT DEFAULT '2.4GHz'
+                    band TEXT DEFAULT '2.4GHz',
+                    is_camera INTEGER DEFAULT 0
                 )
             """)
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_bssid ON networks(bssid)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bluetooth_devices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mac TEXT NOT NULL,
+                    name TEXT DEFAULT '',
+                    rssi INTEGER DEFAULT -100,
+                    device_type TEXT DEFAULT '',
+                    latitude REAL,
+                    longitude REAL,
+                    altitude REAL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    scan_count INTEGER DEFAULT 1
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_bt_mac ON bluetooth_devices(mac)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cell_towers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cell_id TEXT NOT NULL,
+                    mcc TEXT DEFAULT '',
+                    mnc TEXT DEFAULT '',
+                    lac TEXT DEFAULT '',
+                    tech TEXT DEFAULT '',
+                    provider TEXT DEFAULT '',
+                    signal_dbm INTEGER DEFAULT -120,
+                    band_freq TEXT DEFAULT '',
+                    latitude REAL,
+                    longitude REAL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    scan_count INTEGER DEFAULT 1
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cell ON cell_towers(cell_id)
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS gps_track (
@@ -150,6 +203,8 @@ class WardrivingSession:
         band = '5GHz' if (frequency and int(frequency) > 4900) else '2.4GHz'
         if frequency and int(frequency) > 5925:
             band = '6GHz'
+        # Check if MAC matches known camera OUI
+        is_camera = 1 if bssid and bssid[:8].upper() in _CAMERA_OUI else 0
 
         with self._lock:
             try:
@@ -207,11 +262,11 @@ class WardrivingSession:
                                 (bssid, ssid, security, channel, frequency, rssi,
                                  latitude, longitude, altitude, speed_kmh, hdop,
                                  first_seen, last_seen, best_rssi, best_lat, best_lon,
-                                 scan_count, interface, band)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                                 scan_count, interface, band, is_camera)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                         """, (bssid, ssid, security, channel, frequency, rssi,
                               lat, lon, alt, speed, hdop,
-                              now, now, rssi, lat, lon, interface, band))
+                              now, now, rssi, lat, lon, interface, band, is_camera))
                         self.unique_bssids.add(bssid)
                         self.network_count = len(self.unique_bssids)
 
@@ -230,6 +285,65 @@ class WardrivingSession:
             except Exception as e:
                 logger.debug(f"GPS track log error: {e}")
 
+    def upsert_bluetooth(self, mac, name, rssi, device_type, lat, lon, alt):
+        """Insert or update a discovered Bluetooth device."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    existing = conn.execute(
+                        "SELECT scan_count FROM bluetooth_devices WHERE mac = ?", (mac,)
+                    ).fetchone()
+                    if existing:
+                        count = (existing[0] or 0) + 1
+                        conn.execute("""
+                            UPDATE bluetooth_devices SET
+                                name = COALESCE(NULLIF(?, ''), name),
+                                rssi = MAX(rssi, ?), device_type = COALESCE(NULLIF(?, ''), device_type),
+                                latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude),
+                                altitude = COALESCE(?, altitude),
+                                last_seen = ?, scan_count = ?
+                            WHERE mac = ?
+                        """, (name, rssi, device_type, lat, lon, alt, now, count, mac))
+                    else:
+                        conn.execute("""
+                            INSERT INTO bluetooth_devices
+                                (mac, name, rssi, device_type, latitude, longitude, altitude,
+                                 first_seen, last_seen, scan_count)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """, (mac, name, rssi, device_type, lat, lon, alt, now, now))
+            except Exception as e:
+                logger.debug(f"BT upsert error: {e}")
+
+    def upsert_cell_tower(self, cell_id, mcc, mnc, lac, tech, provider,
+                          signal_dbm, band_freq, lat, lon):
+        """Insert or update a detected cell tower."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    existing = conn.execute(
+                        "SELECT scan_count FROM cell_towers WHERE cell_id = ?", (cell_id,)
+                    ).fetchone()
+                    if existing:
+                        count = (existing[0] or 0) + 1
+                        conn.execute("""
+                            UPDATE cell_towers SET
+                                signal_dbm = MAX(signal_dbm, ?), last_seen = ?, scan_count = ?,
+                                latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude)
+                            WHERE cell_id = ?
+                        """, (signal_dbm, now, count, lat, lon, cell_id))
+                    else:
+                        conn.execute("""
+                            INSERT INTO cell_towers
+                                (cell_id, mcc, mnc, lac, tech, provider, signal_dbm, band_freq,
+                                 latitude, longitude, first_seen, last_seen, scan_count)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """, (cell_id, mcc, mnc, lac, tech, provider, signal_dbm, band_freq,
+                              lat, lon, now, now))
+            except Exception as e:
+                logger.debug(f"Cell upsert error: {e}")
+
     def get_stats(self):
         """Return session statistics."""
         with self._lock:
@@ -246,6 +360,23 @@ class WardrivingSession:
                     strongest = conn.execute("SELECT bssid, ssid, best_rssi FROM networks ORDER BY best_rssi DESC LIMIT 1").fetchone()
                     trackpoints = conn.execute("SELECT COUNT(*) FROM gps_track").fetchone()[0]
 
+                    # Bluetooth and cell counts (tables may not exist in old DBs)
+                    bt_count = 0
+                    cell_count = 0
+                    camera_count = 0
+                    try:
+                        bt_count = conn.execute("SELECT COUNT(*) FROM bluetooth_devices").fetchone()[0]
+                    except Exception:
+                        pass
+                    try:
+                        cell_count = conn.execute("SELECT COUNT(*) FROM cell_towers").fetchone()[0]
+                    except Exception:
+                        pass
+                    try:
+                        camera_count = conn.execute("SELECT COUNT(*) FROM networks WHERE is_camera = 1").fetchone()[0]
+                    except Exception:
+                        pass
+
                     return {
                         'session_id': self.session_id,
                         'total_networks': total,
@@ -256,6 +387,9 @@ class WardrivingSession:
                         'band_2_4ghz': band_24,
                         'band_5ghz': band_5,
                         'band_6ghz': band_6,
+                        'bluetooth_devices': bt_count,
+                        'cell_towers': cell_count,
+                        'cameras': camera_count,
                         'gps_trackpoints': trackpoints,
                         'strongest': dict(strongest) if strongest else None,
                         'duration_seconds': (self.end_time or time.time()) - self.start_time,
@@ -286,6 +420,32 @@ class WardrivingSession:
                 logger.error(f"Get networks error: {e}")
                 return []
 
+    def get_bluetooth_devices(self):
+        """Get all discovered Bluetooth devices."""
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT * FROM bluetooth_devices ORDER BY rssi DESC"
+                    ).fetchall()
+                    return [dict(r) for r in rows]
+            except Exception:
+                return []
+
+    def get_cell_towers(self):
+        """Get all discovered cell towers."""
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT * FROM cell_towers ORDER BY signal_dbm DESC"
+                    ).fetchall()
+                    return [dict(r) for r in rows]
+            except Exception:
+                return []
+
     def get_gps_track(self):
         """Return GPS track as list of [lat, lon] points."""
         with self._lock:
@@ -298,16 +458,18 @@ class WardrivingSession:
             except Exception:
                 return []
 
-    def export_wigle_csv(self):
-        """Export session to WiGLE CSV format string."""
+    def export_wigle_csv(self, device_name='Ragnar'):
+        """Export session to WiGLE CSV format string including WiFi, BT, and cell."""
         lines = []
-        lines.append('WigleWifi-1.4,appRelease=Ragnar,model=RaspberryPi,release=1.0,device=Ragnar,display=EPD,board=RPi,brand=Ragnar')
+        dn = device_name or 'Ragnar'
+        lines.append(f'WigleWifi-1.4,appRelease=Ragnar,model=RaspberryPi,release=1.0,device={dn},display=EPD,board=RPi,brand=Ragnar')
         lines.append(','.join(WIGLE_HEADER))
 
         with self._lock:
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.row_factory = sqlite3.Row
+                    # WiFi networks
                     rows = conn.execute("SELECT * FROM networks ORDER BY first_seen").fetchall()
                     for row in rows:
                         r = dict(row)
@@ -324,6 +486,46 @@ class WardrivingSession:
                             str(r.get('hdop', '') or ''),
                             'WIFI'
                         ]))
+                    # Bluetooth devices
+                    try:
+                        bt_rows = conn.execute("SELECT * FROM bluetooth_devices ORDER BY first_seen").fetchall()
+                        for row in bt_rows:
+                            r = dict(row)
+                            lines.append(','.join([
+                                r.get('mac', ''),
+                                r.get('name', '').replace(',', '\\,'),
+                                '[BT]',
+                                r.get('first_seen', ''),
+                                '0',
+                                str(r.get('rssi', -100)),
+                                str(r.get('latitude', '') or ''),
+                                str(r.get('longitude', '') or ''),
+                                str(r.get('altitude', '') or ''),
+                                '',
+                                'BT'
+                            ]))
+                    except Exception:
+                        pass
+                    # Cell towers
+                    try:
+                        cell_rows = conn.execute("SELECT * FROM cell_towers ORDER BY first_seen").fetchall()
+                        for row in cell_rows:
+                            r = dict(row)
+                            lines.append(','.join([
+                                r.get('cell_id', ''),
+                                f"{r.get('provider', '')} {r.get('tech', '')}".strip().replace(',', '\\,'),
+                                f"[{r.get('tech', 'GSM')}]",
+                                r.get('first_seen', ''),
+                                str(r.get('band_freq', '')),
+                                str(r.get('signal_dbm', -120)),
+                                str(r.get('latitude', '') or ''),
+                                str(r.get('longitude', '') or ''),
+                                '',
+                                '',
+                                'GSM'
+                            ]))
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error(f"WiGLE export error: {e}")
 
@@ -339,6 +541,9 @@ class WardrivingSession:
             '<Style id="open"><IconStyle><color>ff00ff00</color><scale>0.8</scale></IconStyle></Style>',
             '<Style id="wep"><IconStyle><color>ff00ffff</color><scale>0.8</scale></IconStyle></Style>',
             '<Style id="wpa"><IconStyle><color>ff0000ff</color><scale>0.8</scale></IconStyle></Style>',
+            '<Style id="bt"><IconStyle><color>ffff8800</color><scale>0.6</scale></IconStyle></Style>',
+            '<Style id="cell"><IconStyle><color>ff8800ff</color><scale>0.7</scale></IconStyle></Style>',
+            '<Style id="camera"><IconStyle><color>ffff0088</color><scale>0.9</scale></IconStyle></Style>',
         ]
 
         with self._lock:
@@ -359,6 +564,41 @@ class WardrivingSession:
 </Placemark>''')
             except Exception as e:
                 logger.error(f"KML export error: {e}")
+
+        # Add Bluetooth devices
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    bt_rows = conn.execute("SELECT * FROM bluetooth_devices WHERE latitude IS NOT NULL").fetchall()
+                    for row in bt_rows:
+                        r = dict(row)
+                        name = (r.get('name') or r.get('mac', 'Unknown')).replace('&', '&amp;').replace('<', '&lt;')
+                        kml_parts.append(f'''<Placemark>
+<name>BT: {name}</name>
+<description>MAC: {r.get("mac","")}\nType: {r.get("device_type","")}\nRSSI: {r.get("rssi",-100)} dBm</description>
+<styleUrl>#bt</styleUrl>
+<Point><coordinates>{r.get("longitude",0)},{r.get("latitude",0)},0</coordinates></Point>
+</Placemark>''')
+            except Exception:
+                pass
+
+        # Add Cell towers
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cell_rows = conn.execute("SELECT * FROM cell_towers WHERE latitude IS NOT NULL").fetchall()
+                    for row in cell_rows:
+                        r = dict(row)
+                        kml_parts.append(f'''<Placemark>
+<name>Cell: {r.get("provider","")} {r.get("tech","")}</name>
+<description>CellID: {r.get("cell_id","")}\nMCC/MNC: {r.get("mcc","")}/{r.get("mnc","")}\nSignal: {r.get("signal_dbm",-120)} dBm</description>
+<styleUrl>#cell</styleUrl>
+<Point><coordinates>{r.get("longitude",0)},{r.get("latitude",0)},0</coordinates></Point>
+</Placemark>''')
+            except Exception:
+                pass
 
         # Add GPS track
         with self._lock:
@@ -404,6 +644,8 @@ class WardrivingEngine:
         self.data_dir = getattr(shared_data, 'data_dir', 'data')
         self._running = False
         self._thread = None
+        self._bt_thread = None
+        self._cell_thread = None
         self._gps = None
         self.session = None
         self.scan_interval = 2  # seconds between scans (fast!)
@@ -415,17 +657,17 @@ class WardrivingEngine:
         self.error = None
         self._gps_track_interval = 5  # log GPS position every 5 seconds
         self._last_gps_track = 0
+        self.bt_count = 0
+        self.cell_count = 0
+        self.device_name = ''
 
-    def start(self, interfaces=None, gps_port=None):
-        """Start a wardriving session.
-        
-        Args:
-            interfaces: List of WiFi interface names to scan with.
-                       If None, auto-detects all WiFi interfaces.
-            gps_port: Serial port for GPS. If None, auto-detects.
-        """
+    def start(self, interfaces=None, gps_port=None, device_name=None):
+        """Start a wardriving session."""
         if self._running:
             return {'error': 'Already running'}
+
+        # Device name from param or config
+        self.device_name = device_name or self.shared_data.config.get('wardriving_device_name', '') or ''
 
         # Detect/validate interfaces
         self.interfaces = interfaces or self._detect_wifi_interfaces()
@@ -444,12 +686,31 @@ class WardrivingEngine:
         self._running = True
         self.error = None
         self.scans_completed = 0
+        self.bt_count = 0
+        self.cell_count = 0
 
-        # Start scanning thread
+        # Save device name and session info
+        if self.device_name:
+            try:
+                with sqlite3.connect(self.session.db_path) as conn:
+                    conn.execute("INSERT OR REPLACE INTO session_info (key, value) VALUES (?, ?)",
+                                 ('device_name', self.device_name))
+            except Exception:
+                pass
+
+        # Start scanning threads
         self._thread = threading.Thread(target=self._scan_loop, daemon=True, name="wardriving")
         self._thread.start()
 
-        logger.info(f"Wardriving started: interfaces={self.interfaces}, GPS={gps_ok}")
+        # Start Bluetooth scanning thread
+        self._bt_thread = threading.Thread(target=self._bt_scan_loop, daemon=True, name="wardriving-bt")
+        self._bt_thread.start()
+
+        # Start cell scanning thread
+        self._cell_thread = threading.Thread(target=self._cell_scan_loop, daemon=True, name="wardriving-cell")
+        self._cell_thread.start()
+
+        logger.info(f"Wardriving started: interfaces={self.interfaces}, GPS={gps_ok}, device={self.device_name}")
         return {
             'success': True,
             'session_id': self.session.session_id,
@@ -509,6 +770,9 @@ class WardrivingEngine:
             'last_scan_time': self.last_scan_time,
             'error': self.error,
             'gps': gps_status,
+            'bluetooth_count': self.bt_count,
+            'cell_count': self.cell_count,
+            'device_name': self.device_name,
         }
         if self.session:
             result['stats'] = self.session.get_stats()
@@ -820,3 +1084,192 @@ class WardrivingEngine:
                 })
 
         return networks
+
+    # ------------------------------------------------------------------
+    # Bluetooth scanning
+    # ------------------------------------------------------------------
+
+    def _bt_scan_loop(self):
+        """Background loop: scan for Bluetooth devices every ~15 seconds."""
+        logger.info("Bluetooth scan loop started")
+        while self._running:
+            try:
+                pos = self._gps.get_position() if self._gps else None
+                lat = pos['lat'] if pos else None
+                lon = pos['lon'] if pos else None
+                alt = pos['alt'] if pos else None
+
+                devices = self._scan_bluetooth()
+                for dev in devices:
+                    self.session.upsert_bluetooth(
+                        mac=dev['mac'], name=dev['name'], rssi=dev.get('rssi', -100),
+                        device_type=dev.get('type', ''), lat=lat, lon=lon, alt=alt
+                    )
+                self.bt_count = len(devices)
+            except Exception as e:
+                logger.debug(f"BT scan error: {e}")
+            time.sleep(15)
+        logger.info("Bluetooth scan loop stopped")
+
+    def _scan_bluetooth(self):
+        """Scan for Bluetooth Classic + BLE devices."""
+        devices = []
+        seen_macs = set()
+
+        # Method 1: bluetoothctl (Classic + BLE)
+        try:
+            # Power on + scan for 8 seconds
+            subprocess.run(['sudo', 'bluetoothctl', 'power', 'on'],
+                           capture_output=True, timeout=5)
+            proc = subprocess.run(
+                ['sudo', 'bluetoothctl', '--timeout', '8', 'scan', 'on'],
+                capture_output=True, text=True, timeout=12
+            )
+            # List discovered devices
+            result = subprocess.run(
+                ['sudo', 'bluetoothctl', 'devices'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    # Format: "Device AA:BB:CC:DD:EE:FF DeviceName"
+                    m = re.match(r'Device\s+([0-9A-Fa-f:]{17})\s+(.*)', line.strip())
+                    if m:
+                        mac = m.group(1).upper()
+                        name = m.group(2).strip()
+                        if mac not in seen_macs:
+                            seen_macs.add(mac)
+                            devices.append({'mac': mac, 'name': name, 'rssi': -80, 'type': 'Classic/BLE'})
+        except Exception as e:
+            logger.debug(f"bluetoothctl scan failed: {e}")
+
+        # Method 2: hcitool lescan for BLE (if available)
+        try:
+            result = subprocess.run(
+                ['sudo', 'timeout', '5', 'hcitool', 'lescan', '--duplicates'],
+                capture_output=True, text=True, timeout=8
+            )
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    m = re.match(r'([0-9A-Fa-f:]{17})\s+(.*)', line.strip())
+                    if m:
+                        mac = m.group(1).upper()
+                        name = m.group(2).strip()
+                        if mac not in seen_macs and name != '(unknown)':
+                            seen_macs.add(mac)
+                            devices.append({'mac': mac, 'name': name, 'rssi': -85, 'type': 'BLE'})
+        except Exception as e:
+            logger.debug(f"hcitool lescan failed: {e}")
+
+        return devices
+
+    # ------------------------------------------------------------------
+    # Cell network scanning
+    # ------------------------------------------------------------------
+
+    def _cell_scan_loop(self):
+        """Background loop: scan for cell towers every ~30 seconds."""
+        logger.info("Cell network scan loop started")
+        while self._running:
+            try:
+                pos = self._gps.get_position() if self._gps else None
+                lat = pos['lat'] if pos else None
+                lon = pos['lon'] if pos else None
+
+                towers = self._scan_cell_networks()
+                for t in towers:
+                    self.session.upsert_cell_tower(
+                        cell_id=t['cell_id'], mcc=t.get('mcc', ''), mnc=t.get('mnc', ''),
+                        lac=t.get('lac', ''), tech=t.get('tech', ''),
+                        provider=t.get('provider', ''), signal_dbm=t.get('signal', -120),
+                        band_freq=t.get('band', ''), lat=lat, lon=lon
+                    )
+                self.cell_count = len(towers)
+            except Exception as e:
+                logger.debug(f"Cell scan error: {e}")
+            time.sleep(30)
+        logger.info("Cell network scan loop stopped")
+
+    def _scan_cell_networks(self):
+        """Scan for cell networks using ModemManager (mmcli)."""
+        towers = []
+
+        # Find modem index
+        try:
+            result = subprocess.run(
+                ['mmcli', '-L'], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return towers
+            # Parse modem number: "/org/freedesktop/ModemManager1/Modem/0"
+            modem_match = re.search(r'/Modem/(\d+)', result.stdout)
+            if not modem_match:
+                return towers
+            modem_idx = modem_match.group(1)
+        except Exception:
+            return towers
+
+        # Get modem info
+        try:
+            result = subprocess.run(
+                ['mmcli', '-m', modem_idx, '--output-json'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                modem = data.get('modem', {})
+                generic = modem.get('generic', {})
+                thr = modem.get('3gpp', {})
+
+                provider = generic.get('operator-name', '') or thr.get('operator-name', '')
+                tech_list = generic.get('access-technologies', [])
+                tech = tech_list[0] if tech_list else ''
+                signal_raw = generic.get('signal-quality', {}).get('value', 0)
+                signal_dbm = int(-120 + (signal_raw * 0.9)) if signal_raw else -120
+
+                mcc = thr.get('operator-code', '')[:3] if thr.get('operator-code') else ''
+                mnc = thr.get('operator-code', '')[3:] if thr.get('operator-code') else ''
+
+                # Get cell info from scan
+                cell_id_str = thr.get('registration', {}).get('cell-id', '') or str(modem_idx)
+
+                if cell_id_str:
+                    towers.append({
+                        'cell_id': cell_id_str,
+                        'mcc': mcc,
+                        'mnc': mnc,
+                        'lac': thr.get('registration', {}).get('lac', ''),
+                        'tech': tech,
+                        'provider': provider,
+                        'signal': signal_dbm,
+                        'band': '',
+                    })
+        except Exception as e:
+            logger.debug(f"mmcli modem info failed: {e}")
+
+        # Try network scan for nearby towers
+        try:
+            result = subprocess.run(
+                ['mmcli', '-m', modem_idx, '--3gpp-scan', '--output-json'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                scan_results = data.get('modem', {}).get('3gpp', {}).get('scan', [])
+                for net in scan_results:
+                    cid = f"{net.get('operator-code', '')}-{net.get('operator-long', '')}"
+                    if cid and not any(t['cell_id'] == cid for t in towers):
+                        towers.append({
+                            'cell_id': cid,
+                            'mcc': net.get('operator-code', '')[:3] if net.get('operator-code') else '',
+                            'mnc': net.get('operator-code', '')[3:] if net.get('operator-code') else '',
+                            'lac': '',
+                            'tech': net.get('access-technology', ''),
+                            'provider': net.get('operator-long', ''),
+                            'signal': -100,
+                            'band': '',
+                        })
+        except Exception as e:
+            logger.debug(f"mmcli 3gpp scan failed: {e}")
+
+        return towers

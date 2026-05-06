@@ -741,7 +741,8 @@ class SharedData:
             "wardriving_gps_port": "auto",
             "wardriving_gps_baudrate": 9600,
             "wardriving_interfaces": [],
-            "wardriving_auto_export": True
+            "wardriving_auto_export": True,
+            "wardriving_device_name": ""
         }
 
     def apply_display_profile(self, epd_type=None, set_orientation_if_missing=False, persist=False):

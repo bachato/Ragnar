@@ -6168,7 +6168,8 @@ def wardriving_export(session_id):
                 headers={'Content-Disposition': f'attachment; filename=ragnar_wardriving_{session_id}.kml'}
             )
         else:
-            content = session.export_wigle_csv()
+            device_name = engine.device_name or get_shared_data().config.get('wardriving_device_name', 'Ragnar')
+            content = session.export_wigle_csv(device_name=device_name)
             return app.response_class(
                 content, mimetype='text/csv',
                 headers={'Content-Disposition': f'attachment; filename=ragnar_wardriving_{session_id}.csv'}
@@ -6227,6 +6228,48 @@ def wardriving_interfaces():
                 pass
             result.append(info)
         return jsonify({'interfaces': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/wardriving/bluetooth')
+def wardriving_bluetooth():
+    """Get discovered Bluetooth devices."""
+    try:
+        engine = _get_wardriving_engine()
+        if engine.session:
+            devices = engine.session.get_bluetooth_devices()
+            return jsonify({'devices': devices, 'total': len(devices)})
+        return jsonify({'devices': [], 'total': 0})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/wardriving/cells')
+def wardriving_cells():
+    """Get discovered cell towers."""
+    try:
+        engine = _get_wardriving_engine()
+        if engine.session:
+            towers = engine.session.get_cell_towers()
+            return jsonify({'towers': towers, 'total': len(towers)})
+        return jsonify({'towers': [], 'total': 0})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/wardriving/device_name', methods=['POST'])
+def wardriving_set_device_name():
+    """Set device name for wardriving sessions."""
+    try:
+        data = request.get_json(silent=True) or {}
+        name = data.get('name', '').strip()[:64]  # Max 64 chars
+        shared_data = get_shared_data()
+        shared_data.config['wardriving_device_name'] = name
+        shared_data.save_config()
+        engine = _get_wardriving_engine()
+        engine.device_name = name
+        return jsonify({'success': True, 'device_name': name})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

@@ -1267,11 +1267,15 @@ class Display:
             ("WEP", str(st.get('wep_networks', 0))),
             ("WPA", str(st.get('wpa_networks', 0))),
             ("2.4G/5G/6G", f"{st.get('band_2_4ghz', 0)}/{st.get('band_5ghz', 0)}/{st.get('band_6ghz', 0)}"),
+            ("BT/Cell/Cam", f"{st.get('bluetooth_devices', 0)}/{st.get('cell_towers', 0)}/{st.get('cameras', 0)}"),
             ("Scans", str(wd.get('scans_completed', 0))),
             ("GPS", gps_str),
         ]
         if gps.get('has_fix'):
+            spd = gps.get('speed_kmh')
+            spd_str = f"{spd:.1f}km/h" if spd is not None else "-"
             stats.append(("Sats", str(gps.get('satellites', '-'))))
+            stats.append(("Speed", spd_str))
 
         self._draw_stat_rows(draw, y, stats)
 
@@ -1637,6 +1641,11 @@ class Display:
             b5 = st.get('band_5ghz', 0)
             b6 = st.get('band_6ghz', 0)
             draw.text((30, y), f"2.4G:{b24} 5G:{b5} 6G:{b6}", font=font_side, fill=C_CYAN)
+            y += line_h
+            bt_n = st.get('bluetooth_devices', 0)
+            cell_n = st.get('cell_towers', 0)
+            cam_n = st.get('cameras', 0)
+            draw.text((30, y), f"BT:{bt_n} Cell:{cell_n} Cam:{cam_n}", font=font_side, fill=C_AMBER)
             y += line_h
             scans = wd.get('scans_completed', 0) if wd else 0
             draw.text((30, y), f"Scans: {scans}", font=font_side, fill=C_GRAY)
@@ -2110,10 +2119,15 @@ class Display:
             total = st.get('total_networks', 0)
             open_n = st.get('open_networks', 0)
             wpa_n = st.get('wpa_networks', 0)
+            bt_n = st.get('bluetooth_devices', 0)
+            cell_n = st.get('cell_towers', 0)
             scans = wd.get('scans_completed', 0) if wd else 0
 
             if gps.get('has_fix'):
+                spd = gps.get('speed_kmh')
                 gps_str = f"{gps.get('latitude', 0):.4f},{gps.get('longitude', 0):.4f}"
+                if spd is not None:
+                    gps_str += f" {spd:.0f}km/h"
             elif gps.get('connected'):
                 gps_str = "GPS searching..."
             else:
@@ -2127,10 +2141,9 @@ class Display:
             draw.text((2, 1), "WARDRIVING", font=font_hdr, fill=0)
 
             # Body
-            draw.text((0, 15), f"Networks: {total}", font=font_body, fill=255)
-            draw.text((0, 26), f"Open:{open_n} WPA:{wpa_n}", font=font_body, fill=255)
-            draw.text((0, 37), f"Scans: {scans}", font=font_body, fill=255)
-            draw.text((0, 48), gps_str[:22], font=font_body, fill=255)
+            draw.text((0, 15), f"Net:{total} Open:{open_n} WPA:{wpa_n}", font=font_body, fill=255)
+            draw.text((0, 26), f"BT:{bt_n} Cell:{cell_n} Scans:{scans}", font=font_body, fill=255)
+            draw.text((0, 37), gps_str[:22], font=font_body, fill=255)
 
             return img
 
