@@ -97,6 +97,9 @@ class WardrivingSession:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-8000")    # 8 MB cache (safe for Pi Zero 512 MB)
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS networks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -456,25 +459,41 @@ class WardrivingSession:
                 logger.debug(f"Cell upsert error: {e}")
 
     def get_stats(self):
-        """Return session statistics."""
+        """Return session statistics (cached for 5 s to reduce SQLite load)."""
+        now = time.time()
+        if hasattr(self, '_stats_cache') and self._stats_cache and now - self._stats_cache_time < 5:
+            return self._stats_cache
         with self._lock:
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.row_factory = sqlite3.Row
-                    total = conn.execute("SELECT COUNT(*) FROM networks").fetchone()[0]
-                    open_nets = conn.execute("SELECT COUNT(*) FROM networks WHERE security IN ('', '--', 'OWE')").fetchone()[0]
-                    wep_nets = conn.execute("SELECT COUNT(*) FROM networks WHERE security LIKE '%WEP%'").fetchone()[0]
-                    wpa_nets = conn.execute("SELECT COUNT(*) FROM networks WHERE security LIKE '%WPA%'").fetchone()[0]
-                    band_24 = conn.execute("SELECT COUNT(*) FROM networks WHERE band = '2.4GHz'").fetchone()[0]
-                    band_5 = conn.execute("SELECT COUNT(*) FROM networks WHERE band = '5GHz'").fetchone()[0]
-                    band_6 = conn.execute("SELECT COUNT(*) FROM networks WHERE band = '6GHz'").fetchone()[0]
+                    # Single query for band + security counts
+                    row = conn.execute("""
+                        SELECT
+                            COUNT(*) AS total,
+                            SUM(CASE WHEN security IN ('', '--', 'OWE') THEN 1 ELSE 0 END) AS open_nets,
+                            SUM(CASE WHEN security LIKE '%WEP%' THEN 1 ELSE 0 END) AS wep_nets,
+                            SUM(CASE WHEN security LIKE '%WPA%' THEN 1 ELSE 0 END) AS wpa_nets,
+                            SUM(CASE WHEN band = '2.4GHz' THEN 1 ELSE 0 END) AS band_24,
+                            SUM(CASE WHEN band = '5GHz' THEN 1 ELSE 0 END) AS band_5,
+                            SUM(CASE WHEN band = '6GHz' THEN 1 ELSE 0 END) AS band_6,
+                            SUM(CASE WHEN is_camera = 1 THEN 1 ELSE 0 END) AS cameras
+                        FROM networks
+                    """).fetchone()
+                    total = row['total']
+                    open_nets = row['open_nets'] or 0
+                    wep_nets = row['wep_nets'] or 0
+                    wpa_nets = row['wpa_nets'] or 0
+                    band_24 = row['band_24'] or 0
+                    band_5 = row['band_5'] or 0
+                    band_6 = row['band_6'] or 0
+                    camera_count = row['cameras'] or 0
                     strongest = conn.execute("SELECT bssid, ssid, best_rssi FROM networks ORDER BY best_rssi DESC LIMIT 1").fetchone()
                     trackpoints = conn.execute("SELECT COUNT(*) FROM gps_track").fetchone()[0]
 
                     # Bluetooth and cell counts (tables may not exist in old DBs)
                     bt_count = 0
                     cell_count = 0
-                    camera_count = 0
                     try:
                         bt_count = conn.execute("SELECT COUNT(*) FROM bluetooth_devices").fetchone()[0]
                     except Exception:
@@ -483,12 +502,8 @@ class WardrivingSession:
                         cell_count = conn.execute("SELECT COUNT(*) FROM cell_towers").fetchone()[0]
                     except Exception:
                         pass
-                    try:
-                        camera_count = conn.execute("SELECT COUNT(*) FROM networks WHERE is_camera = 1").fetchone()[0]
-                    except Exception:
-                        pass
 
-                    return {
+                    result = {
                         'session_id': self.session_id,
                         'total_networks': total,
                         'unique_bssids': total,
@@ -507,6 +522,9 @@ class WardrivingSession:
                         'start_time': self.start_time,
                         'db_path': self.db_path
                     }
+                    self._stats_cache = result
+                    self._stats_cache_time = now
+                    return result
             except Exception as e:
                 logger.error(f"Stats error: {e}")
                 return {'error': str(e)}
@@ -1434,6 +1452,8 @@ class WardrivingEngine:
     # Bluetooth scanning
     # ------------------------------------------------------------------
 
+    _bt_powered_on = False  # Class-level: avoid repeated 'power on' calls
+
     def _bt_scan_loop(self):
         """Background loop: scan for Bluetooth devices every ~15 seconds."""
         logger.info("Bluetooth scan loop started")
@@ -1463,12 +1483,14 @@ class WardrivingEngine:
 
         # Method 1: bluetoothctl (Classic + BLE)
         try:
-            # Power on + scan for 8 seconds
-            subprocess.run(['sudo', 'bluetoothctl', 'power', 'on'],
-                           capture_output=True, timeout=5)
+            # Power on once per session (skip repeated calls)
+            if not WardrivingEngine._bt_powered_on:
+                subprocess.run(['sudo', 'bluetoothctl', 'power', 'on'],
+                               capture_output=True, timeout=5)
+                WardrivingEngine._bt_powered_on = True
             proc = subprocess.run(
-                ['sudo', 'bluetoothctl', '--timeout', '8', 'scan', 'on'],
-                capture_output=True, text=True, timeout=12
+                ['sudo', 'bluetoothctl', '--timeout', '5', 'scan', 'on'],
+                capture_output=True, text=True, timeout=8
             )
             # List discovered devices
             result = subprocess.run(
@@ -1594,9 +1616,12 @@ class WardrivingEngine:
 
         # Try network scan for nearby towers
         try:
+            # 3GPP network scan: use shorter timeout on low-power devices
+            _cpu_count = os.cpu_count() or 1
+            _scan_timeout = 15 if _cpu_count <= 1 else 60
             result = subprocess.run(
                 ['mmcli', '-m', modem_idx, '--3gpp-scan', '--output-json'],
-                capture_output=True, text=True, timeout=60
+                capture_output=True, text=True, timeout=_scan_timeout
             )
             if result.returncode == 0 and result.stdout.strip():
                 data = json.loads(result.stdout)

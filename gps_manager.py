@@ -236,10 +236,18 @@ class GPSManager:
         if not self._running:
             return
 
-        # Try to reopen
+        # Try to reopen — use cached port first, re-detect only every 30 s
         try:
             import serial as pyserial
-            port = self.port or detect_gps_device()
+            now = time.time()
+            if self.port:
+                port = self.port
+            elif hasattr(self, '_detect_cache_time') and now - self._detect_cache_time < 30:
+                port = self._detect_cache_port
+            else:
+                port = detect_gps_device()
+                self._detect_cache_port = port
+                self._detect_cache_time = now
             if port:
                 self._serial = pyserial.Serial(port, self.baudrate, timeout=1)
                 self.port = port
