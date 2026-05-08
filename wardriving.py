@@ -872,7 +872,7 @@ class WardrivingSession:
                     record_type = row[col_map['type']].strip().upper()
 
                 if record_type in ('BT', 'BLE', 'BLUETOOTH'):
-                    self.upsert_bluetooth(mac, ssid, rssi, '', lat, lon, alt)
+                    self.upsert_bluetooth(mac, ssid, rssi, 'BLE', lat, lon, alt)
                     imported_bt += 1
                 elif record_type in ('GSM', 'CDMA', 'LTE', 'UMTS', 'CELL', '5G', 'NR'):
                     self.upsert_cell_tower(
@@ -2017,7 +2017,7 @@ class WardrivingEngine:
                     alt = float(alt)
 
                 if record_type in ('BT', 'BLE', 'BLUETOOTH'):
-                    self.session.upsert_bluetooth(mac, ssid, rssi, '', lat, lon, alt)
+                    self.session.upsert_bluetooth(mac, ssid, rssi, 'BLE', lat, lon, alt)
                     self._esp_ble_count += 1
                 else:
                     freq = 0
@@ -2096,7 +2096,7 @@ class WardrivingEngine:
                 record_type = parts[10].strip().upper() if len(parts) > 10 else 'WIFI'
 
                 if record_type in ('BT', 'BLE'):
-                    self.session.upsert_bluetooth(mac, ssid, rssi, '', lat, lon, alt)
+                    self.session.upsert_bluetooth(mac, ssid, rssi, 'BLE', lat, lon, alt)
                 elif record_type in ('GSM', 'CDMA', 'LTE', 'UMTS', 'CELL'):
                     self.session.upsert_cell_tower(
                         cell_id=mac, tech=record_type, provider=ssid,
