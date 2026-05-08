@@ -135,6 +135,12 @@ class WardrivingSession:
                     latitude REAL,
                     longitude REAL,
                     altitude REAL,
+                    best_rssi INTEGER DEFAULT -100,
+                    best_lat REAL,
+                    best_lon REAL,
+                    pending_lat REAL,
+                    pending_lon REAL,
+                    pending_count INTEGER DEFAULT 0,
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL,
                     scan_count INTEGER DEFAULT 1
@@ -143,6 +149,15 @@ class WardrivingSession:
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_bt_mac ON bluetooth_devices(mac)
             """)
+            # Migrate older bluetooth_devices tables that lack new columns
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(bluetooth_devices)").fetchall()}
+                for col, default in [('best_rssi', '-100'), ('best_lat', 'NULL'), ('best_lon', 'NULL'),
+                                     ('pending_lat', 'NULL'), ('pending_lon', 'NULL'), ('pending_count', '0')]:
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE bluetooth_devices ADD COLUMN {col} DEFAULT {default}")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cell_towers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,33 +300,129 @@ class WardrivingSession:
             except Exception as e:
                 logger.debug(f"GPS track log error: {e}")
 
+    # GPS drift threshold: ignore position jumps unless confirmed by
+    # multiple consecutive pings at the new location.
+    GPS_DRIFT_THRESHOLD_M = 100   # meters — positions closer than this are "same spot"
+    GPS_CONFIRM_PINGS = 3         # pings at new position before accepting the move
+
+    @staticmethod
+    def _haversine_m(lat1, lon1, lat2, lon2):
+        """Approximate distance in meters between two GPS coordinates."""
+        from math import radians, sin, cos, sqrt, atan2
+        R = 6371000
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
     def upsert_bluetooth(self, mac, name, rssi, device_type, lat, lon, alt):
-        """Insert or update a discovered Bluetooth device."""
+        """Insert or update a discovered Bluetooth device.
+
+        GPS position logic:
+        - best_lat/best_lon: position at strongest RSSI (closest sighting)
+        - latitude/longitude: confirmed position, updated only after GPS_CONFIRM_PINGS
+          consecutive pings at a new location (>GPS_DRIFT_THRESHOLD_M away).
+          This filters out GPS drift/jumps while still tracking moving devices.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     existing = conn.execute(
-                        "SELECT scan_count FROM bluetooth_devices WHERE mac = ?", (mac,)
+                        """SELECT scan_count, rssi, best_rssi, latitude, longitude,
+                                  pending_lat, pending_lon, pending_count
+                           FROM bluetooth_devices WHERE mac = ?""", (mac,)
                     ).fetchone()
                     if existing:
                         count = (existing[0] or 0) + 1
+                        old_rssi = existing[1] or -100
+                        old_best = existing[2] or -100
+                        old_lat = existing[3]
+                        old_lon = existing[4]
+                        pend_lat = existing[5]
+                        pend_lon = existing[6]
+                        pend_count = existing[7] or 0
+
+                        # Update best position at strongest signal
+                        new_best = rssi if rssi > old_best else old_best
+                        best_lat_val = lat if (rssi > old_best and lat) else None
+                        best_lon_val = lon if (rssi > old_best and lon) else None
+
+                        # GPS drift protection for main lat/lon
+                        update_lat = old_lat
+                        update_lon = old_lon
+                        new_pend_lat = pend_lat
+                        new_pend_lon = pend_lon
+                        new_pend_count = pend_count
+
+                        if lat and lon:
+                            if old_lat is None or old_lon is None:
+                                # First GPS fix — accept immediately
+                                update_lat = lat
+                                update_lon = lon
+                                new_pend_lat = None
+                                new_pend_lon = None
+                                new_pend_count = 0
+                            else:
+                                dist = self._haversine_m(old_lat, old_lon, lat, lon)
+                                if dist < self.GPS_DRIFT_THRESHOLD_M:
+                                    # Same area — no change needed, reset pending
+                                    new_pend_lat = None
+                                    new_pend_lon = None
+                                    new_pend_count = 0
+                                else:
+                                    # New position detected — is it consistent?
+                                    if pend_lat is not None and pend_lon is not None:
+                                        pend_dist = self._haversine_m(pend_lat, pend_lon, lat, lon)
+                                        if pend_dist < self.GPS_DRIFT_THRESHOLD_M:
+                                            new_pend_count = pend_count + 1
+                                            if new_pend_count >= self.GPS_CONFIRM_PINGS:
+                                                # Confirmed move — accept new position
+                                                update_lat = lat
+                                                update_lon = lon
+                                                new_pend_lat = None
+                                                new_pend_lon = None
+                                                new_pend_count = 0
+                                        else:
+                                            # Different from pending too — reset pending
+                                            new_pend_lat = lat
+                                            new_pend_lon = lon
+                                            new_pend_count = 1
+                                    else:
+                                        # Start tracking new candidate position
+                                        new_pend_lat = lat
+                                        new_pend_lon = lon
+                                        new_pend_count = 1
+
                         conn.execute("""
                             UPDATE bluetooth_devices SET
                                 name = COALESCE(NULLIF(?, ''), name),
-                                rssi = MAX(rssi, ?), device_type = COALESCE(NULLIF(?, ''), device_type),
-                                latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude),
+                                rssi = ?, device_type = COALESCE(NULLIF(?, ''), device_type),
+                                latitude = ?, longitude = ?,
                                 altitude = COALESCE(?, altitude),
+                                best_rssi = ?,
+                                best_lat = COALESCE(?, best_lat),
+                                best_lon = COALESCE(?, best_lon),
+                                pending_lat = ?, pending_lon = ?, pending_count = ?,
                                 last_seen = ?, scan_count = ?
                             WHERE mac = ?
-                        """, (name, rssi, device_type, lat, lon, alt, now, count, mac))
+                        """, (name, rssi, device_type,
+                              update_lat, update_lon, alt,
+                              new_best, best_lat_val, best_lon_val,
+                              new_pend_lat, new_pend_lon, new_pend_count,
+                              now, count, mac))
                     else:
                         conn.execute("""
                             INSERT INTO bluetooth_devices
                                 (mac, name, rssi, device_type, latitude, longitude, altitude,
+                                 best_rssi, best_lat, best_lon,
+                                 pending_lat, pending_lon, pending_count,
                                  first_seen, last_seen, scan_count)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                        """, (mac, name, rssi, device_type, lat, lon, alt, now, now))
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, 1)
+                        """, (mac, name, rssi, device_type, lat, lon, alt,
+                              rssi, lat, lon, now, now))
+            except Exception as e:
+                logger.debug(f"BT upsert error: {e}")
             except Exception as e:
                 logger.debug(f"BT upsert error: {e}")
 
