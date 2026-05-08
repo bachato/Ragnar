@@ -373,3 +373,97 @@ The importer handles Piglet's `WigleWifi-1.4` metadata header line automatically
 | Display | 480×480 RGB touch | 128×64 OLED |
 
 Both devices complement each other — use HuginnESP for real-time scanning with threat detection, and Piglet for standalone field collection that gets imported later.
+
+---
+
+## Piglet ESP-Now Mesh Network
+
+Piglet supports ESP-Now mesh networking for multi-node wardriving. One Piglet acts as the **Core** (coordinator) while one or more Piglets act as **Nodes**, forwarding their WiFi scan results over ESP-Now. The Core handles GPS stamping and data logging — nodes don't need their own SD card or GPS fix.
+
+### Architecture
+
+```
+                  ESP-Now (ch 6)
+┌────────────┐   ─────────────►   ┌────────────────┐
+│ Piglet     │                    │ Piglet Core     │
+│ Node #1    │                    │ (coordinator)   │
+│ ESP32-C5   │                    │ ESP32 + GPS     │       USB / WiFi
+│ No GPS/SD  │                    │ + SD card       │ ────────────────► Ragnar
+└────────────┘                    │                 │     CSV import
+                  ESP-Now (ch 6)  │ Logs ALL nodes  │
+┌────────────┐   ─────────────►   │ to WiGLE CSV    │
+│ Piglet     │                    └────────────────┘
+│ Node #2    │
+│ ESP32-S3   │
+│ No GPS/SD  │
+└────────────┘
+```
+
+### Setup
+
+#### 1. Core (Coordinator) Piglet
+
+The Core needs GPS + SD card. Set `meshModeOnBoot` in `/wardriver.cfg`:
+
+```
+meshModeOnBoot=core
+```
+
+Or navigate to the Mesh Node page on the Core and it enters Core mode automatically.
+
+When set to `core`, the SoftAP window is skipped on boot — ESP-Now owns the WiFi stack. The Core receives scan results from all connected Nodes and logs them to SD card with GPS coordinates.
+
+#### 2. Node Piglets
+
+Nodes are lightweight — no SD card or GPS required. Set:
+
+```
+meshModeOnBoot=node
+```
+
+Or press the button to cycle to the Mesh Node page (page 5, after the pig animation).
+
+Each Node:
+- Automatically searches for a Core on ESP-Now channel 6
+- Receives a channel range assignment from the Core
+- Begins scanning WiFi and forwarding results to the Core
+- OLED shows link status, coordinator MAC, assigned channels, and records forwarded
+
+#### 3. Import to Ragnar
+
+After the wardriving session:
+
+1. Power down the Nodes (or exit Mesh mode with a button press)
+2. On the Core Piglet, connect to its WiFi AP or your home network
+3. Download the CSV files from the Core's web UI — they contain data from **all nodes**, GPS-stamped by the Core
+4. Upload to Ragnar via **Import CSV** (`POST /api/wardriving/import`)
+5. All networks appear on the map with GPS coordinates
+
+### Node Display
+
+While in Mesh Node mode the OLED shows:
+
+| Field | Description |
+|-------|-------------|
+| Link status | `Searching` or `Core linked` |
+| Coordinator MAC | MAC address of the Core |
+| Channel range | Assigned WiFi channels to scan |
+| Networks found | Total unique networks discovered |
+| Records forwarded | Records sent to the Core |
+
+### Compatible Hardware
+
+| Role | Recommended Board | Notes |
+|------|-------------------|-------|
+| Core | XIAO ESP32-C5 | 2.4 + 5 GHz, needs GPS + SD |
+| Core | XIAO ESP32-S3 | 2.4 GHz only, needs GPS + SD |
+| Node | Any supported XIAO | No GPS or SD required |
+| Node | LilyGo T-Dongle C5 | Compact node with built-in TFT |
+
+### Tips
+
+- **Channel coverage**: The Core assigns different channel ranges to each Node, so more Nodes = better frequency coverage
+- **Range**: ESP-Now has ~200m line-of-sight range; nodes can be spread across a building or vehicle convoy
+- **Battery**: Nodes without GPS/SD draw less power — ideal for small LiPo-powered Piglet builds (~$14 BOM)
+- **5 GHz**: Use ESP32-C5 boards for 5 GHz scanning capability
+- **Exit mesh**: Press the button on a Node to leave mesh mode and return to normal standalone wardriving
