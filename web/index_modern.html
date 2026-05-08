@@ -3987,7 +3987,18 @@
                         </div>
 
                         <!-- Wardriving on Boot Card -->
-                        <div class="glass rounded-lg p-4 wardriving-feature hidden">
+                        <!-- MOVED to Wardriving section below -->
+
+                    </div>
+                </div>
+
+                <!-- Wardriving Section -->
+                <div class="mb-8 wardriving-feature hidden">
+                    <h3 class="text-xl font-semibold mb-4 text-Ragnar-400">Wardriving</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+
+                        <!-- Wardriving on Boot Card -->
+                        <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
                                 <h4 class="font-medium">Wardriving on Boot</h4>
                                 <label class="toggle-switch relative inline-flex items-center cursor-pointer">
@@ -4004,7 +4015,7 @@
                         </div>
 
                         <!-- Import WiGLE CSV Card -->
-                        <div class="glass rounded-lg p-4 wardriving-feature hidden">
+                        <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
                                 <h4 class="font-medium">Import WiGLE CSV</h4>
                                 <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
@@ -4020,7 +4031,7 @@
                         </div>
 
                         <!-- Serial ESP32 Listener Card -->
-                        <div class="glass rounded-lg p-4 wardriving-feature hidden">
+                        <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
                                 <h4 class="font-medium">ESP32 Serial (Piglet/HuginnESP)</h4>
                                 <span id="wd-serial-status" class="text-xs px-2 py-0.5 rounded-full bg-gray-700 text-gray-400">Disconnected</span>
@@ -4035,7 +4046,7 @@
                             </div>
                             <div id="wd-serial-networks" class="text-xs text-gray-500 mt-2">Networks from ESP32: <span id="wd-serial-count">0</span></div>
                         </div>
-                        
+
                     </div>
                 </div>
 
