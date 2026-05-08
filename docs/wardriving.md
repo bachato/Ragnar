@@ -387,7 +387,7 @@ Piglet supports ESP-Now mesh networking for multi-node wardriving. One Piglet ac
 ┌────────────┐   ─────────────►   ┌────────────────┐
 │ Piglet     │                    │ Piglet Core     │
 │ Node #1    │                    │ (coordinator)   │
-│ ESP32-C5   │                    │ ESP32 + GPS     │       USB / WiFi
+│ ESP32-C5   │                    │ ESP32 + GPS     │       USB
 │ No GPS/SD  │                    │ + SD card       │ ────────────────► Ragnar
 └────────────┘                    │                 │     CSV import
                   ESP-Now (ch 6)  │ Logs ALL nodes  │
