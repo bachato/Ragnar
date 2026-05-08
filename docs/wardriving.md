@@ -1,0 +1,469 @@
+# Wardriving — Ragnar + HuginnESP
+
+## Overview
+
+Ragnar's wardriving engine collects WiFi networks, BLE devices, cell towers, and GPS positions while driving. Data is stored in SQLite per session and can be exported to WiGLE CSV or KML.
+
+The system has three data sources:
+- **WiFi adapters (wlan)** — Linux adapters in monitor/managed mode, scanning directly via `iw`
+- **HuginnESP** — ESP32-S3 via USB serial, real-time WiFi + BLE + threat detection
+- **Piglet** — Standalone ESP32 wardriver, imports WiGLE CSV files collected in the field
+
+Everything logged automatically receives GPS coordinates if a GPS receiver is connected.
+
+---
+
+## Hardware
+
+### HuginnESP (ESP32-S3)
+
+| Property | Value |
+|----------|-------|
+| Board | Waveshare ESP32-S3 Smart 86 Box |
+| Display | 4" 480×480 RGB IPS, GT911 touch (I2C) |
+| Processor | ESP32-S3, 240 MHz |
+| Flash | 16 MB |
+| PSRAM | 8 MB OPI |
+| Serial | USB CDC, 115200 baud |
+| Firmware | [HuginnESP](https://github.com/PierreGode/HuginnESP) (PlatformIO Arduino) |
+| Libraries | LovyanGFX 1.1.16, NimBLE-Arduino 1.4.1 |
+
+### GPS
+
+Optional USB GPS receiver (NMEA via pyserial). Auto-detected at startup.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────┐     USB Serial      ┌──────────────────┐
+│  Raspberry Pi / PC  │◄───────────────────►│   HuginnESP      │
+│                     │   115200 baud        │   ESP32-S3       │
+│  Ragnar             │                      │                  │
+│  ├─ wardriving.py   │   JSON + alerts      │  ├─ WiFi scan    │
+│  ├─ webapp_modern.py│◄────────────────────│  ├─ BLE scan     │
+│  └─ web UI          │                      │  ├─ AirTag det.  │
+│                     │   Commands           │  ├─ Flipper det. │
+│  GPS ◄──────────┐   │──────────────────►  │  ├─ Skimmer det. │
+│  (USB NMEA)     │   │   scanap, blescan   │  └─ Pineapple    │
+│                 ▼   │                      │                  │
+│  SQLite session DB  │                      │  480×480 display │
+└─────────────────────┘                      └──────────────────┘
+```
+
+---
+
+## HuginnESP Serial Protocol
+
+### Commands (Ragnar → ESP)
+
+| Command | Description |
+|---------|-------------|
+| `scanap` | Start WiFi scanning |
+| `blescan -f` | BLE filtered (Flipper + AirTag) |
+| `blescan -a` | BLE all (all devices + threat detection) |
+| `capture -skimmer` | BLE skimmer detection |
+| `pineap` | Pineapple/Evil Twin detection |
+| `stop` | Stop active scan, return to auto-cycle |
+| `capture -stop` | Stop BLE capture |
+| `status` | Get current mode (JSON) |
+
+### Scan Cycle
+
+Ragnar rotates through these steps:
+
+| Step | Command | Duration | Mode label |
+|------|---------|----------|------------|
+| 1 | `scanap` | 15s | wifi |
+| 2 | `blescan -f` | 8s | ble-filtered |
+| 3 | `scanap` | 15s | wifi |
+| 4 | `blescan -a` | 8s | ble-all |
+| 5 | `scanap` | 15s | wifi |
+| 6 | `capture -skimmer` | 8s | ble-skimmer |
+| 7 | `scanap` | 15s | wifi |
+| 8 | `pineap` | 10s | pineap |
+
+Total cycle: ~94 seconds.
+
+### Serial Output (ESP → Ragnar)
+
+#### WiFi Networks (JSON, one line per AP)
+```json
+{"type":"WIFI","mac":"00:00:00:00:00:00","ssid":"wifiSSID","rssi":-84,"channel":1,"auth":"WPA2"}
+```
+
+#### BLE Devices (JSON, ALL mode, one line per device)
+```json
+{"type":"BLE","mac":"AA:BB:CC:DD:EE:FF","name":"DeviceName","rssi":-60}
+```
+
+#### AirTag (multi-line, FILTERED + ALL mode)
+```
+AirTag found!
+Tag: 1
+MAC Address: D3:59:9B:E4:2C:3A
+RSSI: -89
+```
+
+#### Flipper Zero (multi-line, FILTERED + ALL mode)
+```
+Found White Flipper Device:
+MAC: AA:BB:CC:DD:EE:FF,
+Name: Flipper-X,
+RSSI: -70
+```
+
+#### Skimmer (multi-line, SKIMMER + ALL mode)
+```
+POTENTIAL SKIMMER DETECTED!
+Device Name: HC-05
+MAC Address: 11:22:33:44:55:66
+RSSI: -55
+Reason: Suspicious BLE module near payment terminal
+```
+
+Known skimmer names: `HC-05`, `HC-06`, `HC-08`, `BT05`, `BT06`, `JDY-30`, `JDY-31`, `JDY-33`, `SPP-CA`
+
+#### Pineapple/Evil Twin (multi-line)
+```
+Pineapple detected: NetworkName
+BSSID: AA:BB:CC:DD:EE:FF
+Channel: 6
+```
+
+#### BLE Spam (single line)
+```
+BLE Spam detected from AA:BB:CC:DD:EE:FF
+```
+Triggered at 20+ advertisements from the same MAC within 5 seconds.
+
+#### Status (JSON, response to `status` command)
+```json
+{"mode":"auto","wifi_count":5,"ble_count":12}
+```
+
+#### Boot Messages
+```
+[BOOT] HuginnESP starting...
+[BOOT] Free heap: 234567
+[BOOT] PSRAM: 8388608
+[BOOT] Init WiFi...
+[BOOT] WiFi OK
+[BOOT] Init BLE...
+[BOOT] BLE OK
+[BOOT] All tasks started — entering main loop
+```
+
+---
+
+## Ragnar Parser
+
+`wardriving.py → _parse_serial_line()` handles all output:
+
+| Data type | Detection | Storage | GPS |
+|-----------|-----------|---------|-----|
+| WiFi JSON | `line.startswith('{')` → `type == WIFI` | `upsert_network()` | ✅ |
+| BLE JSON | `line.startswith('{')` → `type == BLE` | `upsert_bluetooth()` | ✅ |
+| AirTag | `line.startswith('AirTag found')` → buffer | `upsert_bluetooth('AirTag')` | ✅ |
+| Flipper | `re.match('Found .* Flipper')` → buffer | `upsert_bluetooth('Flipper')` | ✅ |
+| Skimmer | `'POTENTIAL SKIMMER' in line` → buffer | `upsert_bluetooth('Skimmer')` | ✅ |
+| Pineapple | `'Pineapple detected' in line` | `_esp_alerts` list | ✅ |
+| BLE Spam | `'BLE Spam detected' in line` | `_esp_alerts` list | ✅ |
+| WiGLE CSV | Comma-separated with MAC format | `upsert_network()` / `upsert_bluetooth()` | ✅ |
+| Multi-line WiFi | `[N] SSID: ...` → buffer | `upsert_network()` | ✅ |
+
+Ignored lines:
+- `huginn>`, `Wardrive:`, `Registered`, `Unsupported`
+- `WiFi scan`, `Started`, `Stopped`, `Usage:`, `BLE initialized`, etc.
+- `[BOOT]` prefix (not explicitly filtered but matches no parser)
+
+---
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/wardriving/status` | Full status incl. GPS, serial, counters |
+| POST | `/api/wardriving/start` | Start wardriving session |
+| POST | `/api/wardriving/stop` | Stop session |
+| GET | `/api/wardriving/networks` | List captured WiFi networks |
+| GET | `/api/wardriving/bluetooth` | List BLE devices |
+| GET | `/api/wardriving/cells` | List cell towers |
+| GET | `/api/wardriving/sessions` | List sessions |
+| GET | `/api/wardriving/export/<id>` | Export session (WiGLE CSV / KML) |
+| POST | `/api/wardriving/import` | Import WiGLE CSV |
+| GET | `/api/wardriving/gps` | GPS status |
+| GET | `/api/wardriving/interfaces` | Available WiFi interfaces |
+| GET | `/api/wardriving/serial/detect` | Auto-detect ESP32 port |
+| GET/POST | `/api/wardriving/serial` | Serial status / start/stop listener |
+| GET | `/api/wardriving/track` | GPS track (lat/lon history) |
+| POST | `/api/wardriving/device_name` | Set device name |
+| GET/POST | `/api/wardriving/on_boot` | Auto-start on boot |
+
+---
+
+## Status Object
+
+`GET /api/wardriving/status` returns:
+
+```json
+{
+  "running": true,
+  "session_id": "uuid",
+  "interfaces": ["wlan1"],
+  "scans_completed": 42,
+  "total_networks": 156,
+  "gps": {
+    "connected": true,
+    "port": "/dev/ttyACM0",
+    "has_fix": true
+  },
+  "serial_connected": true,
+  "serial_port": "/dev/ttyACM1",
+  "serial_networks": 23,
+  "esp_mode": "wifi",
+  "esp_ble_count": 87,
+  "esp_alerts": [
+    {"time": 1683456789, "alert": "AirTag found!"}
+  ],
+  "serial_unique": 12,
+  "bluetooth_count": 87,
+  "cell_count": 3,
+  "stats": { ... }
+}
+```
+
+---
+
+## Data Storage
+
+Each session creates a SQLite database in `data/networks/`.
+
+### Table: networks
+| Column | Type | Description |
+|--------|------|-------------|
+| bssid | TEXT | MAC address (primary key) |
+| ssid | TEXT | Network name |
+| security | TEXT | WPA2, WPA3, Open, etc. |
+| channel | INT | WiFi channel |
+| frequency | INT | Frequency in MHz |
+| rssi | INT | Signal strength (dBm) |
+| lat | REAL | GPS latitude |
+| lon | REAL | GPS longitude |
+| alt | REAL | GPS altitude |
+| interface | TEXT | `wlan1`, `esp32-serial`, etc. |
+
+### Table: bluetooth
+| Column | Type | Description |
+|--------|------|-------------|
+| mac | TEXT | BLE MAC address |
+| name | TEXT | Device name |
+| rssi | INT | Signal strength |
+| device_type | TEXT | `BLE`, `AirTag`, `Flipper`, `Skimmer` |
+| lat/lon/alt | REAL | GPS position |
+
+---
+
+## Export
+
+### WiGLE CSV
+Standard format for uploading to wigle.net. Contains MAC, SSID, AuthMode, channel, RSSI, GPS coordinates.
+
+### KML
+Google Earth format with network positions as markers.
+
+---
+
+## Setup
+
+### 1. Flash HuginnESP
+
+```bash
+cd HuginnESP
+pio run --target upload     # COM8 on Windows, /dev/ttyACM* on Linux
+```
+
+### 2. Connect to Ragnar
+
+**Auto-detect (Linux):**
+Click 🔍 Search in the web UI — finds the ESP32 automatically via `udevadm`.
+
+**Manual:**
+Enter the port (`/dev/ttyACM0` or `COM8`) in the serial field and click Connect.
+
+### 3. GPS (optional)
+
+Connect a USB GPS receiver. Ragnar auto-detects NMEA devices.
+
+### 4. Start Wardriving
+
+Click **Start Wardriving** in the web UI. Ragnar begins scanning with all active interfaces + ESP32 serial.
+
+---
+
+## Camera Recognition
+
+Ragnar identifies surveillance cameras based on MAC OUI prefixes (manufacturers):
+Axis, Hikvision, Dahua, Vivotek, Bosch, Samsung, Reolink, Amcrest, Foscam, and more.
+
+Cameras are marked in the network list with type and manufacturer.
+
+---
+
+## Piglet Integration
+
+[Piglet](https://github.com/Hamspiced/piglet) is an open-source ESP32-based wardriving platform by Hamspiced. It scans WiFi networks with GPS positioning and logs WiGLE-compatible CSV files to its SD card.
+
+### Supported Piglet Hardware
+
+| Board | Notes |
+|-------|-------|
+| Seeed XIAO ESP32-S3 | 2.4 GHz only |
+| Seeed XIAO ESP32-C5 | 2.4 + 5 GHz |
+| Seeed XIAO ESP32-C6 | 2.4 GHz only |
+| LilyGo T-Dongle C5 | Standalone variant with built-in TFT |
+
+Piglet peripherals: I2C GPS (ATGM336H), SSD1306 OLED, SPI SD card module.
+
+### How It Connects to Ragnar
+
+Piglet is a **standalone field device** — it has no serial command interface. It collects data independently with its own GPS and stores WiGLE CSV files on its SD card.
+
+**Import workflow:**
+
+1. Take Piglet out wardriving — it logs WiFi networks + GPS to SD card
+2. When home, download the CSV files via Piglet's web UI (connects to your WiFi) or remove the SD card
+3. Upload the CSV file(s) to Ragnar via **Import CSV** in the wardriving section (`POST /api/wardriving/import`)
+4. Ragnar imports all networks with GPS coordinates into the active session
+5. View the imported data on the map and in the network table
+
+### What Gets Imported
+
+| Piglet CSV Column | Ragnar Mapping | Status |
+|-------------------|----------------|--------|
+| MAC | `bssid` | ✅ |
+| SSID | `ssid` | ✅ |
+| AuthMode | `security` | ✅ |
+| Channel | `channel` + `frequency` | ✅ |
+| RSSI | `rssi` | ✅ |
+| CurrentLatitude | `lat` | ✅ |
+| CurrentLongitude | `lon` | ✅ |
+| AltitudeMeters | `alt` | ✅ |
+| Type | WiFi / BT routing | ✅ |
+
+The importer handles Piglet's `WigleWifi-1.4` metadata header line automatically.
+
+### Piglet vs HuginnESP
+
+| Feature | HuginnESP | Piglet |
+|---------|-----------|--------|
+| Connection | USB serial (live) | CSV import (offline) |
+| Real-time data | ✅ Continuous | ❌ Post-collection |
+| WiFi scanning | ✅ | ✅ (+ 5 GHz on C5) |
+| BLE scanning | ✅ Filtered + All | ❌ |
+| AirTag detection | ✅ | ❌ |
+| Flipper detection | ✅ | ❌ |
+| Skimmer detection | ✅ | ❌ |
+| Pineapple detection | ✅ | ❌ |
+| Built-in GPS | ❌ (uses Ragnar's) | ✅ Own GPS module |
+| SD card logging | ❌ | ✅ WiGLE CSV |
+| WiGLE direct upload | ❌ | ✅ Via Piglet web UI |
+| ESP-Now mesh | ❌ | ✅ Multi-node wardriving |
+| Display | 480×480 RGB touch | 128×64 OLED |
+
+Both devices complement each other — use HuginnESP for real-time scanning with threat detection, and Piglet for standalone field collection that gets imported later.
+
+---
+
+## Piglet ESP-Now Mesh Network
+
+Piglet supports ESP-Now mesh networking for multi-node wardriving. One Piglet acts as the **Core** (coordinator) while one or more Piglets act as **Nodes**, forwarding their WiFi scan results over ESP-Now. The Core handles GPS stamping and data logging — nodes don't need their own SD card or GPS fix.
+
+### Architecture
+
+```
+                  ESP-Now (ch 6)
+┌────────────┐   ─────────────►   ┌────────────────┐
+│ Piglet     │                    │ Piglet Core     │
+│ Node #1    │                    │ (coordinator)   │
+│ ESP32-C5   │                    │ ESP32 + GPS     │       USB
+│ No GPS/SD  │                    │ + SD card       │ ────────────────► Ragnar
+└────────────┘                    │                 │     CSV import
+                  ESP-Now (ch 6)  │ Logs ALL nodes  │
+┌────────────┐   ─────────────►   │ to WiGLE CSV    │
+│ Piglet     │                    └────────────────┘
+│ Node #2    │
+│ ESP32-S3   │
+│ No GPS/SD  │
+└────────────┘
+```
+
+### Setup
+
+#### 1. Core (Coordinator) Piglet
+
+The Core needs GPS + SD card. Set `meshModeOnBoot` in `/wardriver.cfg`:
+
+```
+meshModeOnBoot=core
+```
+
+Or navigate to the Mesh Node page on the Core and it enters Core mode automatically.
+
+When set to `core`, the SoftAP window is skipped on boot — ESP-Now owns the WiFi stack. The Core receives scan results from all connected Nodes and logs them to SD card with GPS coordinates.
+
+#### 2. Node Piglets
+
+Nodes are lightweight — no SD card or GPS required. Set:
+
+```
+meshModeOnBoot=node
+```
+
+Or press the button to cycle to the Mesh Node page (page 5, after the pig animation).
+
+Each Node:
+- Automatically searches for a Core on ESP-Now channel 6
+- Receives a channel range assignment from the Core
+- Begins scanning WiFi and forwarding results to the Core
+- OLED shows link status, coordinator MAC, assigned channels, and records forwarded
+
+#### 3. Import to Ragnar
+
+After the wardriving session:
+
+1. Power down the Nodes (or exit Mesh mode with a button press)
+2. On the Core Piglet, connect to its WiFi AP or your home network
+3. Download the CSV files from the Core's web UI — they contain data from **all nodes**, GPS-stamped by the Core
+4. Upload to Ragnar via **Import CSV** (`POST /api/wardriving/import`)
+5. All networks appear on the map with GPS coordinates
+
+### Node Display
+
+While in Mesh Node mode the OLED shows:
+
+| Field | Description |
+|-------|-------------|
+| Link status | `Searching` or `Core linked` |
+| Coordinator MAC | MAC address of the Core |
+| Channel range | Assigned WiFi channels to scan |
+| Networks found | Total unique networks discovered |
+| Records forwarded | Records sent to the Core |
+
+### Compatible Hardware
+
+| Role | Recommended Board | Notes |
+|------|-------------------|-------|
+| Core | XIAO ESP32-C5 | 2.4 + 5 GHz, needs GPS + SD |
+| Core | XIAO ESP32-S3 | 2.4 GHz only, needs GPS + SD |
+| Node | Any supported XIAO | No GPS or SD required |
+| Node | LilyGo T-Dongle C5 | Compact node with built-in TFT |
+
+### Tips
+
+- **Channel coverage**: The Core assigns different channel ranges to each Node, so more Nodes = better frequency coverage
+- **Range**: ESP-Now has ~200m line-of-sight range; nodes can be spread across a building or vehicle convoy
+- **Battery**: Nodes without GPS/SD draw less power — ideal for small LiPo-powered Piglet builds (~$14 BOM)
+- **5 GHz**: Use ESP32-C5 boards for 5 GHz scanning capability
+- **Exit mesh**: Press the button on a Node to leave mesh mode and return to normal standalone wardriving

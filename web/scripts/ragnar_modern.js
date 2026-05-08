@@ -480,6 +480,30 @@ const configMetadata = {
     openai_api_token: {
         label: "OpenAI API Token",
         description: "Your OpenAI API key for AI-powered features. Keep this confidential."
+    },
+    wardriving_enabled: {
+        label: "Enable Wardriving",
+        description: "Enable the wardriving tab for WiFi network discovery with GPS mapping. Requires a USB GPS module for location data. Note: Automatic AP mode is disabled while wardriving is enabled — AP mode (hostapd) would take over wlan0 and block WiFi scanning."
+    },
+    wardriving_display: {
+        label: "Wardriving on Display",
+        description: "Replace the normal Ragnar display with a wardriving dashboard while a session is running. Works on all displays: e-paper, GC9A01 TFT, SSD1306 OLED, LCD1602, and MAX7219 LED matrix."
+    },
+    wardriving_scan_interval: {
+        label: "Scan Interval (s)",
+        description: "Seconds between WiFi scans during wardriving. Lower values capture more networks but use more CPU. Default: 2."
+    },
+    wardriving_gps_port: {
+        label: "GPS Serial Port",
+        description: "Serial port for USB GPS module. Set to 'auto' for automatic detection, or specify a port like /dev/ttyACM0."
+    },
+    wardriving_gps_baudrate: {
+        label: "GPS Baud Rate",
+        description: "Serial baud rate for the GPS module. Most USB GPS modules use 9600. Some high-speed modules use 38400 or 115200."
+    },
+    wardriving_auto_export: {
+        label: "Auto Export on Stop",
+        description: "Automatically export a WiGLE CSV file when a wardriving session is stopped."
     }
 };
 
@@ -1195,6 +1219,9 @@ async function loadTabData(tabName) {
             break;
         case 'adv-vuln':
             loadAdvancedVulnData(); // Non-blocking - tab shows immediately, data fills in
+            break;
+        case 'wardriving':
+            loadWardrivingData();
             break;
         case 'network-map':
             if (!_mapInitialized) { loadNetworkMap(); }
@@ -3677,6 +3704,18 @@ async function loadConfigData() {
 
         // Load security configuration
         await loadSecurityConfig();
+
+        // Load wardriving on-boot toggle state (card is in config page)
+        loadWardrivingOnBootState();
+
+        // Update filename label when CSV file is selected
+        const wdFileInput = document.getElementById('wd-import-file');
+        const wdFileLabel = document.getElementById('wd-import-filename');
+        if (wdFileInput && wdFileLabel) {
+            wdFileInput.addEventListener('change', () => {
+                wdFileLabel.textContent = wdFileInput.files.length ? wdFileInput.files[0].name : 'No file chosen';
+            });
+        }
     } catch (error) {
         console.error('Error loading config:', error);
     }
@@ -10117,8 +10156,8 @@ function displayConfigForm(config) {
         'Display': ['epd_type', 'screen_reversed', 'spi_clock_mhz', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness']
     };
     
-    const knownBooleans = ['manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck'];
-    const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness']);
+    const knownBooleans = ['manual_mode', 'debug_mode', 'scan_vuln_running', 'scan_vuln_no_ports', 'enable_attacks', 'blacklistcheck', 'wardriving_enabled', 'wardriving_display', 'wardriving_auto_export'];
+    const alwaysShowKeys = new Set(['network_max_failed_pings', 'gc9a01_mascot_color', 'ssd1306_i2c_address', 'lcd1602_i2c_address', 'spi_clock_mhz', 'max7219_spi_port', 'max7219_spi_device', 'max7219_block_orientation', 'display_brightness', 'wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate']);
     const fallbackValues = {
         network_max_failed_pings: 15,
         gc9a01_mascot_color: '#96C8FF',
@@ -10128,7 +10167,10 @@ function displayConfigForm(config) {
         max7219_spi_port: 0,
         max7219_spi_device: 0,
         max7219_block_orientation: -90,
-        display_brightness: 8
+        display_brightness: 8,
+        wardriving_scan_interval: 2,
+        wardriving_gps_port: 'auto',
+        wardriving_gps_baudrate: 9600
     };
     const checkboxHandlers = {
         scan_vuln_running: 'handleVulnScanToggle(this)',
@@ -10364,6 +10406,34 @@ function displayConfigForm(config) {
 
     const attacksEnabled = config.hasOwnProperty('enable_attacks') ? Boolean(config.enable_attacks) : true;
     updateAttackWarningBanner(attacksEnabled);
+
+    // Render wardriving config settings into the dedicated Wardriving section slot
+    const wdSlot = document.getElementById('wardriving-config-slot');
+    if (wdSlot) {
+        const wdKeys = ['wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_auto_export'];
+        let wdHtml = '<form id="wardriving-config-form" class="bg-slate-800 bg-opacity-50 rounded-lg p-4 mt-4"><h4 class="text-md font-bold mb-4 text-gray-300">Settings</h4><div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
+        wdKeys.forEach(key => {
+            const hasKey = Object.prototype.hasOwnProperty.call(config, key);
+            let value = config[key];
+            if (!hasKey && knownBooleans.includes(key)) value = true;
+            if (!hasKey && alwaysShowKeys.has(key)) value = fallbackValues[key];
+            if (hasKey || knownBooleans.includes(key) || alwaysShowKeys.has(key)) {
+                const label = getConfigLabel(key);
+                const description = escapeHtml(getConfigDescription(key));
+                if (typeof value === 'boolean') {
+                    wdHtml += `<label class="flex items-center space-x-3 p-3 rounded-lg hover:bg-slate-700 hover:bg-opacity-50 transition-colors cursor-pointer"><input type="checkbox" name="${key}" ${value ? 'checked' : ''} class="w-5 h-5 rounded bg-slate-700 border-slate-600 text-Ragnar-500 focus:ring-Ragnar-500"><span class="flex items-center gap-2">${label}<span class="info-icon" tabindex="0" role="button" aria-label="${description}" data-tooltip="${description}">ⓘ</span></span></label>`;
+                } else {
+                    wdHtml += `<div class="space-y-2"><label class="flex items-center gap-2 text-sm text-gray-400">${label}<span class="info-icon" tabindex="0" role="button" aria-label="${description}" data-tooltip="${description}">ⓘ</span></label><input type="text" name="${key}" value="${value ?? ''}" class="w-full px-4 py-2 rounded-lg bg-slate-700 border border-slate-600 focus:border-Ragnar-500 focus:ring-1 focus:ring-Ragnar-500"></div>`;
+                }
+            }
+        });
+        wdHtml += '</div><button type="submit" class="w-full mt-4 bg-Ragnar-600 hover:bg-Ragnar-700 text-white font-bold py-2 px-4 rounded-lg transition-colors">Save Wardriving Settings</button></form>';
+        wdSlot.innerHTML = wdHtml;
+        document.getElementById('wardriving-config-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            await saveConfig(e.target);
+        });
+    }
 }
 
 // Handle vulnerability scanning checkbox toggle to enable/disable dependent options
@@ -13139,6 +13209,10 @@ async function checkServerCapabilities() {
                     el.classList.add('hidden');
                 }
             });
+
+            // Show/hide wardriving feature based on config
+            const wdEnabled = data.features?.wardriving_enabled || false;
+            applyWardrivingEnabledState(wdEnabled);
             
             if (serverModeEnabled) {
                 console.log('[ServerMode] ✅ Server mode enabled - unlocking advanced features');
@@ -13165,10 +13239,8 @@ async function checkServerCapabilities() {
 
 // Initialize server mode on page load
 document.addEventListener('DOMContentLoaded', function() {
-    // Delay server mode check slightly to not block initial load
-    setTimeout(() => {
-        checkServerCapabilities();
-    }, 2000);
+    // Run immediately — wardriving tab visibility depends on this
+    checkServerCapabilities();
 });
 
 // ============================================================================
@@ -14577,6 +14649,938 @@ function closeTrafficPortModal() {
     if (modal) {
         modal.classList.add('hidden');
         modal.classList.remove('flex');
+    }
+}
+
+// ============================================================================
+// WARDRIVING FUNCTIONS
+// ============================================================================
+
+let _wardrivingInterval = null;
+
+async function loadWardrivingData() {
+    try {
+        const [statusRes, sessionsRes] = await Promise.all([
+            fetch('/api/wardriving/status'),
+            fetch('/api/wardriving/sessions')
+        ]);
+        const status = await statusRes.json();
+        const sessionsData = await sessionsRes.json();
+
+        updateWardrivingUI(status);
+        renderWardrivingSessions(sessionsData.sessions || []);
+        loadWardrivingOnBootState();
+
+        if (status.running) {
+            if (!_wardrivingInterval) {
+                _wardrivingInterval = setInterval(refreshWardrivingStatus, 3000);
+            }
+            await loadWardrivingTableByType();
+        } else {
+            if (_wardrivingInterval) {
+                clearInterval(_wardrivingInterval);
+                _wardrivingInterval = null;
+            }
+            // Still load networks to show previous session data
+            await loadWardrivingTableByType();
+        }
+    } catch (e) {
+        console.error('[Wardriving] Load error:', e);
+    }
+}
+
+async function refreshWardrivingStatus() {
+    try {
+        const res = await fetch('/api/wardriving/status');
+        const status = await res.json();
+        updateWardrivingUI(status);
+        if (status.running) {
+            loadWardrivingTableByType();
+        } else if (_wardrivingInterval) {
+            clearInterval(_wardrivingInterval);
+            _wardrivingInterval = null;
+        }
+    } catch (e) {
+        console.error('[Wardriving] Refresh error:', e);
+    }
+}
+
+function updateWardrivingUI(status) {
+    const badge = document.getElementById('wd-status-badge');
+
+    // Sync running state and toggle button
+    _wardrivingRunning = !!status.running;
+    updateWardrivingToggleButton();
+
+    if (status.running) {
+        if (badge) { badge.textContent = 'Running'; badge.className = 'px-2 py-1 bg-emerald-600 bg-opacity-30 text-emerald-400 text-xs rounded-full animate-pulse'; }
+    } else {
+        if (badge) { badge.textContent = 'Stopped'; badge.className = 'px-2 py-1 bg-gray-600 bg-opacity-30 text-gray-400 text-xs rounded-full'; }
+    }
+
+    // GPS
+    const gps = status.gps || {};
+    const gpsStatus = document.getElementById('wd-gps-status');
+    const gpsCoords = document.getElementById('wd-gps-coords');
+    const gpsSats = document.getElementById('wd-gps-sats');
+    if (gpsStatus) {
+        if (gps.has_fix) {
+            gpsStatus.textContent = 'GPS-Fix OK';
+            gpsStatus.className = 'text-sm font-bold text-emerald-400';
+        } else if (gps.connected && status.running) {
+            gpsStatus.textContent = 'Searching...';
+            gpsStatus.className = 'text-sm font-bold text-yellow-400';
+        } else if (gps.connected) {
+            gpsStatus.textContent = 'Connected';
+            gpsStatus.className = 'text-sm font-bold text-cyan-400';
+        } else {
+            gpsStatus.textContent = 'No GPS';
+            gpsStatus.className = 'text-sm font-bold text-red-400';
+        }
+    }
+    if (gpsCoords) {
+        gpsCoords.textContent = (gps.latitude && gps.longitude) ? `${gps.latitude.toFixed(5)}, ${gps.longitude.toFixed(5)}` : '-';
+    }
+    if (gpsSats) gpsSats.textContent = `Sats: ${gps.satellites || '-'} | HDOP: ${gps.hdop || '-'}`;
+
+    // Speed & direction
+    const speedEl = document.getElementById('wd-speed-val');
+    const headEl = document.getElementById('wd-heading-val');
+    if (speedEl) {
+        speedEl.textContent = (gps.speed_kmh != null && gps.has_fix) ? `${gps.speed_kmh.toFixed(1)} km/h` : '—';
+    }
+    if (headEl) {
+        if (gps.course != null && gps.has_fix) {
+            const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+            const idx = Math.round(gps.course / 45) % 8;
+            headEl.textContent = `${dirs[idx]} (${Math.round(gps.course)}°)`;
+        } else {
+            headEl.textContent = '—';
+        }
+    }
+
+    // Device name
+    const dnEl = document.getElementById('wd-device-name');
+    if (dnEl && !dnEl.matches(':focus') && status.device_name) {
+        dnEl.value = status.device_name;
+    }
+
+    // Stats
+    const stats = status.stats || {};
+    updateElement('wd-total-networks', String(stats.total_networks || 0));
+    updateElement('wd-networks-per-scan', `${status.networks_this_scan || 0} per scan`);
+    updateElement('wd-open-count', String(stats.open_networks || 0));
+    updateElement('wd-wep-count', String(stats.wep_networks || 0));
+    updateElement('wd-wpa-count', String(stats.wpa_networks || 0));
+    updateElement('wd-band24', String(stats.band_2_4ghz || 0));
+    updateElement('wd-band5', String(stats.band_5ghz || 0));
+    updateElement('wd-scans-done', `Scans: ${status.scans_completed || 0}`);
+
+    // BT, Cell, Camera counts
+    updateElement('wd-bt-count', String(stats.bluetooth_devices || status.bluetooth_count || 0));
+    updateElement('wd-cell-count', String(stats.cell_towers || status.cell_count || 0));
+    updateElement('wd-camera-count', String(stats.cameras || 0));
+
+    // Interfaces
+    const ifInfo = document.getElementById('wd-interfaces-info');
+    if (status.interfaces && status.interfaces.length > 0) {
+        if (ifInfo) ifInfo.textContent = `Interfaces: ${status.interfaces.join(', ')}`;
+    }
+
+    // HuginnESP status bar
+    const espBar = document.getElementById('wd-esp-bar');
+    if (espBar) {
+        espBar.classList.remove('hidden');
+        const dot = document.getElementById('wd-esp-status-dot');
+        const details = document.getElementById('wd-esp-details');
+        const labelEl = document.getElementById('wd-esp-label');
+        if (status.serial_connected) {
+            if (dot) dot.className = 'w-2 h-2 rounded-full bg-green-500 animate-pulse';
+            if (details) details.style.display = '';
+            if (labelEl) labelEl.textContent = status.companion_name || 'Companion';
+            updateElement('wd-esp-port', status.serial_port || '');
+            updateElement('wd-esp-net-count', String(status.serial_networks || 0));
+            updateElement('wd-esp-unique', String(status.serial_unique || 0));
+            // Show current scan mode and BLE count
+            const modeEl = document.getElementById('wd-esp-mode');
+            if (modeEl) {
+                const modeLabels = {
+                    wifi: 'WiFi', 'ble-flipper': '🐬 Flipper',
+                    'ble-airtag': '🏷️ AirTag', 'ble-skimmer': '💳 Skimmer',
+                    pineap: '🍍 PineAP', ble: 'BLE', stations: 'Stations'
+                };
+                modeEl.textContent = modeLabels[status.esp_mode] || status.esp_mode || '';
+            }
+            updateElement('wd-esp-ble-count', String(status.esp_ble_count || 0));
+            // Show mesh node count (Piglet Core)
+            const meshWrapper = document.getElementById('wd-esp-mesh-wrapper');
+            if (meshWrapper) {
+                if (status.mesh_node_count > 0) {
+                    meshWrapper.classList.remove('hidden');
+                    updateElement('wd-esp-mesh-nodes', String(status.mesh_node_count));
+                } else {
+                    meshWrapper.classList.add('hidden');
+                }
+            }
+            // Show alerts
+            const alertEl = document.getElementById('wd-esp-alerts');
+            if (alertEl && status.esp_alerts && status.esp_alerts.length > 0) {
+                const latest = status.esp_alerts[status.esp_alerts.length - 1];
+                alertEl.textContent = '⚠️ ' + latest.alert;
+                alertEl.classList.remove('hidden');
+            } else if (alertEl) {
+                alertEl.classList.add('hidden');
+            }
+        } else {
+            // No ESP32 connected — show searching message
+            if (dot) dot.className = 'w-2 h-2 rounded-full bg-gray-500 animate-pulse';
+            if (details) details.style.display = 'none';
+            updateElement('wd-esp-port', 'Ragnar looking for Huginn or Piglet...');
+            const alertEl = document.getElementById('wd-esp-alerts');
+            if (alertEl) alertEl.classList.add('hidden');
+        }
+    }
+
+    // Serial ESP32 config card
+    updateSerialStatus(status);
+}
+
+async function saveWardrivingDeviceName(name) {
+    try {
+        await fetch('/api/wardriving/device_name', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name})
+        });
+    } catch (e) {
+        console.error('[Wardriving] Save device name error:', e);
+    }
+}
+
+async function wipeWardrivingData() {
+    if (!confirm('Are you sure you want to delete ALL wardriving data?\n\nThis will permanently remove all session databases and cannot be undone.')) return;
+    if (!confirm('This is your last chance. Really wipe all wardriving data?')) return;
+    try {
+        const res = await fetch('/api/wardriving/wipe', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+            alert('Error: ' + data.error);
+        } else {
+            alert('Wardriving data wiped. ' + (data.deleted || 0) + ' files deleted.');
+            if (typeof loadWardrivingSessions === 'function') loadWardrivingSessions();
+        }
+    } catch (e) {
+        alert('Wipe failed: ' + e.message);
+    }
+}
+
+function applyWardrivingEnabledState(enabled) {
+    document.querySelectorAll('.wardriving-feature').forEach(el => {
+        el.classList.toggle('hidden', !enabled);
+    });
+    const body = document.getElementById('wardriving-config-body');
+    if (body) body.classList.toggle('hidden', !enabled);
+    const toggle = document.getElementById('wardriving-enable-toggle');
+    if (toggle) toggle.checked = !!enabled;
+}
+
+async function toggleWardrivingEnabled(checkbox) {
+    const enabled = !!checkbox.checked;
+    applyWardrivingEnabledState(enabled);
+    try {
+        await postAPI('/api/config', { wardriving_enabled: enabled });
+        addConsoleMessage('Wardriving ' + (enabled ? 'enabled' : 'disabled'), 'success');
+    } catch (e) {
+        console.error('[Wardriving] enable toggle error:', e);
+        addConsoleMessage('Failed to update wardriving setting', 'error');
+        applyWardrivingEnabledState(!enabled);
+    }
+}
+
+async function toggleWardrivingOnBoot() {
+    const cb = document.getElementById('wardriving-on-boot');
+    if (!cb) return;
+    try {
+        const res = await fetch('/api/wardriving/on_boot', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: cb.checked})
+        });
+        const data = await res.json();
+        if (!data.success) {
+            cb.checked = !cb.checked;
+        }
+    } catch (e) {
+        console.error('[Wardriving] on_boot toggle error:', e);
+        cb.checked = !cb.checked;
+    }
+}
+
+async function loadWardrivingOnBootState() {
+    try {
+        const res = await fetch('/api/wardriving/on_boot');
+        const data = await res.json();
+        const cb = document.getElementById('wardriving-on-boot');
+        if (cb) cb.checked = !!data.wardriving_on_boot;
+    } catch (e) { /* silent */ }
+}
+
+async function importWigleCsv() {
+    const fileInput = document.getElementById('wd-import-file');
+    const resultDiv = document.getElementById('wd-import-result');
+    if (!fileInput || !fileInput.files.length) {
+        if (resultDiv) { resultDiv.textContent = 'Select a CSV file first.'; resultDiv.className = 'text-xs mt-2 text-yellow-400'; }
+        return;
+    }
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+    try {
+        if (resultDiv) { resultDiv.textContent = 'Importing...'; resultDiv.className = 'text-xs mt-2 text-blue-400'; }
+        const res = await fetch('/api/wardriving/import', { method: 'POST', body: formData });
+        const data = await res.json();
+        if (data.error) {
+            if (resultDiv) { resultDiv.textContent = 'Error: ' + data.error; resultDiv.className = 'text-xs mt-2 text-red-400'; }
+        } else {
+            if (resultDiv) {
+                resultDiv.textContent = `Imported: ${data.imported_wifi || 0} WiFi, ${data.imported_bluetooth || 0} BT, ${data.imported_cell || 0} Cell (${data.skipped || 0} skipped)`;
+                resultDiv.className = 'text-xs mt-2 text-green-400';
+            }
+            loadWardrivingData();
+        }
+    } catch (e) {
+        if (resultDiv) { resultDiv.textContent = 'Import failed: ' + e.message; resultDiv.className = 'text-xs mt-2 text-red-400'; }
+    }
+}
+
+async function detectSerialPort() {
+    const portInput = document.getElementById('wd-serial-port');
+    const statusEl = document.getElementById('wd-serial-status');
+    try {
+        if (statusEl) { statusEl.textContent = 'Searching...'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-400'; }
+        const res = await fetch('/api/wardriving/serial/detect');
+        const data = await res.json();
+        if (data.found && data.port) {
+            if (portInput) portInput.value = data.port;
+            if (statusEl) { statusEl.textContent = 'Found: ' + data.port; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-400'; }
+        } else {
+            if (statusEl) { statusEl.textContent = 'Not found'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-red-900 text-red-400'; }
+            setTimeout(() => { if (statusEl) { statusEl.textContent = 'Disconnected'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-gray-700 text-gray-400'; } }, 3000);
+        }
+    } catch (e) {
+        console.error('[Wardriving] detect error:', e);
+        if (statusEl) { statusEl.textContent = 'Error'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-red-900 text-red-400'; }
+    }
+}
+
+async function toggleSerialListener() {
+    const portInput = document.getElementById('wd-serial-port');
+    const statusEl = document.getElementById('wd-serial-status');
+    const btn = document.getElementById('wd-serial-btn');
+    const isConnected = statusEl && statusEl.textContent === 'Connected';
+
+    try {
+        if (isConnected) {
+            const res = await fetch('/api/wardriving/serial', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: 'stop'})
+            });
+            const data = await res.json();
+            if (data.success) {
+                if (statusEl) { statusEl.textContent = 'Disconnected'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-gray-700 text-gray-400'; }
+                if (btn) btn.textContent = 'Connect';
+            }
+        } else {
+            const port = portInput ? portInput.value.trim() : '';
+            if (!port) { alert('Enter a serial port (e.g. /dev/ttyUSB0 or COM3)'); return; }
+            const res = await fetch('/api/wardriving/serial', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action: 'start', port: port})
+            });
+            const data = await res.json();
+            if (data.success) {
+                if (statusEl) { statusEl.textContent = 'Connected'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-400'; }
+                if (btn) btn.textContent = 'Disconnect';
+            } else {
+                alert('Serial error: ' + (data.error || 'Unknown'));
+            }
+        }
+    } catch (e) {
+        console.error('[Wardriving] serial toggle error:', e);
+    }
+}
+
+function updateSerialStatus(status) {
+    const statusEl = document.getElementById('wd-serial-status');
+    const btn = document.getElementById('wd-serial-btn');
+    const countEl = document.getElementById('wd-serial-count');
+    const portInput = document.getElementById('wd-serial-port');
+    if (status.serial_connected) {
+        if (statusEl) { statusEl.textContent = 'Connected'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-green-900 text-green-400'; }
+        if (btn) btn.textContent = 'Disconnect';
+        if (portInput && status.serial_port) portInput.value = status.serial_port;
+    } else {
+        if (statusEl) { statusEl.textContent = 'Disconnected'; statusEl.className = 'text-xs px-2 py-0.5 rounded-full bg-gray-700 text-gray-400'; }
+        if (btn) btn.textContent = 'Connect';
+    }
+    if (countEl) countEl.textContent = status.serial_networks || '0';
+}
+
+function loadWardrivingTableByType() {
+    const type = document.getElementById('wd-table-type')?.value || 'wifi';
+    if (type === 'wifi') loadWardrivingNetworks();
+    else if (type === 'bluetooth') _loadWardrivingBluetooth();
+    else if (type === 'cell') _loadWardrivingCellTable();
+    else if (type === 'cameras') _loadWardrivingCameras();
+}
+
+const _WD_HEADERS = {
+    wifi: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">📷</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
+    bluetooth: '<tr><th class="px-3 py-2">Name</th><th class="px-3 py-2">MAC</th><th class="px-3 py-2">Type</th><th class="px-3 py-2">RSSI</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">First Seen</th><th class="px-3 py-2">Seen</th></tr>',
+    cell: '<tr><th class="px-3 py-2">Provider</th><th class="px-3 py-2">Tech</th><th class="px-3 py-2">Cell ID</th><th class="px-3 py-2">MCC/MNC</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2">Band</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
+    cameras: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>'
+};
+
+function _setWdTableHeaders(type) {
+    const thead = document.getElementById('wd-table-head');
+    if (thead) thead.innerHTML = _WD_HEADERS[type] || _WD_HEADERS.wifi;
+}
+
+async function loadWardrivingNetworks() {
+    _setWdTableHeaders('wifi');
+    try {
+        const sid = _wdSelectedSessionId ? `&session_id=${encodeURIComponent(_wdSelectedSessionId)}` : '';
+        const res = await fetch(`/api/wardriving/networks?limit=200${sid}`);
+        const data = await res.json();
+        const tbody = document.getElementById('wd-network-table');
+        if (!tbody) return;
+
+        const networks = data.networks || [];
+        if (networks.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="9" class="text-center text-gray-500 py-8">No networks yet.</td></tr>';
+            return;
+        }
+
+        const html = networks.map(n => {
+            const secColor = !n.security || n.security === '--' ? 'text-green-400' :
+                             n.security.includes('WEP') ? 'text-yellow-400' : 'text-blue-400';
+            const sigColor = n.best_rssi > -50 ? 'text-emerald-400' :
+                             n.best_rssi > -70 ? 'text-yellow-400' : 'text-red-400';
+            const ssid = n.ssid || '<hidden>';
+            const hasGps = n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0;
+            const gpsIcon = hasGps
+                ? `<span title="${n.best_lat.toFixed(5)}, ${n.best_lon.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            const camIcon = n.is_camera ? '<span class="text-pink-400">📷</span>' : '';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 font-mono text-xs">${escapeHtml(ssid)}</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${n.bssid}</td>
+                <td class="px-3 py-1.5 text-xs ${secColor}">${n.security || 'Open'}</td>
+                <td class="px-3 py-1.5 text-xs text-center">${n.channel || '-'}</td>
+                <td class="px-3 py-1.5 text-xs">${n.band || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}">${n.best_rssi} dBm</td>
+                <td class="px-3 py-1.5 text-xs text-center">${camIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${n.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+
+        tbody.innerHTML = html;
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(networks.length));
+        updateElement('wd-total', String(data.total || networks.length));
+    } catch (e) {
+        console.error('[Wardriving] Networks error:', e);
+    }
+}
+
+async function _loadWardrivingBluetooth() {
+    _setWdTableHeaders('bluetooth');
+    const tbody = document.getElementById('wd-network-table');
+    if (!tbody) return;
+    try {
+        const sid = _wdSelectedSessionId ? `?session_id=${encodeURIComponent(_wdSelectedSessionId)}` : '';
+        const res = await fetch(`/api/wardriving/bluetooth${sid}`);
+        const data = await res.json();
+        const devices = data.devices || [];
+        if (devices.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-gray-500 py-8">No Bluetooth devices found yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = devices.map(d => {
+            const hasGps = d.latitude && d.longitude;
+            const gpsIcon = hasGps
+                ? `<span title="${d.latitude.toFixed(5)}, ${d.longitude.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            const sigColor = d.rssi > -50 ? 'text-emerald-400' : d.rssi > -70 ? 'text-yellow-400' : 'text-red-400';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 font-mono text-xs">${escapeHtml(d.name || '(unknown)')}</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${d.mac}</td>
+                <td class="px-3 py-1.5 text-xs text-orange-400">${d.device_type || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}">${d.rssi || '-'} dBm</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${d.first_seen || '-'}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${d.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(devices.length));
+        updateElement('wd-total', String(data.total || devices.length));
+    } catch (e) {
+        console.error('[Wardriving] BT table error:', e);
+    }
+}
+
+async function _loadWardrivingCellTable() {
+    _setWdTableHeaders('cell');
+    const tbody = document.getElementById('wd-network-table');
+    if (!tbody) return;
+    try {
+        const res = await fetch('/api/wardriving/cells');
+        const data = await res.json();
+        const towers = data.towers || [];
+        if (towers.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">No cell towers found yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = towers.map(t => {
+            const hasGps = t.latitude && t.longitude;
+            const gpsIcon = hasGps
+                ? `<span title="${t.latitude.toFixed(5)}, ${t.longitude.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            const sigColor = t.signal_dbm > -70 ? 'text-emerald-400' : t.signal_dbm > -90 ? 'text-yellow-400' : 'text-red-400';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 text-xs text-fuchsia-400">${escapeHtml(t.provider || '-')}</td>
+                <td class="px-3 py-1.5 text-xs">${t.tech || '-'}</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${t.cell_id || '-'}</td>
+                <td class="px-3 py-1.5 text-xs">${t.mcc || '-'}/${t.mnc || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}">${t.signal_dbm || '-'} dBm</td>
+                <td class="px-3 py-1.5 text-xs">${t.band_freq || '-'}</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${t.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(towers.length));
+        updateElement('wd-total', String(data.total || towers.length));
+    } catch (e) {
+        console.error('[Wardriving] Cell table error:', e);
+    }
+}
+
+async function _loadWardrivingCameras() {
+    _setWdTableHeaders('cameras');
+    const tbody = document.getElementById('wd-network-table');
+    if (!tbody) return;
+    try {
+        const sid = _wdSelectedSessionId ? `&session_id=${encodeURIComponent(_wdSelectedSessionId)}` : '';
+        const res = await fetch(`/api/wardriving/networks?limit=2000${sid}`);
+        const data = await res.json();
+        const cameras = (data.networks || []).filter(n => n.is_camera);
+        if (cameras.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-8">No cameras detected yet.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = cameras.map(n => {
+            const secColor = !n.security || n.security === '--' ? 'text-green-400' :
+                             n.security.includes('WEP') ? 'text-yellow-400' : 'text-blue-400';
+            const sigColor = n.best_rssi > -50 ? 'text-emerald-400' : n.best_rssi > -70 ? 'text-yellow-400' : 'text-red-400';
+            const hasGps = n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0;
+            const gpsIcon = hasGps
+                ? `<span title="${n.best_lat.toFixed(5)}, ${n.best_lon.toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 font-mono text-xs text-pink-400">${escapeHtml(n.ssid || '<hidden>')} 📷</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400">${n.bssid}</td>
+                <td class="px-3 py-1.5 text-xs ${secColor}">${n.security || 'Open'}</td>
+                <td class="px-3 py-1.5 text-xs text-center">${n.channel || '-'}</td>
+                <td class="px-3 py-1.5 text-xs">${n.band || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}">${n.best_rssi} dBm</td>
+                <td class="px-3 py-1.5 text-xs text-center">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400">${n.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(cameras.length));
+        updateElement('wd-total', String(cameras.length));
+    } catch (e) {
+        console.error('[Wardriving] Camera table error:', e);
+    }
+}
+
+function renderWardrivingSessions(sessions) {
+    const container = document.getElementById('wd-sessions-list');
+    if (!container) return;
+    if (!sessions || sessions.length === 0) {
+        container.innerHTML = '<p class="text-gray-500 text-sm">No previous sessions.</p>';
+        return;
+    }
+    container.innerHTML = sessions.map(s => {
+        const isActive = _wdSelectedSessionId === s.session_id;
+        const activeClass = isActive ? 'ring-2 ring-cyan-500 bg-slate-700/60' : 'bg-slate-800/40';
+        let dateStr = s.session_id;
+        if (s.start_time) {
+            const d = new Date(typeof s.start_time === 'number' ? s.start_time * 1000 : s.start_time);
+            if (!isNaN(d.getTime())) dateStr = d.toLocaleString();
+        }
+        return `
+        <div class="flex flex-wrap items-center justify-between ${activeClass} rounded-lg px-4 py-2 gap-2 cursor-pointer hover:bg-slate-700/50 transition-colors" onclick="selectWardrivingSession('${s.session_id}')">
+            <div>
+                <span class="text-sm font-mono text-gray-300">${dateStr}</span>
+                <span class="text-xs text-gray-500 ml-2">${s.total_networks || 0} networks</span>
+                ${isActive ? '<span class="text-xs text-cyan-400 ml-2">● viewing</span>' : ''}
+            </div>
+            <div class="flex gap-2">
+                <a href="/api/wardriving/export/${encodeURIComponent(s.session_id)}?format=wigle" class="text-xs text-cyan-400 hover:text-cyan-300" onclick="event.stopPropagation()">WiGLE CSV</a>
+                <a href="/api/wardriving/export/${encodeURIComponent(s.session_id)}?format=kml" class="text-xs text-purple-400 hover:text-purple-300" onclick="event.stopPropagation()">KML</a>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function selectWardrivingSession(sessionId) {
+    if (_wdSelectedSessionId === sessionId) {
+        _wdSelectedSessionId = null; // deselect = back to live
+    } else {
+        _wdSelectedSessionId = sessionId;
+    }
+    // Show/hide banner and back-to-live button
+    const banner = document.getElementById('wd-session-banner');
+    const backBtn = document.getElementById('wd-back-live-btn');
+    if (banner) banner.classList.toggle('hidden', !_wdSelectedSessionId);
+    if (backBtn) backBtn.classList.toggle('hidden', !_wdSelectedSessionId);
+    // Re-render session list to show active state
+    fetch('/api/wardriving/sessions').then(r => r.json()).then(d => renderWardrivingSessions(d.sessions || []));
+    // Reload table and map with selected session
+    const activeTab = document.querySelector('#wd-table-tabs .wd-tab-active, #wd-table-tabs [class*=\"bg-indigo-600\"]');
+    const type = activeTab?.getAttribute('data-type') || 'wifi';
+    if (type === 'wifi') loadWardrivingNetworks();
+    else if (type === 'bluetooth') _loadWardrivingBluetooth();
+    else if (type === 'cameras') _loadWardrivingCameras();
+    if (_wdMapVisible) loadWardrivingMapData();
+}
+
+// ============================================================================
+// WARDRIVING MAP
+// ============================================================================
+let _wdMap = null;
+let _wdMapVisible = false;
+let _wdMapClusterGroup = null;
+let _wdMapAllNetworks = [];
+let _wdMapBtDevices = [];
+let _wdMapCellTowers = [];
+let _wdVikingMarker = null;
+let _wdGpsInterval = null;
+let _wdSelectedSessionId = null; // null = current/live session
+
+const _VIKING_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 50" width="40" height="50">
+  <ellipse cx="20" cy="46" rx="8" ry="3" fill="rgba(0,0,0,0.3)"/>
+  <circle cx="20" cy="24" r="10" fill="#f59e0b" stroke="#92400e" stroke-width="2"/>
+  <path d="M10 20 Q8 12 5 8 L12 14 Z" fill="#94a3b8"/>
+  <path d="M30 20 Q32 12 35 8 L28 14 Z" fill="#94a3b8"/>
+  <circle cx="16" cy="22" r="2" fill="#1e293b"/>
+  <circle cx="24" cy="22" r="2" fill="#1e293b"/>
+  <path d="M16 28 Q20 32 24 28" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+  <rect x="12" y="12" width="16" height="6" rx="2" fill="#64748b" stroke="#475569" stroke-width="1"/>
+  <path d="M14 36 L18 44 L22 44 L26 36" fill="#3b82f6" stroke="#1e40af" stroke-width="1"/>
+  <line x1="20" y1="36" x2="20" y2="44" stroke="#1e40af" stroke-width="1"/>
+</svg>`;
+
+function toggleWardrivingMap() {
+    const container = document.getElementById('wd-map-container');
+    if (!container) return;
+    _wdMapVisible = !_wdMapVisible;
+    container.classList.toggle('hidden', !_wdMapVisible);
+    const btn = document.getElementById('wd-map-btn');
+    if (btn) {
+        if (_wdMapVisible) {
+            btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-700');
+            btn.classList.add('bg-indigo-800', 'hover:bg-indigo-900');
+        } else {
+            btn.classList.remove('bg-indigo-800', 'hover:bg-indigo-900');
+            btn.classList.add('bg-indigo-600', 'hover:bg-indigo-700');
+        }
+    }
+    if (_wdMapVisible) {
+        if (!_wdMap) {
+            _wdMap = L.map('wd-map', { zoomControl: true }).setView([59.33, 18.07], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '&copy; OpenStreetMap'
+            }).addTo(_wdMap);
+        }
+        setTimeout(() => { _wdMap.invalidateSize(); }, 200);
+        loadWardrivingMapData();
+        // Start live GPS position updates
+        if (!_wdGpsInterval) {
+            _wdGpsInterval = setInterval(_updateVikingPosition, 3000);
+        }
+    } else {
+        if (_wdGpsInterval) {
+            clearInterval(_wdGpsInterval);
+            _wdGpsInterval = null;
+        }
+    }
+}
+
+function _wdSecurityType(sec) {
+    if (!sec || sec === 'Open') return 'open';
+    if (sec.includes('WEP')) return 'wep';
+    return 'wpa';
+}
+
+function _wdMarkerColor(sec) {
+    const t = _wdSecurityType(sec);
+    if (t === 'open') return '#10b981';
+    if (t === 'wep') return '#f59e0b';
+    return '#3b82f6';
+}
+
+async function _updateVikingPosition() {
+    if (!_wdMap || !_wdMapVisible) return;
+    try {
+        const res = await fetch('/api/wardriving/gps');
+        const gps = await res.json();
+        if (gps.has_fix && gps.latitude && gps.longitude) {
+            const lat = gps.latitude;
+            const lon = gps.longitude;
+            const heading = gps.course || 0;
+            if (!_wdVikingMarker) {
+                const icon = L.divIcon({
+                    html: `<div style="transform:rotate(${heading}deg);width:40px;height:50px;">${_VIKING_SVG}</div>`,
+                    className: 'wd-viking-icon',
+                    iconSize: [40, 50],
+                    iconAnchor: [20, 46]
+                });
+                _wdVikingMarker = L.marker([lat, lon], { icon: icon, zIndexOffset: 1000 }).addTo(_wdMap);
+                _wdVikingMarker.bindPopup(`<b>Ragnar</b><br>${gps.speed_kmh?.toFixed(1) || 0} km/h`);
+            } else {
+                _wdVikingMarker.setLatLng([lat, lon]);
+                const icon = L.divIcon({
+                    html: `<div style="transform:rotate(${heading}deg);width:40px;height:50px;">${_VIKING_SVG}</div>`,
+                    className: 'wd-viking-icon',
+                    iconSize: [40, 50],
+                    iconAnchor: [20, 46]
+                });
+                _wdVikingMarker.setIcon(icon);
+                _wdVikingMarker.setPopupContent(`<b>Ragnar</b><br>${gps.speed_kmh?.toFixed(1) || 0} km/h`);
+            }
+        }
+    } catch (e) { /* silent */ }
+}
+
+async function loadWardrivingMapData() {
+    if (!_wdMap) return;
+    try {
+        const sid = _wdSelectedSessionId ? encodeURIComponent(_wdSelectedSessionId) : '';
+        const netUrl = sid ? `/api/wardriving/networks?session_id=${sid}&limit=2000` : '/api/wardriving/networks?limit=2000';
+        const btUrl = sid ? `/api/wardriving/bluetooth?session_id=${sid}` : '/api/wardriving/bluetooth';
+        const cellUrl = sid ? `/api/wardriving/cells?session_id=${sid}` : '/api/wardriving/cells';
+        const [netRes, btRes, cellRes] = await Promise.all([
+            fetch(netUrl),
+            fetch(btUrl),
+            fetch(cellUrl)
+        ]);
+        const netData = await netRes.json();
+        const btData = await btRes.json();
+        const cellData = await cellRes.json();
+        _wdMapAllNetworks = (netData.networks || []).filter(n => n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0);
+        _wdMapBtDevices = (btData.devices || []).filter(d => d.latitude && d.longitude);
+        _wdMapCellTowers = (cellData.towers || []).filter(t => t.latitude && t.longitude);
+        applyWardrivingMapFilters();
+        _updateVikingPosition();
+    } catch (e) {
+        console.error('[Wardriving] Map error:', e);
+    }
+}
+
+function applyWardrivingMapFilters() {
+    if (!_wdMap) return;
+
+    const typeFilter = document.getElementById('wd-map-filter-type')?.value || 'all';
+    const secFilter = document.getElementById('wd-map-filter-security')?.value || 'all';
+    const bandFilter = document.getElementById('wd-map-filter-band')?.value || 'all';
+    const signalMin = parseInt(document.getElementById('wd-map-filter-signal')?.value || '-100', 10);
+
+    // Remove old cluster group
+    if (_wdMapClusterGroup) {
+        _wdMap.removeLayer(_wdMapClusterGroup);
+    }
+    _wdMapClusterGroup = L.markerClusterGroup({
+        maxClusterRadius: 40,
+        spiderfyOnMaxZoom: true,
+        showCoverageOnHover: false,
+        iconCreateFunction: function(cluster) {
+            const count = cluster.getChildCount();
+            let sz = count >= 50 ? [44,44] : count >= 10 ? [36,36] : [28,28];
+            return L.divIcon({
+                html: '<div style="background:rgba(99,102,241,0.85);color:#fff;border-radius:50%;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:12px;border:2px solid rgba(255,255,255,0.4);">' + count + '</div>',
+                className: 'wd-cluster-icon',
+                iconSize: sz
+            });
+        }
+    });
+
+    const bounds = [];
+    let totalShown = 0;
+
+    // WiFi networks
+    if (typeFilter === 'all' || typeFilter === 'wifi' || typeFilter === 'cameras') {
+        let filtered = _wdMapAllNetworks;
+        if (typeFilter === 'cameras') {
+            filtered = filtered.filter(n => n.is_camera);
+        }
+        if (secFilter !== 'all') {
+            filtered = filtered.filter(n => _wdSecurityType(n.security) === secFilter);
+        }
+        if (bandFilter !== 'all') {
+            filtered = filtered.filter(n => n.band === bandFilter);
+        }
+        if (signalMin > -100) {
+            filtered = filtered.filter(n => n.best_rssi >= signalMin);
+        }
+        filtered.forEach(n => {
+            const lat = n.best_lat, lon = n.best_lon;
+            bounds.push([lat, lon]);
+            const color = n.is_camera ? '#ec4899' : _wdMarkerColor(n.security);
+            const marker = L.circleMarker([lat, lon], {
+                radius: n.is_camera ? 9 : 7,
+                fillColor: color,
+                color: '#1e293b',
+                weight: 1,
+                fillOpacity: 0.85
+            });
+            const ssid = n.ssid || '&lt;hidden&gt;';
+            const cam = n.is_camera ? ' 📷' : '';
+            marker.bindPopup(`<div style="font-family:monospace;min-width:180px;">
+                <b style="font-size:13px;">${ssid}${cam}</b><br>
+                <span style="color:#888;">BSSID:</span> ${n.bssid}<br>
+                <span style="color:#888;">Security:</span> <span style="color:${color}">${n.security || 'Open'}</span><br>
+                <span style="color:#888;">Channel:</span> ${n.channel || '-'} (${n.band || '-'})<br>
+                <span style="color:#888;">Signal:</span> ${n.best_rssi} dBm<br>
+                <span style="color:#888;">Seen:</span> ${n.scan_count || 1}x<br>
+                <span style="color:#888;">Pos:</span> ${lat.toFixed(5)}, ${lon.toFixed(5)}
+            </div>`);
+            _wdMapClusterGroup.addLayer(marker);
+            totalShown++;
+        });
+    }
+
+    // Bluetooth
+    if (typeFilter === 'all' || typeFilter === 'bluetooth') {
+        _wdMapBtDevices.forEach(d => {
+            bounds.push([d.latitude, d.longitude]);
+            const marker = L.circleMarker([d.latitude, d.longitude], {
+                radius: 6, fillColor: '#f97316', color: '#1e293b', weight: 1, fillOpacity: 0.85
+            });
+            marker.bindPopup(`<div style="font-family:monospace;min-width:160px;">
+                <b style="font-size:13px;">🔵 ${d.name || d.mac}</b><br>
+                <span style="color:#888;">MAC:</span> ${d.mac}<br>
+                <span style="color:#888;">Type:</span> ${d.device_type || '-'}<br>
+                <span style="color:#888;">RSSI:</span> ${d.rssi} dBm<br>
+                <span style="color:#888;">Seen:</span> ${d.scan_count || 1}x
+            </div>`);
+            _wdMapClusterGroup.addLayer(marker);
+            totalShown++;
+        });
+    }
+
+    // Cell towers
+    if (typeFilter === 'all' || typeFilter === 'cell') {
+        _wdMapCellTowers.forEach(t => {
+            bounds.push([t.latitude, t.longitude]);
+            const marker = L.circleMarker([t.latitude, t.longitude], {
+                radius: 10, fillColor: '#d946ef', color: '#1e293b', weight: 2, fillOpacity: 0.8
+            });
+            marker.bindPopup(`<div style="font-family:monospace;min-width:160px;">
+                <b style="font-size:13px;">📶 ${t.provider || 'Cell'} ${t.tech || ''}</b><br>
+                <span style="color:#888;">CellID:</span> ${t.cell_id}<br>
+                <span style="color:#888;">MCC/MNC:</span> ${t.mcc || '-'}/${t.mnc || '-'}<br>
+                <span style="color:#888;">Signal:</span> ${t.signal_dbm} dBm<br>
+                <span style="color:#888;">Seen:</span> ${t.scan_count || 1}x
+            </div>`);
+            _wdMapClusterGroup.addLayer(marker);
+            totalShown++;
+        });
+    }
+
+    _wdMap.addLayer(_wdMapClusterGroup);
+
+    if (bounds.length > 0) {
+        _wdMap.fitBounds(bounds, { padding: [30, 30] });
+    }
+
+    const totalAll = _wdMapAllNetworks.length + _wdMapBtDevices.length + _wdMapCellTowers.length;
+    document.getElementById('wd-map-info').textContent = totalShown === 0
+        ? 'No GPS-tagged items match filters.'
+        : totalShown === totalAll
+            ? `${totalAll} items with GPS position`
+            : `${totalShown} / ${totalAll} items match filters`;
+}
+
+let _wardrivingRunning = false;
+let _wardrivingBusy = false;
+
+async function toggleWardriving() {
+    if (_wardrivingBusy) return;
+    _wardrivingBusy = true;
+    const btn = document.getElementById('wd-toggle-btn');
+    if (btn) { btn.disabled = true; btn.classList.add('opacity-50', 'pointer-events-none'); }
+    try {
+        const endpoint = _wardrivingRunning ? '/api/wardriving/stop' : '/api/wardriving/start';
+        const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+        const data = await res.json();
+        if (data.error) {
+            showToast(data.error, 'error');
+        } else if (data.success) {
+            if (!_wardrivingRunning) {
+                showToast(`Wardriving started! Session: ${data.session_id}`, 'success');
+            } else {
+                showToast(`Wardriving stopped. ${data.stats?.total_networks || 0} networks found.`, 'success');
+            }
+        }
+    } catch (e) {
+        showToast('Failed to toggle wardriving', 'error');
+    }
+    // Always refresh state from server regardless of success/failure
+    await loadWardrivingData();
+    // After starting, do an extra refresh after a short delay so first scan results appear
+    if (_wardrivingRunning) {
+        setTimeout(() => loadWardrivingData(), 2000);
+        setTimeout(() => loadWardrivingData(), 5000);
+    }
+    _wardrivingBusy = false;
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50', 'pointer-events-none'); }
+}
+
+function updateWardrivingToggleButton() {
+    const btn = document.getElementById('wd-toggle-btn');
+    if (!btn) return;
+    if (_wardrivingRunning) {
+        btn.innerHTML = `
+            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"></path>
+            </svg>
+            Stop
+        `;
+        btn.classList.remove('bg-green-600', 'hover:bg-green-700');
+        btn.classList.add('bg-red-600', 'hover:bg-red-700');
+    } else {
+        btn.innerHTML = `
+            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+            </svg>
+            Start
+        `;
+        btn.classList.remove('bg-red-600', 'hover:bg-red-700');
+        btn.classList.add('bg-green-600', 'hover:bg-green-700');
     }
 }
 

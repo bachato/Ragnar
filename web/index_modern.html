@@ -225,6 +225,11 @@
         #map-ai-toggle-track.active #map-ai-toggle-knob { transform: translateX(16px); }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" crossorigin=""/>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js" crossorigin=""></script>
 </head>
 
 <body class="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white min-h-screen">
@@ -297,6 +302,15 @@
                             <span>Adv Scan</span>
                         </span>
                     </button>
+                    <button onclick="showTab('wardriving')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap wardriving-feature hidden" data-tab="wardriving">
+                        <span class="flex items-center space-x-1">
+                            <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                            </svg>
+                            <span>Wardriving</span>
+                        </span>
+                    </button>
                     <button onclick="showTab('epaper')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap requires-display" data-tab="epaper">
                         Display
                     </button>
@@ -344,6 +358,7 @@
                 <button onclick="showTab('threat-intel')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Threat Intel</button>
                 <button onclick="showTab('traffic')" data-tab="traffic" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 server-mode-feature hidden">Traffic Analysis</button>
                 <button onclick="showTab('adv-vuln')" data-tab="adv-vuln" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 server-mode-feature hidden">Adv Scan</button>
+                <button onclick="showTab('wardriving')" data-tab="wardriving" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 wardriving-feature hidden">Wardriving</button>
                 <button onclick="showTab('epaper')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 requires-display">Display</button>
                 <button onclick="showTab('files')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Files</button>
                 <button onclick="showTab('system')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">System</button>
@@ -3654,6 +3669,209 @@
             </div>
         </div>
         
+        <!-- Wardriving Tab -->
+        <div id="wardriving-tab" class="tab-content hidden">
+            <div class="glass rounded-xl p-4 sm:p-6">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
+                    <div class="flex items-center space-x-3">
+                        <h2 class="text-lg sm:text-2xl font-bold">Wardriving</h2>
+                        <span id="wd-status-badge" class="px-2 py-1 bg-gray-600 bg-opacity-30 text-gray-400 text-xs rounded-full">Stopped</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <button id="wd-toggle-btn" onclick="toggleWardriving()" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition-colors text-sm">
+                            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            Start
+                        </button>
+                        <button onclick="loadWardrivingData()" class="refresh-btn bg-slate-700 hover:bg-slate-600 text-white px-3 py-2 rounded-lg transition-colors text-sm">
+                            <svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </button>
+                        <button onclick="toggleWardrivingMap()" id="wd-map-btn" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition-colors text-sm">
+                            <svg class="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"></path>
+                            </svg>
+                            Map
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Device Name + GPS + Stats Row -->
+                <div class="flex flex-wrap gap-3 items-center mb-4 bg-slate-800/30 rounded-lg px-4 py-2">
+                    <label class="text-xs text-gray-400">Device Name:</label>
+                    <input type="text" id="wd-device-name" placeholder="e.g. RagnarPi-01" maxlength="64"
+                        class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600 w-40"
+                        onchange="saveWardrivingDeviceName(this.value)">
+                    <span id="wd-speed-display" class="text-xs text-gray-400 ml-auto">
+                        <span class="text-gray-500">Speed:</span> <span id="wd-speed-val">—</span>
+                        <span class="text-gray-500 ml-2">Heading:</span> <span id="wd-heading-val">—</span>
+                    </span>
+                </div>
+
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+                    <!-- GPS Status Card -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">GPS</div>
+                        <div id="wd-gps-status" class="text-sm font-bold text-red-400">No Fix</div>
+                        <div id="wd-gps-coords" class="text-xs text-gray-500 mt-1">-</div>
+                        <div id="wd-gps-sats" class="text-xs text-gray-500">Sats: -</div>
+                    </div>
+                    <!-- Total Networks -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">WiFi</div>
+                        <div id="wd-total-networks" class="text-2xl font-bold text-emerald-400">0</div>
+                        <div id="wd-networks-per-scan" class="text-xs text-gray-500 mt-1">0 per scan</div>
+                    </div>
+                    <!-- Security Breakdown -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Security</div>
+                        <div class="flex flex-wrap gap-2 mt-1">
+                            <span class="text-xs"><span class="text-green-400" id="wd-open-count">0</span> Open</span>
+                            <span class="text-xs"><span class="text-yellow-400" id="wd-wep-count">0</span> WEP</span>
+                            <span class="text-xs"><span class="text-blue-400" id="wd-wpa-count">0</span> WPA</span>
+                        </div>
+                    </div>
+                    <!-- Bluetooth -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Bluetooth</div>
+                        <div id="wd-bt-count" class="text-2xl font-bold text-orange-400">0</div>
+                        <div class="text-xs text-gray-500 mt-1">devices</div>
+                    </div>
+                    <!-- Cell Towers -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">Cell</div>
+                        <div id="wd-cell-count" class="text-2xl font-bold text-fuchsia-400">0</div>
+                        <div class="text-xs text-gray-500 mt-1">towers</div>
+                    </div>
+                    <!-- Cameras + Bands -->
+                    <div class="bg-slate-800/50 rounded-lg p-3">
+                        <div class="text-xs text-gray-400 mb-1 uppercase tracking-wider">More</div>
+                        <div class="flex flex-wrap gap-2 mt-1">
+                            <span class="text-xs">📷 <span class="text-pink-400" id="wd-camera-count">0</span></span>
+                            <span class="text-xs"><span class="text-cyan-400" id="wd-band24">0</span> 2.4G</span>
+                            <span class="text-xs"><span class="text-purple-400" id="wd-band5">0</span> 5G</span>
+                        </div>
+                        <div id="wd-scans-done" class="text-xs text-gray-500 mt-1">Scans: 0</div>
+                    </div>
+                </div>
+
+                <!-- ESP Companion Status Bar -->
+                <div id="wd-esp-bar" class="hidden bg-slate-800/40 border border-slate-700 rounded-lg px-4 py-2 mb-4 flex items-center gap-3 flex-wrap">
+                    <span id="wd-esp-label" class="text-xs font-bold text-purple-400">Companion</span>
+                    <span id="wd-esp-port" class="text-xs text-gray-400"></span>
+                    <span id="wd-esp-status-dot" class="w-2 h-2 rounded-full bg-gray-500"></span>
+                    <span id="wd-esp-details" class="contents">
+                        <span class="text-xs text-gray-500">|</span>
+                        <span class="text-xs text-gray-400">Mode:</span>
+                        <span id="wd-esp-mode" class="text-xs font-bold text-amber-400"></span>
+                        <span class="text-xs text-gray-500">|</span>
+                        <span class="text-xs text-gray-400">WiFi:</span>
+                        <span id="wd-esp-net-count" class="text-xs font-bold text-emerald-400">0</span>
+                        <span class="text-xs text-gray-400">BLE:</span>
+                        <span id="wd-esp-ble-count" class="text-xs font-bold text-blue-400">0</span>
+                        <span class="text-xs text-gray-400">Unique:</span>
+                        <span id="wd-esp-unique" class="text-xs font-bold text-cyan-400">0</span>
+                        <span id="wd-esp-mesh-wrapper" class="contents hidden">
+                            <span class="text-xs text-gray-500">|</span>
+                            <span class="text-xs text-gray-400">Mesh:</span>
+                            <span id="wd-esp-mesh-nodes" class="text-xs font-bold text-orange-400">0</span>
+                            <span class="text-xs text-gray-500">nodes</span>
+                        </span>
+                    </span>
+                    <span id="wd-esp-alerts" class="hidden text-xs font-bold text-red-400 ml-2"></span>
+                </div>
+
+                <!-- Table Type Selector -->
+                <div class="bg-slate-800/30 rounded-lg px-4 py-2 mb-4 flex items-center gap-3">
+                    <label class="text-xs text-gray-400">View:</label>
+                    <select id="wd-table-type" onchange="loadWardrivingTableByType()" class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600">
+                        <option value="wifi" selected>📶 WiFi Networks</option>
+                        <option value="bluetooth">🔵 Bluetooth Devices</option>
+                        <option value="cell">📶 Cell Towers</option>
+                        <option value="cameras">📷 Cameras</option>
+                    </select>
+                    <span id="wd-interfaces-info" class="text-xs text-gray-500 ml-auto"></span>
+                </div>
+
+                <!-- Map Container (hidden by default) -->
+                <div id="wd-map-container" class="hidden mb-6">
+                    <!-- Map Filters -->
+                    <div class="flex flex-wrap gap-3 items-center mb-3 bg-slate-800/50 rounded-lg px-4 py-2">
+                        <label class="text-xs text-gray-400">Show:</label>
+                        <select id="wd-map-filter-type" onchange="applyWardrivingMapFilters()" class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600">
+                            <option value="all">All</option>
+                            <option value="wifi" selected>WiFi</option>
+                            <option value="bluetooth">Bluetooth</option>
+                            <option value="cell">Cell Towers</option>
+                            <option value="cameras">Cameras</option>
+                        </select>
+                        <label class="text-xs text-gray-400">Security:</label>
+                        <select id="wd-map-filter-security" onchange="applyWardrivingMapFilters()" class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600">
+                            <option value="all">All</option>
+                            <option value="open">Open</option>
+                            <option value="wep">WEP</option>
+                            <option value="wpa">WPA/WPA2</option>
+                        </select>
+                        <label class="text-xs text-gray-400">Band:</label>
+                        <select id="wd-map-filter-band" onchange="applyWardrivingMapFilters()" class="bg-slate-700 text-white text-xs rounded px-2 py-1 border border-slate-600">
+                            <option value="all">All</option>
+                            <option value="2.4GHz">2.4 GHz</option>
+                            <option value="5GHz">5 GHz</option>
+                        </select>
+                        <label class="text-xs text-gray-400">Min Signal:</label>
+                        <input type="range" id="wd-map-filter-signal" min="-100" max="-30" value="-100" oninput="document.getElementById('wd-map-signal-val').textContent=this.value+' dBm'; applyWardrivingMapFilters()" class="w-24">
+                        <span id="wd-map-signal-val" class="text-xs text-gray-300">-100 dBm</span>
+                    </div>
+                    <div id="wd-map" style="height: 450px; border-radius: 0.75rem; z-index: 1;"></div>
+                    <div class="text-xs text-gray-500 mt-1 text-right" id="wd-map-info"></div>
+                </div>
+
+                <!-- Network Table -->
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm text-left">
+                        <thead id="wd-table-head" class="text-xs uppercase text-gray-400 border-b border-gray-700">
+                            <tr>
+                                <th class="px-3 py-2">SSID</th>
+                                <th class="px-3 py-2">BSSID</th>
+                                <th class="px-3 py-2">Security</th>
+                                <th class="px-3 py-2">Ch</th>
+                                <th class="px-3 py-2">Band</th>
+                                <th class="px-3 py-2">Signal</th>
+                                <th class="px-3 py-2 text-center">📷</th>
+                                <th class="px-3 py-2 text-center">GPS</th>
+                                <th class="px-3 py-2">Seen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="wd-network-table" class="divide-y divide-gray-800">
+                            <tr><td colspan="9" class="text-center text-gray-500 py-8">No networks yet. Press Start to begin wardriving.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="wd-table-info" class="text-xs text-gray-500 mt-2 text-right hidden">
+                    Showing <span id="wd-showing">0</span> of <span id="wd-total">0</span> networks
+                </div>
+
+                <!-- Session History -->
+                <div class="mt-8">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-md font-semibold text-gray-300">Session History</h3>
+                        <button id="wd-back-live-btn" class="hidden text-xs bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1 rounded-lg transition-colors" onclick="selectWardrivingSession(_wdSelectedSessionId)">
+                            &#9654; Back to Live
+                        </button>
+                    </div>
+                    <div id="wd-session-banner" class="hidden mb-2 bg-cyan-900/40 border border-cyan-700/50 rounded-lg px-4 py-2 text-sm text-cyan-300">
+                        Viewing historical session — click again to return to live data
+                    </div>
+                    <div id="wd-sessions-list" class="space-y-2">
+                        <p class="text-gray-500 text-sm">No previous sessions.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
         <!-- Config Tab -->
         <div id="config-tab" class="tab-content hidden">
             <div class="glass rounded-xl p-6">
@@ -3775,8 +3993,102 @@
                                 Disabled for headless installations. Pwnagotchi requires a display.
                             </div>
                         </div>
-                        
+
+                        <!-- Wardriving on Boot Card -->
+                        <!-- MOVED to Wardriving section below -->
+
                     </div>
+                </div>
+
+                <!-- Wardriving Section -->
+                <div id="wardriving-config-section" class="mb-8">
+                    <h3 class="text-xl font-semibold mb-4 text-Ragnar-400">Wardriving</h3>
+
+                    <!-- Always-visible Enable toggle: gates the rest of the section -->
+                    <div class="glass rounded-lg p-4 mb-4">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <h4 class="font-medium">Enable Wardriving</h4>
+                                <p class="text-xs text-gray-500 mt-1">Toggle on to reveal wardriving cards and settings.</p>
+                            </div>
+                            <label class="toggle-switch relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" id="wardriving-enable-toggle" class="sr-only peer" onchange="toggleWardrivingEnabled(this)">
+                                <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Everything below is gated by the Enable toggle -->
+                    <div id="wardriving-config-body" class="hidden">
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+
+                        <!-- Wardriving on Boot Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">Wardriving on Boot</h4>
+                                <label class="toggle-switch relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="wardriving-on-boot" class="sr-only peer" onchange="toggleWardrivingOnBoot()">
+                                    <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                                </label>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-2">
+                                Automatically start wardriving when Ragnar boots. Orchestrator will be stopped.
+                            </div>
+                            <div class="text-xs text-gray-500">
+                                Ragnar will enter wardriving mode immediately on power-on — ideal for mobile/walk setups.
+                            </div>
+                        </div>
+
+                        <!-- Import WiGLE CSV Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">Import WiGLE CSV</h4>
+                                <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-3">
+                                Import data from Piglet, HuginnESP, or any WiGLE-format CSV file.
+                            </div>
+                            <div class="flex gap-2 items-center">
+                                <input type="file" id="wd-import-file" accept=".csv" class="hidden">
+                                <button type="button" onclick="document.getElementById('wd-import-file').click()" class="bg-slate-700 hover:bg-slate-600 text-gray-300 px-3 py-1.5 rounded text-xs border border-slate-600 transition-colors">Choose file</button>
+                                <span id="wd-import-filename" class="text-xs text-gray-500">No file chosen</span>
+                                <button onclick="importWigleCsv()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-xs transition-colors">Import</button>
+                            </div>
+                            <div id="wd-import-result" class="text-xs mt-2 hidden"></div>
+                        </div>
+
+                        <!-- Serial ESP32 Listener Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">ESP32 Serial (Piglet/HuginnESP)</h4>
+                                <span id="wd-serial-status" class="text-xs px-2 py-0.5 rounded-full bg-gray-700 text-gray-400">Disconnected</span>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-3">
+                                Listen for real-time wardriving data from a USB-connected ESP32 device.
+                            </div>
+                            <div class="flex gap-2 items-center flex-wrap">
+                                <input type="text" id="wd-serial-port" placeholder="/dev/ttyUSB0 or COM3" class="bg-slate-700 text-white text-xs rounded px-2 py-1.5 border border-slate-600 w-44">
+                                <button onclick="detectSerialPort()" class="bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded text-xs transition-colors" title="Auto-detect ESP32">🔍 Search</button>
+                                <button id="wd-serial-btn" onclick="toggleSerialListener()" class="bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded text-xs transition-colors">Connect</button>
+                            </div>
+                            <div id="wd-serial-networks" class="text-xs text-gray-500 mt-2">Networks from ESP32: <span id="wd-serial-count">0</span></div>
+                        </div>
+
+                    </div>
+                    <!-- Dynamic wardriving config settings get injected here by displayConfigForm() -->
+                    <div id="wardriving-config-slot"></div>
+
+                    <!-- Wipe Wardriving Data -->
+                    <div class="mt-6 pt-4 border-t border-red-900/30">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <h4 class="text-sm font-medium text-red-400">Wipe All Wardriving Data</h4>
+                                <p class="text-xs text-gray-500 mt-1">Permanently delete all session databases. This cannot be undone.</p>
+                            </div>
+                            <button onclick="wipeWardrivingData()" class="bg-red-700 hover:bg-red-600 text-white px-4 py-2 rounded text-xs font-bold transition-colors">🗑️ Wipe Data</button>
+                        </div>
+                    </div>
+                    </div><!-- /#wardriving-config-body -->
                 </div>
 
                 <!-- Security Section (collapsible) -->

@@ -2996,6 +2996,22 @@ def update_config():
         # Save configuration
         shared_data.save_config()
 
+        # Auto-install pyserial when wardriving is enabled
+        if data.get('wardriving_enabled') is True:
+            try:
+                import serial  # noqa: F401
+            except ImportError:
+                import subprocess
+                logger.info("Installing pyserial for wardriving GPS support...")
+                try:
+                    subprocess.check_call(
+                        ['pip3', 'install', '--break-system-packages', 'pyserial'],
+                        timeout=60
+                    )
+                    logger.info("pyserial installed successfully")
+                except Exception as pip_err:
+                    logger.warning(f"Failed to install pyserial: {pip_err}")
+
         # Reflect orientation changes immediately for both hardware and screenshots
         from shared import normalize_rotation
         shared_data.screen_reversed = normalize_rotation(shared_data.config.get('screen_reversed', 0))
@@ -6039,6 +6055,357 @@ def reset_vulnerability_scan_history():
         
     except Exception as e:
         logger.error(f"Error resetting scan history: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# WARDRIVING ENDPOINTS
+# ============================================================================
+
+_wardriving_engine = None
+
+def _get_wardriving_engine():
+    global _wardriving_engine
+    if _wardriving_engine is None:
+        from wardriving import WardrivingEngine
+        _wardriving_engine = WardrivingEngine(shared_data)
+    return _wardriving_engine
+
+@app.route('/api/wardriving/status')
+def wardriving_status():
+    """Get wardriving engine status."""
+    try:
+        if not shared_data.config.get('wardriving_enabled', False):
+            return jsonify({'enabled': False, 'running': False})
+        engine = _get_wardriving_engine()
+        status = engine.get_status()
+        status['enabled'] = True
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Wardriving status error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/on_boot', methods=['GET', 'POST'])
+def wardriving_on_boot():
+    """Get or set wardriving-on-boot setting."""
+    try:
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            enabled = bool(data.get('enabled', False))
+            shared_data.config['wardriving_on_boot'] = enabled
+            # If enabling wardriving on boot, also ensure wardriving is enabled
+            if enabled:
+                shared_data.config['wardriving_enabled'] = True
+            shared_data.save_config()
+            return jsonify({'success': True, 'wardriving_on_boot': enabled})
+        else:
+            return jsonify({'wardriving_on_boot': shared_data.config.get('wardriving_on_boot', False)})
+    except Exception as e:
+        logger.error(f"Wardriving on_boot error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/start', methods=['POST'])
+def wardriving_start():
+    """Start a wardriving session."""
+    try:
+        if not shared_data.config.get('wardriving_enabled', False):
+            return jsonify({'error': 'Wardriving not enabled in config'}), 400
+        data = request.get_json(silent=True) or {}
+        interfaces = data.get('interfaces')  # optional list
+        gps_port = data.get('gps_port')      # optional
+        engine = _get_wardriving_engine()
+        engine.scan_interval = shared_data.config.get('wardriving_scan_interval', 2)
+        result = engine.start(interfaces=interfaces, gps_port=gps_port)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Wardriving start error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/stop', methods=['POST'])
+def wardriving_stop():
+    """Stop the current wardriving session."""
+    try:
+        engine = _get_wardriving_engine()
+        result = engine.stop()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Wardriving stop error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/networks')
+def wardriving_networks():
+    """Get discovered networks from current/specified session."""
+    try:
+        engine = _get_wardriving_engine()
+        session_id = request.args.get('session_id')
+        limit = min(int(request.args.get('limit', 500)), 2000)
+        offset = int(request.args.get('offset', 0))
+        sort_by = request.args.get('sort', 'best_rssi')
+        order = request.args.get('order', 'DESC')
+
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            # Load a past session
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'networks': [], 'total': 0})
+
+        networks = session.get_networks(limit=limit, offset=offset, sort_by=sort_by, order=order)
+        stats = session.get_stats()
+        return jsonify({
+            'networks': networks,
+            'total': stats.get('total_networks', 0),
+            'session_id': session.session_id
+        })
+    except Exception as e:
+        logger.error(f"Wardriving networks error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/sessions')
+def wardriving_sessions():
+    """List all wardriving sessions."""
+    try:
+        engine = _get_wardriving_engine()
+        sessions = engine.get_session_list()
+        return jsonify({'sessions': sessions})
+    except Exception as e:
+        logger.error(f"Wardriving sessions error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/export/<session_id>')
+def wardriving_export(session_id):
+    """Export a wardriving session as WiGLE CSV or KML."""
+    try:
+        # Validate session_id to prevent path traversal
+        if not re.match(r'^[A-Za-z0-9_-]+$', session_id):
+            return jsonify({'error': 'Invalid session ID'}), 400
+
+        fmt = request.args.get('format', 'wigle')
+        engine = _get_wardriving_engine()
+
+        from wardriving import WardrivingSession
+        session = WardrivingSession(engine.data_dir, session_id=session_id)
+
+        if fmt == 'kml':
+            content = session.export_kml()
+            return app.response_class(
+                content, mimetype='application/vnd.google-earth.kml+xml',
+                headers={'Content-Disposition': f'attachment; filename=ragnar_wardriving_{session_id}.kml'}
+            )
+        else:
+            device_name = engine.device_name or get_shared_data().config.get('wardriving_device_name', 'Ragnar')
+            content = session.export_wigle_csv(device_name=device_name)
+            return app.response_class(
+                content, mimetype='text/csv',
+                headers={'Content-Disposition': f'attachment; filename=ragnar_wardriving_{session_id}.csv'}
+            )
+    except Exception as e:
+        logger.error(f"Wardriving export error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/gps')
+def wardriving_gps():
+    """Get current GPS status and position."""
+    try:
+        engine = _get_wardriving_engine()
+        if engine._gps:
+            return jsonify(engine._gps.get_status())
+        return jsonify({'connected': False, 'error': 'GPS not initialized'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/import', methods=['POST'])
+def wardriving_import_csv():
+    """Import a WiGLE CSV file into the current or a new wardriving session."""
+    try:
+        engine = _get_wardriving_engine()
+
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+
+        file = request.files['file']
+        if not file.filename:
+            return jsonify({'error': 'Empty filename'}), 400
+
+        # Validate file extension
+        if not file.filename.lower().endswith('.csv'):
+            return jsonify({'error': 'Only CSV files accepted'}), 400
+
+        import io
+        from wardriving import WardrivingSession
+
+        # Use current session or create a new one for import
+        if engine.session:
+            session = engine.session
+        else:
+            session = WardrivingSession(engine.data_dir)
+
+        stream = io.StringIO(file.read().decode('utf-8', errors='replace'))
+        result = session.import_wigle_csv(stream)
+
+        if not engine.session:
+            session.close()
+
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Wardriving import error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/serial/detect', methods=['GET'])
+def wardriving_serial_detect():
+    """Auto-detect ESP32 on serial ports."""
+    try:
+        engine = _get_wardriving_engine()
+        port = engine._detect_esp32_serial()
+        if port:
+            return jsonify({'found': True, 'port': port})
+        return jsonify({'found': False, 'port': ''})
+    except Exception as e:
+        logger.error(f"Wardriving serial detect error: {e}")
+        return jsonify({'found': False, 'error': str(e)})
+
+@app.route('/api/wardriving/serial', methods=['GET', 'POST'])
+def wardriving_serial():
+    """Get or set serial ESP32 listener configuration."""
+    try:
+        engine = _get_wardriving_engine()
+
+        if request.method == 'GET':
+            return jsonify({
+                'connected': engine.serial_connected,
+                'port': engine._serial_port or '',
+                'networks': engine.serial_networks
+            })
+
+        data = request.get_json() or {}
+        action = data.get('action', 'start')
+
+        if action == 'stop':
+            result = engine.stop_serial()
+            return jsonify(result)
+        else:
+            port = data.get('port', '')
+            if not port:
+                return jsonify({'error': 'No serial port specified'}), 400
+            # Basic port validation
+            if not re.match(r'^(/dev/tty[A-Za-z0-9]+|COM\d+)$', port):
+                return jsonify({'error': 'Invalid serial port format'}), 400
+            # Save to config
+            shared_data.config['wardriving_serial_port'] = port
+            result = engine.start_serial(port)
+            return jsonify(result)
+    except Exception as e:
+        logger.error(f"Wardriving serial error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/track')
+def wardriving_track():
+    """Get GPS track for current session (for map display)."""
+    try:
+        engine = _get_wardriving_engine()
+        session_id = request.args.get('session_id')
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'track': []})
+        return jsonify({'track': session.get_gps_track()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/interfaces')
+def wardriving_interfaces():
+    """List available WiFi interfaces for wardriving."""
+    try:
+        engine = _get_wardriving_engine()
+        interfaces = engine._detect_wifi_interfaces()
+        result = []
+        for iface in interfaces:
+            info = {'name': iface, 'type': 'wifi'}
+            # Try to get driver/chipset info
+            try:
+                driver_path = f'/sys/class/net/{iface}/device/driver'
+                if os.path.islink(driver_path):
+                    info['driver'] = os.path.basename(os.readlink(driver_path))
+                phy_path = f'/sys/class/net/{iface}/phy80211/name'
+                if os.path.exists(phy_path):
+                    with open(phy_path) as f:
+                        info['phy'] = f.read().strip()
+            except Exception:
+                pass
+            result.append(info)
+        return jsonify({'interfaces': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/wardriving/bluetooth')
+def wardriving_bluetooth():
+    """Get discovered Bluetooth devices."""
+    try:
+        engine = _get_wardriving_engine()
+        session_id = request.args.get('session_id')
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'devices': [], 'total': 0})
+        devices = session.get_bluetooth_devices()
+        return jsonify({'devices': devices, 'total': len(devices)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/wardriving/cells')
+def wardriving_cells():
+    """Get discovered cell towers."""
+    try:
+        engine = _get_wardriving_engine()
+        session_id = request.args.get('session_id')
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'towers': [], 'total': 0})
+        towers = session.get_cell_towers()
+        return jsonify({'towers': towers, 'total': len(towers)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/wardriving/device_name', methods=['POST'])
+def wardriving_set_device_name():
+    """Set device name for wardriving sessions."""
+    try:
+        data = request.get_json(silent=True) or {}
+        name = data.get('name', '').strip()[:64]  # Max 64 chars
+        shared_data = get_shared_data()
+        shared_data.config['wardriving_device_name'] = name
+        shared_data.save_config()
+        engine = _get_wardriving_engine()
+        engine.device_name = name
+        return jsonify({'success': True, 'device_name': name})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/wipe', methods=['POST'])
+def wardriving_wipe_data():
+    """Delete all wardriving session data."""
+    try:
+        engine = _get_wardriving_engine()
+        result = engine.wipe_all_data()
+        if 'error' in result:
+            return jsonify(result), 409
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Wardriving wipe error: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
@@ -12717,7 +13084,8 @@ def get_server_capabilities_api():
                 'advanced_vuln_assessment': False,
                 'parallel_scanning': False,
                 'local_ai': False,
-                'large_dictionaries': False
+                'large_dictionaries': False,
+                'wardriving_enabled': shared_data.config.get('wardriving_enabled', False)
             }
         })
     except Exception as e:
