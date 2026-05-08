@@ -4024,7 +4024,9 @@
                                 Import data from Piglet, HuginnESP, or any WiGLE-format CSV file.
                             </div>
                             <div class="flex gap-2 items-center">
-                                <input type="file" id="wd-import-file" accept=".csv" class="text-xs text-gray-300 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-blue-600 file:text-white file:cursor-pointer">
+                                <input type="file" id="wd-import-file" accept=".csv" class="hidden">
+                                <button type="button" onclick="document.getElementById('wd-import-file').click()" class="bg-slate-700 hover:bg-slate-600 text-gray-300 px-3 py-1.5 rounded text-xs border border-slate-600 transition-colors">Choose file</button>
+                                <span id="wd-import-filename" class="text-xs text-gray-500">No file chosen</span>
                                 <button onclick="importWigleCsv()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-xs transition-colors">Import</button>
                             </div>
                             <div id="wd-import-result" class="text-xs mt-2 hidden"></div>

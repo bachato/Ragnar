@@ -3707,6 +3707,15 @@ async function loadConfigData() {
 
         // Load wardriving on-boot toggle state (card is in config page)
         loadWardrivingOnBootState();
+
+        // Update filename label when CSV file is selected
+        const wdFileInput = document.getElementById('wd-import-file');
+        const wdFileLabel = document.getElementById('wd-import-filename');
+        if (wdFileInput && wdFileLabel) {
+            wdFileInput.addEventListener('change', () => {
+                wdFileLabel.textContent = wdFileInput.files.length ? wdFileInput.files[0].name : 'No file chosen';
+            });
+        }
     } catch (error) {
         console.error('Error loading config:', error);
     }
