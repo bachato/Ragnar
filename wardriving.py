@@ -1134,13 +1134,23 @@ class WardrivingEngine:
         }
         if self.session:
             result['stats'] = self.session.get_stats()
-            # Count unique ESP32-only networks (found by esp32-serial but not by wlan)
             try:
                 with sqlite3.connect(self.session.db_path) as conn:
+                    # Unique ESP32-only networks (found by esp32-serial but not by wlan)
                     row = conn.execute(
                         "SELECT COUNT(DISTINCT bssid) FROM networks WHERE interface='esp32-serial'"
                     ).fetchone()
                     result['serial_unique'] = row[0] if row else 0
+                    # Unique BLE devices detected via Huginn (overrides running line counter
+                    # so the status bar matches what Huginn actually sees, not stream volume)
+                    try:
+                        row = conn.execute(
+                            "SELECT COUNT(*) FROM bluetooth_devices "
+                            "WHERE device_type IN ('BLE','Flipper','AirTag','Skimmer')"
+                        ).fetchone()
+                        result['esp_ble_count'] = row[0] if row else 0
+                    except Exception:
+                        pass
             except Exception:
                 result['serial_unique'] = 0
         return result
@@ -1478,10 +1488,19 @@ class WardrivingEngine:
     _bt_powered_on = False  # Class-level: avoid repeated 'power on' calls
 
     def _bt_scan_loop(self):
-        """Background loop: scan for Bluetooth devices every ~15 seconds."""
+        """Background loop: scan for Bluetooth devices every ~15 seconds.
+
+        Skipped while Huginn is streaming over serial — Huginn has a dedicated
+        ESP32 BLE radio and the Pi's local bluetoothctl just re-imports BlueZ's
+        all-time device cache, inflating unique counts. Piglet does not do BLE,
+        so the local scan still runs when only Piglet is connected.
+        """
         logger.info("Bluetooth scan loop started")
         while self._running:
             try:
+                if self.serial_connected and self._companion_name == 'Huginn':
+                    time.sleep(15)
+                    continue
                 pos = self._gps.get_position() if self._gps else None
                 lat = pos['lat'] if pos else None
                 lon = pos['lon'] if pos else None
