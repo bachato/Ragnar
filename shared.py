@@ -218,6 +218,7 @@ class SharedData:
         self.status_list = []
         self.last_comment_time = time.time() # Last time a comment was displayed
         self._stats_lock = threading.Lock()  # Thread-safe lock for update_stats()
+        self._config_lock = threading.RLock()  # Serializes save_config() vs mutations
         self.default_config = self.get_default_config() # Default configuration of the application
         self.config = self.default_config.copy() # Configuration of the application
         # Load existing configuration first
@@ -1440,16 +1441,24 @@ class SharedData:
             self.save_config()
 
     def save_config(self):
-        """Save the configuration to the shared configuration JSON file."""
+        """Save the configuration to the shared configuration JSON file.
+
+        Holds _config_lock so concurrent writers to self.config can't change
+        the dict mid-serialization (would raise "dictionary changed size
+        during iteration"). Serializes a shallow snapshot to keep the lock
+        window short.
+        """
         logger.info("Saving configuration...")
         try:
             if not os.path.exists(self.configdir):
                 os.makedirs(self.configdir)
                 logger.info(f"Created configuration directory at {self.configdir}")
             try:
-                self.config = self._normalize_config_keys(self.config)
+                with self._config_lock:
+                    self.config = self._normalize_config_keys(self.config)
+                    snapshot = dict(self.config)
                 with open(self.shared_config_json, 'w') as f:
-                    json.dump(self.config, f, indent=4)
+                    json.dump(snapshot, f, indent=4)
                 logger.info(f"Configuration saved to {self.shared_config_json}")
             except IOError as e:
                 logger.error(f"Error writing to configuration file: {e}")

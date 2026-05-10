@@ -2753,9 +2753,53 @@ def auth_setup():
         return jsonify(result), 400
 
 
+# Simple in-memory rate limit for login / recovery. Per source-IP sliding window:
+#   _AUTH_LOCKOUT_THRESHOLD failed attempts within _AUTH_LOCKOUT_WINDOW seconds
+#   → next attempts rejected for _AUTH_LOCKOUT_WINDOW seconds.
+# Memory only: resets on process restart. Sufficient on a single-Pi deployment.
+_AUTH_LOCKOUT_THRESHOLD = 5
+_AUTH_LOCKOUT_WINDOW = 60
+_auth_attempts = {}  # ip -> list[timestamp] of failed attempts
+_auth_attempts_lock = threading.Lock()
+
+
+def _auth_client_ip():
+    # Trust X-Forwarded-For only if explicitly configured; otherwise use remote_addr.
+    return request.headers.get('X-Real-IP') or request.remote_addr or 'unknown'
+
+
+def _auth_rate_limited(ip):
+    now = time.time()
+    with _auth_attempts_lock:
+        attempts = [t for t in _auth_attempts.get(ip, []) if now - t < _AUTH_LOCKOUT_WINDOW]
+        _auth_attempts[ip] = attempts
+        if len(attempts) >= _AUTH_LOCKOUT_THRESHOLD:
+            retry_after = int(_AUTH_LOCKOUT_WINDOW - (now - attempts[0])) + 1
+            return True, max(retry_after, 1)
+    return False, 0
+
+
+def _auth_record_failure(ip):
+    with _auth_attempts_lock:
+        _auth_attempts.setdefault(ip, []).append(time.time())
+
+
+def _auth_clear_failures(ip):
+    with _auth_attempts_lock:
+        _auth_attempts.pop(ip, None)
+
+
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
     """Login with username and password."""
+    ip = _auth_client_ip()
+    limited, retry_after = _auth_rate_limited(ip)
+    if limited:
+        response = jsonify({'success': False, 'error': 'Too many failed attempts. Try again later.',
+                            'retry_after': retry_after})
+        response.headers['Retry-After'] = str(retry_after)
+        return response, 429
+
     data = request.get_json()
     if not data:
         return jsonify({'success': False, 'error': 'No data provided'}), 400
@@ -2765,12 +2809,14 @@ def auth_login():
 
     result = auth_mgr.login(username, password)
     if result['success']:
+        _auth_clear_failures(ip)
         session['authenticated'] = True
         session['username'] = username
         session['login_time'] = time.time()
         session.permanent = True
         return jsonify(result)
     else:
+        _auth_record_failure(ip)
         return jsonify(result), 401
 
 
@@ -2803,6 +2849,14 @@ def auth_change_password():
 @app.route('/api/auth/recover', methods=['POST'])
 def auth_recover():
     """Use a recovery code to reset password and login."""
+    ip = _auth_client_ip()
+    limited, retry_after = _auth_rate_limited(ip)
+    if limited:
+        response = jsonify({'success': False, 'error': 'Too many failed attempts. Try again later.',
+                            'retry_after': retry_after})
+        response.headers['Retry-After'] = str(retry_after)
+        return response, 429
+
     data = request.get_json()
     if not data:
         return jsonify({'success': False, 'error': 'No data provided'}), 400
@@ -2813,11 +2867,14 @@ def auth_recover():
         data.get('new_password', '')
     )
     if result['success']:
+        _auth_clear_failures(ip)
         session['authenticated'] = True
         session['username'] = data.get('username', '').strip()
         session['login_time'] = time.time()
         session.permanent = True
-    return jsonify(result) if result['success'] else (jsonify(result), 400)
+        return jsonify(result)
+    _auth_record_failure(ip)
+    return jsonify(result), 400
 
 
 @app.route('/api/auth/regenerate-recovery', methods=['POST'])
@@ -3064,7 +3121,7 @@ def update_config():
                 import time, os, signal
                 time.sleep(2)  # Give the response time to reach the client
                 logger.info(f"Restarting Ragnar service for EPD type change to: {shared_data.config.get('epd_type')}")
-                os.system('systemctl restart ragnar.service')
+                subprocess.Popen(['systemctl', 'restart', 'ragnar.service'])
             threading.Thread(target=_delayed_restart, daemon=True).start()
 
         return jsonify(response)
@@ -5188,8 +5245,8 @@ def attack_logs():
             attack_type_filter = request.args.get('type', None)
             status_filter = request.args.get('status', None)
             network_filter = request.args.get('network', None)
-            limit = int(request.args.get('limit', 100))
-            days_back = int(request.args.get('days', 7))
+            limit = _safe_int(request.args.get('limit'), 100, min_v=1, max_v=10000)
+            days_back = _safe_int(request.args.get('days'), 7, min_v=1, max_v=365)
             
             attack_log_dir = os.path.join(shared_data.logsdir, 'attacks')
 
@@ -6137,8 +6194,8 @@ def wardriving_networks():
     try:
         engine = _get_wardriving_engine()
         session_id = request.args.get('session_id')
-        limit = min(int(request.args.get('limit', 500)), 2000)
-        offset = int(request.args.get('offset', 0))
+        limit = _safe_int(request.args.get('limit'), 500, min_v=1, max_v=2000)
+        offset = _safe_int(request.args.get('offset'), 0, min_v=0)
         sort_by = request.args.get('sort', 'best_rssi')
         order = request.args.get('order', 'DESC')
 
@@ -7812,20 +7869,32 @@ def _set_toml_value(doc, dotted_key, value):
     d[keys[-1]] = value
 
 
+_TOML_FALLBACK_SCRIPT = (
+    "import sys, json, tomlkit\n"
+    "config_path, dotted, value_json = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+    "value = json.loads(value_json)\n"
+    "with open(config_path, 'r') as _f: doc = tomlkit.parse(_f.read())\n"
+    "keys = dotted.split('.')\n"
+    "d = doc\n"
+    "for k in keys[:-1]:\n"
+    "    if k not in d: d[k] = tomlkit.table()\n"
+    "    d = d[k]\n"
+    "d[keys[-1]] = value\n"
+    "with open(config_path, 'w') as _f: _f.write(tomlkit.dumps(doc))\n"
+)
+
+
 def _set_toml_value_fallback(dotted_key, value):
-    """Fallback: use Python inline script to update a TOML value when tomlkit is unavailable."""
-    if isinstance(value, bool):
-        val_str = 'true' if value else 'false'
-    elif isinstance(value, int):
-        val_str = str(value)
-    else:
-        val_str = value
+    """Fallback: use sub-python to update a TOML value when tomlkit is unavailable here.
+
+    Passes key and value as separate argv parameters and JSON-encodes the value.
+    No exec, no string-built code — so a malicious key or value can never reach
+    the Python parser as code.
+    """
     try:
         subprocess.run(
-            ['sudo', 'python3', '-c',
-             f"import tomlkit; f=open('{PWN_CONFIG_FILE}','r'); d=tomlkit.parse(f.read()); f.close(); "
-             f"exec(\"keys='{dotted_key}'.split('.');o=d\\nfor k in keys[:-1]:\\n if k not in o: o[k]=tomlkit.table()\\n o=o[k]\\no[keys[-1]]={repr(value)}\")"
-             f"; f=open('{PWN_CONFIG_FILE}','w'); f.write(tomlkit.dumps(d)); f.close()"],
+            ['sudo', 'python3', '-c', _TOML_FALLBACK_SCRIPT,
+             PWN_CONFIG_FILE, dotted_key, json.dumps(value)],
             capture_output=True, text=True, timeout=10
         )
     except Exception as exc:
@@ -12197,6 +12266,44 @@ def _resolve_loot_path(virtual_root, network_rel_path, path):
     return actual
 
 
+def _resolve_legacy_path(virtual_root, base_dir, path):
+    """Resolve /logs|/backups|/uploads-style paths safely.
+
+    Returns the joined real-fs path. Raises ValueError on:
+      - prefix mismatch ("/logsfoo" must not match virtual_root "/logs")
+      - path traversal ("/logs/../etc/passwd" escaping base_dir)
+    """
+    if path != virtual_root and not path.startswith(virtual_root + '/'):
+        raise ValueError(f'Invalid path prefix: {path!r}')
+
+    remainder = path[len(virtual_root):].lstrip('/')
+    actual = os.path.join(base_dir, remainder) if remainder else base_dir
+
+    real_actual = os.path.realpath(actual)
+    real_base = os.path.realpath(base_dir)
+    if real_actual != real_base and not real_actual.startswith(real_base + os.sep):
+        raise ValueError(f'Path traversal detected: {path!r}')
+
+    return actual
+
+
+def _safe_int(value, default, min_v=None, max_v=None):
+    """Parse an int from request input without raising on bad input.
+
+    Used wherever a 500 (unhandled ValueError) would otherwise be returned to
+    the client when they pass a non-numeric query arg.
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    if min_v is not None and v < min_v:
+        return min_v
+    if max_v is not None and v > max_v:
+        return max_v
+    return v
+
+
 def _network_loot_dirs(network_rel_path, virtual_root):
     """Return a list-API response listing all networks as virtual directories."""
     networks = _list_all_networks()
@@ -12419,18 +12526,21 @@ def list_files_api():
             actual_path = _resolve_loot_path('/vulnerabilities', 'output/vulnerabilities', path)
             if actual_path is None:
                 return jsonify(_network_loot_dirs('output/vulnerabilities', '/vulnerabilities'))
-        elif path.startswith('/logs'):
-            actual_path = shared_data.datadir + '/logs'
-            if len(path) > 5:  # More than just '/logs'
-                actual_path = os.path.join(actual_path, path[6:])
-        elif path.startswith('/backups'):
-            actual_path = shared_data.backupdir
-            if len(path) > 8:  # More than just '/backups'
-                actual_path = os.path.join(actual_path, path[9:])
-        elif path.startswith('/uploads'):
-            actual_path = shared_data.upload_dir
-            if len(path) > 8:  # More than just '/uploads'
-                actual_path = os.path.join(actual_path, path[9:])
+        elif path == '/logs' or path.startswith('/logs/'):
+            try:
+                actual_path = _resolve_legacy_path('/logs', os.path.join(shared_data.datadir, 'logs'), path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif path == '/backups' or path.startswith('/backups/'):
+            try:
+                actual_path = _resolve_legacy_path('/backups', shared_data.backupdir, path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif path == '/uploads' or path.startswith('/uploads/'):
+            try:
+                actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
         else:
             return jsonify({'error': 'Invalid path'}), 400
         
@@ -12490,19 +12600,27 @@ def preview_file_api():
             if resolved is None:
                 return jsonify({'error': 'Invalid path'}), 400
             actual_path = resolved
-        elif file_path.startswith('/logs'):
-            actual_path = shared_data.datadir + '/logs' + file_path[5:]
-        elif file_path.startswith('/backups'):
-            actual_path = shared_data.backupdir + file_path[8:]
-        elif file_path.startswith('/uploads'):
-            actual_path = shared_data.upload_dir + file_path[8:]
+        elif file_path == '/logs' or file_path.startswith('/logs/'):
+            try:
+                actual_path = _resolve_legacy_path('/logs', os.path.join(shared_data.datadir, 'logs'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif file_path == '/backups' or file_path.startswith('/backups/'):
+            try:
+                actual_path = _resolve_legacy_path('/backups', shared_data.backupdir, file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
+        elif file_path == '/uploads' or file_path.startswith('/uploads/'):
+            try:
+                actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid path'}), 400
         else:
             return jsonify({'error': 'Invalid path'}), 400
 
         if not os.path.isfile(actual_path):
             return jsonify({'error': 'File not found'}), 404
 
-        # Security: ensure path doesn't escape allowed dirs
         actual_path = os.path.realpath(actual_path)
 
         mime_type, _ = mimetypes.guess_type(actual_path)
@@ -12571,12 +12689,21 @@ def download_file_api():
             if resolved is None:
                 return jsonify({'error': 'Invalid file path'}), 400
             actual_path = resolved
-        elif file_path.startswith('/logs'):
-            actual_path = shared_data.datadir + '/logs' + file_path[5:]
-        elif file_path.startswith('/backups'):
-            actual_path = shared_data.backupdir + file_path[8:]
-        elif file_path.startswith('/uploads'):
-            actual_path = shared_data.upload_dir + file_path[8:]
+        elif file_path == '/logs' or file_path.startswith('/logs/'):
+            try:
+                actual_path = _resolve_legacy_path('/logs', os.path.join(shared_data.datadir, 'logs'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/backups' or file_path.startswith('/backups/'):
+            try:
+                actual_path = _resolve_legacy_path('/backups', shared_data.backupdir, file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/uploads' or file_path.startswith('/uploads/'):
+            try:
+                actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
         else:
             return jsonify({'error': 'Invalid file path'}), 400
 
@@ -12626,12 +12753,21 @@ def delete_file_api():
             if resolved is None:
                 return jsonify({'error': 'Invalid file path'}), 400
             actual_path = resolved
-        elif file_path.startswith('/logs'):
-            actual_path = shared_data.datadir + '/logs' + file_path[5:]
-        elif file_path.startswith('/backups'):
-            actual_path = shared_data.backupdir + file_path[8:]
-        elif file_path.startswith('/uploads'):
-            actual_path = shared_data.upload_dir + file_path[8:]
+        elif file_path == '/logs' or file_path.startswith('/logs/'):
+            try:
+                actual_path = _resolve_legacy_path('/logs', os.path.join(shared_data.datadir, 'logs'), file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/backups' or file_path.startswith('/backups/'):
+            try:
+                actual_path = _resolve_legacy_path('/backups', shared_data.backupdir, file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
+        elif file_path == '/uploads' or file_path.startswith('/uploads/'):
+            try:
+                actual_path = _resolve_legacy_path('/uploads', shared_data.upload_dir, file_path)
+            except ValueError:
+                return jsonify({'error': 'Invalid file path'}), 400
         else:
             return jsonify({'error': 'Invalid file path'}), 400
 
@@ -12704,47 +12840,58 @@ def upload_file_api():
 def clear_files_api():
     """Clear files from specified directories"""
     try:
-        data = request.get_json()
-        clear_type = data.get('type', 'light')  # 'light' or 'full'
-        
-        if clear_type == 'light':
-            # Clear only logs and temporary files (like clear_files_light)
-            command = f"""
-            rm -rf {shared_data.datadir}/*.log && 
-            rm -rf {shared_data.datastolendir}/* && 
-            rm -rf {shared_data.crackedpwddir}/* && 
-            rm -rf {shared_data.scan_results_dir}/* && 
-            rm -rf {shared_data.datadir}/logs/* && 
-            rm -rf {shared_data.vulnerabilities_dir}/*
-            """
-        else:
-            # Full clear (like clear_files)
-            command = f"""
-            rm -rf {shared_data.configdir}/*.json && 
-            rm -rf {shared_data.datadir}/*.csv && 
-            rm -rf {shared_data.datadir}/*.log && 
-            rm -rf {shared_data.backupdir}/* && 
-            rm -rf {shared_data.upload_dir}/* && 
-            rm -rf {shared_data.datastolendir}/* && 
-            rm -rf {shared_data.crackedpwddir}/* && 
-            rm -rf {shared_data.scan_results_dir}/* && 
-            rm -rf {shared_data.datadir}/logs/* && 
-            rm -rf {shared_data.vulnerabilities_dir}/*
-            """
-        
-        import subprocess
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            logger.info(f"Files cleared successfully ({clear_type} clear)")
-            return jsonify({
-                'success': True,
-                'message': f'Files cleared successfully ({clear_type} clear)'
-            })
-        else:
-            logger.error(f"Error clearing files: {result.stderr}")
-            return jsonify({'error': result.stderr}), 500
-        
+        import glob as _glob
+        import shutil as _shutil
+
+        data = request.get_json() or {}
+        clear_type = data.get('type', 'light')
+
+        # Patterns to clear. Each entry is (glob_pattern, base_dir_that_pattern_must_resolve_within).
+        # Build paths from shared_data.* so empty/missing config attrs can't expand
+        # into "/", and verify with realpath that every match stays under its base.
+        light_targets = [
+            (os.path.join(shared_data.datadir, '*.log'),               shared_data.datadir),
+            (os.path.join(shared_data.datastolendir, '*'),             shared_data.datastolendir),
+            (os.path.join(shared_data.crackedpwddir, '*'),             shared_data.crackedpwddir),
+            (os.path.join(shared_data.scan_results_dir, '*'),          shared_data.scan_results_dir),
+            (os.path.join(shared_data.datadir, 'logs', '*'),           os.path.join(shared_data.datadir, 'logs')),
+            (os.path.join(shared_data.vulnerabilities_dir, '*'),       shared_data.vulnerabilities_dir),
+        ]
+        full_targets = light_targets + [
+            (os.path.join(shared_data.configdir, '*.json'),            shared_data.configdir),
+            (os.path.join(shared_data.datadir, '*.csv'),               shared_data.datadir),
+            (os.path.join(shared_data.backupdir, '*'),                 shared_data.backupdir),
+            (os.path.join(shared_data.upload_dir, '*'),                shared_data.upload_dir),
+        ]
+
+        targets = light_targets if clear_type == 'light' else full_targets
+        removed = 0
+        for pattern, base in targets:
+            if not base:
+                continue  # missing config attr — skip rather than risk wildcard / expansion
+            real_base = os.path.realpath(base)
+            # Hard floor: never delete anything outside Ragnar's install/data tree
+            if real_base in ('/', os.sep) or not real_base:
+                continue
+            for hit in _glob.glob(pattern):
+                real_hit = os.path.realpath(hit)
+                if real_hit != real_base and not real_hit.startswith(real_base + os.sep):
+                    continue
+                try:
+                    if os.path.isdir(real_hit) and not os.path.islink(real_hit):
+                        _shutil.rmtree(real_hit)
+                    else:
+                        os.remove(real_hit)
+                    removed += 1
+                except Exception as e:
+                    logger.warning(f"clear_files: could not remove {real_hit}: {e}")
+
+        logger.info(f"Files cleared ({clear_type}): {removed} entries removed")
+        return jsonify({
+            'success': True,
+            'message': f'Files cleared successfully ({clear_type} clear, {removed} entries)'
+        })
+
     except Exception as e:
         logger.error(f"Error clearing files: {e}")
         return jsonify({'error': str(e)}), 500
@@ -13984,7 +14131,7 @@ def get_zap_logs():
         filter: additional keyword filter (optional)
     """
     try:
-        max_lines = min(int(request.args.get('lines', 200)), 2000)
+        max_lines = _safe_int(request.args.get('lines'), 200, min_v=1, max_v=2000)
         extra_filter = request.args.get('filter', '').strip()
         
         log_path = os.path.join(shared_data.logsdir, 'advanced_vuln_scanner.log')

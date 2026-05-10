@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 import os
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -120,4 +121,4 @@ class EPDButtonListener:
     def _do_restart():
         """Restart the ragnar service after a short delay."""
         time.sleep(1)
-        os.system('systemctl restart ragnar.service')
+        subprocess.Popen(['systemctl', 'restart', 'ragnar.service'])
