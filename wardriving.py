@@ -1266,6 +1266,17 @@ class WardrivingEngine:
             self.session.close()
         if self._gps:
             self._gps.stop()
+            # Drop the reference so a fresh probe runs next time get_status() or
+            # start() is called. Otherwise the stale GPSManager (with any error
+            # it accumulated during the prior session — e.g. "No GPS device
+            # detected" from a session where the receiver wasn't plugged in
+            # yet) is what callers see, even after the user plugs in the GPS.
+            self._gps = None
+        # Force re-probe on the next status call instead of serving cached
+        # "not detected" from before the user plugged in the receiver.
+        if hasattr(self, '_gps_probe_cache'):
+            self._gps_probe_cache = None
+            self._gps_probe_time = 0
 
         stats = self.session.get_stats() if self.session else {}
         logger.info(f"Wardriving stopped. Networks: {stats.get('total_networks', 0)}")
@@ -1553,7 +1564,12 @@ class WardrivingEngine:
     def get_status(self):
         """Get current wardriving status."""
         # GPS status: use live GPS if running, otherwise probe for device (cached)
-        if self._gps:
+        # Only trust the live GPSManager while wardriving is actually running.
+        # Otherwise its state can be stale ("No GPS device detected" from a
+        # session where the receiver wasn't plugged in yet would persist even
+        # after the user plugs it in). Falling through to the probe path on
+        # the !running case ensures the status reflects current hardware.
+        if self._gps and self._running:
             gps_status = self._gps.get_status()
         else:
             now = time.time()
