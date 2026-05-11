@@ -14843,8 +14843,41 @@ function updateWardrivingUI(status) {
         }
     }
 
+    // WiFi Adapters status bar
+    _renderWifiAdaptersBar(status);
+
     // Serial ESP32 config card
     updateSerialStatus(status);
+}
+
+function _renderWifiAdaptersBar(status) {
+    const bar = document.getElementById('wd-adapters-bar');
+    if (!bar) return;
+    const details = status.interface_details;
+    if (!details || details.length === 0) {
+        bar.classList.add('hidden');
+        return;
+    }
+    bar.classList.remove('hidden');
+    const bandColors = {'2.4GHz': 'text-emerald-400', '5GHz': 'text-purple-400', '6GHz': 'text-pink-400'};
+    const html = details.map(d => {
+        const icon = d.is_usb ? '🔌' : '📡';
+        const label = d.manufacturer || d.product || d.driver || d.name;
+        const bands = (d.bands || []).map(b =>
+            `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-700 ${bandColors[b] || 'text-gray-400'}">${b}</span>`
+        ).join(' ');
+        const nets = d.networks || 0;
+        return `<div class="bg-slate-800/40 border border-slate-700 rounded-lg px-4 py-2 flex items-center gap-3 flex-wrap">
+            <span class="text-sm">${icon}</span>
+            <span class="text-xs font-bold text-cyan-400">${escapeHtml(d.name)}</span>
+            <span class="text-xs text-gray-400">${escapeHtml(label)}</span>
+            <span class="flex gap-1">${bands}</span>
+            <span class="text-xs text-gray-500">|</span>
+            <span class="text-xs text-gray-400">Networks:</span>
+            <span class="text-xs font-bold text-emerald-400">${nets}</span>
+        </div>`;
+    }).join('');
+    bar.innerHTML = html;
 }
 
 async function saveWardrivingDeviceName(name) {

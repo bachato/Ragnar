@@ -54,14 +54,20 @@ def _nmea_to_decimal(raw, direction):
         return None
 
 
-def detect_gps_device():
+def detect_gps_device(exclude_ports=None):
     """Auto-detect USB GPS serial device.
     
+    Args:
+        exclude_ports: set/list of ports to skip (e.g. ports already used by
+                       ESP32 companions). Prevents opening another device's
+                       serial port which would steal bytes and cause conflicts.
+    
     Checks common paths:
-    - /dev/ttyUSB* (FTDI/PL2303/CP210x USB-serial adapters)
-    - /dev/ttyACM* (CDC-ACM devices like u-blox)
-    - /dev/serial/by-id/*GPS* or *gps* or *u-blox*
+    - /dev/serial/by-id/*GPS* or *gps* or *u-blox* (udev symlinks — most reliable)
+    - /dev/ttyACM*, /dev/ttyUSB* with NMEA probe (fallback)
     """
+    exclude = set(exclude_ports or [])
+
     # Check by-id symlinks first (most reliable)
     by_id = '/dev/serial/by-id'
     if os.path.isdir(by_id):
@@ -69,13 +75,23 @@ def detect_gps_device():
             lower = entry.lower()
             if any(kw in lower for kw in ('gps', 'u-blox', 'ublox', 'nmea', 'gnss', 'bn-', 'vk-')):
                 path = os.path.realpath(os.path.join(by_id, entry))
-                if os.path.exists(path):
+                if os.path.exists(path) and path not in exclude:
                     return path
+
+    # Also check by-id for Espressif devices so we can skip them
+    if os.path.isdir(by_id):
+        for entry in os.listdir(by_id):
+            lower = entry.lower()
+            if 'espressif' in lower or 'cp210' in lower:
+                path = os.path.realpath(os.path.join(by_id, entry))
+                exclude.add(path)
 
     # Fall back to ttyACM/ttyUSB (prefer ACM for u-blox)
     for pattern in ('/dev/ttyACM*', '/dev/ttyUSB*'):
         devices = sorted(glob.glob(pattern))
         for dev in devices:
+            if dev in exclude:
+                continue
             # Quick probe: try reading a few bytes to see if it sends NMEA
             try:
                 import serial as pyserial
@@ -92,9 +108,10 @@ def detect_gps_device():
 class GPSManager:
     """Manages a USB GPS module, providing real-time position data."""
 
-    def __init__(self, port=None, baudrate=9600):
+    def __init__(self, port=None, baudrate=9600, exclude_ports=None):
         self.port = port
         self.baudrate = baudrate
+        self._exclude_ports = set(exclude_ports or [])
         self._serial = None
         self._running = False
         self._thread = None
@@ -119,7 +136,7 @@ class GPSManager:
             return
 
         if not self.port:
-            self.port = detect_gps_device()
+            self.port = detect_gps_device(exclude_ports=self._exclude_ports)
         if not self.port:
             self.error = "No GPS device detected"
             logger.warning(self.error)

@@ -1000,12 +1000,24 @@ class WardrivingEngine:
         if not self.interfaces:
             return {'error': 'No WiFi interfaces found'}
 
-        # Start GPS
+        # Pre-detect ESP32 companion port BEFORE GPS auto-detection so we can
+        # exclude it. This prevents GPS from opening the ESP32's serial port
+        # and stealing bytes (which causes GPS to report 0 sats and the serial
+        # listener to mis-classify the device).
+        serial_port = self.shared_data.config.get('wardriving_serial_port', '')
+        pre_detected_esp = self._detect_esp32_serial() if not serial_port else None
+        esp_exclude = set()
+        if serial_port:
+            esp_exclude.add(serial_port)
+        if pre_detected_esp:
+            esp_exclude.add(pre_detected_esp)
+
+        # Start GPS (exclude known ESP32 ports from probing)
         from gps_manager import GPSManager
         # Treat "auto" or empty string as None to trigger auto-detection
         if gps_port and gps_port.lower() == 'auto':
             gps_port = None
-        self._gps = GPSManager(port=gps_port)
+        self._gps = GPSManager(port=gps_port, exclude_ports=esp_exclude)
         gps_ok = self._gps.start()
         if not gps_ok:
             logger.warning(f"GPS not available: {self._gps.error}. Wardriving without GPS.")
@@ -1290,6 +1302,80 @@ class WardrivingEngine:
         except Exception:
             return False
 
+    def _get_interface_info(self, iface):
+        """Get detailed info about a WiFi interface (bands, manufacturer, USB/built-in)."""
+        info = {'name': iface, 'bands': [], 'manufacturer': '', 'driver': '', 'is_usb': False, 'networks': 0}
+        try:
+            # Driver
+            driver_link = f'/sys/class/net/{iface}/device/driver'
+            if os.path.islink(driver_link):
+                info['driver'] = os.path.basename(os.readlink(driver_link))
+            # USB check
+            device_path = os.path.realpath(f'/sys/class/net/{iface}/device')
+            info['is_usb'] = '/usb' in device_path
+            # Manufacturer from udev
+            try:
+                result = subprocess.run(
+                    ['udevadm', 'info', '-a', f'/sys/class/net/{iface}'],
+                    capture_output=True, text=True, timeout=3
+                )
+                for line in result.stdout.split('\n'):
+                    line = line.strip()
+                    if line.startswith('ATTRS{manufacturer}=='):
+                        val = line.split('==', 1)[1].strip('"')
+                        if val and val.lower() not in ('linux', 'usb', ''):
+                            info['manufacturer'] = val
+                            break
+                    elif line.startswith('ATTRS{product}==') and not info.get('product'):
+                        val = line.split('==', 1)[1].strip('"')
+                        if val:
+                            info['product'] = val
+            except Exception:
+                pass
+            # Supported bands from iw phy
+            phy_path = f'/sys/class/net/{iface}/phy80211/name'
+            if os.path.exists(phy_path):
+                with open(phy_path) as f:
+                    phy = f.read().strip()
+                try:
+                    result = subprocess.run(
+                        ['iw', 'phy', phy, 'info'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        output = result.stdout
+                        if 'Band 1:' in output or '2412 MHz' in output:
+                            info['bands'].append('2.4GHz')
+                        if 'Band 2:' in output or '5180 MHz' in output:
+                            info['bands'].append('5GHz')
+                        if 'Band 4:' in output or '5955 MHz' in output:
+                            info['bands'].append('6GHz')
+                except Exception:
+                    pass
+            if not info['bands']:
+                info['bands'] = ['2.4GHz']  # Safe default
+            # Per-interface network count from DB
+            if self.session:
+                try:
+                    with sqlite3.connect(self.session.db_path) as conn:
+                        row = conn.execute(
+                            "SELECT COUNT(DISTINCT bssid) FROM networks WHERE interface=?",
+                            (iface,)
+                        ).fetchone()
+                        info['networks'] = row[0] if row else 0
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Interface info error for {iface}: {e}")
+        return info
+
+    def get_interface_details(self):
+        """Get details for all active WiFi interfaces (for UI display)."""
+        details = []
+        for iface in self.interfaces:
+            details.append(self._get_interface_info(iface))
+        return details
+
     def is_running(self):
         return self._running
 
@@ -1303,7 +1389,8 @@ class WardrivingEngine:
             if not hasattr(self, '_gps_probe_cache') or now - self._gps_probe_time > 15:
                 from gps_manager import detect_gps_device
                 try:
-                    detected = detect_gps_device()
+                    esp_port = self._serial_port or ''
+                    detected = detect_gps_device(exclude_ports={esp_port} if esp_port else None)
                 except Exception:
                     detected = None
                 self._gps_probe_cache = detected
@@ -1338,6 +1425,29 @@ class WardrivingEngine:
             'esp_ble_count': getattr(self, '_esp_ble_count', 0),
             'esp_alerts': getattr(self, '_esp_alerts', [])[-5:],  # Last 5 alerts
         }
+        # Interface details (cached 30s — sysfs/udev calls are slow)
+        now_if = time.time()
+        if self._running and self.interfaces:
+            if not hasattr(self, '_iface_cache') or not self._iface_cache or \
+               now_if - getattr(self, '_iface_cache_time', 0) > 30:
+                self._iface_cache = self.get_interface_details()
+                self._iface_cache_time = now_if
+            else:
+                # Update only the per-interface network counts (cheap DB query)
+                if self.session:
+                    try:
+                        with sqlite3.connect(self.session.db_path) as conn:
+                            for d in self._iface_cache:
+                                row = conn.execute(
+                                    "SELECT COUNT(DISTINCT bssid) FROM networks WHERE interface=?",
+                                    (d['name'],)
+                                ).fetchone()
+                                d['networks'] = row[0] if row else 0
+                    except Exception:
+                        pass
+            result['interface_details'] = self._iface_cache
+        else:
+            result['interface_details'] = []
         if self.session:
             result['stats'] = self.session.get_stats()
             try:
