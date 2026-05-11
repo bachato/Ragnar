@@ -3846,8 +3846,15 @@
                         <label class="text-xs text-gray-400">Min Signal:</label>
                         <input type="range" id="wd-map-filter-signal" min="-100" max="-30" value="-100" oninput="document.getElementById('wd-map-signal-val').textContent=this.value+' dBm'; applyWardrivingMapFilters()" class="w-24">
                         <span id="wd-map-signal-val" class="text-xs text-gray-300">-100 dBm</span>
+                        <button onclick="backfillWardrivingGps()" id="wd-map-backfill-btn" title="Estimate positions for networks scanned during GPS dropouts by interpolating from the recorded GPS track"
+                            class="ml-auto bg-emerald-700 hover:bg-emerald-600 text-white text-xs rounded px-2 py-1 border border-emerald-800 flex items-center gap-1">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                            </svg>
+                            Backfill GPS
+                        </button>
                         <button onclick="toggleWardrivingMapFullscreen()" id="wd-map-fs-btn" title="Toggle fullscreen (Esc to exit)"
-                            class="ml-auto bg-slate-700 hover:bg-slate-600 text-white text-xs rounded px-2 py-1 border border-slate-600 flex items-center gap-1">
+                            class="bg-slate-700 hover:bg-slate-600 text-white text-xs rounded px-2 py-1 border border-slate-600 flex items-center gap-1">
                             <svg id="wd-map-fs-icon-enter" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4"/>
                             </svg>
@@ -4827,7 +4834,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260511e"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260511f"></script>
 
 </body>
 </html>

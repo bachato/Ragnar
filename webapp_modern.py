@@ -6457,6 +6457,34 @@ def wardriving_cells():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/wardriving/backfill_gps', methods=['POST'])
+def wardriving_backfill_gps():
+    """Backfill missing GPS positions on networks / BT / cell rows from the
+    session's gps_track table by interpolating each row's first_seen
+    timestamp. Covers brief GPS dropouts and the warm-up window before TTFF."""
+    try:
+        engine = _get_wardriving_engine()
+        body = request.get_json(silent=True) or {}
+        session_id = request.args.get('session_id') or body.get('session_id')
+
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'error': 'No session selected'}), 400
+
+        result = session.backfill_gps_from_track()
+        return jsonify({
+            'session_id': session.session_id,
+            'backfilled': result
+        })
+    except Exception as e:
+        logger.error(f"Wardriving backfill error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/wardriving/device_name', methods=['POST'])
 def wardriving_set_device_name():
     """Set device name for wardriving sessions."""

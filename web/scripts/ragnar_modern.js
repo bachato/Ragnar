@@ -15685,24 +15685,72 @@ async function loadWardrivingMapData() {
     if (!_wdMap) return;
     try {
         const sid = _wdSelectedSessionId ? encodeURIComponent(_wdSelectedSessionId) : '';
-        const netUrl = sid ? `/api/wardriving/networks?session_id=${sid}&limit=2000` : '/api/wardriving/networks?limit=2000';
+        // Server caps each request at 2000 rows. For big sessions (multi-thousand
+        // networks) we paginate so the map reflects the full DB, not just the
+        // top 2000 by signal strength. Hard ceiling of 10 pages keeps memory
+        // bounded on pathological sessions.
+        const PAGE = 2000;
+        const MAX_PAGES = 10;
+        const sidQ = sid ? `session_id=${sid}&` : '';
+        const allNets = [];
+        let netTotal = 0;
+        for (let i = 0; i < MAX_PAGES; i++) {
+            const off = i * PAGE;
+            const res = await fetch(`/api/wardriving/networks?${sidQ}limit=${PAGE}&offset=${off}&sort=first_seen&order=ASC`);
+            const d = await res.json();
+            const got = d.networks || [];
+            allNets.push(...got);
+            netTotal = d.total || allNets.length;
+            if (got.length < PAGE) break;
+        }
         const btUrl = sid ? `/api/wardriving/bluetooth?session_id=${sid}` : '/api/wardriving/bluetooth';
         const cellUrl = sid ? `/api/wardriving/cells?session_id=${sid}` : '/api/wardriving/cells';
-        const [netRes, btRes, cellRes] = await Promise.all([
-            fetch(netUrl),
-            fetch(btUrl),
-            fetch(cellUrl)
-        ]);
-        const netData = await netRes.json();
+        const [btRes, cellRes] = await Promise.all([fetch(btUrl), fetch(cellUrl)]);
         const btData = await btRes.json();
         const cellData = await cellRes.json();
-        _wdMapAllNetworks = (netData.networks || []).filter(n => n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0);
+        _wdMapAllNetworks = allNets.filter(n => n.best_lat && n.best_lon && n.best_lat !== 0 && n.best_lon !== 0);
         _wdMapBtDevices = (btData.devices || []).filter(d => d.latitude && d.longitude);
         _wdMapCellTowers = (cellData.towers || []).filter(t => t.latitude && t.longitude);
+        _wdMapNetTotalDb = netTotal;
         applyWardrivingMapFilters();
         _updateVikingPosition();
     } catch (e) {
         console.error('[Wardriving] Map error:', e);
+    }
+}
+
+let _wdMapNetTotalDb = 0;
+
+async function backfillWardrivingGps() {
+    const btn = document.getElementById('wd-map-backfill-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Backfilling…'; }
+    try {
+        const body = _wdSelectedSessionId ? { session_id: _wdSelectedSessionId } : {};
+        const res = await fetch('/api/wardriving/backfill_gps', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const d = await res.json();
+        if (d.error) {
+            alert('Backfill failed: ' + d.error);
+        } else {
+            const b = d.backfilled || {};
+            const msg = `Backfilled ${b.wifi || 0} WiFi, ${b.bluetooth || 0} BT, ${b.cells || 0} cells from ${b.trackpoints || 0} GPS trackpoints.`;
+            const info = document.getElementById('wd-map-info');
+            if (info) {
+                const prev = info.textContent;
+                info.textContent = msg;
+                info.classList.add('text-emerald-400');
+                setTimeout(() => { info.classList.remove('text-emerald-400'); }, 6000);
+            }
+            console.log('[Wardriving] ' + msg);
+            await loadWardrivingMapData();
+        }
+    } catch (e) {
+        alert('Backfill error: ' + e);
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = '<svg class="w-3.5 h-3.5 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>Backfill GPS'; }
     }
 }
 
@@ -15823,11 +15871,15 @@ function applyWardrivingMapFilters() {
     }
 
     const totalAll = _wdMapAllNetworks.length + _wdMapBtDevices.length + _wdMapCellTowers.length;
+    const dbTotal = _wdMapNetTotalDb || 0;
+    const dbExtra = dbTotal > _wdMapAllNetworks.length
+        ? ` (${dbTotal - _wdMapAllNetworks.length} WiFi without GPS)`
+        : '';
     document.getElementById('wd-map-info').textContent = totalShown === 0
         ? 'No GPS-tagged items match filters.'
         : totalShown === totalAll
-            ? `${totalAll} items with GPS position`
-            : `${totalShown} / ${totalAll} items match filters`;
+            ? `${totalAll} items with GPS position${dbExtra}`
+            : `${totalShown} / ${totalAll} items match filters${dbExtra}`;
 }
 
 let _wardrivingRunning = false;

@@ -736,6 +736,131 @@ class WardrivingSession:
             except Exception:
                 return []
 
+    def backfill_gps_from_track(self, max_gap_seconds=300):
+        """Fill missing positions on networks / BT / cell rows by interpolating
+        each row's first_seen timestamp against the gps_track table.
+
+        Handles the typical wardriving GPS gap: device discovered during the
+        first ~minutes before fix lock, or during a brief reception dropout.
+        Uses linear interpolation when bracketing trackpoints exist within
+        max_gap_seconds on both sides; falls back to the nearest single
+        trackpoint when only one side is close enough.
+
+        Returns dict {wifi, bluetooth, cells} of row counts backfilled.
+        Invalidates the stats cache so subsequent reads reflect new positions.
+        """
+        import bisect
+        result = {'wifi': 0, 'bluetooth': 0, 'cells': 0, 'trackpoints': 0}
+
+        def _parse_iso(s):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+            except Exception:
+                return None
+
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    track = conn.execute(
+                        "SELECT timestamp, latitude, longitude, altitude "
+                        "FROM gps_track ORDER BY timestamp"
+                    ).fetchall()
+                    if not track:
+                        return result
+                    ts_list = [t['timestamp'] for t in track]
+                    result['trackpoints'] = len(track)
+
+                    def _pos_at(epoch):
+                        if epoch is None:
+                            return None
+                        idx = bisect.bisect_left(ts_list, epoch)
+                        before = track[idx - 1] if idx > 0 else None
+                        after = track[idx] if idx < len(track) else None
+                        if before and after:
+                            gb = epoch - before['timestamp']
+                            ga = after['timestamp'] - epoch
+                            if gb <= max_gap_seconds and ga <= max_gap_seconds:
+                                span = (after['timestamp'] - before['timestamp']) or 1
+                                f = max(0.0, min(1.0, (epoch - before['timestamp']) / span))
+                                lat = before['latitude'] + (after['latitude'] - before['latitude']) * f
+                                lon = before['longitude'] + (after['longitude'] - before['longitude']) * f
+                                alt = None
+                                if before['altitude'] is not None and after['altitude'] is not None:
+                                    alt = before['altitude'] + (after['altitude'] - before['altitude']) * f
+                                return (lat, lon, alt)
+                        cand = before if (before and (epoch - before['timestamp']) <= max_gap_seconds) else None
+                        if cand is None and after and (after['timestamp'] - epoch) <= max_gap_seconds:
+                            cand = after
+                        if cand:
+                            return (cand['latitude'], cand['longitude'], cand['altitude'])
+                        return None
+
+                    rows = conn.execute(
+                        "SELECT bssid, first_seen FROM networks "
+                        "WHERE best_lat IS NULL OR best_lon IS NULL"
+                    ).fetchall()
+                    for r in rows:
+                        pos = _pos_at(_parse_iso(r['first_seen']))
+                        if pos:
+                            conn.execute(
+                                "UPDATE networks SET "
+                                "latitude = COALESCE(latitude, ?), "
+                                "longitude = COALESCE(longitude, ?), "
+                                "altitude = COALESCE(altitude, ?), "
+                                "best_lat = ?, best_lon = ? WHERE bssid = ?",
+                                (pos[0], pos[1], pos[2], pos[0], pos[1], r['bssid'])
+                            )
+                            result['wifi'] += 1
+
+                    try:
+                        rows = conn.execute(
+                            "SELECT mac, first_seen FROM bluetooth_devices "
+                            "WHERE latitude IS NULL OR longitude IS NULL"
+                        ).fetchall()
+                        for r in rows:
+                            pos = _pos_at(_parse_iso(r['first_seen']))
+                            if pos:
+                                conn.execute(
+                                    "UPDATE bluetooth_devices SET "
+                                    "latitude = ?, longitude = ?, "
+                                    "altitude = COALESCE(altitude, ?), "
+                                    "best_lat = COALESCE(best_lat, ?), "
+                                    "best_lon = COALESCE(best_lon, ?) WHERE mac = ?",
+                                    (pos[0], pos[1], pos[2], pos[0], pos[1], r['mac'])
+                                )
+                                result['bluetooth'] += 1
+                    except sqlite3.OperationalError:
+                        pass
+
+                    try:
+                        rows = conn.execute(
+                            "SELECT cell_id, first_seen FROM cell_towers "
+                            "WHERE latitude IS NULL OR longitude IS NULL"
+                        ).fetchall()
+                        for r in rows:
+                            pos = _pos_at(_parse_iso(r['first_seen']))
+                            if pos:
+                                conn.execute(
+                                    "UPDATE cell_towers SET latitude = ?, longitude = ? "
+                                    "WHERE cell_id = ?",
+                                    (pos[0], pos[1], r['cell_id'])
+                                )
+                                result['cells'] += 1
+                    except sqlite3.OperationalError:
+                        pass
+
+                self._stats_cache_time = 0
+                logger.info(
+                    f"GPS backfill: wifi={result['wifi']} bt={result['bluetooth']} "
+                    f"cells={result['cells']} (using {result['trackpoints']} trackpoints)"
+                )
+            except Exception as e:
+                logger.error(f"GPS backfill error: {e}")
+        return result
+
     def export_wigle_csv(self, device_name='Ragnar'):
         """Export session to WiGLE CSV format string including WiFi, BT, and cell."""
         lines = []
