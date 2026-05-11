@@ -1817,13 +1817,72 @@ class WardrivingEngine:
             pass
         return ''
 
-    def _prepare_interface(self, interface):
-        """Ensure interface is unblocked, in managed mode, and admin-up.
+    def _iface_phy(self, interface):
+        """Return the phy name (e.g. 'phy0') for an interface, or '' on failure."""
+        try:
+            path = f'/sys/class/net/{interface}/phy80211/name'
+            if os.path.exists(path):
+                with open(path) as f:
+                    return f.read().strip()
+        except Exception:
+            pass
+        return ''
 
-        mt76x2u + pwnagotchi failure mode: pwnagotchi puts USB adapters into
-        monitor mode for handshake capture, which makes nl80211 scans return
-        -EOPNOTSUPP. Forcing type=managed reclaims the interface for active
-        scanning. Idempotent — a no-op when already managed+up.
+    def _cleanup_phy_children(self, interface):
+        """Delete any monitor/AP child interfaces sharing this iface's phy.
+
+        airmon-ng / bettercap / kismet create child interfaces (mon0, wlan1mon,
+        …) on the same phy. While the child exists the kernel may refuse scans
+        on the managed parent. Wardriving owns non-WiFi-connected adapters, so
+        clear them.
+        """
+        phy = self._iface_phy(interface)
+        if not phy:
+            return
+        try:
+            r = subprocess.run(['iw', 'dev'], capture_output=True, text=True, timeout=3)
+            if r.returncode != 0:
+                return
+            current_phy = None
+            current_iface = None
+            current_type = None
+            for line in r.stdout.split('\n'):
+                line_strip = line.strip()
+                if line.startswith('phy#'):
+                    current_phy = 'phy' + line_strip[4:]
+                    current_iface = None
+                    current_type = None
+                elif line_strip.startswith('Interface '):
+                    current_iface = line_strip.split(' ', 1)[1].strip()
+                    current_type = None
+                elif line_strip.startswith('type '):
+                    current_type = line_strip.split(' ', 1)[1].strip().lower()
+                    if (current_phy == phy and current_iface and
+                        current_iface != interface and
+                        current_type in ('monitor', 'ap')):
+                        logger.warning(
+                            f"Wardriving: removing leftover {current_type} "
+                            f"child {current_iface} on {phy} (parent {interface})"
+                        )
+                        try:
+                            subprocess.run(['sudo', 'ip', 'link', 'set', current_iface, 'down'],
+                                           capture_output=True, timeout=3)
+                            subprocess.run(['sudo', 'iw', 'dev', current_iface, 'del'],
+                                           capture_output=True, timeout=3)
+                        except Exception as e:
+                            logger.warning(f"Failed to delete {current_iface}: {e}")
+        except Exception as e:
+            logger.debug(f"phy-children cleanup failed for {interface}: {e}")
+
+    def _prepare_interface(self, interface):
+        """Ensure interface is unblocked, free of monitor children, in managed
+        mode, and admin-up.
+
+        Design contract: wardriving owns every wlan adapter that isn't the
+        WiFi-management interface. Anything else (leftover airmon mon0,
+        bettercap monitor child, manual `iw set type monitor`) gets reclaimed.
+        Only pwnagotchi mode — explicitly started by the user — is allowed to
+        flip an adapter back to monitor.
         """
         # rfkill unblock — cheap, idempotent
         try:
@@ -1832,13 +1891,20 @@ class WardrivingEngine:
         except Exception as e:
             logger.debug(f"rfkill unblock failed: {e}")
 
+        # Kill any monitor/AP child interfaces on this phy first.
+        self._cleanup_phy_children(interface)
+
         current_type = self._iface_type(interface)
 
-        # If not managed, do the full down → set type → up dance.
-        if current_type and current_type != 'managed':
+        # Force managed if (a) we know it's not managed, or (b) we couldn't
+        # read the type at all — the latter usually means the interface is in
+        # a weird state and we want to reset it anyway. The cost of a
+        # redundant down/up on an already-managed iface is ~100 ms.
+        needs_reset = (not current_type) or (current_type != 'managed')
+        if needs_reset:
+            reason = current_type or 'unknown-state'
             logger.warning(
-                f"Wardriving: {interface} is in '{current_type}' mode "
-                f"(likely pwnagotchi/airmon) — forcing managed for scanning"
+                f"Wardriving: {interface} state='{reason}' — forcing managed for scanning"
             )
             try:
                 subprocess.run(['sudo', 'ip', 'link', 'set', interface, 'down'],
