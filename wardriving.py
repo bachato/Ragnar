@@ -1095,6 +1095,7 @@ class WardrivingEngine:
         self._iface_zero_scans = {}  # consecutive zero-network scans per interface
         self._iface_prepared = set()  # interfaces successfully brought up at least once
         self._iface_last_error = {}  # most informative scan-failure reason per interface
+        self._iface_freq_cache = {}  # cached supported-frequency list per interface
         self.networks_per_scan = 0
         self.total_networks = 0
         self.scans_completed = 0
@@ -1836,6 +1837,48 @@ class WardrivingEngine:
             pass
         return ''
 
+    def _iface_supported_freqs(self, interface):
+        """Frequencies (MHz) from _ALL_FREQUENCIES that this adapter's phy
+        actually supports. Cached — radio capabilities don't change at runtime.
+
+        Critical for single-band adapters: kernel returns -EINVAL on the whole
+        scan trigger if any one frequency in the list is unsupported, so a
+        2.4 GHz-only radio (e.g. rt2800usb) silently fails the entire sweep.
+        """
+        if interface in self._iface_freq_cache:
+            return self._iface_freq_cache[interface]
+        supported = set()
+        phy = self._iface_phy(interface)
+        if phy:
+            try:
+                r = subprocess.run(['iw', 'phy', phy, 'info'],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    # "    * 2412 MHz [1] (20.0 dBm)" — skip "(disabled)" entries
+                    for line in r.stdout.split('\n'):
+                        if '(disabled)' in line.lower():
+                            continue
+                        m = re.search(r'\*\s*(\d{4,5})\s*MHz', line)
+                        if m:
+                            supported.add(int(m.group(1)))
+            except Exception as e:
+                logger.debug(f"Failed to read supported freqs for {interface}: {e}")
+        freqs = [f for f in self._ALL_FREQUENCIES if f in supported] if supported else []
+        self._iface_freq_cache[interface] = freqs
+        if freqs:
+            logger.info(
+                f"Wardriving: {interface} sweep list = {len(freqs)} channels "
+                f"({'2.4' if any(f<3000 for f in freqs) else ''}"
+                f"{'/' if any(f<3000 for f in freqs) and any(f>=4900 for f in freqs) else ''}"
+                f"{'5' if any(f>=4900 for f in freqs) else ''} GHz)"
+            )
+        else:
+            logger.warning(
+                f"Wardriving: {interface} supported-freq detection failed — "
+                f"will let kernel pick channels"
+            )
+        return freqs
+
     def _cleanup_phy_children(self, interface):
         """Delete any monitor/AP child interfaces sharing this iface's phy.
 
@@ -1952,17 +1995,17 @@ class WardrivingEngine:
 
         networks = []
 
-        # Method 1: Active full-channel sweep — trigger scan across ALL
-        # frequencies so the kernel visits every channel.  This is critical
-        # for stationary wardriving where `scan dump` alone only returns
-        # networks on the associated channel + whatever the kernel happened
-        # to scan recently.
+        # Method 1: Active full-channel sweep — trigger scan across every
+        # frequency this radio supports. We filter against the phy's actual
+        # channel list because the kernel returns -EINVAL on the whole
+        # trigger if even one requested frequency is unsupported (e.g. a
+        # 5 GHz freq on a 2.4-GHz-only adapter like rt2800usb).
         trigger_err = ''
         try:
-            freq_args = []
-            for f in self._ALL_FREQUENCIES:
-                freq_args += ['freq', str(f)]
-            trigger_cmd = ['sudo', 'iw', 'dev', interface, 'scan', 'trigger'] + freq_args
+            sweep_freqs = self._iface_supported_freqs(interface)
+            trigger_cmd = ['sudo', 'iw', 'dev', interface, 'scan', 'trigger']
+            for f in sweep_freqs:
+                trigger_cmd += ['freq', str(f)]
             trigger = subprocess.run(
                 trigger_cmd,
                 capture_output=True, text=True, timeout=5
