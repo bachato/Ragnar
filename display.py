@@ -817,10 +817,11 @@ class Display:
         """Draw verbose per-adapter rows as one left-aligned line each.
 
         Unlike _draw_stat_rows the value is rendered next to the label with a
-        fixed indent (no right-align, no 22-char truncation), so longer
-        values like '19 Networks, M RSSI: -63 dBm [2.4]' survive intact. If
-        the combined string still overflows the display width, the line is
-        trimmed character-by-character until it fits.
+        small dynamic gap (no right-align, no 22-char truncation), so longer
+        values like '19 Networks, M RSSI: -63 dBm [2.4]' survive intact and
+        the value gets every available pixel of row width. If the combined
+        string still overflows, it's trimmed character-by-character until it
+        fits.
         """
         w = getattr(self, 'render_w', self.shared_data.width)
         sx = getattr(self, 'render_sx', self.scale_factor_x)
@@ -828,17 +829,20 @@ class Display:
         font = self.shared_data.font_arial9
         line_h = int(14 * sy)
         pad_x = int(6 * sx)
-        max_px = w - 2 * pad_x
-        # Match the visual gap between the column-style stat rows (~70 px on a
-        # 250 px e-paper). Tunable: pick the longest label width + small pad.
-        label_col_px = int(50 * sx)
+        right_edge = w - pad_x
+        gap_px = int(6 * sx)  # small visual breathing room between label and value
         for label, value in rows:
+            label_str = str(label)
+            label_w = font.getlength(label_str)
+            value_x = pad_x + int(label_w) + gap_px
             text = str(value)
-            # Trim from the end until label area + value fit the row width.
-            while text and (font.getlength(text) > max_px - label_col_px):
+            # Trim from the end until the value fits between its start column
+            # and the right edge.
+            available = right_edge - value_x
+            while text and font.getlength(text) > available:
                 text = text[:-1]
-            draw.text((pad_x, y), label, font=font, fill=0)
-            draw.text((pad_x + label_col_px, y), text, font=font, fill=0)
+            draw.text((pad_x, y), label_str, font=font, fill=0)
+            draw.text((value_x, y), text, font=font, fill=0)
             y += line_h
         return y
 
