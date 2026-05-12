@@ -69,6 +69,10 @@ fi
 if ! command -v unclutter >/dev/null 2>&1; then
     PKGS_TO_INSTALL+=(unclutter)
 fi
+# xauth is needed to generate the X authority cookie under systemd PAM
+if ! command -v xauth >/dev/null 2>&1; then
+    PKGS_TO_INSTALL+=(xauth)
+fi
 
 if [[ "${#PKGS_TO_INSTALL[@]}" -gt 0 ]]; then
     echo "[kiosk-install] apt installing: ${PKGS_TO_INSTALL[*]}"
@@ -168,6 +172,15 @@ KIOSK_HOME="$(getent passwd "$KIOSK_USER" | cut -d: -f6)"
 if [[ -n "$KIOSK_HOME" ]]; then
     install -d -o "$KIOSK_USER" -g "$KIOSK_USER" -m 0755 \
         "$KIOSK_HOME/.local" "$KIOSK_HOME/.local/share" "$KIOSK_HOME/.local/share/xorg"
+fi
+
+# Ensure /var/log/ragnar is writable by the kiosk user — the wrapper writes
+# the Xorg log and its own stdout/stderr there. The directory may already
+# exist from other Ragnar installers (created as root).
+install -d -m 0775 /var/log/ragnar
+if id -u "$KIOSK_USER" >/dev/null 2>&1; then
+    chgrp "$KIOSK_USER" /var/log/ragnar 2>/dev/null || true
+    chmod g+w /var/log/ragnar 2>/dev/null || true
 fi
 
 echo "[kiosk-install] done. Enable with: sudo systemctl enable --now ragnar-kiosk.service"

@@ -48,17 +48,47 @@ if [[ "$WARDRIVING_ENABLED" == "true" ]]; then
     FINAL_URL="${FINAL_URL}#wardriving"
 fi
 
-# Make sure the Xorg log directory exists; otherwise the X server aborts
-# before xinit can connect and we get cryptic "Authorization required"
-# errors. Belt-and-braces: also pass -logfile to a writable path below.
-mkdir -p "$HOME/.local/share/xorg" 2>/dev/null || true
-KIOSK_RUNTIME_DIR="$(mktemp -d --tmpdir ragnar-kiosk-runtime-XXXXXX)"
-chmod 700 "$KIOSK_RUNTIME_DIR"
-XORG_LOG="$KIOSK_RUNTIME_DIR/Xorg.0.log"
+# Persistent log location so Xorg crash output survives across restarts.
+LOG_DIR="${RAGNAR_KIOSK_LOG_DIR:-/var/log/ragnar}"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+XORG_LOG="$LOG_DIR/kiosk-Xorg.log"
+WRAPPER_LOG="$LOG_DIR/kiosk-wrapper.log"
+# Mirror this wrapper's own stdout/stderr into a log file too (helps when
+# the issue is xinit/xauth, not the X server itself).
+exec > >(tee -a "$WRAPPER_LOG") 2>&1
+echo "[kiosk-run] start $(date -Iseconds) HOME=$HOME XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}"
 
-# xinitrc-style session script
+# Pi OS keeps the Xorg default-log dir in the user's home; create it too.
+mkdir -p "$HOME/.local/share/xorg" 2>/dev/null || true
+
+# Clean up stale X locks/sockets from any prior crashed Xorg on :0.
+rm -f /tmp/.X0-lock 2>/dev/null || true
+rm -f /tmp/.X11-unix/X0 2>/dev/null || true
+
+# Explicit xauth cookie. Under systemd PAMName=login, xinit's automatic
+# cookie generation doesn't always land in $HOME/.Xauthority, which is
+# why we get "Authorization required, but no authorization protocol
+# specified". Generate one ourselves.
+export XAUTHORITY="$HOME/.Xauthority"
+touch "$XAUTHORITY" 2>/dev/null || true
+chmod 600 "$XAUTHORITY" 2>/dev/null || true
+if command -v xauth >/dev/null 2>&1; then
+    COOKIE=""
+    if command -v mcookie >/dev/null 2>&1; then
+        COOKIE="$(mcookie)"
+    elif [[ -r /dev/urandom ]] && command -v xxd >/dev/null 2>&1; then
+        COOKIE="$(head -c 16 /dev/urandom | xxd -p)"
+    else
+        COOKIE="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    fi
+    if [[ -n "$COOKIE" ]]; then
+        xauth -f "$XAUTHORITY" add ":0" . "$COOKIE" 2>/dev/null || true
+    fi
+fi
+
+# Per-run session script (still cleaned, but Xorg log is kept).
 SESSION_SCRIPT="$(mktemp --tmpdir ragnar-kiosk-XXXXXX.sh)"
-trap 'rm -f "$SESSION_SCRIPT"; rm -rf "$KIOSK_RUNTIME_DIR"' EXIT
+trap 'rm -f "$SESSION_SCRIPT"' EXIT
 cat > "$SESSION_SCRIPT" <<EOF
 #!/bin/bash
 # Disable screen blanking / DPMS
@@ -115,4 +145,4 @@ exec "$BROWSER" \\
 EOF
 chmod +x "$SESSION_SCRIPT"
 
-exec xinit "$SESSION_SCRIPT" -- :0 vt7 -nolisten tcp -logfile "$XORG_LOG" -keeptty
+exec xinit "$SESSION_SCRIPT" -- /usr/bin/X :0 vt7 -nolisten tcp -auth "$XAUTHORITY" -logfile "$XORG_LOG" -keeptty
