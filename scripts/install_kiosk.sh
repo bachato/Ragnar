@@ -130,6 +130,10 @@ StandardError=journal
 Environment=HOME=/home/$KIOSK_USER
 Environment=RAGNAR_REPO=$REPO_ROOT
 Environment=RAGNAR_BROWSER=$BROWSER_BIN
+# Run as root (the leading '+') to clear stale X locks. /tmp has the
+# sticky bit so the kiosk user can't delete files left by a prior
+# root-run Xorg attempt.
+ExecStartPre=+/bin/sh -c 'rm -f /tmp/.X0-lock; rm -rf /tmp/.X11-unix/X0'
 ExecStart=$WRAPPER_DST
 Restart=on-failure
 RestartSec=5
