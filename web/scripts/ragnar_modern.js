@@ -15141,7 +15141,7 @@ async function onKioskEnabledToggled(cb) {
     const enabled = !!cb.checked;
     const cfgPanel = document.getElementById('kiosk-config');
     if (cfgPanel) cfgPanel.classList.toggle('hidden', !enabled);
-    _setKioskMessage(enabled ? 'Installing kiosk and starting service…' : 'Stopping kiosk service…', 'info');
+    _setKioskMessage(enabled ? 'Installing kiosk…' : 'Removing kiosk…', 'info');
     _setKioskBadge(enabled ? 'activating' : 'deactivating');
     try {
         const res = await fetch('/api/config', {
@@ -15156,7 +15156,7 @@ async function onKioskEnabledToggled(cb) {
             _setKioskMessage(data.error || 'Failed to update kiosk setting', 'error');
             return;
         }
-        _pollKioskStatusUntilStable(enabled ? 'active' : 'inactive');
+        _pollKioskStatusUntilStable(enabled);
     } catch (e) {
         cb.checked = !enabled;
         if (cfgPanel) cfgPanel.classList.toggle('hidden', enabled);
@@ -15183,9 +15183,9 @@ function onKioskSettingChanged() {
             });
             const data = await res.json();
             if (data.success) {
-                _setKioskMessage('Settings saved — restarting kiosk service…', 'info');
+                _setKioskMessage('Settings saved — kiosk will pick up new values on next launch', 'info');
                 _setKioskBadge('activating');
-                _pollKioskStatusUntilStable('active');
+                _pollKioskStatusUntilStable(true);
             } else {
                 _setKioskMessage(data.error || 'Failed to save kiosk settings', 'error');
             }
@@ -15195,7 +15195,10 @@ function onKioskSettingChanged() {
     }, 500);
 }
 
-function _pollKioskStatusUntilStable(targetState, maxAttempts = 12) {
+function _pollKioskStatusUntilStable(expectEnabled, maxAttempts = 12) {
+    // Stability differs by mode:
+    //   service  → service_state reaches 'active' (enabled) or 'inactive' (disabled)
+    //   autostart → installed=true is the success signal on enable; mode!=autostart on disable.
     if (_kioskPollTimer) clearTimeout(_kioskPollTimer);
     let attempts = 0;
     const tick = async () => {
@@ -15203,21 +15206,45 @@ function _pollKioskStatusUntilStable(targetState, maxAttempts = 12) {
         try {
             const data = await fetchAPI('/api/kiosk/status');
             _setKioskBadge(data.service_state || 'unknown');
-            if (data.service_state === targetState || data.service_state === 'failed') {
+
+            const isStableSuccess = (() => {
+                if (expectEnabled) {
+                    if (data.mode === 'service') return data.service_state === 'active';
+                    if (data.mode === 'autostart') return data.installed === true;
+                    return false;
+                } else {
+                    return data.installed === false || data.mode === 'not_installed';
+                }
+            })();
+            const isStableFailure = data.service_state === 'failed';
+
+            if (isStableSuccess) {
+                let msg;
+                if (!expectEnabled) {
+                    msg = 'Kiosk removed.';
+                } else if (data.mode === 'autostart') {
+                    msg = data.service_state === 'active'
+                        ? 'Kiosk is running on the display.'
+                        : 'Kiosk installed — launches on next desktop login.';
+                } else {
+                    msg = 'Kiosk is running on the display.';
+                }
+                _setKioskMessage(msg, 'success');
+                setTimeout(() => _setKioskMessage('', null), 5000);
+                return;
+            }
+            if (isStableFailure) {
                 _setKioskMessage(
-                    data.service_state === 'failed'
-                        ? 'Kiosk service failed to start. Check `journalctl -u ragnar-kiosk`.'
-                        : (targetState === 'active' ? 'Kiosk is running.' : 'Kiosk stopped.'),
-                    data.service_state === 'failed' ? 'error' : 'success'
+                    'Kiosk service failed. Check `journalctl -u ragnar-kiosk` on the Pi.',
+                    'error'
                 );
-                setTimeout(() => _setKioskMessage('', null), 4000);
                 return;
             }
         } catch (e) { /* keep polling */ }
         if (attempts < maxAttempts) {
             _kioskPollTimer = setTimeout(tick, 2000);
         } else {
-            _setKioskMessage('Kiosk service state did not stabilize. Check journalctl.', 'error');
+            _setKioskMessage('Kiosk state did not stabilize — check the Pi journal.', 'error');
         }
     };
     _kioskPollTimer = setTimeout(tick, 1500);
