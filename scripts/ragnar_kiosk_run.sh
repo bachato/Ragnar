@@ -48,9 +48,17 @@ if [[ "$WARDRIVING_ENABLED" == "true" ]]; then
     FINAL_URL="${FINAL_URL}#wardriving"
 fi
 
+# Make sure the Xorg log directory exists; otherwise the X server aborts
+# before xinit can connect and we get cryptic "Authorization required"
+# errors. Belt-and-braces: also pass -logfile to a writable path below.
+mkdir -p "$HOME/.local/share/xorg" 2>/dev/null || true
+KIOSK_RUNTIME_DIR="$(mktemp -d --tmpdir ragnar-kiosk-runtime-XXXXXX)"
+chmod 700 "$KIOSK_RUNTIME_DIR"
+XORG_LOG="$KIOSK_RUNTIME_DIR/Xorg.0.log"
+
 # xinitrc-style session script
 SESSION_SCRIPT="$(mktemp --tmpdir ragnar-kiosk-XXXXXX.sh)"
-trap 'rm -f "$SESSION_SCRIPT"' EXIT
+trap 'rm -f "$SESSION_SCRIPT"; rm -rf "$KIOSK_RUNTIME_DIR"' EXIT
 cat > "$SESSION_SCRIPT" <<EOF
 #!/bin/bash
 # Disable screen blanking / DPMS
@@ -107,4 +115,4 @@ exec "$BROWSER" \\
 EOF
 chmod +x "$SESSION_SCRIPT"
 
-exec xinit "$SESSION_SCRIPT" -- :0 vt7 -nolisten tcp
+exec xinit "$SESSION_SCRIPT" -- :0 vt7 -nolisten tcp -logfile "$XORG_LOG" -keeptty

@@ -137,18 +137,37 @@ echo "[kiosk-install] systemd unit installed -> $SERVICE_FILE"
 
 systemctl daemon-reload
 
-# Allow the kiosk user to start an X session on tty7
-# (Debian's Xwrapper.config defaults to console-only on some images)
-if [[ -f /etc/X11/Xwrapper.config ]]; then
+# Allow the kiosk user to start an X session on tty7. Debian's default
+# Xwrapper.config restricts X startup to the console user; on Pi OS Lite
+# the file may also be missing entirely after a fresh apt install.
+mkdir -p /etc/X11
+if [[ ! -f /etc/X11/Xwrapper.config ]]; then
+    cat > /etc/X11/Xwrapper.config <<'XWRAP'
+allowed_users=anybody
+needs_root_rights=yes
+XWRAP
+    echo "[kiosk-install] Xwrapper.config created"
+else
     if grep -q '^allowed_users=' /etc/X11/Xwrapper.config; then
         sed -i 's/^allowed_users=.*/allowed_users=anybody/' /etc/X11/Xwrapper.config
     else
         echo 'allowed_users=anybody' >> /etc/X11/Xwrapper.config
     fi
-    if ! grep -q '^needs_root_rights=' /etc/X11/Xwrapper.config; then
+    if grep -q '^needs_root_rights=' /etc/X11/Xwrapper.config; then
+        sed -i 's/^needs_root_rights=.*/needs_root_rights=yes/' /etc/X11/Xwrapper.config
+    else
         echo 'needs_root_rights=yes' >> /etc/X11/Xwrapper.config
     fi
     echo "[kiosk-install] Xwrapper.config updated"
+fi
+
+# Pre-create the Xorg log directory in the kiosk user's home, in case the
+# wrapper hasn't run yet. The wrapper also passes -logfile so this is belt-
+# and-braces.
+KIOSK_HOME="$(getent passwd "$KIOSK_USER" | cut -d: -f6)"
+if [[ -n "$KIOSK_HOME" ]]; then
+    install -d -o "$KIOSK_USER" -g "$KIOSK_USER" -m 0755 \
+        "$KIOSK_HOME/.local" "$KIOSK_HOME/.local/share" "$KIOSK_HOME/.local/share/xorg"
 fi
 
 echo "[kiosk-install] done. Enable with: sudo systemctl enable --now ragnar-kiosk.service"
