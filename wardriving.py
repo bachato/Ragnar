@@ -375,6 +375,7 @@ class WardrivingSession:
                               now, now, rssi, lat, lon, interface, band, is_camera))
                         self.unique_bssids.add(bssid)
                         self.network_count = len(self.unique_bssids)
+                        return True
 
                     # Per-interface observation row — records what THIS adapter
                     # actually saw, independent of which adapter "owns" the
@@ -406,6 +407,7 @@ class WardrivingSession:
 
             except Exception as e:
                 logger.error(f"DB upsert error: {e}")
+        return False
 
     def log_gps_track(self, lat, lon, alt, speed, satellites, hdop):
         """Log a GPS trackpoint."""
@@ -3169,13 +3171,14 @@ class WardrivingEngine:
                     freq = 0
                     if channel:
                         freq = (2407 + channel * 5) if channel <= 14 else (5000 + channel * 5)
-                    self.session.upsert_network(
+                    is_new = self.session.upsert_network(
                         bssid=mac, ssid=ssid, security=auth,
                         channel=channel, frequency=freq, rssi=rssi,
                         lat=lat, lon=lon, alt=alt, speed=None, hdop=None,
                         interface='esp32-serial'
                     )
-                    self.serial_networks += 1
+                    if is_new:
+                        self.serial_networks += 1
                 return
             except (json.JSONDecodeError, ValueError):
                 pass
@@ -3323,13 +3326,14 @@ class WardrivingEngine:
                 signal_dbm=rssi, lat=lat, lon=lon
             )
         else:
-            self.session.upsert_network(
+            is_new = self.session.upsert_network(
                 bssid=mac, ssid=ssid, security=auth,
                 channel=channel, frequency=freq, rssi=rssi,
                 lat=lat, lon=lon, alt=alt, speed=None, hdop=None,
                 interface='esp32-serial'
             )
-            self.serial_networks += 1
+            if is_new:
+                self.serial_networks += 1
 
     def _flush_serial_entry(self, gps_lat, gps_lon, gps_alt):
         """Flush a buffered HuginnESP multi-line entry to the session."""
@@ -3357,10 +3361,11 @@ class WardrivingEngine:
         if channel:
             freq = (2407 + channel * 5) if channel <= 14 else (5000 + channel * 5)
 
-        self.session.upsert_network(
+        is_new = self.session.upsert_network(
             bssid=bssid, ssid=ssid, security=security,
             channel=channel, frequency=freq, rssi=rssi,
             lat=gps_lat, lon=gps_lon, alt=gps_alt, speed=None, hdop=None,
             interface='esp32-serial'
         )
-        self.serial_networks += 1
+        if is_new:
+            self.serial_networks += 1
