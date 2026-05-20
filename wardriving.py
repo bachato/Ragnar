@@ -800,7 +800,7 @@ class WardrivingSession:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.row_factory = sqlite3.Row
                     track = conn.execute(
-                        "SELECT timestamp, latitude, longitude, altitude "
+                        "SELECT timestamp, latitude, longitude, altitude, speed_kmh "
                         "FROM gps_track ORDER BY timestamp"
                     ).fetchall()
                     if not track:
@@ -819,7 +819,14 @@ class WardrivingSession:
                             ga = after['timestamp'] - epoch
                             if gb <= max_gap_seconds and ga <= max_gap_seconds:
                                 span = (after['timestamp'] - before['timestamp']) or 1
-                                f = max(0.0, min(1.0, (epoch - before['timestamp']) / span))
+                                f_time = max(0.0, min(1.0, (epoch - before['timestamp']) / span))
+                                v1 = before['speed_kmh']
+                                v2 = after['speed_kmh']
+                                if v1 is not None and v2 is not None and (v1 + v2) > 0:
+                                    f = (2 * v1 * f_time + (v2 - v1) * f_time * f_time) / (v1 + v2)
+                                    f = max(0.0, min(1.0, f))
+                                else:
+                                    f = f_time
                                 lat = before['latitude'] + (after['latitude'] - before['latitude']) * f
                                 lon = before['longitude'] + (after['longitude'] - before['longitude']) * f
                                 alt = None
