@@ -329,10 +329,14 @@ class WardrivingSession:
                                     ssid = COALESCE(NULLIF(?, ''), ssid),
                                     security = COALESCE(NULLIF(?, ''), security),
                                     channel = ?, frequency = ?, rssi = ?,
-                                    latitude = ?, longitude = ?, altitude = ?,
-                                    speed_kmh = ?, hdop = ?,
+                                    latitude  = COALESCE(?, latitude),
+                                    longitude = COALESCE(?, longitude),
+                                    altitude  = COALESCE(?, altitude),
+                                    speed_kmh = COALESCE(?, speed_kmh),
+                                    hdop      = COALESCE(?, hdop),
                                     last_seen = ?, best_rssi = ?,
-                                    best_lat = ?, best_lon = ?,
+                                    best_lat  = COALESCE(?, best_lat),
+                                    best_lon  = COALESCE(?, best_lon),
                                     scan_count = ?, interface = ?, band = ?
                                 WHERE bssid = ?
                             """, (ssid, security, channel, frequency, rssi,
