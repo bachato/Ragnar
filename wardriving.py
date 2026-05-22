@@ -3308,8 +3308,13 @@ class WardrivingEngine:
             return
 
         # Try WiGLE CSV format (Piglet style)
-        parts = line.split(',')
-
+        # Use csv.reader to correctly handle quoted fields that contain
+        # commas (e.g. SSID "Johansson 2,4Ghz").  Simple split(',') would
+        # break those into multiple columns and shift everything.
+        try:
+            parts = next(csv.reader([line]))
+        except (csv.Error, StopIteration):
+            parts = line.split(',')  # fallback
         # Capture column header if we're expecting one. Recognize by the
         # presence of 'MAC' or 'BSSID' as the first column, which uniquely
         # identifies the header row vs a data row (data row[0] is a MAC
