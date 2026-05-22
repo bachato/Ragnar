@@ -863,31 +863,33 @@
                 </div>
             </div>
 
-            <!-- Network Hosts Table -->
-            <div class="glass rounded-xl p-6">
-                <div class="stackable-row mb-4">
-                    <h3 class="text-lg font-semibold">Discovered Hosts</h3>
-                    <div class="flex items-center space-x-3">
+            <!-- External Threat Detection Card -->
+            <div class="glass rounded-xl p-6 mb-6">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-4">
+                    <div>
+                        <h2 class="text-xl font-semibold mb-1">External Threat Detection</h2>
+                        <p class="text-sm text-gray-400">Scan WiFi airspace for rogue access points, evil twins, deauth attacks, and suspicious devices</p>
+                    </div>
+                    <div class="flex items-center space-x-3 mt-3 sm:mt-0">
                         <button id="threat-sweep-btn"
                                 onclick="runThreatSweep()"
-                                class="bg-red-700 hover:bg-red-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap flex items-center space-x-1">
+                                class="bg-red-700 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap flex items-center space-x-2">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                             </svg>
-                            <span>Check External Threats</span>
+                            <span>Scan Now</span>
                         </button>
                         <div class="flex items-center space-x-2 border-l border-slate-700 pl-3">
-                            <label for="threat-monitor-toggle" class="text-xs text-gray-400 cursor-pointer whitespace-nowrap" title="Continuously scan WiFi airspace for rogue APs every 60 seconds">Continuous</label>
+                            <label for="threat-monitor-toggle" class="text-sm text-gray-300 cursor-pointer whitespace-nowrap font-medium" title="Continuously scan WiFi airspace for rogue APs every 60 seconds">Continuous</label>
                             <button id="threat-monitor-toggle"
                                     onclick="toggleThreatMonitor()"
-                                    class="relative w-9 h-5 rounded-full bg-slate-700 transition-colors focus:outline-none"
+                                    class="relative w-10 h-6 rounded-full bg-slate-600 border border-slate-500 transition-colors focus:outline-none focus:ring-2 focus:ring-red-500"
                                     role="switch" aria-checked="false"
                                     title="Enable continuous airspace monitoring">
-                                <span id="threat-monitor-knob" class="absolute left-0.5 top-0.5 w-4 h-4 rounded-full bg-gray-400 transition-transform"></span>
+                                <span id="threat-monitor-knob" class="absolute left-0.5 top-0.5 w-5 h-5 rounded-full bg-gray-300 shadow transition-transform"></span>
                             </button>
-                            <span id="threat-monitor-status" class="text-xs text-gray-500 hidden"></span>
+                            <span id="threat-monitor-status" class="text-xs text-gray-400 hidden"></span>
                         </div>
-                        <span id="host-count" class="text-sm text-gray-300">0 hosts</span>
                     </div>
                 </div>
 
@@ -903,7 +905,17 @@
                 </div>
 
                 <!-- Threat Sweep Results Panel (hidden by default) -->
-                <div id="threat-sweep-results" class="hidden mb-4 rounded-lg border p-4">
+                <div id="threat-sweep-results" class="hidden rounded-lg border p-4">
+                </div>
+            </div>
+
+            <!-- Network Hosts Table -->
+            <div class="glass rounded-xl p-6">
+                <div class="stackable-row mb-4">
+                    <h3 class="text-lg font-semibold">Discovered Hosts</h3>
+                    <div class="flex items-center space-x-2">
+                        <span id="host-count" class="text-sm text-gray-300">0 hosts</span>
+                    </div>
                 </div>
                 
                 <div id="network-table" class="overflow-x-auto">

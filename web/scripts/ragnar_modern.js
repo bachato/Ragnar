@@ -3035,11 +3035,11 @@ async function toggleThreatMonitor() {
 
         if (data.enabled) {
             // Switched ON
-            toggle.classList.remove('bg-slate-700');
+            toggle.classList.remove('bg-slate-600');
             toggle.classList.add('bg-red-600');
             toggle.setAttribute('aria-checked', 'true');
             knob.classList.add('translate-x-4');
-            knob.classList.remove('bg-gray-400');
+            knob.classList.remove('bg-gray-300');
             knob.classList.add('bg-white');
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = 'Monitoring…'; statusEl.classList.remove('hidden'); }
@@ -3048,11 +3048,11 @@ async function toggleThreatMonitor() {
             _startThreatMonitorPoll(panel);
         } else {
             // Switched OFF
-            toggle.classList.add('bg-slate-700');
+            toggle.classList.add('bg-slate-600');
             toggle.classList.remove('bg-red-600');
             toggle.setAttribute('aria-checked', 'false');
             knob.classList.remove('translate-x-4');
-            knob.classList.add('bg-gray-400');
+            knob.classList.add('bg-gray-300');
             knob.classList.remove('bg-white');
             if (warning) warning.classList.add('hidden');
             if (statusEl) { statusEl.textContent = 'Off'; statusEl.classList.add('hidden'); }
@@ -3126,13 +3126,13 @@ async function _restoreThreatMonitorState() {
             const panel = document.getElementById('threat-sweep-results');
 
             if (toggle) {
-                toggle.classList.remove('bg-slate-700');
+                toggle.classList.remove('bg-slate-600');
                 toggle.classList.add('bg-red-600');
                 toggle.setAttribute('aria-checked', 'true');
             }
             if (knob) {
                 knob.classList.add('translate-x-4');
-                knob.classList.remove('bg-gray-400');
+                knob.classList.remove('bg-gray-300');
                 knob.classList.add('bg-white');
             }
             if (warning) warning.classList.remove('hidden');
