@@ -869,6 +869,7 @@
                     <div>
                         <h2 class="text-xl font-semibold mb-1">External Threat Detection</h2>
                         <p class="text-sm text-gray-400">Scan WiFi airspace for rogue access points, evil twins, deauth attacks, and suspicious devices</p>
+                        <span id="monitor-mode-badge" class="hidden inline-flex items-center mt-1 text-xs font-medium px-2 py-0.5 rounded-full"></span>
                     </div>
                     <div class="flex items-center space-x-3 mt-3 sm:mt-0">
                         <button id="threat-sweep-btn"
@@ -902,6 +903,7 @@
                         <div class="text-xs text-amber-300/90">
                             <p class="font-semibold mb-1">Continuous Threat Monitoring</p>
                             <p>Ragnar will perform periodic WiFi airspace sweeps at the configured interval to detect rogue access points, evil twins, and deauthentication attacks. Each sweep takes ~5 seconds. This may cause <strong>brief network interruptions</strong> as the WiFi adapter momentarily switches channels during each scan cycle. Shorter intervals increase detection speed but cause more frequent disruptions.</p>
+                            <p class="mt-2 text-amber-400/80"><strong>Tip:</strong> Plug in a USB WiFi adapter that supports monitor mode (e.g. Alfa AWUS036ACH) for full cross-network deauth detection. Without one, Ragnar can only detect deauth attacks targeting its own connection.</p>
                         </div>
                     </div>
                 </div>

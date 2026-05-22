@@ -2982,6 +2982,19 @@ function _renderThreatFindings(data, panel) {
         <p class="text-xs text-gray-500 mt-2">${escapeHtml(sweepInfo)}</p>`;
 }
 
+function _updateMonitorModeBadge(monitorMode) {
+    const badge = document.getElementById('monitor-mode-badge');
+    if (!badge) return;
+    badge.classList.remove('hidden');
+    if (monitorMode) {
+        badge.className = 'inline-flex items-center mt-1 text-xs font-medium px-2 py-0.5 rounded-full bg-green-900/60 text-green-300 border border-green-700';
+        badge.innerHTML = '📡 Monitor mode active — full deauth detection';
+    } else {
+        badge.className = 'inline-flex items-center mt-1 text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-900/50 text-yellow-300 border border-yellow-700';
+        badge.innerHTML = '⚠ No monitor adapter — limited deauth detection';
+    }
+}
+
 async function runThreatSweep() {
     const btn = document.getElementById('threat-sweep-btn');
     const panel = document.getElementById('threat-sweep-results');
@@ -3008,6 +3021,7 @@ async function runThreatSweep() {
         }
 
         _renderThreatFindings(data, panel);
+        _updateMonitorModeBadge(data.monitor_mode);
 
     } catch (err) {
         panel.className = 'mb-4 rounded-lg border border-red-800 bg-red-950/30 p-4';
@@ -3084,6 +3098,7 @@ function _startThreatMonitorPoll(panel) {
                 panel.classList.remove('hidden');
                 _renderThreatFindings(data, panel);
             }
+            _updateMonitorModeBadge(data.monitor_mode);
         } catch (e) {
             console.warn('Threat monitor poll failed:', e);
         }
@@ -3126,6 +3141,7 @@ async function _restoreThreatMonitorState() {
             if (intervalInput) { intervalInput.value = data.interval || 60; intervalInput.disabled = true; }
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = `Sweep #${data.sweep_count || 0}`; statusEl.classList.remove('hidden'); }
+            _updateMonitorModeBadge(data.monitor_mode);
 
             if (panel && data.findings && data.findings.length > 0) {
                 panel.classList.remove('hidden');

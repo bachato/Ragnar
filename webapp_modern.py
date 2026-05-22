@@ -9032,27 +9032,121 @@ def network_threat_sweep():
         import time as _time
         import threading as _threading
 
-        # Start iw event listener in background to catch deauth frames
+        # Deauth capture via monitor mode — hops channels 1/6/11
+        # to detect deauth attacks on ANY nearby network, not just our own.
+        # Priority: 1) secondary USB WiFi adapter → put in monitor mode directly
+        #           2) virtual monitor vif on primary (rarely works on Broadcom)
+        #           3) iw event fallback (own network only)
         deauth_events = []
-        def _capture_iw_events():
+        _mon = 'mon_ragnar'
+        _monitor_mode_used = [False]  # mutable so inner function can set it
+
+        def _capture_deauth_frames():
+            channels = [1, 6, 11]
+            dwell = 0.4  # seconds per channel
+            capture_iface = None
+            restore_secondary = None  # secondary iface to restore to managed after
+
             try:
-                proc = subprocess.Popen(
-                    ['sudo', 'iw', 'event', '-t'],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                # --- Find a secondary WiFi interface (USB adapter) ---
+                iw_out = subprocess.run(
+                    ['iw', 'dev'], capture_output=True, text=True, timeout=5
                 )
-                # Read lines until the scan window closes
-                while proc.poll() is None:
-                    line = proc.stdout.readline()
-                    if not line:
-                        break
-                    ll = line.strip().lower()
-                    if any(kw in ll for kw in ['deauth', 'disassoc', 'disconnect']):
-                        deauth_events.append(line.strip())
-                proc.terminate()
+                secondary = None
+                cur = None
+                for ln in iw_out.stdout.splitlines():
+                    ln = ln.strip()
+                    if ln.startswith('Interface '):
+                        cur = ln.split()[1]
+                        if cur != iface and cur != _mon:
+                            secondary = cur
+
+                if secondary:
+                    # Put secondary adapter directly into monitor mode
+                    subprocess.run(['sudo', 'ip', 'link', 'set', secondary, 'down'],
+                                  capture_output=True, timeout=3)
+                    r = subprocess.run(
+                        ['sudo', 'iw', 'dev', secondary, 'set', 'type', 'monitor'],
+                        capture_output=True, timeout=5
+                    )
+                    if r.returncode == 0:
+                        subprocess.run(['sudo', 'ip', 'link', 'set', secondary, 'up'],
+                                      capture_output=True, timeout=3)
+                        capture_iface = secondary
+                        restore_secondary = secondary
+                        _monitor_mode_used[0] = True
+
+                if not capture_iface:
+                    # Try virtual monitor on primary (won't work on Broadcom)
+                    subprocess.run(['sudo', 'iw', 'dev', _mon, 'del'],
+                                  capture_output=True, timeout=3)
+                    r = subprocess.run(
+                        ['sudo', 'iw', 'dev', iface, 'interface', 'add',
+                         _mon, 'type', 'monitor'],
+                        capture_output=True, timeout=5
+                    )
+                    if r.returncode == 0:
+                        subprocess.run(['sudo', 'ip', 'link', 'set', _mon, 'up'],
+                                      capture_output=True, timeout=5)
+                        capture_iface = _mon
+                        _monitor_mode_used[0] = True
+
+                if not capture_iface:
+                    # Final fallback: iw event — only sees deauth on own connection
+                    proc = subprocess.Popen(
+                        ['sudo', 'iw', 'event', '-t'],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    )
+                    _time.sleep(3)
+                    proc.terminate()
+                    for line in (proc.stdout.read() or '').splitlines():
+                        if any(k in line.lower() for k in ['deauth', 'disassoc']):
+                            deauth_events.append(line.strip())
+                    return
+
+                # --- Hop channels and capture deauth frames ---
+                for ch in channels:
+                    subprocess.run(
+                        ['sudo', 'iw', 'dev', capture_iface, 'set', 'channel', str(ch)],
+                        capture_output=True, timeout=3
+                    )
+                    proc = subprocess.Popen(
+                        ['sudo', 'tcpdump', '-i', capture_iface, '-c', '100',
+                         '-n', '-l',
+                         'type mgt subtype deauth or type mgt subtype disassoc'],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    )
+                    try:
+                        stdout, _ = proc.communicate(timeout=dwell)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        stdout, _ = proc.communicate()
+                    for line in stdout.splitlines():
+                        ln = line.strip()
+                        if ln and 'listening' not in ln and 'packets captured' not in ln:
+                            deauth_events.append(f'ch{ch}: {ln}')
+
             except Exception:
                 pass
+            finally:
+                # Cleanup: delete virtual mon or restore secondary to managed
+                try:
+                    if capture_iface == _mon:
+                        subprocess.run(['sudo', 'ip', 'link', 'set', _mon, 'down'],
+                                      capture_output=True, timeout=3)
+                        subprocess.run(['sudo', 'iw', 'dev', _mon, 'del'],
+                                      capture_output=True, timeout=3)
+                    elif restore_secondary:
+                        subprocess.run(['sudo', 'ip', 'link', 'set', restore_secondary, 'down'],
+                                      capture_output=True, timeout=3)
+                        subprocess.run(['sudo', 'iw', 'dev', restore_secondary, 'set', 'type', 'managed'],
+                                      capture_output=True, timeout=3)
+                        subprocess.run(['sudo', 'ip', 'link', 'set', restore_secondary, 'up'],
+                                      capture_output=True, timeout=3)
+                except Exception:
+                    pass
 
-        ev_thread = _threading.Thread(target=_capture_iw_events, daemon=True)
+        ev_thread = _threading.Thread(target=_capture_deauth_frames, daemon=True)
         ev_thread.start()
 
         _time.sleep(4)
@@ -9244,17 +9338,16 @@ def network_threat_sweep():
                         'description': f'{len(ssid_set)} different SSIDs from {vendor} OUI {oui_prefix} — likely beacon spam from a deauther/Marauder'
                     })
 
-        # 6. Deauth detection from iw event capture
-        # Stop the event thread and check results
-        ev_thread.join(timeout=1)
+        # 6. Deauth detection from monitor-mode capture (channels 1/6/11)
+        ev_thread.join(timeout=5)
         if deauth_events:
             findings.append({
                 'type': 'Deauth Attack Detected',
                 'severity': 'critical',
-                'ssid': own_ssid or '(your network)',
-                'bssid': own_bssid or '-',
+                'ssid': '(airspace)',
+                'bssid': '-',
                 'signal': '-',
-                'description': f'{len(deauth_events)} deauth/disassociation frame(s) captured during scan — active WiFi attack in progress'
+                'description': f'{len(deauth_events)} deauth/disassoc frame(s) captured across ch 1/6/11 — active WiFi attack in progress'
             })
 
         # Sort by severity
@@ -9266,7 +9359,8 @@ def network_threat_sweep():
             'findings': findings,
             'total': len(findings),
             'interface': iface,
-            'own_network': own_ssid or '(unknown)'
+            'own_network': own_ssid or '(unknown)',
+            'monitor_mode': _monitor_mode_used[0]
         })
 
     except subprocess.TimeoutExpired:
@@ -9286,6 +9380,7 @@ _threat_monitor_state = {
     'last_sweep': None,
     'sweep_count': 0,
     'interval': 60,  # seconds between sweeps
+    'monitor_mode': False,
 }
 _threat_monitor_lock = threading.Lock()
 
@@ -9325,6 +9420,8 @@ def _threat_monitor_loop():
                 with _threat_monitor_lock:
                     _threat_monitor_state['last_sweep'] = datetime.now().isoformat()
                     _threat_monitor_state['sweep_count'] += 1
+                    if data:
+                        _threat_monitor_state['monitor_mode'] = data.get('monitor_mode', False)
 
         except Exception as e:
             logger.warning(f"Threat monitor sweep failed: {e}")
@@ -9348,6 +9445,7 @@ def get_threat_monitor_status():
             'last_sweep': _threat_monitor_state['last_sweep'],
             'sweep_count': _threat_monitor_state['sweep_count'],
             'interval': _threat_monitor_state['interval'],
+            'monitor_mode': _threat_monitor_state['monitor_mode'],
         })
 
 
