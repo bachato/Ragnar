@@ -3369,6 +3369,9 @@ class WardrivingEngine:
         # negative (dBm), so a positive value at the legacy RSSI position
         # means it's actually a frequency.  Promote to 1.6 layout once
         # and cache it so all subsequent rows parse correctly.
+        # Piglet's full 14-column format (WiGLE 1.6):
+        #   MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,
+        #   Lat,Lon,Alt,Acc,RCOIs,MfgrId,Type
         if not self._wigle_col_map and len(parts) > 11:
             try:
                 probe = int(parts[5].strip())
@@ -3378,7 +3381,7 @@ class WardrivingEngine:
                 cm = {
                     'mac': 0, 'ssid': 1, 'auth': 2, 'firstseen': 3,
                     'channel': 4, 'frequency': 5, 'rssi': 6, 'lat': 7,
-                    'lon': 8, 'alt': 9, 'acc': 10, 'type': 11,
+                    'lon': 8, 'alt': 9, 'acc': 10, 'type': 13,
                 }
                 self._wigle_col_map = cm
                 logger.info("Auto-detected WiGLE 1.6 layout (Frequency column at position 5)")
@@ -3390,6 +3393,9 @@ class WardrivingEngine:
             return parts[idx].strip()
 
         ssid = _field('ssid')
+        # Piglet wraps SSIDs in double quotes — strip them
+        if ssid.startswith('"') and ssid.endswith('"'):
+            ssid = ssid[1:-1]
         auth = _field('auth')
         try:
             channel = int(_field('channel') or 0)
@@ -3413,6 +3419,13 @@ class WardrivingEngine:
             alt = float(_field('alt')) if _field('alt') else gps_alt
         except (ValueError, TypeError):
             lat, lon = gps_lat, gps_lon
+            alt = gps_alt
+
+        # Piglet reports 0.000000,0.000000 when it has no GPS fix — fall
+        # back to the Pi's own GPS so the network still gets a position.
+        if lat is not None and lon is not None and lat == 0.0 and lon == 0.0:
+            lat = gps_lat
+            lon = gps_lon
             alt = gps_alt
 
         record_type = (_field('type') or 'WIFI').upper()
