@@ -9016,6 +9016,193 @@ def get_preferred_scan_interface():
         return jsonify({'success': False, 'error': str(exc)}), 500
 
 
+@app.route('/api/network/threat-sweep', methods=['POST'])
+def network_threat_sweep():
+    """Quick 10-second WiFi airspace scan to detect rogue APs, evil twins, and suspicious SSIDs."""
+    try:
+        import re as _re
+
+        iface = _get_wifi_iface()
+
+        # Trigger a fresh scan
+        subprocess.run(
+            ['sudo', 'nmcli', 'dev', 'wifi', 'rescan', 'ifname', iface],
+            capture_output=True, timeout=15
+        )
+        import time as _time
+        _time.sleep(4)
+
+        # Get results WITH BSSID, SSID, signal, security, frequency, channel
+        result = subprocess.run(
+            ['nmcli', '-t', '-f', 'BSSID,SSID,SIGNAL,SECURITY,FREQ,CHAN',
+             'dev', 'wifi', 'list', '--rescan', 'no', 'ifname', iface],
+            capture_output=True, text=True, timeout=15
+        )
+
+        if result.returncode != 0:
+            return jsonify({'success': False, 'error': 'WiFi scan failed', 'findings': []}), 500
+
+        # Get our own connected network for evil twin detection
+        link_result = subprocess.run(
+            ['iw', 'dev', iface, 'link'],
+            capture_output=True, text=True, timeout=5
+        )
+        own_ssid = ''
+        own_bssid = ''
+        for ln in link_result.stdout.splitlines():
+            ln = ln.strip()
+            if ln.startswith('SSID:'):
+                own_ssid = ln.split(':', 1)[1].strip()
+            elif ln.startswith('Connected to'):
+                own_bssid = ln.split(' ')[2].strip().upper()
+
+        # Rogue SSID patterns
+        _ROGUE_SSID_PATTERNS = [
+            (_re.compile(r'piglet', _re.I), 'Piglet Wardriver', 'high',
+             'Piglet wardriving device AP detected nearby'),
+            (_re.compile(r'pineapple|hak5', _re.I), 'WiFi Pineapple', 'critical',
+             'Hak5 WiFi Pineapple rogue AP detected'),
+            (_re.compile(r'pwned|pwnagotchi', _re.I), 'Pwnagotchi', 'high',
+             'Pwnagotchi handshake capture device detected'),
+            (_re.compile(r'deauth|dstike|spacehuhn', _re.I), 'Deauther', 'high',
+             'WiFi deauthentication attack device AP detected'),
+            (_re.compile(r'marauder', _re.I), 'ESP32 Marauder', 'high',
+             'ESP32 Marauder attack platform AP detected'),
+            (_re.compile(r'flipper', _re.I), 'Flipper Zero', 'high',
+             'Flipper Zero WiFi dev board AP detected'),
+            (_re.compile(r'^free[_\s-]?wifi$|^free[_\s-]?internet$|^open[_\s-]?guest$', _re.I),
+             'Honeypot AP', 'medium', 'Suspicious open network — possible evil twin honeypot'),
+        ]
+
+        # Suspicious OUI prefixes (Espressif, Raspberry Pi) acting as APs
+        _SUSPICIOUS_AP_OUIS = {
+            '24:0A:C4': 'Espressif', '24:6F:28': 'Espressif', '24:62:AB': 'Espressif',
+            '30:AE:A4': 'Espressif', '3C:61:05': 'Espressif', '3C:71:BF': 'Espressif',
+            '40:F5:20': 'Espressif', '4C:11:AE': 'Espressif', '54:43:B2': 'Espressif',
+            '58:BF:25': 'Espressif', '68:67:25': 'Espressif', '7C:9E:BD': 'Espressif',
+            '84:0D:8E': 'Espressif', '84:CC:A8': 'Espressif', '8C:AA:B5': 'Espressif',
+            '94:3C:C6': 'Espressif', 'A0:20:A6': 'Espressif', 'A4:CF:12': 'Espressif',
+            'AC:67:B2': 'Espressif', 'B4:E6:2D': 'Espressif', 'BC:DD:C2': 'Espressif',
+            'C4:4F:33': 'Espressif', 'C8:2B:96': 'Espressif', 'CC:50:E3': 'Espressif',
+            'D8:A0:1D': 'Espressif', 'DC:4F:22': 'Espressif', 'E0:98:06': 'Espressif',
+            'E8:68:E7': 'Espressif', 'EC:FA:BC': 'Espressif', 'F0:08:D1': 'Espressif',
+            'F4:CF:A2': 'Espressif', '10:52:1C': 'Espressif', '08:3A:F2': 'Espressif',
+            'B8:27:EB': 'Raspberry Pi', 'DC:A6:32': 'Raspberry Pi',
+            'D8:3A:DD': 'Raspberry Pi', '2C:CF:67': 'Raspberry Pi',
+            'E4:5F:01': 'Raspberry Pi',
+        }
+
+        findings = []
+        seen = set()
+
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            # nmcli terse uses \: for escaped colons in BSSID
+            # Format: BSSID:SSID:SIGNAL:SECURITY:FREQ:CHAN
+            # BSSID has colons escaped as \: in terse mode
+            parts = line.split(':')
+            if len(parts) < 6:
+                continue
+
+            # Reconstruct BSSID (first 17 chars with \: → :)
+            raw = line
+            # Find BSSID: escaped colons e.g. AA\:BB\:CC\:DD\:EE\:FF
+            bssid_match = _re.match(r'^([0-9A-Fa-f]{2}\\:[0-9A-Fa-f]{2}\\:[0-9A-Fa-f]{2}\\:[0-9A-Fa-f]{2}\\:[0-9A-Fa-f]{2}\\:[0-9A-Fa-f]{2})', raw)
+            if not bssid_match:
+                continue
+            bssid = bssid_match.group(1).replace('\\:', ':').upper()
+            remainder = raw[bssid_match.end():]
+            if remainder.startswith(':'):
+                remainder = remainder[1:]
+            rparts = remainder.split(':')
+            if len(rparts) < 4:
+                continue
+            ssid = rparts[0] if rparts[0] else '(Hidden)'
+            signal = rparts[1] if len(rparts) > 1 else '0'
+            security = rparts[2] if len(rparts) > 2 else ''
+            freq = rparts[3] if len(rparts) > 3 else ''
+
+            # 1. Evil twin detection — same SSID as ours, different BSSID
+            if own_ssid and ssid == own_ssid and bssid != own_bssid and own_bssid:
+                key = f'evil_twin_{bssid}'
+                if key not in seen:
+                    seen.add(key)
+                    findings.append({
+                        'type': 'Evil Twin',
+                        'severity': 'critical',
+                        'ssid': ssid,
+                        'bssid': bssid,
+                        'signal': signal,
+                        'description': f'AP impersonating your network "{ssid}" with different BSSID {bssid}'
+                    })
+
+            # 2. Rogue SSID patterns
+            for pattern, name, severity, desc in _ROGUE_SSID_PATTERNS:
+                if pattern.search(ssid):
+                    key = f'rogue_{name}_{bssid}'
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append({
+                            'type': name,
+                            'severity': severity,
+                            'ssid': ssid,
+                            'bssid': bssid,
+                            'signal': signal,
+                            'description': desc
+                        })
+                    break
+
+            # 3. Suspicious OUI (ESP32/Pi broadcasting as AP)
+            oui = bssid[:8]
+            if oui in _SUSPICIOUS_AP_OUIS:
+                vendor = _SUSPICIOUS_AP_OUIS[oui]
+                key = f'sus_oui_{bssid}'
+                if key not in seen:
+                    seen.add(key)
+                    findings.append({
+                        'type': f'Suspicious {vendor} AP',
+                        'severity': 'low',
+                        'ssid': ssid,
+                        'bssid': bssid,
+                        'signal': signal,
+                        'description': f'{vendor} device broadcasting as access point — may be rogue'
+                    })
+
+            # 4. Open network with enticing name
+            if security and 'open' in security.lower() and not security.strip().startswith('WPA'):
+                if any(w in ssid.lower() for w in ['free', 'guest', 'open', 'public', 'wifi']):
+                    key = f'open_honey_{bssid}'
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append({
+                            'type': 'Suspicious Open AP',
+                            'severity': 'medium',
+                            'ssid': ssid,
+                            'bssid': bssid,
+                            'signal': signal,
+                            'description': f'Open network "{ssid}" — possible honeypot or evil twin'
+                        })
+
+        # Sort by severity
+        sev_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+        findings.sort(key=lambda f: sev_order.get(f['severity'], 4))
+
+        return jsonify({
+            'success': True,
+            'findings': findings,
+            'total': len(findings),
+            'interface': iface,
+            'own_network': own_ssid or '(unknown)'
+        })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'Scan timed out', 'findings': []}), 504
+    except Exception as e:
+        logger.error(f"Threat sweep error: {e}")
+        return jsonify({'success': False, 'error': str(e), 'findings': []}), 500
+
+
 @app.route('/api/wifi/scan', methods=['POST'])
 def scan_wifi_networks():
     """Scan for available Wi-Fi networks with AP mode considerations for Pi Zero W2"""

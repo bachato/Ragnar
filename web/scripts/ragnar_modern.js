@@ -2909,6 +2909,100 @@ function formatLastScanCell(info) {
     return `<div${tooltip}><span class="${info.className}">${escapeHtml(info.label)}</span>${timestampLine}</div>`;
 }
 
+// ---------------------------------------------------------------------------
+// External threat sweep (WiFi airspace scan for rogue APs)
+// ---------------------------------------------------------------------------
+async function runThreatSweep() {
+    const btn = document.getElementById('threat-sweep-btn');
+    const panel = document.getElementById('threat-sweep-results');
+    if (!btn || !panel) return;
+
+    // Show scanning state
+    const origHTML = btn.innerHTML;
+    btn.disabled = true;
+    btn.classList.add('opacity-60');
+    btn.innerHTML = `<svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg><span>Scanning airspace…</span>`;
+
+    panel.classList.remove('hidden');
+    panel.className = 'mb-4 rounded-lg border border-slate-700 bg-slate-900/50 p-4';
+    panel.innerHTML = `<div class="flex items-center space-x-2 text-gray-300 text-sm"><svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg><span>Scanning WiFi airspace for rogue APs, evil twins, and suspicious devices… (~10s)</span></div>`;
+
+    try {
+        const resp = await fetch('/api/network/threat-sweep', { method: 'POST' });
+        const data = await resp.json();
+
+        if (!data.success) {
+            panel.className = 'mb-4 rounded-lg border border-yellow-800 bg-yellow-950/30 p-4';
+            panel.innerHTML = `<p class="text-yellow-300 text-sm">⚠ Scan failed: ${escapeHtml(data.error || 'Unknown error')}</p>`;
+            return;
+        }
+
+        if (!data.findings || data.findings.length === 0) {
+            panel.className = 'mb-4 rounded-lg border border-green-800 bg-green-950/30 p-4';
+            panel.innerHTML = `
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center space-x-2">
+                        <span class="text-green-400 text-lg">✓</span>
+                        <span class="text-green-300 text-sm font-medium">No external threats detected</span>
+                    </div>
+                    <button onclick="document.getElementById('threat-sweep-results').classList.add('hidden')" class="text-gray-500 hover:text-gray-300 text-xs">dismiss</button>
+                </div>
+                <p class="text-green-300/60 text-xs mt-1">Scanned WiFi airspace on ${escapeHtml(data.interface || '?')} · Connected to "${escapeHtml(data.own_network || '?')}"</p>`;
+            return;
+        }
+
+        // Findings found
+        const sevColors = {
+            critical: { border: 'border-red-700', bg: 'bg-red-950/40', badge: 'bg-red-600 text-white', text: 'text-red-300' },
+            high:     { border: 'border-orange-700', bg: 'bg-orange-950/40', badge: 'bg-orange-600 text-white', text: 'text-orange-300' },
+            medium:   { border: 'border-yellow-700', bg: 'bg-yellow-950/40', badge: 'bg-yellow-600 text-black', text: 'text-yellow-300' },
+            low:      { border: 'border-blue-700', bg: 'bg-blue-950/40', badge: 'bg-blue-600 text-white', text: 'text-blue-300' },
+        };
+
+        const worstSev = data.findings[0].severity;
+        const colors = sevColors[worstSev] || sevColors.medium;
+        panel.className = `mb-4 rounded-lg border ${colors.border} ${colors.bg} p-4`;
+
+        let rows = data.findings.map(f => {
+            const sc = sevColors[f.severity] || sevColors.medium;
+            return `<tr class="border-b border-slate-800/50">
+                <td class="py-2 pr-3"><span class="px-1.5 py-0.5 rounded text-xs font-bold ${sc.badge}">${escapeHtml(f.severity.toUpperCase())}</span></td>
+                <td class="py-2 pr-3 text-sm font-medium ${sc.text}">${escapeHtml(f.type)}</td>
+                <td class="py-2 pr-3 text-sm font-mono text-gray-300">${escapeHtml(f.ssid)}</td>
+                <td class="py-2 pr-3 text-xs font-mono text-gray-400">${escapeHtml(f.bssid)}</td>
+                <td class="py-2 pr-3 text-xs text-gray-400">${escapeHtml(f.signal)}%</td>
+                <td class="py-2 text-xs text-gray-400">${escapeHtml(f.description)}</td>
+            </tr>`;
+        }).join('');
+
+        panel.innerHTML = `
+            <div class="flex items-center justify-between mb-3">
+                <div class="flex items-center space-x-2">
+                    <span class="${colors.text} text-lg">⚠</span>
+                    <span class="${colors.text} text-sm font-bold">${data.total} threat${data.total > 1 ? 's' : ''} detected in WiFi airspace</span>
+                </div>
+                <button onclick="document.getElementById('threat-sweep-results').classList.add('hidden')" class="text-gray-500 hover:text-gray-300 text-xs">dismiss</button>
+            </div>
+            <table class="w-full text-left">
+                <thead><tr class="border-b border-slate-700 text-xs text-gray-500">
+                    <th class="pb-1 pr-3">Severity</th><th class="pb-1 pr-3">Type</th>
+                    <th class="pb-1 pr-3">SSID</th><th class="pb-1 pr-3">BSSID</th>
+                    <th class="pb-1 pr-3">Signal</th><th class="pb-1">Description</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+            <p class="text-xs text-gray-500 mt-2">Interface: ${escapeHtml(data.interface || '?')} · Your network: "${escapeHtml(data.own_network || '?')}"</p>`;
+
+    } catch (err) {
+        panel.className = 'mb-4 rounded-lg border border-red-800 bg-red-950/30 p-4';
+        panel.innerHTML = `<p class="text-red-300 text-sm">⚠ Error: ${escapeHtml(err.message || 'Request failed')}</p>`;
+    } finally {
+        btn.disabled = false;
+        btn.classList.remove('opacity-60');
+        btn.innerHTML = origHTML;
+    }
+}
+
 function formatThreatBadge(threats) {
     if (!threats || threats.length === 0) return '';
     const severityColors = {
