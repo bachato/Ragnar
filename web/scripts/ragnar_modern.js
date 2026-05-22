@@ -3024,7 +3024,6 @@ async function runThreatSweep() {
 // ---------------------------------------------------------------------------
 async function toggleThreatMonitor() {
     const toggle = document.getElementById('threat-monitor-toggle');
-    const knob = document.getElementById('threat-monitor-knob');
     const warning = document.getElementById('threat-monitor-warning');
     const statusEl = document.getElementById('threat-monitor-status');
     const panel = document.getElementById('threat-sweep-results');
@@ -3034,32 +3033,19 @@ async function toggleThreatMonitor() {
         const data = await resp.json();
 
         if (data.enabled) {
-            // Switched ON
-            toggle.classList.remove('bg-slate-600');
-            toggle.classList.add('bg-red-600');
-            toggle.setAttribute('aria-checked', 'true');
-            knob.classList.add('translate-x-4');
-            knob.classList.remove('bg-gray-300');
-            knob.classList.add('bg-white');
+            if (toggle) toggle.checked = true;
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = 'Monitoring…'; statusEl.classList.remove('hidden'); }
-
-            // Start polling for findings
             _startThreatMonitorPoll(panel);
         } else {
-            // Switched OFF
-            toggle.classList.add('bg-slate-600');
-            toggle.classList.remove('bg-red-600');
-            toggle.setAttribute('aria-checked', 'false');
-            knob.classList.remove('translate-x-4');
-            knob.classList.add('bg-gray-300');
-            knob.classList.remove('bg-white');
+            if (toggle) toggle.checked = false;
             if (warning) warning.classList.add('hidden');
             if (statusEl) { statusEl.textContent = 'Off'; statusEl.classList.add('hidden'); }
-
             _stopThreatMonitorPoll();
         }
     } catch (err) {
+        // Revert checkbox on failure
+        if (toggle) toggle.checked = !toggle.checked;
         console.error('Failed to toggle threat monitor:', err);
     }
 }
@@ -3120,21 +3106,11 @@ async function _restoreThreatMonitorState() {
         const data = await resp.json();
         if (data.enabled) {
             const toggle = document.getElementById('threat-monitor-toggle');
-            const knob = document.getElementById('threat-monitor-knob');
             const warning = document.getElementById('threat-monitor-warning');
             const statusEl = document.getElementById('threat-monitor-status');
             const panel = document.getElementById('threat-sweep-results');
 
-            if (toggle) {
-                toggle.classList.remove('bg-slate-600');
-                toggle.classList.add('bg-red-600');
-                toggle.setAttribute('aria-checked', 'true');
-            }
-            if (knob) {
-                knob.classList.add('translate-x-4');
-                knob.classList.remove('bg-gray-300');
-                knob.classList.add('bg-white');
-            }
+            if (toggle) toggle.checked = true;
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = `Sweep #${data.sweep_count || 0}`; statusEl.classList.remove('hidden'); }
 
