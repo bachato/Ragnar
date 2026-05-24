@@ -690,9 +690,11 @@ def _build_pwnagotchi_status(persist: bool = True) -> dict:
         status['mode'] = 'pwnagotchi'
     elif ragnar_service_active:
         status['mode'] = 'ragnar'
-        if status['state'] not in {'error', 'installing'}:
+        if status['state'] not in {'switching', 'installing'}:
             status['state'] = 'running'
             status['message'] = 'Ragnar service is running'
+            status['phase'] = 'idle'
+            status['target_mode'] = 'ragnar'
     else:
         status['mode'] = status.get('mode', shared_data.config.get('pwnagotchi_mode', 'ragnar'))
 
