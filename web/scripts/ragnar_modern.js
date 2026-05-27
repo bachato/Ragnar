@@ -14028,13 +14028,52 @@ function formatAlertCategory(category) {
 }
 
 /**
- * Format alert details for display
+ * Format alert details for display.
+ *
+ * Renders the alert.details object as a compact, human-readable block.
+ * Arrays (mitre tags, channels, dst_ips, ...) and numbers are formatted
+ * specially so beacon / JA3 / IRC alerts read nicely.
  */
 function formatAlertDetails(details) {
     if (!details || typeof details !== 'object') return '';
-    return Object.entries(details)
-        .map(([key, value]) => `${key.replace(/_/g, ' ')}: ${value}`)
-        .join(' | ');
+
+    // Keys we promote visually (rendered as chips) when present.
+    const chipKeys = new Set(['mitre', 'channels', 'tags']);
+    // Keys we hide from the inline summary because they're either redundant
+    // with the alert.message text or only useful in deep-dive views.
+    const hideKeys = new Set(['first_seen', 'last_seen', 'protocol']);
+
+    const formatValue = (key, v) => {
+        if (v === null || v === undefined || v === '') return null;
+        if (Array.isArray(v)) {
+            if (v.length === 0) return null;
+            if (chipKeys.has(key)) {
+                return v.map(item => `<span class="inline-block px-1.5 py-0.5 mr-1 rounded bg-slate-700 text-cyan-300 text-xs">${escapeHtml(String(item))}</span>`).join('');
+            }
+            const shown = v.slice(0, 5).map(x => escapeHtml(String(x))).join(', ');
+            const more = v.length > 5 ? ` (+${v.length - 5} more)` : '';
+            return shown + more;
+        }
+        if (typeof v === 'object') {
+            try { return escapeHtml(JSON.stringify(v)); }
+            catch { return ''; }
+        }
+        if (typeof v === 'number' && !Number.isInteger(v)) {
+            return escapeHtml(v.toFixed(3));
+        }
+        return escapeHtml(String(v));
+    };
+
+    const rows = [];
+    for (const [key, raw] of Object.entries(details)) {
+        if (hideKeys.has(key)) continue;
+        const val = formatValue(key, raw);
+        if (val === null || val === '') continue;
+        const label = key.replace(/_/g, ' ');
+        rows.push(`<div><span class="text-gray-400">${escapeHtml(label)}:</span> <span class="text-gray-200">${val}</span></div>`);
+    }
+    if (!rows.length) return '';
+    return `<div class="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-x-3 gap-y-0.5 text-xs">${rows.join('')}</div>`;
 }
 
 async function loadTrafficProtocols() {
