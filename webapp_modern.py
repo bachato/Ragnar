@@ -8204,6 +8204,35 @@ def pwn_check_updates():
         logger.error(f"Error in pwn_check_updates: {e}")
         return jsonify({'installed': True, 'error': str(e)}), 500
 
+@app.route('/api/pwn/update', methods=['POST'])
+def pwn_perform_update():
+    """Run git pull against /opt/pwnagotchi. Does NOT touch any service."""
+    repo_path = PWN_REPO_PATH
+
+    if not os.path.isdir(os.path.join(repo_path, '.git')):
+        return jsonify({
+            'success': False,
+            'error': 'Pwnagotchi is not installed at /opt/pwnagotchi'
+        }), 400
+
+    logger.info(f"Pwn manual update requested at {repo_path}")
+    update_result = _execute_pwn_git_update(repo_path)
+
+    if not update_result['success']:
+        return jsonify({
+            'success': False,
+            'error': update_result['error'] or 'Unknown error during git pull',
+            'warnings': update_result['warnings'],
+            'suggestion': 'Check repository status; SSH in if persistent.'
+        }), 500
+
+    return jsonify({
+        'success': True,
+        'message': 'Pwnagotchi update completed successfully',
+        'output': update_result['output'],
+        'warnings': update_result['warnings']
+    })
+
 @app.route('/api/system/resolve-conflicts', methods=['POST'])
 def resolve_git_conflicts():
     """Resolve git merge conflicts by resetting to HEAD then pulling latest."""
