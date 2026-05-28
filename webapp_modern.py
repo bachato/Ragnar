@@ -8233,6 +8233,85 @@ def pwn_perform_update():
         'warnings': update_result['warnings']
     })
 
+@app.route('/api/pwn/stash-update', methods=['POST'])
+def pwn_stash_and_update():
+    """Stash, pull, drop stash (or preserve on failure). Mirrors stash_and_update
+    but operates on /opt/pwnagotchi via sudo."""
+    repo_path = PWN_REPO_PATH
+
+    if not os.path.isdir(os.path.join(repo_path, '.git')):
+        return jsonify({
+            'success': False,
+            'error': 'Pwnagotchi is not installed at /opt/pwnagotchi'
+        }), 400
+
+    payload = request.get_json(silent=True) or {}
+    stash_message = payload.get('message') or f"Ragnar pwn auto stash {datetime.utcnow().isoformat()}"
+    include_untracked = payload.get('include_untracked', True)
+
+    stash_cmd = ['sudo', '-n', 'git', '-C', repo_path, 'stash', 'push']
+    if include_untracked:
+        stash_cmd.append('-u')
+    stash_cmd.extend(['-m', stash_message])
+
+    logger.info("Pwn auto stash + update requested via UI")
+
+    try:
+        stash_proc = subprocess.run(
+            stash_cmd, capture_output=True, text=True, check=True,
+            timeout=PWN_GIT_TIMEOUT
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        if isinstance(e, subprocess.TimeoutExpired):
+            err = f"git stash timed out after {PWN_GIT_TIMEOUT}s"
+        else:
+            err = (e.stderr or e.stdout or '').strip() or str(e)
+        logger.error(f"Pwn git stash failed: {err}")
+        return jsonify({'success': False, 'error': f'Git stash failed: {err}'}), 500
+
+    stash_stdout = (stash_proc.stdout.strip() or stash_proc.stderr.strip() or '')
+    stash_created = 'No local changes to save' not in stash_stdout
+    stash_ref = 'stash@{0}' if stash_created else None
+
+    if stash_created:
+        logger.info(f"Pwn local changes stashed as {stash_ref}")
+    else:
+        logger.info("Pwn auto stash requested but no local changes were found")
+
+    update_result = _execute_pwn_git_update(repo_path)
+    if not update_result['success']:
+        logger.error("Pwn auto stash update failed; stash preserved for manual recovery")
+        return jsonify({
+            'success': False,
+            'error': update_result['error'] or 'Unknown error during git pull',
+            'warnings': update_result['warnings'],
+            'local_changes_preserved': stash_created
+        }), 500
+
+    if stash_created and stash_ref:
+        try:
+            subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'stash', 'drop', stash_ref],
+                capture_output=True, text=True, check=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            logger.info(f"Pwn stash {stash_ref} dropped after successful pull")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                drop_err = f"stash drop timed out after {PWN_GIT_TIMEOUT}s"
+            else:
+                drop_err = (getattr(e, 'stderr', '') or str(e)).strip() if hasattr(e, 'stderr') else str(e)
+            logger.warning(f"Pwn stash drop failed (continuing): {drop_err}")
+            update_result['warnings'].append(f"Stash drop failed: {drop_err}")
+
+    return jsonify({
+        'success': True,
+        'message': 'Pwnagotchi update completed successfully',
+        'output': update_result['output'],
+        'warnings': update_result['warnings'],
+        'stash_created': stash_created
+    })
+
 @app.route('/api/system/resolve-conflicts', methods=['POST'])
 def resolve_git_conflicts():
     """Resolve git merge conflicts by resetting to HEAD then pulling latest."""
