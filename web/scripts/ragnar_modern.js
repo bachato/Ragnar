@@ -5442,6 +5442,117 @@ function initializePwnagotchiVisibility() {
     applyPwnVisibilityPreference(isEnabled);
 }
 
+// ============================================================================
+// PWNAGOTCHI BRIDGE UPDATES (independent of Ragnar self-update)
+// ============================================================================
+
+let pwnUpdateInitialChecked = false;
+let pwnUpdateInFlight = false;
+
+function _setPwnUpdateBadge(text, classes) {
+    const el = document.getElementById('pwn-update-status-badge');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'text-xs font-semibold uppercase tracking-wide px-3 py-1 rounded-full self-start whitespace-nowrap ' + classes;
+}
+
+function _setPwnUpdateWarnings(messages) {
+    const el = document.getElementById('pwn-update-warnings');
+    if (!el) return;
+    if (!messages || messages.length === 0) {
+        el.classList.add('hidden');
+        el.innerHTML = '';
+        return;
+    }
+    el.classList.remove('hidden');
+    el.innerHTML = messages.map(m => `<div>&#9888; ${m}</div>`).join('');
+}
+
+function _setPwnUpdatePerformEnabled(enabled) {
+    const btn = document.getElementById('pwn-update-perform-btn');
+    if (!btn) return;
+    btn.disabled = !enabled;
+    btn.className = enabled
+        ? 'flex-1 bg-fuchsia-600 hover:bg-fuchsia-700 text-white py-2 px-4 rounded-lg transition-colors'
+        : 'flex-1 bg-gray-600 text-white py-2 px-4 rounded-lg cursor-not-allowed transition-colors';
+}
+
+function _setPwnUpdateStashVisible(visible) {
+    const btn = document.getElementById('pwn-update-stash-btn');
+    if (!btn) return;
+    if (visible) btn.classList.remove('hidden');
+    else btn.classList.add('hidden');
+}
+
+async function checkPwnUpdates() {
+    const card = document.getElementById('pwn-update-card');
+    if (!card) return;
+    if (pwnUpdateInFlight) return;
+    pwnUpdateInFlight = true;
+    _setPwnUpdateBadge('Checking…', 'bg-slate-700 text-slate-200');
+
+    try {
+        const data = await fetchAPI('/api/pwn/check-updates');
+
+        if (data && data.installed === false) {
+            card.style.display = 'none';
+            return;
+        }
+
+        card.style.display = 'block';
+
+        if (data && data.error) {
+            _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+            _setPwnUpdateWarnings([data.error]);
+            _setPwnUpdatePerformEnabled(false);
+            _setPwnUpdateStashVisible(false);
+            return;
+        }
+
+        const branchEl = document.getElementById('pwn-update-branch');
+        const behindEl = document.getElementById('pwn-update-behind');
+        const curEl = document.getElementById('pwn-update-current-commit');
+        const latEl = document.getElementById('pwn-update-latest-commit');
+        if (branchEl) branchEl.textContent = data.current_branch || '—';
+        if (behindEl) behindEl.textContent = String(data.commits_behind ?? 0);
+        if (curEl) curEl.textContent = data.current_commit || '—';
+        if (latEl) latEl.textContent = data.latest_commit || '—';
+
+        const gitStatus = data.git_status || {};
+        const warnings = [];
+        if (gitStatus.has_conflicts) {
+            warnings.push('Local merge conflicts detected in /opt/pwnagotchi');
+        } else if (gitStatus.is_dirty) {
+            const n = (gitStatus.modified_files || []).length;
+            warnings.push(`${n} local change${n === 1 ? '' : 's'} in /opt/pwnagotchi`);
+        }
+        if (gitStatus.has_stash) {
+            warnings.push(`${gitStatus.stash_entries} stash ${gitStatus.stash_entries === 1 ? 'entry' : 'entries'} present`);
+        }
+        if (gitStatus.status_error) {
+            warnings.push(gitStatus.status_error);
+        }
+        _setPwnUpdateWarnings(warnings);
+
+        if (data.updates_available && (data.commits_behind || 0) > 0) {
+            _setPwnUpdateBadge('Update Available', 'bg-orange-700 text-orange-200');
+            _setPwnUpdatePerformEnabled(true);
+        } else {
+            _setPwnUpdateBadge('Up to Date', 'bg-green-700 text-green-200');
+            _setPwnUpdatePerformEnabled(false);
+        }
+
+        _setPwnUpdateStashVisible(Boolean(gitStatus.is_dirty));
+    } catch (err) {
+        _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+        _setPwnUpdateWarnings([String(err && err.message || err)]);
+        _setPwnUpdatePerformEnabled(false);
+        _setPwnUpdateStashVisible(false);
+    } finally {
+        pwnUpdateInFlight = false;
+    }
+}
+
 function updatePwnToggleAvailability(isHeadless) {
     headlessMode = Boolean(isHeadless);
     const checkbox = document.getElementById('pwnagotchi-enabled');
