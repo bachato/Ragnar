@@ -7729,7 +7729,8 @@ def _execute_pwn_git_update(repo_path: str) -> dict:
                 try:
                     subprocess.run(
                         ['sudo', '-n', 'git', '-C', repo_path, 'reset', '--hard', 'HEAD'],
-                        capture_output=True, text=True, check=True
+                        capture_output=True, text=True, check=True,
+                        timeout=PWN_GIT_TIMEOUT
                     )
                     recovered = True
                     result['warnings'].append("Reset working tree to resolve conflicts and retrying pull")
@@ -7755,7 +7756,8 @@ def _execute_pwn_git_update(repo_path: str) -> dict:
                 try:
                     subprocess.run(
                         ['sudo', '-n', 'git', '-C', repo_path, 'reset', '--hard', 'HEAD'],
-                        capture_output=True, text=True, check=True
+                        capture_output=True, text=True, check=True,
+                        timeout=PWN_GIT_TIMEOUT
                     )
                     result['warnings'].append(f"Auto-recovery: reset working tree and retrying (was: {error_msg})")
                 except Exception:

@@ -5553,6 +5553,7 @@ async function checkPwnUpdates() {
 
         _setPwnUpdateStashVisible(Boolean(gitStatus.is_dirty));
     } catch (err) {
+        card.style.display = 'block';
         _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
         _setPwnUpdateWarnings([String(err && err.message || err)]);
         _setPwnUpdatePerformEnabled(false);
@@ -5575,23 +5576,37 @@ async function performPwnUpdate() {
     _setPwnUpdatePerformEnabled(false);
 
     try {
-        const data = await fetchAPI('/api/pwn/update', {
+        const response = await networkAwareFetch('/api/pwn/update', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
         });
+        if (response.status === 401) {
+            window.location.href = '/login';
+            return;
+        }
+        let data = null;
+        try {
+            data = await response.json();
+        } catch (parseErr) {
+            data = null;
+        }
         const outEl = document.getElementById('pwn-update-output');
         if (outEl) outEl.textContent = (data && (data.output || data.message)) || '';
-        if (!data || data.success === false) {
+        if (!response.ok || !data || data.success === false) {
             _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
             const errMsgs = [];
             if (data && data.error) errMsgs.push(data.error);
             if (data && Array.isArray(data.warnings)) errMsgs.push(...data.warnings);
+            if (!data) errMsgs.push(`HTTP ${response.status}`);
             _setPwnUpdateWarnings(errMsgs.length ? errMsgs : ['Update failed']);
             return;
         }
         if (Array.isArray(data.warnings) && data.warnings.length) {
             _setPwnUpdateWarnings(data.warnings);
+        } else {
+            _setPwnUpdateWarnings([]);
         }
+        _setPwnUpdateBadge('Refreshing…', 'bg-slate-700 text-slate-200');
     } catch (err) {
         _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
         _setPwnUpdateWarnings([String(err && err.message || err)]);
@@ -5616,25 +5631,39 @@ async function stashAndUpdatePwn() {
     _setPwnUpdateStashVisible(false);
 
     try {
-        const data = await fetchAPI('/api/pwn/stash-update', {
+        const response = await networkAwareFetch('/api/pwn/stash-update', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({})
         });
+        if (response.status === 401) {
+            window.location.href = '/login';
+            return;
+        }
+        let data = null;
+        try {
+            data = await response.json();
+        } catch (parseErr) {
+            data = null;
+        }
         const outEl = document.getElementById('pwn-update-output');
         if (outEl) outEl.textContent = (data && (data.output || data.message)) || '';
-        if (!data || data.success === false) {
+        if (!response.ok || !data || data.success === false) {
             _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
             const errMsgs = [];
             if (data && data.error) errMsgs.push(data.error);
             if (data && data.local_changes_preserved) errMsgs.push('Local changes preserved as a git stash.');
             if (data && Array.isArray(data.warnings)) errMsgs.push(...data.warnings);
+            if (!data) errMsgs.push(`HTTP ${response.status}`);
             _setPwnUpdateWarnings(errMsgs.length ? errMsgs : ['Stash update failed']);
             return;
         }
         if (Array.isArray(data.warnings) && data.warnings.length) {
             _setPwnUpdateWarnings(data.warnings);
+        } else {
+            _setPwnUpdateWarnings([]);
         }
+        _setPwnUpdateBadge('Refreshing…', 'bg-slate-700 text-slate-200');
     } catch (err) {
         _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
         _setPwnUpdateWarnings([String(err && err.message || err)]);
