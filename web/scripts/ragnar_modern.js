@@ -5553,6 +5553,59 @@ async function checkPwnUpdates() {
     }
 }
 
+async function performPwnUpdate() {
+    const perfBtn = document.getElementById('pwn-update-perform-btn');
+    if (!perfBtn || perfBtn.disabled) return;
+    if (pwnUpdateInFlight) return;
+
+    const confirmed = confirm('Pull latest Pwnagotchi from origin into /opt/pwnagotchi?\n\nServices are NOT restarted; the new version takes effect on next mode swap or reboot.');
+    if (!confirmed) return;
+
+    pwnUpdateInFlight = true;
+    _setPwnUpdateBadge('Updating…', 'bg-slate-700 text-slate-200');
+    _setPwnUpdatePerformEnabled(false);
+
+    try {
+        const data = await fetchAPI('/api/pwn/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const outEl = document.getElementById('pwn-update-output');
+        if (outEl) outEl.textContent = (data && (data.output || data.message)) || '';
+        if (!data || data.success === false) {
+            _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+            const errMsgs = [];
+            if (data && data.error) errMsgs.push(data.error);
+            if (data && Array.isArray(data.warnings)) errMsgs.push(...data.warnings);
+            _setPwnUpdateWarnings(errMsgs.length ? errMsgs : ['Update failed']);
+            return;
+        }
+        if (Array.isArray(data.warnings) && data.warnings.length) {
+            _setPwnUpdateWarnings(data.warnings);
+        }
+    } catch (err) {
+        _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+        _setPwnUpdateWarnings([String(err && err.message || err)]);
+    } finally {
+        pwnUpdateInFlight = false;
+        // Refresh state from server.
+        checkPwnUpdates();
+    }
+}
+
+function _bindPwnUpdateButtons() {
+    const checkBtn = document.getElementById('pwn-update-check-btn');
+    const perfBtn = document.getElementById('pwn-update-perform-btn');
+    if (checkBtn && !checkBtn.dataset.bound) {
+        checkBtn.dataset.bound = '1';
+        checkBtn.onclick = checkPwnUpdates;
+    }
+    if (perfBtn && !perfBtn.dataset.bound) {
+        perfBtn.dataset.bound = '1';
+        perfBtn.onclick = performPwnUpdate;
+    }
+}
+
 function updatePwnToggleAvailability(isHeadless) {
     headlessMode = Boolean(isHeadless);
     const checkbox = document.getElementById('pwnagotchi-enabled');
