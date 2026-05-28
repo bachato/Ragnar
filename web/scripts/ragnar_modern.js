@@ -5593,9 +5593,52 @@ async function performPwnUpdate() {
     }
 }
 
+async function stashAndUpdatePwn() {
+    const stashBtn = document.getElementById('pwn-update-stash-btn');
+    if (!stashBtn || stashBtn.classList.contains('hidden')) return;
+    if (pwnUpdateInFlight) return;
+
+    const confirmed = confirm('Stash local changes in /opt/pwnagotchi, pull, then drop the stash on success?\n\nLocal changes will be preserved as a git stash if the pull fails.');
+    if (!confirmed) return;
+
+    pwnUpdateInFlight = true;
+    _setPwnUpdateBadge('Stashing & Updating…', 'bg-slate-700 text-slate-200');
+    _setPwnUpdatePerformEnabled(false);
+    _setPwnUpdateStashVisible(false);
+
+    try {
+        const data = await fetchAPI('/api/pwn/stash-update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        const outEl = document.getElementById('pwn-update-output');
+        if (outEl) outEl.textContent = (data && (data.output || data.message)) || '';
+        if (!data || data.success === false) {
+            _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+            const errMsgs = [];
+            if (data && data.error) errMsgs.push(data.error);
+            if (data && data.local_changes_preserved) errMsgs.push('Local changes preserved as a git stash.');
+            if (data && Array.isArray(data.warnings)) errMsgs.push(...data.warnings);
+            _setPwnUpdateWarnings(errMsgs.length ? errMsgs : ['Stash update failed']);
+            return;
+        }
+        if (Array.isArray(data.warnings) && data.warnings.length) {
+            _setPwnUpdateWarnings(data.warnings);
+        }
+    } catch (err) {
+        _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+        _setPwnUpdateWarnings([String(err && err.message || err)]);
+    } finally {
+        pwnUpdateInFlight = false;
+        checkPwnUpdates();
+    }
+}
+
 function _bindPwnUpdateButtons() {
     const checkBtn = document.getElementById('pwn-update-check-btn');
     const perfBtn = document.getElementById('pwn-update-perform-btn');
+    const stashBtn = document.getElementById('pwn-update-stash-btn');
     if (checkBtn && !checkBtn.dataset.bound) {
         checkBtn.dataset.bound = '1';
         checkBtn.onclick = checkPwnUpdates;
@@ -5603,6 +5646,10 @@ function _bindPwnUpdateButtons() {
     if (perfBtn && !perfBtn.dataset.bound) {
         perfBtn.dataset.bound = '1';
         perfBtn.onclick = performPwnUpdate;
+    }
+    if (stashBtn && !stashBtn.dataset.bound) {
+        stashBtn.dataset.bound = '1';
+        stashBtn.onclick = stashAndUpdatePwn;
     }
 }
 
