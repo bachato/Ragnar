@@ -8063,7 +8063,8 @@ def pwn_check_updates():
         subprocess.run(
             ['sudo', '-n', 'git', 'config', '--global',
              'safe.directory', repo_path],
-            capture_output=True, text=True, check=False
+            capture_output=True, text=True, check=False,
+            timeout=PWN_GIT_TIMEOUT
         )
 
         # Fetch (retry once after safe.directory in case it wasn't applied).
@@ -8086,6 +8087,7 @@ def pwn_check_updates():
             }), 500
 
         # Current branch.
+        current_branch = None
         try:
             branch_proc = subprocess.run(
                 ['sudo', '-n', 'git', '-C', repo_path, 'rev-parse',
@@ -8093,10 +8095,18 @@ def pwn_check_updates():
                 check=True, capture_output=True, text=True,
                 timeout=PWN_GIT_TIMEOUT
             )
-            current_branch = branch_proc.stdout.strip() or 'noai'
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            current_branch = 'noai'
+            current_branch = branch_proc.stdout.strip() or None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"Pwn rev-parse failed: {e}")
 
+        if not current_branch or current_branch == 'HEAD':
+            return jsonify({
+                'installed': True,
+                'error': 'Could not determine current branch (detached HEAD or git failure)',
+                'repo_path': repo_path
+            }), 500
+
+        logger.info(f"Pwn current branch is: {current_branch}")
         remote_branch = f'origin/{current_branch}'
 
         # Commits behind.
@@ -8158,8 +8168,9 @@ def pwn_check_updates():
                     git_status['conflicted_files'].append(entry)
             git_status['has_conflicts'] = bool(git_status['conflicted_files'])
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            err_text = getattr(e, 'stderr', '') or str(e)
-            git_status['status_error'] = (err_text or '').strip() if isinstance(err_text, str) else str(e)
+            stderr_val = getattr(e, 'stderr', None)
+            err_msg = stderr_val.strip() if isinstance(stderr_val, str) and stderr_val else str(e)
+            git_status['status_error'] = err_msg
             logger.warning(f"Pwn git status failed: {git_status['status_error']}")
 
         # Stash entries.
@@ -8173,10 +8184,10 @@ def pwn_check_updates():
             git_status['stash_entries'] = len(stash_lines)
             git_status['has_stash'] = git_status['stash_entries'] > 0
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            err_text = getattr(e, 'stderr', '') or str(e)
-            msg = (err_text or '').strip() if isinstance(err_text, str) else str(e)
-            git_status['status_error'] = git_status['status_error'] or msg
-            logger.warning(f"Pwn git stash list failed: {msg}")
+            stderr_val = getattr(e, 'stderr', None)
+            err_msg = stderr_val.strip() if isinstance(stderr_val, str) and stderr_val else str(e)
+            git_status['status_error'] = git_status['status_error'] or err_msg
+            logger.warning(f"Pwn git stash list failed: {err_msg}")
 
         return jsonify({
             'installed': True,
