@@ -8045,6 +8045,154 @@ def stash_and_update():
         'update_output': update_result['output']
     })
 
+@app.route('/api/pwn/check-updates')
+def pwn_check_updates():
+    """Check for updates to the Pwnagotchi clone at PWN_REPO_PATH.
+
+    Returns {'installed': False} when /opt/pwnagotchi/.git is absent so
+    the UI can hide the Updates card and prompt the user to install first.
+    """
+    repo_path = PWN_REPO_PATH
+    git_dir = os.path.join(repo_path, '.git')
+
+    if not os.path.isdir(git_dir):
+        return jsonify({'installed': False})
+
+    try:
+        # Ensure safe.directory so sudo git doesn't complain about ownership.
+        subprocess.run(
+            ['sudo', '-n', 'git', 'config', '--global',
+             'safe.directory', repo_path],
+            capture_output=True, text=True, check=False
+        )
+
+        # Fetch (retry once after safe.directory in case it wasn't applied).
+        try:
+            subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'fetch'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                err = f"git fetch timed out after {PWN_GIT_TIMEOUT}s"
+            else:
+                err = (e.stderr or '').strip() or (e.stdout or '').strip() or str(e)
+            logger.error(f"Pwn git fetch failed: {err}")
+            return jsonify({
+                'installed': True,
+                'error': f'Failed to fetch from remote: {err}',
+                'repo_path': repo_path
+            }), 500
+
+        # Current branch.
+        try:
+            branch_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'rev-parse',
+                 '--abbrev-ref', 'HEAD'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            current_branch = branch_proc.stdout.strip() or 'noai'
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            current_branch = 'noai'
+
+        remote_branch = f'origin/{current_branch}'
+
+        # Commits behind.
+        commits_behind = 0
+        try:
+            behind_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'rev-list', '--count',
+                 f'HEAD..{remote_branch}'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            commits_behind = int(behind_proc.stdout.strip() or '0')
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as e:
+            logger.error(f"Pwn rev-list failed for {remote_branch}: {e}")
+
+        # Current / latest commit oneline.
+        def _oneline(rev: str) -> str:
+            try:
+                p = subprocess.run(
+                    ['sudo', '-n', 'git', '-C', repo_path, 'log', rev,
+                     '--oneline', '-1'],
+                    check=True, capture_output=True, text=True,
+                    timeout=PWN_GIT_TIMEOUT
+                )
+                return p.stdout.strip()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                return ''
+
+        current_commit = _oneline('HEAD')
+        latest_commit = _oneline(remote_branch)
+
+        # Working-tree status.
+        git_status = {
+            'is_dirty': False,
+            'has_conflicts': False,
+            'has_stash': False,
+            'stash_entries': 0,
+            'modified_files': [],
+            'conflicted_files': [],
+            'status_error': ''
+        }
+
+        try:
+            status_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'status', '--porcelain'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            status_lines = [ln for ln in status_proc.stdout.splitlines() if ln.strip()]
+            git_status['is_dirty'] = bool(status_lines)
+
+            conflict_codes = {'AA', 'DD', 'AU', 'UA', 'DU', 'UD', 'UU'}
+            for raw in status_lines:
+                code = raw[:2]
+                path_fragment = raw[3:].strip() if len(raw) > 3 else raw.strip()
+                entry = {'code': code, 'path': path_fragment}
+                git_status['modified_files'].append(entry)
+                if code in conflict_codes or 'U' in code:
+                    git_status['conflicted_files'].append(entry)
+            git_status['has_conflicts'] = bool(git_status['conflicted_files'])
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            err_text = getattr(e, 'stderr', '') or str(e)
+            git_status['status_error'] = (err_text or '').strip() if isinstance(err_text, str) else str(e)
+            logger.warning(f"Pwn git status failed: {git_status['status_error']}")
+
+        # Stash entries.
+        try:
+            stash_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'stash', 'list'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            stash_lines = [ln for ln in stash_proc.stdout.splitlines() if ln.strip()]
+            git_status['stash_entries'] = len(stash_lines)
+            git_status['has_stash'] = git_status['stash_entries'] > 0
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            err_text = getattr(e, 'stderr', '') or str(e)
+            msg = (err_text or '').strip() if isinstance(err_text, str) else str(e)
+            git_status['status_error'] = git_status['status_error'] or msg
+            logger.warning(f"Pwn git stash list failed: {msg}")
+
+        return jsonify({
+            'installed': True,
+            'updates_available': commits_behind > 0,
+            'commits_behind': commits_behind,
+            'current_commit': current_commit,
+            'latest_commit': latest_commit,
+            'current_branch': current_branch,
+            'repo_path': repo_path,
+            'git_status': git_status
+        })
+
+    except Exception as e:
+        logger.error(f"Error in pwn_check_updates: {e}")
+        return jsonify({'installed': True, 'error': str(e)}), 500
+
 @app.route('/api/system/resolve-conflicts', methods=['POST'])
 def resolve_git_conflicts():
     """Resolve git merge conflicts by resetting to HEAD then pulling latest."""
