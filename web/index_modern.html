@@ -4522,6 +4522,55 @@
                         </div>
                     </div>
 
+                    <!-- Pwnagotchi Updates Card -->
+                    <div id="pwn-update-card" class="glass rounded-lg p-4 mt-4" style="display: none;">
+                        <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                            <div>
+                                <h4 class="font-medium text-lg">Pwnagotchi Updates</h4>
+                                <p class="text-xs text-gray-500 mt-1">Pull updates for <code class="text-fuchsia-300">/opt/pwnagotchi</code> from <code class="text-fuchsia-300">PierreGode/pwnagotchiworking</code>. Services are not restarted — changes take effect on the next swap or reboot.</p>
+                            </div>
+                            <span id="pwn-update-status-badge" class="text-xs font-semibold uppercase tracking-wide px-3 py-1 rounded-full bg-slate-700 text-slate-200 self-start whitespace-nowrap">Status Pending</span>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 text-sm text-gray-300">
+                            <div class="flex justify-between">
+                                <span class="text-gray-400">Branch</span>
+                                <span id="pwn-update-branch" class="font-semibold text-slate-200">—</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-400">Commits behind</span>
+                                <span id="pwn-update-behind" class="font-semibold text-slate-200">—</span>
+                            </div>
+                            <div class="flex justify-between md:col-span-2">
+                                <span class="text-gray-400">Current</span>
+                                <span id="pwn-update-current-commit" class="font-mono text-xs text-slate-200 truncate ml-3">—</span>
+                            </div>
+                            <div class="flex justify-between md:col-span-2">
+                                <span class="text-gray-400">Latest</span>
+                                <span id="pwn-update-latest-commit" class="font-mono text-xs text-slate-200 truncate ml-3">—</span>
+                            </div>
+                        </div>
+
+                        <div id="pwn-update-warnings" class="hidden mt-3 p-3 rounded-lg bg-yellow-900/40 border border-yellow-700/60 text-yellow-200 text-xs"></div>
+
+                        <div class="flex flex-col sm:flex-row gap-2 mt-4">
+                            <button id="pwn-update-check-btn" class="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2 px-4 rounded-lg transition-colors">
+                                Check for Updates
+                            </button>
+                            <button id="pwn-update-perform-btn" class="flex-1 bg-gray-600 text-white py-2 px-4 rounded-lg cursor-not-allowed transition-colors" disabled>
+                                Update Pwnagotchi
+                            </button>
+                            <button id="pwn-update-stash-btn" class="flex-1 bg-yellow-700 hover:bg-yellow-600 text-white py-2 px-4 rounded-lg transition-colors hidden">
+                                Stash &amp; Update
+                            </button>
+                        </div>
+
+                        <details class="mt-3">
+                            <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">Last pull output</summary>
+                            <pre id="pwn-update-output" class="mt-2 text-xs text-gray-400 bg-slate-900/60 p-2 rounded whitespace-pre-wrap"></pre>
+                        </details>
+                    </div>
+
                     <!-- Pwnagotchi Configuration Card -->
                     <div id="pwn-config-card" class="glass rounded-lg p-4 mt-4" style="display: none;">
                         <div class="flex items-center justify-between mb-4">
