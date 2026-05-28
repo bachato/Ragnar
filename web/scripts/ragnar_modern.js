@@ -5413,6 +5413,15 @@ function applyPwnVisibilityPreference(isEnabled) {
         pwnSection.style.display = isEnabled ? 'block' : 'none';
     }
     updatePwnDiscoveredCard(pwnStatus);
+
+    // Bind Update-card buttons and fire one-shot check on first reveal.
+    if (isEnabled) {
+        _bindPwnUpdateButtons();
+        if (!pwnUpdateInitialChecked) {
+            pwnUpdateInitialChecked = true;
+            checkPwnUpdates();
+        }
+    }
 }
 
 function togglePwnagotchiVisibility() {
@@ -5440,6 +5449,246 @@ function initializePwnagotchiVisibility() {
     const isEnabled = arePwnFeaturesEnabled();
     checkbox.checked = isEnabled;
     applyPwnVisibilityPreference(isEnabled);
+}
+
+// ============================================================================
+// PWNAGOTCHI BRIDGE UPDATES (independent of Ragnar self-update)
+// ============================================================================
+
+let pwnUpdateInitialChecked = false; // wired in Task 9 (one-shot auto-check on Bridge reveal)
+let pwnUpdateInFlight = false;
+
+function _setPwnUpdateBadge(text, classes) {
+    const el = document.getElementById('pwn-update-status-badge');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'text-xs font-semibold uppercase tracking-wide px-3 py-1 rounded-full self-start whitespace-nowrap ' + classes;
+}
+
+function _setPwnUpdateWarnings(messages) {
+    const el = document.getElementById('pwn-update-warnings');
+    if (!el) return;
+    if (!messages || messages.length === 0) {
+        el.classList.add('hidden');
+        el.innerHTML = '';
+        return;
+    }
+    el.classList.remove('hidden');
+    el.innerHTML = messages.map(m => `<div>&#9888; ${escapeHtml(m)}</div>`).join('');
+}
+
+function _setPwnUpdatePerformEnabled(enabled) {
+    const btn = document.getElementById('pwn-update-perform-btn');
+    if (!btn) return;
+    btn.disabled = !enabled;
+    btn.className = enabled
+        ? 'flex-1 bg-fuchsia-600 hover:bg-fuchsia-700 text-white py-2 px-4 rounded-lg transition-colors'
+        : 'flex-1 bg-gray-600 text-white py-2 px-4 rounded-lg cursor-not-allowed transition-colors';
+}
+
+function _setPwnUpdateStashVisible(visible) {
+    const btn = document.getElementById('pwn-update-stash-btn');
+    if (!btn) return;
+    if (visible) btn.classList.remove('hidden');
+    else btn.classList.add('hidden');
+}
+
+async function checkPwnUpdates() {
+    const card = document.getElementById('pwn-update-card');
+    if (!card) return;
+    if (pwnUpdateInFlight) return;
+    pwnUpdateInFlight = true;
+    _setPwnUpdateBadge('Checking…', 'bg-slate-700 text-slate-200');
+
+    try {
+        const data = await fetchAPI('/api/pwn/check-updates');
+
+        if (data && data.installed === false) {
+            card.style.display = 'none';
+            return;
+        }
+
+        card.style.display = 'block';
+
+        if (data && data.error) {
+            _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+            _setPwnUpdateWarnings([data.error]);
+            _setPwnUpdatePerformEnabled(false);
+            _setPwnUpdateStashVisible(false);
+            return;
+        }
+
+        const branchEl = document.getElementById('pwn-update-branch');
+        const behindEl = document.getElementById('pwn-update-behind');
+        const curEl = document.getElementById('pwn-update-current-commit');
+        const latEl = document.getElementById('pwn-update-latest-commit');
+        if (branchEl) branchEl.textContent = data.current_branch || '—';
+        if (behindEl) behindEl.textContent = String(data.commits_behind ?? 0);
+        if (curEl) curEl.textContent = data.current_commit || '—';
+        if (latEl) latEl.textContent = data.latest_commit || '—';
+
+        const gitStatus = data.git_status || {};
+        const warnings = [];
+        if (gitStatus.has_conflicts) {
+            warnings.push('Local merge conflicts detected in /opt/pwnagotchi');
+        } else if (gitStatus.is_dirty) {
+            const n = (gitStatus.modified_files || []).length;
+            warnings.push(`${n} local change${n === 1 ? '' : 's'} in /opt/pwnagotchi`);
+        }
+        if (gitStatus.has_stash) {
+            warnings.push(`${gitStatus.stash_entries} stash ${gitStatus.stash_entries === 1 ? 'entry' : 'entries'} present`);
+        }
+        if (gitStatus.status_error) {
+            warnings.push(gitStatus.status_error);
+        }
+        _setPwnUpdateWarnings(warnings);
+
+        if (data.updates_available && (data.commits_behind || 0) > 0) {
+            _setPwnUpdateBadge('Update Available', 'bg-orange-700 text-orange-200');
+            _setPwnUpdatePerformEnabled(true);
+        } else {
+            _setPwnUpdateBadge('Up to Date', 'bg-green-700 text-green-200');
+            _setPwnUpdatePerformEnabled(false);
+        }
+
+        _setPwnUpdateStashVisible(Boolean(gitStatus.is_dirty));
+    } catch (err) {
+        card.style.display = 'block';
+        _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+        _setPwnUpdateWarnings([String(err && err.message || err)]);
+        _setPwnUpdatePerformEnabled(false);
+        _setPwnUpdateStashVisible(false);
+    } finally {
+        pwnUpdateInFlight = false;
+    }
+}
+
+async function performPwnUpdate() {
+    const perfBtn = document.getElementById('pwn-update-perform-btn');
+    if (!perfBtn || perfBtn.disabled) return;
+    if (pwnUpdateInFlight) return;
+
+    const confirmed = confirm('Pull latest Pwnagotchi from origin into /opt/pwnagotchi?\n\nServices are NOT restarted; the new version takes effect on next mode swap or reboot.');
+    if (!confirmed) return;
+
+    pwnUpdateInFlight = true;
+    _setPwnUpdateBadge('Updating…', 'bg-slate-700 text-slate-200');
+    _setPwnUpdatePerformEnabled(false);
+
+    try {
+        const response = await networkAwareFetch('/api/pwn/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        if (response.status === 401) {
+            window.location.href = '/login';
+            return;
+        }
+        let data = null;
+        try {
+            data = await response.json();
+        } catch (parseErr) {
+            data = null;
+        }
+        const outEl = document.getElementById('pwn-update-output');
+        if (outEl) outEl.textContent = (data && (data.output || data.message)) || '';
+        if (!response.ok || !data || data.success === false) {
+            _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+            const errMsgs = [];
+            if (data && data.error) errMsgs.push(data.error);
+            if (data && Array.isArray(data.warnings)) errMsgs.push(...data.warnings);
+            if (!data) errMsgs.push(`HTTP ${response.status}`);
+            _setPwnUpdateWarnings(errMsgs.length ? errMsgs : ['Update failed']);
+            return;
+        }
+        if (Array.isArray(data.warnings) && data.warnings.length) {
+            _setPwnUpdateWarnings(data.warnings);
+        } else {
+            _setPwnUpdateWarnings([]);
+        }
+        _setPwnUpdateBadge('Refreshing…', 'bg-slate-700 text-slate-200');
+    } catch (err) {
+        _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+        _setPwnUpdateWarnings([String(err && err.message || err)]);
+    } finally {
+        pwnUpdateInFlight = false;
+        // Refresh state from server.
+        checkPwnUpdates();
+    }
+}
+
+async function stashAndUpdatePwn() {
+    const stashBtn = document.getElementById('pwn-update-stash-btn');
+    if (!stashBtn || stashBtn.classList.contains('hidden')) return;
+    if (pwnUpdateInFlight) return;
+
+    const confirmed = confirm('Stash local changes in /opt/pwnagotchi, pull, then drop the stash on success?\n\nLocal changes will be preserved as a git stash if the pull fails.');
+    if (!confirmed) return;
+
+    pwnUpdateInFlight = true;
+    _setPwnUpdateBadge('Stashing & Updating…', 'bg-slate-700 text-slate-200');
+    _setPwnUpdatePerformEnabled(false);
+    _setPwnUpdateStashVisible(false);
+
+    try {
+        const response = await networkAwareFetch('/api/pwn/stash-update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        if (response.status === 401) {
+            window.location.href = '/login';
+            return;
+        }
+        let data = null;
+        try {
+            data = await response.json();
+        } catch (parseErr) {
+            data = null;
+        }
+        const outEl = document.getElementById('pwn-update-output');
+        if (outEl) outEl.textContent = (data && (data.output || data.message)) || '';
+        if (!response.ok || !data || data.success === false) {
+            _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+            const errMsgs = [];
+            if (data && data.error) errMsgs.push(data.error);
+            if (data && data.local_changes_preserved) errMsgs.push('Local changes preserved as a git stash.');
+            if (data && Array.isArray(data.warnings)) errMsgs.push(...data.warnings);
+            if (!data) errMsgs.push(`HTTP ${response.status}`);
+            _setPwnUpdateWarnings(errMsgs.length ? errMsgs : ['Stash update failed']);
+            return;
+        }
+        if (Array.isArray(data.warnings) && data.warnings.length) {
+            _setPwnUpdateWarnings(data.warnings);
+        } else {
+            _setPwnUpdateWarnings([]);
+        }
+        _setPwnUpdateBadge('Refreshing…', 'bg-slate-700 text-slate-200');
+    } catch (err) {
+        _setPwnUpdateBadge('Error', 'bg-red-700 text-red-200');
+        _setPwnUpdateWarnings([String(err && err.message || err)]);
+    } finally {
+        pwnUpdateInFlight = false;
+        checkPwnUpdates();
+    }
+}
+
+function _bindPwnUpdateButtons() {
+    const checkBtn = document.getElementById('pwn-update-check-btn');
+    const perfBtn = document.getElementById('pwn-update-perform-btn');
+    const stashBtn = document.getElementById('pwn-update-stash-btn');
+    if (checkBtn && !checkBtn.dataset.bound) {
+        checkBtn.dataset.bound = '1';
+        checkBtn.onclick = checkPwnUpdates;
+    }
+    if (perfBtn && !perfBtn.dataset.bound) {
+        perfBtn.dataset.bound = '1';
+        perfBtn.onclick = performPwnUpdate;
+    }
+    if (stashBtn && !stashBtn.dataset.bound) {
+        stashBtn.dataset.bound = '1';
+        stashBtn.onclick = stashAndUpdatePwn;
+    }
 }
 
 function updatePwnToggleAvailability(isHeadless) {

@@ -155,6 +155,11 @@ PWN_CONFIG_FILE = '/etc/pwnagotchi/config.toml'
 PWN_SWAP_DELAY_SECONDS = 1
 PWN_INSTALL_STALE_SECONDS = 600  # Treat installer as stale after 10 minutes
 PWN_SWITCH_STALE_SECONDS = 60  # Consider switch stuck after 60 seconds
+# Path to the Pwnagotchi clone that the Ragnar installer manages.
+# Used by the /api/pwn/* endpoints for update detection and git pull.
+PWN_REPO_PATH = "/opt/pwnagotchi"
+# Max seconds to wait for any single git operation on /opt/pwnagotchi.
+PWN_GIT_TIMEOUT = 120
 RELEASE_GATE_DEFAULT_MESSAGE = (
     "A controlled release is rolling out. Proceeding with a manual update may cause instability."
 )
@@ -7633,6 +7638,138 @@ def _execute_git_update(repo_path: str) -> dict:
     return result
 
 
+def _execute_pwn_git_update(repo_path: str) -> dict:
+    """Run the git pull sequence for the Pwnagotchi clone at repo_path.
+
+    Mirrors `_execute_git_update` but:
+      - All git operations go through `sudo -n` (non-interactive) so a
+        misconfigured NOPASSWD surfaces as an error instead of hanging.
+      - Skips the Ragnar-specific pre-pull chown and post-pull chmod steps.
+      - Never restarts any service (callers handle that decision).
+    """
+    result = {
+        'success': False,
+        'output': '',
+        'error': '',
+        'warnings': []
+    }
+
+    # Remove stale lock files via sudo (the dir is not owned by ragnar).
+    git_dir = os.path.join(repo_path, '.git')
+    for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock',
+                      os.path.join('refs', 'heads', 'noai.lock'),
+                      os.path.join('refs', 'heads', 'main.lock')):
+        lock_path = os.path.join(git_dir, lock_name)
+        try:
+            if os.path.isfile(lock_path):
+                subprocess.run(
+                    ['sudo', '-n', 'rm', '-f', lock_path],
+                    capture_output=True, text=True, check=False
+                )
+        except Exception as e:
+            logger.debug(f"Could not remove {lock_name}: {e}")
+
+    # Ensure safe.directory is configured (avoids ownership errors when
+    # /opt/pwnagotchi is owned by root but git runs via sudo).
+    try:
+        subprocess.run(
+            ['sudo', '-n', 'git', 'config', '--global',
+             'safe.directory', repo_path],
+            capture_output=True, text=True, check=False
+        )
+    except Exception:
+        pass
+
+    # Perform git pull with one automatic retry on failure.
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pull_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'pull'],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            result['output'] = pull_proc.stdout.strip()
+            logger.info(f"Pwn git pull completed: {result['output']}")
+            break  # success
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                error_msg = f"git pull timed out after {PWN_GIT_TIMEOUT}s"
+            else:
+                error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
+            logger.error(f"Pwn git pull attempt {attempt}/{max_attempts} failed: {error_msg}")
+
+            if attempt >= max_attempts:
+                result['error'] = f"Git pull failed: {error_msg}"
+                return result
+
+            # Auto-recover before retrying.
+            recovered = False
+            err_lower = error_msg.lower()
+
+            # Lock file appeared during pull
+            if 'lock' in err_lower or 'another git process' in err_lower:
+                any_removed = False
+                for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock'):
+                    lp = os.path.join(git_dir, lock_name)
+                    if os.path.isfile(lp):
+                        subprocess.run(
+                            ['sudo', '-n', 'rm', '-f', lp],
+                            capture_output=True, text=True, check=False
+                        )
+                        any_removed = True
+                if any_removed:
+                    recovered = True
+                    result['warnings'].append("Removed lock file(s) and retrying pull")
+
+            # Merge conflict or dirty state
+            if 'conflict' in err_lower or 'merge' in err_lower or 'overwritten by merge' in err_lower:
+                try:
+                    subprocess.run(
+                        ['sudo', '-n', 'git', '-C', repo_path, 'reset', '--hard', 'HEAD'],
+                        capture_output=True, text=True, check=True,
+                        timeout=PWN_GIT_TIMEOUT
+                    )
+                    recovered = True
+                    result['warnings'].append("Reset working tree to resolve conflicts and retrying pull")
+                except Exception:
+                    pass
+
+            # Diverged history
+            if 'diverge' in err_lower or 'need to specify' in err_lower:
+                try:
+                    rebase_proc = subprocess.run(
+                        ['sudo', '-n', 'git', '-C', repo_path, 'pull', '--rebase'],
+                        capture_output=True, text=True, check=True,
+                        timeout=PWN_GIT_TIMEOUT
+                    )
+                    result['output'] = rebase_proc.stdout.strip() or 'Pulled with rebase after divergence'
+                    result['warnings'].append("Branches had diverged; resolved with rebase")
+                    break
+                except Exception:
+                    pass
+
+            if not recovered:
+                # Generic recovery: reset and retry
+                try:
+                    subprocess.run(
+                        ['sudo', '-n', 'git', '-C', repo_path, 'reset', '--hard', 'HEAD'],
+                        capture_output=True, text=True, check=True,
+                        timeout=PWN_GIT_TIMEOUT
+                    )
+                    result['warnings'].append(f"Auto-recovery: reset working tree and retrying (was: {error_msg})")
+                except Exception:
+                    result['error'] = f"Git pull failed: {error_msg}"
+                    return result
+
+            logger.info("Pwn auto-recovery applied, retrying git pull...")
+
+    result['success'] = True
+    return result
+
+
 def _schedule_service_restart(delay_seconds: int = 2) -> None:
     """Restart the Ragnar service after a short delay so HTTP responses return first."""
 
@@ -7908,6 +8045,273 @@ def stash_and_update():
         'message': 'Update applied successfully.',
         'warnings': update_result['warnings'],
         'update_output': update_result['output']
+    })
+
+@app.route('/api/pwn/check-updates')
+def pwn_check_updates():
+    """Check for updates to the Pwnagotchi clone at PWN_REPO_PATH.
+
+    Returns {'installed': False} when /opt/pwnagotchi/.git is absent so
+    the UI can hide the Updates card and prompt the user to install first.
+    """
+    repo_path = PWN_REPO_PATH
+    git_dir = os.path.join(repo_path, '.git')
+
+    if not os.path.isdir(git_dir):
+        return jsonify({'installed': False})
+
+    try:
+        # Ensure safe.directory so sudo git doesn't complain about ownership.
+        subprocess.run(
+            ['sudo', '-n', 'git', 'config', '--global',
+             'safe.directory', repo_path],
+            capture_output=True, text=True, check=False,
+            timeout=PWN_GIT_TIMEOUT
+        )
+
+        # Fetch (retry once after safe.directory in case it wasn't applied).
+        try:
+            subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'fetch'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                err = f"git fetch timed out after {PWN_GIT_TIMEOUT}s"
+            else:
+                err = (e.stderr or '').strip() or (e.stdout or '').strip() or str(e)
+            logger.error(f"Pwn git fetch failed: {err}")
+            return jsonify({
+                'installed': True,
+                'error': f'Failed to fetch from remote: {err}',
+                'repo_path': repo_path
+            }), 500
+
+        # Current branch.
+        current_branch = None
+        try:
+            branch_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'rev-parse',
+                 '--abbrev-ref', 'HEAD'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            current_branch = branch_proc.stdout.strip() or None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.error(f"Pwn rev-parse failed: {e}")
+
+        if not current_branch or current_branch == 'HEAD':
+            return jsonify({
+                'installed': True,
+                'error': 'Could not determine current branch (detached HEAD or git failure)',
+                'repo_path': repo_path
+            }), 500
+
+        logger.info(f"Pwn current branch is: {current_branch}")
+        remote_branch = f'origin/{current_branch}'
+
+        # Commits behind.
+        commits_behind = 0
+        try:
+            behind_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'rev-list', '--count',
+                 f'HEAD..{remote_branch}'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            commits_behind = int(behind_proc.stdout.strip() or '0')
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as e:
+            logger.error(f"Pwn rev-list failed for {remote_branch}: {e}")
+
+        # Current / latest commit oneline.
+        def _oneline(rev: str) -> str:
+            try:
+                p = subprocess.run(
+                    ['sudo', '-n', 'git', '-C', repo_path, 'log', rev,
+                     '--oneline', '-1'],
+                    check=True, capture_output=True, text=True,
+                    timeout=PWN_GIT_TIMEOUT
+                )
+                return p.stdout.strip()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                return ''
+
+        current_commit = _oneline('HEAD')
+        latest_commit = _oneline(remote_branch)
+
+        # Working-tree status.
+        git_status = {
+            'is_dirty': False,
+            'has_conflicts': False,
+            'has_stash': False,
+            'stash_entries': 0,
+            'modified_files': [],
+            'conflicted_files': [],
+            'status_error': ''
+        }
+
+        try:
+            status_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'status', '--porcelain'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            status_lines = [ln for ln in status_proc.stdout.splitlines() if ln.strip()]
+            git_status['is_dirty'] = bool(status_lines)
+
+            conflict_codes = {'AA', 'DD', 'AU', 'UA', 'DU', 'UD', 'UU'}
+            for raw in status_lines:
+                code = raw[:2]
+                path_fragment = raw[3:].strip() if len(raw) > 3 else raw.strip()
+                entry = {'code': code, 'path': path_fragment}
+                git_status['modified_files'].append(entry)
+                if code in conflict_codes or 'U' in code:
+                    git_status['conflicted_files'].append(entry)
+            git_status['has_conflicts'] = bool(git_status['conflicted_files'])
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            stderr_val = getattr(e, 'stderr', None)
+            err_msg = stderr_val.strip() if isinstance(stderr_val, str) and stderr_val else str(e)
+            git_status['status_error'] = err_msg
+            logger.warning(f"Pwn git status failed: {git_status['status_error']}")
+
+        # Stash entries.
+        try:
+            stash_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'stash', 'list'],
+                check=True, capture_output=True, text=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            stash_lines = [ln for ln in stash_proc.stdout.splitlines() if ln.strip()]
+            git_status['stash_entries'] = len(stash_lines)
+            git_status['has_stash'] = git_status['stash_entries'] > 0
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            stderr_val = getattr(e, 'stderr', None)
+            err_msg = stderr_val.strip() if isinstance(stderr_val, str) and stderr_val else str(e)
+            git_status['status_error'] = git_status['status_error'] or err_msg
+            logger.warning(f"Pwn git stash list failed: {err_msg}")
+
+        return jsonify({
+            'installed': True,
+            'updates_available': commits_behind > 0,
+            'commits_behind': commits_behind,
+            'current_commit': current_commit,
+            'latest_commit': latest_commit,
+            'current_branch': current_branch,
+            'repo_path': repo_path,
+            'git_status': git_status
+        })
+
+    except Exception as e:
+        logger.error(f"Error in pwn_check_updates: {e}")
+        return jsonify({'installed': True, 'error': str(e)}), 500
+
+@app.route('/api/pwn/update', methods=['POST'])
+def pwn_perform_update():
+    """Run git pull against /opt/pwnagotchi. Does NOT touch any service."""
+    repo_path = PWN_REPO_PATH
+
+    if not os.path.isdir(os.path.join(repo_path, '.git')):
+        return jsonify({
+            'success': False,
+            'error': 'Pwnagotchi is not installed at /opt/pwnagotchi'
+        }), 400
+
+    logger.info(f"Pwn manual update requested at {repo_path}")
+    update_result = _execute_pwn_git_update(repo_path)
+
+    if not update_result['success']:
+        return jsonify({
+            'success': False,
+            'error': update_result['error'] or 'Unknown error during git pull',
+            'warnings': update_result['warnings'],
+            'suggestion': 'Check repository status; SSH in if persistent.'
+        }), 500
+
+    return jsonify({
+        'success': True,
+        'message': 'Pwnagotchi update completed successfully',
+        'output': update_result['output'],
+        'warnings': update_result['warnings']
+    })
+
+@app.route('/api/pwn/stash-update', methods=['POST'])
+def pwn_stash_and_update():
+    """Stash, pull, drop stash (or preserve on failure). Mirrors stash_and_update
+    but operates on /opt/pwnagotchi via sudo."""
+    repo_path = PWN_REPO_PATH
+
+    if not os.path.isdir(os.path.join(repo_path, '.git')):
+        return jsonify({
+            'success': False,
+            'error': 'Pwnagotchi is not installed at /opt/pwnagotchi'
+        }), 400
+
+    payload = request.get_json(silent=True) or {}
+    stash_message = payload.get('message') or f"Ragnar pwn auto stash {datetime.utcnow().isoformat()}"
+    include_untracked = payload.get('include_untracked', True)
+
+    stash_cmd = ['sudo', '-n', 'git', '-C', repo_path, 'stash', 'push']
+    if include_untracked:
+        stash_cmd.append('-u')
+    stash_cmd.extend(['-m', stash_message])
+
+    logger.info("Pwn auto stash + update requested via UI")
+
+    try:
+        stash_proc = subprocess.run(
+            stash_cmd, capture_output=True, text=True, check=True,
+            timeout=PWN_GIT_TIMEOUT
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        if isinstance(e, subprocess.TimeoutExpired):
+            err = f"git stash timed out after {PWN_GIT_TIMEOUT}s"
+        else:
+            err = (e.stderr or e.stdout or '').strip() or str(e)
+        logger.error(f"Pwn git stash failed: {err}")
+        return jsonify({'success': False, 'error': f'Git stash failed: {err}'}), 500
+
+    stash_stdout = (stash_proc.stdout.strip() or stash_proc.stderr.strip() or '')
+    stash_created = 'No local changes to save' not in stash_stdout
+    stash_ref = 'stash@{0}' if stash_created else None
+
+    if stash_created:
+        logger.info(f"Pwn local changes stashed as {stash_ref}")
+    else:
+        logger.info("Pwn auto stash requested but no local changes were found")
+
+    update_result = _execute_pwn_git_update(repo_path)
+    if not update_result['success']:
+        logger.error("Pwn auto stash update failed; stash preserved for manual recovery")
+        return jsonify({
+            'success': False,
+            'error': update_result['error'] or 'Unknown error during git pull',
+            'warnings': update_result['warnings'],
+            'local_changes_preserved': stash_created
+        }), 500
+
+    if stash_created and stash_ref:
+        try:
+            subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'stash', 'drop', stash_ref],
+                capture_output=True, text=True, check=True,
+                timeout=PWN_GIT_TIMEOUT
+            )
+            logger.info(f"Pwn stash {stash_ref} dropped after successful pull")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                drop_err = f"stash drop timed out after {PWN_GIT_TIMEOUT}s"
+            else:
+                drop_err = (getattr(e, 'stderr', '') or str(e)).strip() if hasattr(e, 'stderr') else str(e)
+            logger.warning(f"Pwn stash drop failed (continuing): {drop_err}")
+            update_result['warnings'].append(f"Stash drop failed: {drop_err}")
+
+    return jsonify({
+        'success': True,
+        'message': 'Pwnagotchi update completed successfully',
+        'output': update_result['output'],
+        'warnings': update_result['warnings'],
+        'stash_created': stash_created
     })
 
 @app.route('/api/system/resolve-conflicts', methods=['POST'])
