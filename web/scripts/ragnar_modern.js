@@ -5413,6 +5413,15 @@ function applyPwnVisibilityPreference(isEnabled) {
         pwnSection.style.display = isEnabled ? 'block' : 'none';
     }
     updatePwnDiscoveredCard(pwnStatus);
+
+    // Bind Update-card buttons and fire one-shot check on first reveal.
+    if (isEnabled) {
+        _bindPwnUpdateButtons();
+        if (!pwnUpdateInitialChecked) {
+            pwnUpdateInitialChecked = true;
+            checkPwnUpdates();
+        }
+    }
 }
 
 function togglePwnagotchiVisibility() {
