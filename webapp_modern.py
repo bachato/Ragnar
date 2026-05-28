@@ -7469,6 +7469,10 @@ def deep_scan_host():
 # SYSTEM MANAGEMENT UTILITIES & ENDPOINTS
 # ============================================================================
 
+# Path to the Pwnagotchi clone that the Ragnar installer manages.
+# Used by the /api/pwn/* endpoints for update detection and git pull.
+PWN_REPO_PATH = "/opt/pwnagotchi"
+
 def _execute_git_update(repo_path: str) -> dict:
     """Run the git pull sequence Ragnar uses, returning status metadata."""
     result = {
@@ -7628,6 +7632,132 @@ def _execute_git_update(repo_path: str) -> dict:
         warning = f"Chmod error (continuing): {e}"
         logger.warning(warning)
         result['warnings'].append(warning)
+
+    result['success'] = True
+    return result
+
+
+def _execute_pwn_git_update(repo_path: str) -> dict:
+    """Run the git pull sequence for the Pwnagotchi clone at repo_path.
+
+    Mirrors `_execute_git_update` but:
+      - All git operations go through `sudo -n` (non-interactive) so a
+        misconfigured NOPASSWD surfaces as an error instead of hanging.
+      - Skips the Ragnar-specific pre-pull chown and post-pull chmod steps.
+      - Never restarts any service (callers handle that decision).
+    """
+    result = {
+        'success': False,
+        'output': '',
+        'error': '',
+        'warnings': []
+    }
+
+    # Remove stale lock files via sudo (the dir is not owned by ragnar).
+    git_dir = os.path.join(repo_path, '.git')
+    for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock',
+                      os.path.join('refs', 'heads', 'noai.lock'),
+                      os.path.join('refs', 'heads', 'main.lock')):
+        lock_path = os.path.join(git_dir, lock_name)
+        try:
+            rm_proc = subprocess.run(
+                ['sudo', '-n', 'rm', '-f', lock_path],
+                capture_output=True, text=True, check=False
+            )
+            if rm_proc.returncode == 0 and os.path.exists(lock_path) is False:
+                # Best-effort: we don't know if a file was actually removed
+                # because `rm -f` succeeds either way. Skip warning unless
+                # we have evidence of a stale lock.
+                pass
+        except Exception as e:
+            logger.debug(f"Could not remove {lock_name}: {e}")
+
+    # Ensure safe.directory is configured (avoids ownership errors when
+    # /opt/pwnagotchi is owned by root but git runs via sudo).
+    try:
+        subprocess.run(
+            ['sudo', '-n', 'git', 'config', '--global', '--add',
+             'safe.directory', repo_path],
+            capture_output=True, text=True, check=False
+        )
+    except Exception:
+        pass
+
+    # Perform git pull with one automatic retry on failure.
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pull_proc = subprocess.run(
+                ['sudo', '-n', 'git', '-C', repo_path, 'pull'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            result['output'] = pull_proc.stdout.strip()
+            logger.info(f"Pwn git pull completed: {result['output']}")
+            break  # success
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
+            logger.error(f"Pwn git pull attempt {attempt}/{max_attempts} failed: {error_msg}")
+
+            if attempt >= max_attempts:
+                result['error'] = f"Git pull failed: {error_msg}"
+                return result
+
+            # Auto-recover before retrying.
+            recovered = False
+            err_lower = error_msg.lower()
+
+            # Lock file appeared during pull
+            if 'lock' in err_lower or 'another git process' in err_lower:
+                for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock'):
+                    lp = os.path.join(git_dir, lock_name)
+                    subprocess.run(
+                        ['sudo', '-n', 'rm', '-f', lp],
+                        capture_output=True, text=True, check=False
+                    )
+                recovered = True
+                result['warnings'].append("Removed lock file(s) and retrying pull")
+
+            # Merge conflict or dirty state
+            if 'conflict' in err_lower or 'merge' in err_lower or 'overwritten by merge' in err_lower:
+                try:
+                    subprocess.run(
+                        ['sudo', '-n', 'git', '-C', repo_path, 'reset', '--hard', 'HEAD'],
+                        capture_output=True, text=True, check=True
+                    )
+                    recovered = True
+                    result['warnings'].append("Reset working tree to resolve conflicts and retrying pull")
+                except Exception:
+                    pass
+
+            # Diverged history
+            if 'diverge' in err_lower or 'need to specify' in err_lower:
+                try:
+                    rebase_proc = subprocess.run(
+                        ['sudo', '-n', 'git', '-C', repo_path, 'pull', '--rebase'],
+                        capture_output=True, text=True, check=True
+                    )
+                    result['output'] = rebase_proc.stdout.strip() or 'Pulled with rebase after divergence'
+                    result['warnings'].append("Branches had diverged; resolved with rebase")
+                    result['success'] = True
+                    return result
+                except Exception:
+                    pass
+
+            if not recovered:
+                # Generic recovery: reset and retry
+                try:
+                    subprocess.run(
+                        ['sudo', '-n', 'git', '-C', repo_path, 'reset', '--hard', 'HEAD'],
+                        capture_output=True, text=True, check=True
+                    )
+                    result['warnings'].append(f"Auto-recovery: reset working tree and retrying (was: {error_msg})")
+                except Exception:
+                    result['error'] = f"Git pull failed: {error_msg}"
+                    return result
+
+            logger.info("Pwn auto-recovery applied, retrying git pull...")
 
     result['success'] = True
     return result
