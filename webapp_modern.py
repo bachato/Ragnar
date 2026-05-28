@@ -155,6 +155,11 @@ PWN_CONFIG_FILE = '/etc/pwnagotchi/config.toml'
 PWN_SWAP_DELAY_SECONDS = 1
 PWN_INSTALL_STALE_SECONDS = 600  # Treat installer as stale after 10 minutes
 PWN_SWITCH_STALE_SECONDS = 60  # Consider switch stuck after 60 seconds
+# Path to the Pwnagotchi clone that the Ragnar installer manages.
+# Used by the /api/pwn/* endpoints for update detection and git pull.
+PWN_REPO_PATH = "/opt/pwnagotchi"
+# Max seconds to wait for any single git operation on /opt/pwnagotchi.
+PWN_GIT_TIMEOUT = 120
 RELEASE_GATE_DEFAULT_MESSAGE = (
     "A controlled release is rolling out. Proceeding with a manual update may cause instability."
 )
@@ -7469,10 +7474,6 @@ def deep_scan_host():
 # SYSTEM MANAGEMENT UTILITIES & ENDPOINTS
 # ============================================================================
 
-# Path to the Pwnagotchi clone that the Ragnar installer manages.
-# Used by the /api/pwn/* endpoints for update detection and git pull.
-PWN_REPO_PATH = "/opt/pwnagotchi"
-
 def _execute_git_update(repo_path: str) -> dict:
     """Run the git pull sequence Ragnar uses, returning status metadata."""
     result = {
@@ -7660,15 +7661,11 @@ def _execute_pwn_git_update(repo_path: str) -> dict:
                       os.path.join('refs', 'heads', 'main.lock')):
         lock_path = os.path.join(git_dir, lock_name)
         try:
-            rm_proc = subprocess.run(
-                ['sudo', '-n', 'rm', '-f', lock_path],
-                capture_output=True, text=True, check=False
-            )
-            if rm_proc.returncode == 0 and os.path.exists(lock_path) is False:
-                # Best-effort: we don't know if a file was actually removed
-                # because `rm -f` succeeds either way. Skip warning unless
-                # we have evidence of a stale lock.
-                pass
+            if os.path.isfile(lock_path):
+                subprocess.run(
+                    ['sudo', '-n', 'rm', '-f', lock_path],
+                    capture_output=True, text=True, check=False
+                )
         except Exception as e:
             logger.debug(f"Could not remove {lock_name}: {e}")
 
@@ -7676,7 +7673,7 @@ def _execute_pwn_git_update(repo_path: str) -> dict:
     # /opt/pwnagotchi is owned by root but git runs via sudo).
     try:
         subprocess.run(
-            ['sudo', '-n', 'git', 'config', '--global', '--add',
+            ['sudo', '-n', 'git', 'config', '--global',
              'safe.directory', repo_path],
             capture_output=True, text=True, check=False
         )
@@ -7691,13 +7688,17 @@ def _execute_pwn_git_update(repo_path: str) -> dict:
                 ['sudo', '-n', 'git', '-C', repo_path, 'pull'],
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=PWN_GIT_TIMEOUT
             )
             result['output'] = pull_proc.stdout.strip()
             logger.info(f"Pwn git pull completed: {result['output']}")
             break  # success
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                error_msg = f"git pull timed out after {PWN_GIT_TIMEOUT}s"
+            else:
+                error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
             logger.error(f"Pwn git pull attempt {attempt}/{max_attempts} failed: {error_msg}")
 
             if attempt >= max_attempts:
@@ -7710,14 +7711,18 @@ def _execute_pwn_git_update(repo_path: str) -> dict:
 
             # Lock file appeared during pull
             if 'lock' in err_lower or 'another git process' in err_lower:
+                any_removed = False
                 for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock'):
                     lp = os.path.join(git_dir, lock_name)
-                    subprocess.run(
-                        ['sudo', '-n', 'rm', '-f', lp],
-                        capture_output=True, text=True, check=False
-                    )
-                recovered = True
-                result['warnings'].append("Removed lock file(s) and retrying pull")
+                    if os.path.isfile(lp):
+                        subprocess.run(
+                            ['sudo', '-n', 'rm', '-f', lp],
+                            capture_output=True, text=True, check=False
+                        )
+                        any_removed = True
+                if any_removed:
+                    recovered = True
+                    result['warnings'].append("Removed lock file(s) and retrying pull")
 
             # Merge conflict or dirty state
             if 'conflict' in err_lower or 'merge' in err_lower or 'overwritten by merge' in err_lower:
@@ -7736,12 +7741,12 @@ def _execute_pwn_git_update(repo_path: str) -> dict:
                 try:
                     rebase_proc = subprocess.run(
                         ['sudo', '-n', 'git', '-C', repo_path, 'pull', '--rebase'],
-                        capture_output=True, text=True, check=True
+                        capture_output=True, text=True, check=True,
+                        timeout=PWN_GIT_TIMEOUT
                     )
                     result['output'] = rebase_proc.stdout.strip() or 'Pulled with rebase after divergence'
                     result['warnings'].append("Branches had diverged; resolved with rebase")
-                    result['success'] = True
-                    return result
+                    break
                 except Exception:
                     pass
 
