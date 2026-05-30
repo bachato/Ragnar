@@ -53,6 +53,8 @@ Access Ragnar's dashboard at `http://<ragnar-ip>:8000`
 
 The portal supports network scanning with signal strength, manual entry for hidden SSIDs, known network management, and one-tap reconnection.
 
+web will be down during wardrive without ap or wifi connection.
+
 ---
 
 ## 🌟 Features
