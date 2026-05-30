@@ -1380,22 +1380,23 @@ class Display:
             if spd is not None and spd > 0:
                 stats_bottom.append(("Speed", f"{spd:.1f}km/h"))
 
-        # Companion (Piglet / Huginn) — STATIC row, always rendered so the user
-        # can tell at a glance whether a companion firmware is attached.
-        companion = (wd.get('companion_name') or '').strip()
-        if wd.get('serial_connected') and companion:
-            stats_bottom.append(("Companion", companion))
-            cached = wd.get('serial_networks', 0)
-            if cached > 0:
-                stats_bottom.append(("Cached", f"{cached} nets"))
-            if companion == 'Piglet':
-                nodes = wd.get('mesh_node_count', 0)
+        # Companions — show each connected device separately so the user can
+        # see a Huginn + Piglet + Piglet Core at a glance.
+        companions = wd.get('companions') or []
+        active_companions = [c for c in companions if c.get('connected')]
+        if active_companions:
+            for c in active_companions:
+                label = c.get('name') or 'Companion'
+                stats_bottom.append(("Companion", label))
+                nets = c.get('networks', 0)
+                if nets > 0:
+                    stats_bottom.append(("  Nets", str(nets)))
+                nodes = c.get('mesh_node_count', 0)
                 if nodes > 0:
-                    stats_bottom.append(("Mesh Nodes", str(nodes)))
-            elif companion == 'Huginn':
-                ble = wd.get('esp_ble_count', 0)
+                    stats_bottom.append(("  Nodes", str(nodes)))
+                ble = c.get('esp_ble_count', 0)
                 if ble > 0:
-                    stats_bottom.append(("BLE Devs", str(ble)))
+                    stats_bottom.append(("  BLE", str(ble)))
         else:
             stats_bottom.append(("Companion", "None"))
 

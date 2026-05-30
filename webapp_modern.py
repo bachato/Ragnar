@@ -6583,45 +6583,43 @@ def wardriving_import_csv():
 
 @app.route('/api/wardriving/serial/detect', methods=['GET'])
 def wardriving_serial_detect():
-    """Auto-detect ESP32 on serial ports."""
+    """Auto-detect all ESP32 companions on serial ports."""
     try:
         engine = _get_wardriving_engine()
-        port = engine._detect_esp32_serial()
-        if port:
-            return jsonify({'found': True, 'port': port})
-        return jsonify({'found': False, 'port': ''})
+        ports = engine._detect_all_esp32_serial()
+        return jsonify({'found': bool(ports), 'ports': ports, 'port': ports[0] if ports else ''})
     except Exception as e:
         logger.error(f"Wardriving serial detect error: {e}")
-        return jsonify({'found': False, 'error': str(e)})
+        return jsonify({'found': False, 'ports': [], 'port': '', 'error': str(e)})
 
 @app.route('/api/wardriving/serial', methods=['GET', 'POST'])
 def wardriving_serial():
-    """Get or set serial ESP32 listener configuration."""
+    """Get or set serial ESP32 listener configuration. Supports multiple companions."""
     try:
         engine = _get_wardriving_engine()
 
         if request.method == 'GET':
+            companions = [c.as_dict() for c in engine._companions.values()]
             return jsonify({
                 'connected': engine.serial_connected,
                 'port': engine._serial_port or '',
-                'networks': engine.serial_networks
+                'networks': engine.serial_networks,
+                'companions': companions,
             })
 
         data = request.get_json() or {}
         action = data.get('action', 'start')
 
         if action == 'stop':
-            result = engine.stop_serial()
+            port = data.get('port')  # None = stop all
+            result = engine.stop_serial(port)
             return jsonify(result)
         else:
             port = data.get('port', '')
             if not port:
                 return jsonify({'error': 'No serial port specified'}), 400
-            # Basic port validation
             if not re.match(r'^(/dev/tty[A-Za-z0-9]+|COM\d+)$', port):
                 return jsonify({'error': 'Invalid serial port format'}), 400
-            # Save to config
-            shared_data.config['wardriving_serial_port'] = port
             result = engine.start_serial(port)
             return jsonify(result)
     except Exception as e:
