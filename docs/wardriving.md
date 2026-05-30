@@ -14,7 +14,16 @@ Ragnar supports **five operating modes**, in any combination — all five can ru
 | 4 | **+ Piglet Coordinator (USB)** | Dedicated [Coordinator](https://pierregode.github.io/Ragnar/) firmware on a Waveshare ESP32-C5 *or* ESP32-S3-Touch-LCD-4B | Receives records from a fleet of Piglet mesh nodes over ESP-Now and forwards them to Ragnar live |
 | 5 | **+ Piglet Core (USB)** | A regular Piglet board running mesh `core` mode, tethered to Ragnar | Same idea as #4 but on a standard Piglet — the Core scans locally *and* aggregates its mesh nodes, streaming the combined feed to Ragnar |
 
-Modes 1+2, 1+3, 1+4, 1+5 are all common. Modes 4 and 5 are alternative coordinator implementations — pick whichever hardware you have. All four serial companions are auto-detected on the same `/dev/ttyACM*` paths; Ragnar identifies which one is on the wire from its boot banner.
+All modes can be combined simultaneously — including multiples of the same type. Ragnar scans all `/dev/ttyACM*` and `/dev/ttyUSB*` ports at startup, starts a dedicated thread for every Espressif device it finds, and identifies each one from its boot banner. Example fleet: 2 USB WiFi antennas + 1 HuginnESP + 1 Piglet + 1 Piglet Core with 5 mesh nodes — all streams merge into the same session DB.
+
+**Companion identification banner** (emitted at boot over USB-serial):
+
+| Companion | Banner key | Banner value |
+|-----------|-----------|--------------|
+| HuginnESP | `{"device":"HuginnESP",...}` | Detected via `device` field |
+| Piglet (standard) | `{"device":"Piglet",...}` | Falls back to WiGLE CSV header |
+| Piglet Core (T-Dongle C5, mesh-core mode) | `{"device":"PigletCore",...}` | Upgraded after config load |
+| Piglet Coordinator (dedicated FW) | `{"device":"RagnarCoord",...}` | Dedicated coordinator firmware |
 
 Everything logged automatically receives GPS coordinates if a GPS receiver is connected.
 
