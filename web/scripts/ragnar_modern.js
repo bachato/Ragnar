@@ -9074,22 +9074,23 @@ function renderComplianceCIS(data, summaryEl, resultsEl) {
         resultsEl.innerHTML = '<p class="text-gray-400 text-sm">No Lynis audit data found. Run a Lynis SSH audit against a host with known credentials, then refresh.</p>';
         return;
     }
-    let html = '<table class="w-full text-sm"><thead><tr class="text-gray-400 text-left">' +
-        '<th class="py-2 pr-3">CIS Area</th><th class="py-2 pr-3">Topic</th><th class="py-2 pr-3">Status</th>' +
-        '<th class="py-2 pr-3">Warn</th><th class="py-2 pr-3">Sugg</th><th class="py-2">Findings</th></tr></thead><tbody>';
+    let html = '<table class="min-w-[680px] w-full text-sm"><thead><tr class="text-gray-400 text-left border-b border-slate-700">' +
+        '<th class="py-2 pr-3 whitespace-nowrap">CIS Area</th><th class="py-2 pr-3 whitespace-nowrap">Topic</th>' +
+        '<th class="py-2 pr-3 whitespace-nowrap">Status</th><th class="py-2 pr-3 whitespace-nowrap text-right">Warn</th>' +
+        '<th class="py-2 pr-3 whitespace-nowrap text-right">Sugg</th><th class="py-2 whitespace-nowrap">Findings</th></tr></thead><tbody>';
     rows.forEach(r => {
         const findingList = r.findings || [];
         const findings = findingList.slice(0, 5).map(f =>
-            `<div class="text-xs text-gray-400"><span class="font-mono text-gray-500">${complianceEscape(f.host)} · ${complianceEscape(f.code)}</span> — ${complianceEscape((f.message || '').slice(0, 120))}</div>`
+            `<div class="text-xs text-gray-400 break-words"><span class="font-mono text-gray-500">${complianceEscape(f.host)} · ${complianceEscape(f.code)}</span> — ${complianceEscape((f.message || '').slice(0, 120))}</div>`
         ).join('');
         const more = findingList.length > 5 ? `<div class="text-xs text-gray-600">…and ${findingList.length - 5} more</div>` : '';
         html += `<tr class="border-t border-slate-700/60 align-top">
-            <td class="py-2 pr-3 text-gray-200">${complianceEscape(r.control)}</td>
+            <td class="py-2 pr-3 text-gray-200 whitespace-nowrap">${complianceEscape(r.control)}</td>
             <td class="py-2 pr-3 text-gray-300">${complianceEscape(r.title)}</td>
-            <td class="py-2 pr-3">${complianceStatusBadge(r.status)}</td>
-            <td class="py-2 pr-3 text-gray-300">${r.warnings}</td>
-            <td class="py-2 pr-3 text-gray-300">${r.suggestions}</td>
-            <td class="py-2">${findings}${more || (findings ? '' : '—')}</td>
+            <td class="py-2 pr-3 whitespace-nowrap">${complianceStatusBadge(r.status)}</td>
+            <td class="py-2 pr-3 text-right text-gray-300">${r.warnings}</td>
+            <td class="py-2 pr-3 text-right text-gray-300">${r.suggestions}</td>
+            <td class="py-2 min-w-[220px] break-words">${findings}${more || (findings ? '' : '—')}</td>
         </tr>`;
     });
     html += '</tbody></table>';
@@ -9111,17 +9112,18 @@ function renderCompliancePCI(data, summaryEl, resultsEl) {
         resultsEl.innerHTML = '<p class="text-gray-400 text-sm">No data available.</p>';
         return;
     }
-    let html = '<table class="w-full text-sm"><thead><tr class="text-gray-400 text-left">' +
-        '<th class="py-2 pr-3">Req</th><th class="py-2 pr-3">Title</th><th class="py-2 pr-3">Status</th>' +
-        '<th class="py-2 pr-3">Guidance</th><th class="py-2">Evidence</th></tr></thead><tbody>';
+    let html = '<table class="min-w-[680px] w-full text-sm"><thead><tr class="text-gray-400 text-left border-b border-slate-700">' +
+        '<th class="py-2 pr-3 whitespace-nowrap">Req</th><th class="py-2 pr-3 whitespace-nowrap">Title</th>' +
+        '<th class="py-2 pr-3 whitespace-nowrap">Status</th><th class="py-2 pr-3 whitespace-nowrap">Guidance</th>' +
+        '<th class="py-2 whitespace-nowrap">Evidence</th></tr></thead><tbody>';
     rows.forEach(r => {
-        const evidence = (r.evidence || []).map(x => `<div class="text-xs text-gray-400">${complianceEscape(x)}</div>`).join('') || '—';
+        const evidence = (r.evidence || []).map(x => `<div class="text-xs text-gray-400 break-words">${complianceEscape(x)}</div>`).join('') || '—';
         html += `<tr class="border-t border-slate-700/60 align-top">
-            <td class="py-2 pr-3 font-mono text-gray-200">${complianceEscape(r.id)}</td>
+            <td class="py-2 pr-3 font-mono text-gray-200 whitespace-nowrap">${complianceEscape(r.id)}</td>
             <td class="py-2 pr-3 text-gray-300">${complianceEscape(r.title)}</td>
-            <td class="py-2 pr-3">${complianceStatusBadge(r.status)}</td>
-            <td class="py-2 pr-3 text-xs text-gray-500">${complianceEscape(r.guidance)}</td>
-            <td class="py-2">${evidence}</td>
+            <td class="py-2 pr-3 whitespace-nowrap">${complianceStatusBadge(r.status)}</td>
+            <td class="py-2 pr-3 text-xs text-gray-500 min-w-[180px] break-words">${complianceEscape(r.guidance)}</td>
+            <td class="py-2 min-w-[220px] break-words">${evidence}</td>
         </tr>`;
     });
     html += '</tbody></table>';
