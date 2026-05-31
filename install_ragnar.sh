@@ -372,49 +372,37 @@ check_system_compatibility() {
 check_internet() {
     log "INFO" "Checking internet connectivity..."
     
-    # Try to ping common servers (bounded so a filtered/dead route can't hang the installer)
-    if ping -c 2 -W 3 -w 6 8.8.8.8 > /dev/null 2>&1 || ping -c 2 -W 3 -w 6 1.1.1.1 > /dev/null 2>&1; then
+    # Try to ping common servers
+    if ping -c 2 8.8.8.8 > /dev/null 2>&1 || ping -c 2 1.1.1.1 > /dev/null 2>&1; then
         log "SUCCESS" "Internet connectivity confirmed"
-
+        
         # Test DNS resolution
-        if ping -c 1 -W 3 -w 6 pypi.org > /dev/null 2>&1; then
+        if ping -c 1 pypi.org > /dev/null 2>&1; then
             log "SUCCESS" "DNS resolution working"
         else
             log "WARNING" "DNS resolution issues detected. Package installation may be slow."
             log "INFO" "Consider checking /etc/resolv.conf or your network settings"
         fi
         return 0
+    else
+        log "WARNING" "No internet connectivity detected!"
+        echo -e "${YELLOW}Internet connection is required to download Python packages.${NC}"
+        echo -e "${YELLOW}Please check your network connection and try again.${NC}"
+        echo -e "\nDo you want to:"
+        echo "1. Continue anyway (installation may fail)"
+        echo "2. Exit and fix network issues first (recommended)"
+        read -r choice
+        case $choice in
+            1) 
+                log "WARNING" "Continuing without verified internet connection"
+                return 0
+                ;;
+            *)
+                log "INFO" "Installation aborted - please fix network issues first"
+                clean_exit 1
+                ;;
+        esac
     fi
-
-    # ICMP can be filtered even on a perfectly healthy network. Before declaring
-    # the box offline, verify what pip actually needs: HTTPS reachability to PyPI.
-    log "INFO" "ICMP unreachable; verifying HTTPS reachability to PyPI..."
-    if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 https://pypi.org/simple/ -o /dev/null 2>/dev/null; then
-        log "SUCCESS" "Internet connectivity confirmed via HTTPS (ICMP appears blocked)"
-        return 0
-    fi
-    if command -v wget >/dev/null 2>&1 && wget -q --timeout=10 --tries=1 --spider https://pypi.org/simple/ 2>/dev/null; then
-        log "SUCCESS" "Internet connectivity confirmed via HTTPS (ICMP appears blocked)"
-        return 0
-    fi
-
-    log "WARNING" "No internet connectivity detected!"
-    echo -e "${YELLOW}Internet connection is required to download Python packages.${NC}"
-    echo -e "${YELLOW}Please check your network connection and try again.${NC}"
-    echo -e "\nDo you want to:"
-    echo "1. Continue anyway (installation may fail)"
-    echo "2. Exit and fix network issues first (recommended)"
-    read -r choice
-    case $choice in
-        1)
-            log "WARNING" "Continuing without verified internet connection"
-            return 0
-            ;;
-        *)
-            log "INFO" "Installation aborted - please fix network issues first"
-            clean_exit 1
-            ;;
-    esac
 }
 
 

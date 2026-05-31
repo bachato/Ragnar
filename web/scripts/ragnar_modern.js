@@ -4687,6 +4687,17 @@ async function loadPwnConfig() {
         _setPwnCfgChecked('pwn-cfg-memtemp', cfg['main.plugins.memtemp.enabled']);
         _setPwnCfgChecked('pwn-cfg-grid', cfg['main.plugins.grid.enabled']);
         _setPwnCfgChecked('pwn-cfg-fix-services', cfg['main.plugins.fix_services.enabled']);
+
+        // Manual mode is a launcher flag, not a TOML key, so it has its own endpoint.
+        try {
+            const manualResp = await fetchAPI('/api/pwnagotchi/manual-mode');
+            if (manualResp && manualResp.success) {
+                _setPwnCfgChecked('pwn-manual-mode', manualResp.enabled);
+            }
+        } catch (manualErr) {
+            console.error('Error loading Pwnagotchi manual mode:', manualErr);
+        }
+
         _showPwnConfigAlert(alert, 'Configuration loaded', 'success');
         setTimeout(() => { if (alert) alert.classList.add('hidden'); }, 2000);
     } catch (error) {
@@ -4728,6 +4739,17 @@ async function savePwnConfig() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ config })
         });
+
+        // Manual mode is a launcher flag, not a TOML key, so it saves separately.
+        const manualEnabled = document.getElementById('pwn-manual-mode')?.checked || false;
+        const manualResponse = await fetchAPI('/api/pwnagotchi/manual-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: manualEnabled })
+        });
+        if (manualResponse && manualResponse.success) {
+            pwnStatus.manual_mode = manualEnabled;
+        }
 
         if (response && response.success) {
             _showPwnConfigAlert(alert, `Saved ${response.updated?.length || 0} setting(s). Changes apply on next Pwnagotchi start.`, 'success');
@@ -8944,6 +8966,168 @@ async function downloadPentestReport() {
         console.error('Report download error:', error);
         addConsoleMessage(`Failed to download report: ${error.message}`, 'error');
     }
+}
+
+// ============================================================================
+// COMPLIANCE – CIS / PCI DSS reporting
+// ============================================================================
+
+let complianceFramework = 'cis';
+let threatIntelSubtab = 'vulns';
+
+function showThreatIntelSubtab(which) {
+    threatIntelSubtab = which;
+    const vulns = document.getElementById('ti-sub-vulns');
+    const comp = document.getElementById('ti-sub-compliance');
+    const vBtn = document.getElementById('ti-subtab-vulns');
+    const cBtn = document.getElementById('ti-subtab-compliance');
+    if (vulns) vulns.classList.toggle('hidden', which !== 'vulns');
+    if (comp) comp.classList.toggle('hidden', which !== 'compliance');
+    const active = 'ti-subtab px-4 py-2 text-sm font-semibold border-b-2 border-Ragnar-500 text-white -mb-px';
+    const idle = 'ti-subtab px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-white -mb-px';
+    if (vBtn) vBtn.className = which === 'vulns' ? active : idle;
+    if (cBtn) cBtn.className = which === 'compliance' ? active : idle;
+    if (which === 'compliance') loadComplianceData();
+}
+
+function complianceEscape(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+    ));
+}
+
+function complianceStatusBadge(status) {
+    const map = {
+        attention: ['Action needed', 'text-red-400'],
+        review: ['Review', 'text-yellow-400'],
+        ok: ['No issues', 'text-green-400'],
+        not_assessed: ['Not assessed', 'text-gray-400'],
+    };
+    const [label, cls] = map[status] || [status, 'text-gray-400'];
+    return `<span class="${cls} font-semibold">${label}</span>`;
+}
+
+function complianceStatCard(value, label, color) {
+    return `<div class="glass rounded-lg p-3 text-center">
+        <div class="text-2xl font-bold ${color || 'text-white'}">${value}</div>
+        <div class="text-xs text-gray-400 uppercase tracking-wide mt-1">${label}</div>
+    </div>`;
+}
+
+function setComplianceFramework(fw) {
+    complianceFramework = fw;
+    const cisBtn = document.getElementById('compliance-tab-cis');
+    const pciBtn = document.getElementById('compliance-tab-pci');
+    if (cisBtn && pciBtn) {
+        const active = 'px-4 py-1.5 text-sm bg-Ragnar-600 text-white';
+        const idle = 'px-4 py-1.5 text-sm bg-slate-700 text-gray-300 hover:bg-slate-600';
+        cisBtn.className = fw === 'cis' ? active : idle;
+        pciBtn.className = fw === 'pci' ? active : idle;
+    }
+    loadComplianceData();
+}
+
+function refreshComplianceData() {
+    loadComplianceData();
+}
+
+function exportComplianceReport() {
+    const a = document.createElement('a');
+    a.href = '/api/compliance/export';
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    addConsoleMessage('Compliance report exported', 'success');
+}
+
+async function loadComplianceData() {
+    const summaryEl = document.getElementById('compliance-summary');
+    const resultsEl = document.getElementById('compliance-results');
+    if (!resultsEl) return;
+    resultsEl.innerHTML = '<p class="text-gray-500 text-sm">Loading…</p>';
+    if (summaryEl) summaryEl.innerHTML = '';
+    try {
+        const data = await fetchAPI(`/api/compliance/${complianceFramework}`);
+        if (complianceFramework === 'cis') {
+            renderComplianceCIS(data, summaryEl, resultsEl);
+        } else {
+            renderCompliancePCI(data, summaryEl, resultsEl);
+        }
+    } catch (err) {
+        resultsEl.innerHTML = `<p class="text-red-400 text-sm">Failed to load compliance data: ${complianceEscape(err.message)}</p>`;
+    }
+}
+
+function renderComplianceCIS(data, summaryEl, resultsEl) {
+    const s = data.summary || {};
+    if (summaryEl) {
+        summaryEl.innerHTML = [
+            complianceStatCard(s.hosts_assessed || 0, 'Hosts Audited'),
+            complianceStatCard(s.controls_flagged || 0, 'Controls Flagged', 'text-red-400'),
+            complianceStatCard(s.controls_review || 0, 'Review', 'text-yellow-400'),
+            complianceStatCard(s.avg_hardening_index == null ? 'n/a' : s.avg_hardening_index, 'Avg Hardening Index'),
+        ].join('');
+    }
+    const rows = data.controls || [];
+    if (!rows.length) {
+        resultsEl.innerHTML = '<p class="text-gray-400 text-sm">No Lynis audit data found. Run a Lynis SSH audit against a host with known credentials, then refresh.</p>';
+        return;
+    }
+    let html = '<table class="min-w-[680px] w-full text-sm"><thead><tr class="text-gray-400 text-left border-b border-slate-700">' +
+        '<th class="py-2 pr-3 whitespace-nowrap">CIS Area</th><th class="py-2 pr-3 whitespace-nowrap">Topic</th>' +
+        '<th class="py-2 pr-3 whitespace-nowrap">Status</th><th class="py-2 pr-3 whitespace-nowrap text-right">Warn</th>' +
+        '<th class="py-2 pr-3 whitespace-nowrap text-right">Sugg</th><th class="py-2 whitespace-nowrap">Findings</th></tr></thead><tbody>';
+    rows.forEach(r => {
+        const findingList = r.findings || [];
+        const findings = findingList.slice(0, 5).map(f =>
+            `<div class="text-xs text-gray-400 break-words"><span class="font-mono text-gray-500">${complianceEscape(f.host)} · ${complianceEscape(f.code)}</span> — ${complianceEscape((f.message || '').slice(0, 120))}</div>`
+        ).join('');
+        const more = findingList.length > 5 ? `<div class="text-xs text-gray-600">…and ${findingList.length - 5} more</div>` : '';
+        html += `<tr class="border-t border-slate-700/60 align-top">
+            <td class="py-2 pr-3 text-gray-200 whitespace-nowrap">${complianceEscape(r.control)}</td>
+            <td class="py-2 pr-3 text-gray-300">${complianceEscape(r.title)}</td>
+            <td class="py-2 pr-3 whitespace-nowrap">${complianceStatusBadge(r.status)}</td>
+            <td class="py-2 pr-3 text-right text-gray-300">${r.warnings}</td>
+            <td class="py-2 pr-3 text-right text-gray-300">${r.suggestions}</td>
+            <td class="py-2 min-w-[220px] break-words">${findings}${more || (findings ? '' : '—')}</td>
+        </tr>`;
+    });
+    html += '</tbody></table>';
+    resultsEl.innerHTML = html;
+}
+
+function renderCompliancePCI(data, summaryEl, resultsEl) {
+    const s = data.summary || {};
+    if (summaryEl) {
+        summaryEl.innerHTML = [
+            complianceStatCard(s.requirements_total || 0, 'Requirements'),
+            complianceStatCard(s.attention || 0, 'Action Needed', 'text-red-400'),
+            complianceStatCard(s.ok || 0, 'No Issues', 'text-green-400'),
+            complianceStatCard(s.not_assessed || 0, 'Not Assessed', 'text-gray-400'),
+        ].join('');
+    }
+    const rows = data.requirements || [];
+    if (!rows.length) {
+        resultsEl.innerHTML = '<p class="text-gray-400 text-sm">No data available.</p>';
+        return;
+    }
+    let html = '<table class="min-w-[680px] w-full text-sm"><thead><tr class="text-gray-400 text-left border-b border-slate-700">' +
+        '<th class="py-2 pr-3 whitespace-nowrap">Req</th><th class="py-2 pr-3 whitespace-nowrap">Title</th>' +
+        '<th class="py-2 pr-3 whitespace-nowrap">Status</th><th class="py-2 pr-3 whitespace-nowrap">Guidance</th>' +
+        '<th class="py-2 whitespace-nowrap">Evidence</th></tr></thead><tbody>';
+    rows.forEach(r => {
+        const evidence = (r.evidence || []).map(x => `<div class="text-xs text-gray-400 break-words">${complianceEscape(x)}</div>`).join('') || '—';
+        html += `<tr class="border-t border-slate-700/60 align-top">
+            <td class="py-2 pr-3 font-mono text-gray-200 whitespace-nowrap">${complianceEscape(r.id)}</td>
+            <td class="py-2 pr-3 text-gray-300">${complianceEscape(r.title)}</td>
+            <td class="py-2 pr-3 whitespace-nowrap">${complianceStatusBadge(r.status)}</td>
+            <td class="py-2 pr-3 text-xs text-gray-500 min-w-[180px] break-words">${complianceEscape(r.guidance)}</td>
+            <td class="py-2 min-w-[220px] break-words">${evidence}</td>
+        </tr>`;
+    });
+    html += '</tbody></table>';
+    resultsEl.innerHTML = html;
 }
 
 // ============================================================================

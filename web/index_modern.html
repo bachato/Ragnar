@@ -2075,6 +2075,11 @@
 
         <!-- Threat Intelligence Tab -->
         <div id="threat-intel-tab" class="tab-content hidden">
+            <div class="flex items-center gap-1 mb-5 border-b border-slate-800">
+                <button id="ti-subtab-vulns" onclick="showThreatIntelSubtab('vulns')" class="ti-subtab px-4 py-2 text-sm font-semibold border-b-2 border-Ragnar-500 text-white -mb-px">Vulnerabilities by Host</button>
+                <button id="ti-subtab-compliance" onclick="showThreatIntelSubtab('compliance')" class="ti-subtab px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-white -mb-px">Compliance</button>
+            </div>
+            <div id="ti-sub-vulns">
             <div class="mb-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
                 <div>
                     <h1 class="text-3xl font-bold text-white mb-2">🛡️ Vulnerabilities by Host</h1>
@@ -2293,9 +2298,36 @@
                 </div>
             </div>
             </div><!-- End legacy threat intel section -->
+            </div><!-- End #ti-sub-vulns -->
+
+            <div id="ti-sub-compliance" class="hidden">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-4 gap-3">
+                    <div>
+                        <h2 class="text-2xl font-bold text-white">Compliance</h2>
+                        <p class="text-sm text-gray-400">CIS hardening &amp; PCI DSS mapping from Lynis audits + scan findings</p>
+                    </div>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <div class="inline-flex rounded-lg overflow-hidden border border-slate-600">
+                            <button id="compliance-tab-cis" onclick="setComplianceFramework('cis')" class="px-4 py-1.5 text-sm bg-Ragnar-600 text-white">CIS</button>
+                            <button id="compliance-tab-pci" onclick="setComplianceFramework('pci')" class="px-4 py-1.5 text-sm bg-slate-700 text-gray-300 hover:bg-slate-600">PCI DSS</button>
+                        </div>
+                        <button onclick="refreshComplianceData()" class="px-3 py-1.5 text-sm rounded-lg bg-slate-700 text-gray-200 hover:bg-slate-600">Refresh</button>
+                        <button onclick="exportComplianceReport()" class="px-3 py-1.5 text-sm rounded-lg bg-Ragnar-600 text-white hover:bg-Ragnar-500">Export HTML</button>
+                    </div>
+                </div>
+
+                <div class="glass rounded-lg p-3 mb-4 border-l-4 border-yellow-500 text-xs text-gray-300">
+                    <strong class="text-yellow-400">Informal / internal report.</strong>
+                    Mappings are a curated subset. This is not a certified CIS-CAT assessment or PCI DSS ASV scan, and findings are not false-positive validated.
+                </div>
+
+                <div id="compliance-summary" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
+                <div id="compliance-results" class="glass rounded-xl p-4 overflow-x-auto">
+                    <p class="text-gray-500 text-sm">Loading…</p>
+                </div>
+            </div>
         </div>
-        
-        <!-- Files Tab -->
+
         <div id="files-tab" class="tab-content hidden">
             <div class="glass rounded-xl p-6">
                 <div class="flex items-center justify-between mb-6">
@@ -4561,6 +4593,16 @@
                                 <h5 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-wide pt-2">Personality</h5>
                                 <div class="flex items-center justify-between">
                                     <div>
+                                        <label class="text-xs text-gray-400">Start in Manual Mode</label>
+                                        <p class="text-xs text-gray-500">Boot paused (MANU), no auto-hunting</p>
+                                    </div>
+                                    <label class="relative inline-flex items-center cursor-pointer">
+                                        <input type="checkbox" id="pwn-manual-mode" class="sr-only peer">
+                                        <div class="w-9 h-5 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-fuchsia-600"></div>
+                                    </label>
+                                </div>
+                                <div class="flex items-center justify-between">
+                                    <div>
                                         <label class="text-xs text-gray-400">Deauth Attacks</label>
                                         <p class="text-xs text-gray-500">Send deauth to capture handshakes</p>
                                     </div>
@@ -5120,7 +5162,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260530b"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260531d"></script>
 
 </body>
 </html>
