@@ -37,9 +37,38 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Detect the primary Wi-Fi interface without assuming the name is wlan0.
+# Mirrors detect_wifi_interface() in shared.py: nmcli first, then sysfs.
+# Honours an explicit RAGNAR_WIFI_IFACE override.
+detect_wifi_interface() {
+    if [ -n "$RAGNAR_WIFI_IFACE" ]; then
+        echo "$RAGNAR_WIFI_IFACE"
+        return 0
+    fi
+
+    if command -v nmcli >/dev/null 2>&1; then
+        local dev
+        dev=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
+        if [ -n "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+    fi
+
+    local path
+    for path in /sys/class/net/*; do
+        if [ -d "$path/wireless" ] || [ -e "$path/phy80211" ]; then
+            basename "$path"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 check_requirements() {
     print_status "Checking system requirements..."
-    
+
     # Check if running on Raspberry Pi
     if ! grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
         print_warning "This system doesn't appear to be a Raspberry Pi"
@@ -49,13 +78,17 @@ check_requirements() {
             exit 1
         fi
     fi
-    
-    # Check for Wi-Fi interface
-    if ! ip link show wlan0 &>/dev/null; then
-        print_error "No wlan0 interface found. This system may not have Wi-Fi capability."
+
+    # Check for a Wi-Fi interface (any name: wlan0, wlp*, wlx*, ...)
+    # '|| true' so 'set -e' doesn't abort before the friendly error below.
+    WIFI_IFACE="$(detect_wifi_interface)" || true
+    if [ -z "$WIFI_IFACE" ]; then
+        print_error "No Wi-Fi interface found. This system may not have Wi-Fi capability."
+        print_error "If your adapter uses a non-standard name, set RAGNAR_WIFI_IFACE=<name> and re-run."
         exit 1
     fi
-    
+    print_status "Using Wi-Fi interface: $WIFI_IFACE"
+
     # Check Python version
     if ! python3 --version | grep -q "Python 3\.[89]" && ! python3 --version | grep -q "Python 3\.1[0-9]"; then
         print_warning "Python 3.8+ recommended for best compatibility"

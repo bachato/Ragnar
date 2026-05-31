@@ -11,8 +11,10 @@ NC='\033[0m' # No Color
 # Configuration
 HOSTAPD_CONFIG="/tmp/ragnar/hostapd.conf"
 DNSMASQ_CONFIG="/tmp/ragnar/dnsmasq.conf"
-INTERFACE="wlan0"
+# INTERFACE is resolved at runtime in main(); explicit override wins.
+INTERFACE="${RAGNAR_WIFI_IFACE:-}"
 AP_IP="192.168.4.1"
+NAT_STATE_FILE="/tmp/ragnar/nat_uplink"
 
 print_status() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -28,6 +30,48 @@ print_error() {
 
 print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Detect the primary Wi-Fi interface without assuming the name is wlan0.
+# Mirrors detect_wifi_interface() in shared.py: nmcli first, then sysfs.
+detect_wifi_interface() {
+    if [ -n "$RAGNAR_WIFI_IFACE" ]; then
+        echo "$RAGNAR_WIFI_IFACE"
+        return 0
+    fi
+
+    if command -v nmcli >/dev/null 2>&1; then
+        local dev
+        dev=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
+        if [ -n "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+    fi
+
+    local path
+    for path in /sys/class/net/*; do
+        if [ -d "$path/wireless" ] || [ -e "$path/phy80211" ]; then
+            basename "$path"
+            return 0
+        fi
+    done
+
+    echo "wlan0"
+    return 1
+}
+
+# Find the uplink (internet-facing) interface for NAT: the device carrying the
+# default route, excluding the AP interface itself. Returns empty if none.
+detect_uplink_interface() {
+    local ap="$1"
+    local dev
+    dev=$(ip route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    if [ -n "$dev" ] && [ "$dev" != "$ap" ]; then
+        echo "$dev"
+        return 0
+    fi
+    return 1
 }
 
 # Check if running as root
@@ -139,32 +183,51 @@ cleanup_ap() {
 # Set up NAT and forwarding rules
 setup_nat() {
     print_status "Setting up NAT rules..."
-    
+
     # Enable IP forwarding
     echo 1 > /proc/sys/net/ipv4/ip_forward
-    
-    # Set up iptables rules for NAT
-    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o wlan1 -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -s 192.168.4.0/24 ! -d 192.168.4.0/24 -j MASQUERADE
-    
-    iptables -A FORWARD -i "$INTERFACE" -o eth0 -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "$INTERFACE" -o wlan1 -j ACCEPT 2>/dev/null || true
-    
+
+    # Route AP clients out through whatever interface currently has internet,
+    # instead of assuming the uplink is eth0/wlan1.
+    local uplink
+    uplink="$(detect_uplink_interface "$INTERFACE")"
+
+    if [ -n "$uplink" ]; then
+        print_status "Using uplink interface for NAT: $uplink"
+        iptables -t nat -A POSTROUTING -o "$uplink" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s 192.168.4.0/24 ! -d 192.168.4.0/24 -j MASQUERADE
+        iptables -A FORWARD -i "$INTERFACE" -o "$uplink" -j ACCEPT 2>/dev/null || true
+        mkdir -p "$(dirname "$NAT_STATE_FILE")" 2>/dev/null || true
+        echo "$uplink" > "$NAT_STATE_FILE" 2>/dev/null || true
+    else
+        print_warning "No uplink interface detected; using generic masquerade rule"
+        iptables -t nat -A POSTROUTING -s 192.168.4.0/24 ! -d 192.168.4.0/24 -j MASQUERADE
+        rm -f "$NAT_STATE_FILE" 2>/dev/null || true
+    fi
+
     iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-    
+
     print_success "NAT rules configured"
 }
 
 # Clean up NAT rules
 cleanup_nat() {
     print_status "Cleaning up NAT rules..."
-    
-    # Remove specific rules (this is a simplified cleanup)
-    iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -o wlan1 -j MASQUERADE 2>/dev/null || true
+
+    # Tear down the uplink rule recorded by setup_nat, if any.
+    if [ -f "$NAT_STATE_FILE" ]; then
+        local uplink
+        uplink="$(cat "$NAT_STATE_FILE" 2>/dev/null)"
+        if [ -n "$uplink" ]; then
+            iptables -t nat -D POSTROUTING -o "$uplink" -j MASQUERADE 2>/dev/null || true
+            iptables -D FORWARD -i "$INTERFACE" -o "$uplink" -j ACCEPT 2>/dev/null || true
+        fi
+        rm -f "$NAT_STATE_FILE" 2>/dev/null || true
+    fi
+
+    # Also remove the generic subnet rule if present.
     iptables -t nat -D POSTROUTING -s 192.168.4.0/24 ! -d 192.168.4.0/24 -j MASQUERADE 2>/dev/null || true
-    
+
     print_success "NAT rules cleaned up"
 }
 
@@ -318,7 +381,12 @@ show_help() {
 main() {
     local command="$1"
     shift
-    
+
+    # Resolve the Wi-Fi interface once per invocation (override > nmcli > sysfs).
+    if [ -z "$INTERFACE" ]; then
+        INTERFACE="$(detect_wifi_interface)"
+    fi
+
     case "$command" in
         start-ap)
             check_root
