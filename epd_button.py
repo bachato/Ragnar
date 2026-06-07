@@ -28,6 +28,13 @@ KEY2_PIN = 6
 KEY3_PIN = 13
 KEY4_PIN = 19
 
+# Other apps that drive the same 2.7" HAT and grab these exact GPIO buttons.
+# If one is running it claims the pins first and Ragnar's listener fails with
+# 'GPIO busy'. Stopped on demand when wardriving starts so Ragnar can own the
+# keys (see EPDButtonListener.ensure_available). Override via config key
+# 'wardriving_button_reclaim_services'.
+CONFLICTING_BUTTON_SERVICES = ['airprint.service']
+
 # Display pages
 PAGE_MAIN = 0         # Default Ragnar display
 PAGE_NETWORK = 1      # Network scanner stats
@@ -82,6 +89,44 @@ class EPDButtonListener:
             except Exception:
                 pass
         self._buttons = []
+
+    def ensure_available(self):
+        """Make sure Ragnar owns the HAT buttons, reclaiming them if needed.
+
+        Called when wardriving starts. If the listener never got the GPIO
+        lines because another app grabbed them first (e.g. airprint.service —
+        a standalone Waveshare button app), stop those services and retry once.
+        Returns True if the buttons are usable afterwards.
+        """
+        if self.available:
+            return True
+        services = self.shared_data.config.get(
+            'wardriving_button_reclaim_services', CONFLICTING_BUTTON_SERVICES)
+        freed = False
+        for svc in services or []:
+            if self._stop_service(svc):
+                freed = True
+        if freed:
+            time.sleep(0.5)   # let the kernel release the GPIO lines
+            self.stop()       # drop any partial handles from the failed start
+            self.start()      # retry claiming the pins
+        return self.available
+
+    @staticmethod
+    def _stop_service(name):
+        """Stop a systemd service holding the HAT buttons (only if active)."""
+        try:
+            active = subprocess.run(['systemctl', 'is-active', name],
+                                    capture_output=True, text=True).stdout.strip()
+            if active != 'active':
+                return False
+            logger.info(f"Reclaiming HAT buttons: stopping {name}")
+            subprocess.run(['sudo', 'systemctl', 'stop', name],
+                           capture_output=True, text=True, timeout=10)
+            return True
+        except Exception as e:
+            logger.warning(f"Could not stop {name}: {e}")
+            return False
 
     def _is_wardriving_active(self):
         """Return True if the wardriving engine is currently running."""

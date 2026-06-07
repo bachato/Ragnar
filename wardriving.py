@@ -1567,6 +1567,10 @@ class WardrivingEngine:
             self._start_companion_thread(port)
             logger.info(f"Companion auto-detected on {port}")
 
+        # Make sure the e-paper HAT keys are ours — a standalone button app
+        # (e.g. airprint.service) may have grabbed the GPIO pins at boot.
+        self._ensure_hat_buttons()
+
         logger.info(f"Wardriving started: interfaces={self.interfaces}, GPS={gps_ok}, device={self.device_name}")
         return {
             'success': True,
@@ -1575,6 +1579,21 @@ class WardrivingEngine:
             'gps_available': gps_ok,
             'gps_port': self._gps.port if gps_ok else None
         }
+
+    def _ensure_hat_buttons(self):
+        """Reclaim the 2.7" e-paper HAT buttons for Ragnar when wardriving
+        starts, in case another app (airprint.service) holds the GPIO pins."""
+        try:
+            display = getattr(self.shared_data, 'display_instance', None)
+            listener = getattr(display, 'button_listener', None) if display else None
+            if listener is None or not hasattr(listener, 'ensure_available'):
+                return
+            if listener.ensure_available():
+                logger.info("Wardriving: e-paper HAT buttons ready")
+            else:
+                logger.warning("Wardriving: could not reclaim e-paper HAT buttons")
+        except Exception as e:
+            logger.debug(f"HAT button reclaim skipped: {e}")
 
     def _trigger_wifi_reconnect_on_disconnect(self, source: str, port: str):
         """Attempt WiFi reconnect after a companion or USB antenna disconnects.
