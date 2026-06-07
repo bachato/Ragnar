@@ -3314,6 +3314,33 @@ class WardrivingEngine:
         except Exception:
             pass
 
+    @staticmethod
+    def _resolve_coords(raw_lat, raw_lon, raw_alt, gps_lat, gps_lon, gps_alt):
+        """Resolve the coordinates to store for a companion record.
+
+        Companions (notably Huginn, which often runs without its own GPS) may
+        emit records with no lat/lon, a JSON null, or the 0/0 "no fix"
+        sentinel. When the companion's position is missing or invalid and
+        Ragnar has its own fix, we stamp Ragnar's GPS onto the record so the
+        data still lands on the map.
+
+        Returns ``(lat, lon, alt, from_companion)`` where ``from_companion`` is
+        True only when the companion supplied a real position — letting the
+        caller decide whether to forward it to the GPS manager as an external
+        fix (we must not feed Ragnar's own GPS back as a companion fix).
+        """
+        def _f(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        lat, lon, alt = _f(raw_lat), _f(raw_lon), _f(raw_alt)
+        if lat is None or lon is None or (lat == 0.0 and lon == 0.0):
+            return gps_lat, gps_lon, gps_alt, False
+        if alt is None:
+            alt = gps_alt
+        return lat, lon, alt, True
+
     def _parse_serial_line(self, line: str, companion: '_CompanionState'):
         """Parse a single line from one ESP32 serial companion."""
         if not self.session:
@@ -3551,17 +3578,16 @@ class WardrivingEngine:
                 rssi = int(data.get('rssi', data.get('signal', -80)))
                 channel = int(data.get('channel', 0))
                 auth = data.get('auth', data.get('security', data.get('encryption', '')))
-                lat = data.get('lat', data.get('latitude', gps_lat))
-                lon = data.get('lon', data.get('longitude', gps_lon))
-                alt = data.get('alt', data.get('altitude', gps_alt))
                 record_type = data.get('type', 'WIFI').upper()
 
-                if lat:
-                    lat = float(lat)
-                if lon:
-                    lon = float(lon)
-                if alt:
-                    alt = float(alt)
+                # Huginn frequently has no GPS of its own — stamp Ragnar's fix
+                # when the record lacks a valid position.
+                lat, lon, alt, from_companion = self._resolve_coords(
+                    data.get('lat', data.get('latitude')),
+                    data.get('lon', data.get('longitude')),
+                    data.get('alt', data.get('altitude')),
+                    gps_lat, gps_lon, gps_alt,
+                )
 
                 if record_type in ('BT', 'BLE', 'BLUETOOTH'):
                     companion.current_esp_mode = 'ble-all'
@@ -3580,7 +3606,7 @@ class WardrivingEngine:
                     )
                     if is_new:
                         companion.networks += 1
-                if lat is not None and lon is not None and self._gps is not None:
+                if from_companion and self._gps is not None:
                     self._gps.update_external_fix(lat, lon, alt,
                                                    source=companion.name or 'companion')
                 return
