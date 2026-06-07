@@ -1315,6 +1315,11 @@ class WardrivingEngine:
         self.scan_interval = 2  # seconds between scans (fast!)
         self.interfaces = []     # WiFi interfaces to use
         self._iface_swap_lock = threading.Lock()  # guards lend/reclaim of a scan iface
+        # USB-serial hot-plug monitor: stable_id -> {'role','node'} for every
+        # managed GPS/companion device. Driven by _device_monitor_loop so a puck
+        # or companion plugged/swapped after start is picked up within seconds.
+        self._managed_devices = {}
+        self._device_monitor_thread = None
         self._iface_zero_scans = {}  # consecutive zero-network scans per interface
         self._iface_prepared = set()  # interfaces successfully brought up at least once
         self._iface_last_error = {}  # most informative scan-failure reason per interface
@@ -1556,17 +1561,17 @@ class WardrivingEngine:
         self._cell_thread = threading.Thread(target=self._cell_scan_loop, daemon=True, name="wardriving-cell")
         self._cell_thread.start()
 
-        # Start serial ESP32 listeners — one thread per detected companion.
-        # Guards against two real failure modes seen in practice:
-        #   1. Same port as GPS: opening /dev/ttyACM0 twice makes both threads read
-        #      half the bytes each. GPS reports 0 satellites; serial listener parses
-        #      NMEA as garbage and mis-classifies the device as Piglet.
-        #   2. Stale saved port: shared_data.config holds a port from a previous
-        #      session, but the ESP32 has been unplugged. Re-verify via udevadm.
-        all_detected = self._detect_all_esp32_serial()
-        for port in all_detected:
-            self._start_companion_thread(port)
-            logger.info(f"Companion auto-detected on {port}")
+        # Continuous USB-serial device monitor — discovers and classifies GPS
+        # pucks and ESP32 companions (Huginn/Piglet/Core/Coordinator) on the fly
+        # and attaches/detaches handlers on hot-plug. Replaces the old one-shot
+        # detection so a device that appears late (the u-blox 7 enumerates ~3.5
+        # min after boot and re-enumerates), or a Huginn→Piglet swap, is picked
+        # up within seconds with no restart. Its first tick handles whatever is
+        # already plugged in.
+        self._managed_devices = {}
+        self._device_monitor_thread = threading.Thread(
+            target=self._device_monitor_loop, daemon=True, name="wardriving-usb-monitor")
+        self._device_monitor_thread.start()
 
         # Make sure the e-paper HAT keys are ours — a standalone button app
         # (e.g. airprint.service) may have grabbed the GPIO pins at boot.
@@ -1915,6 +1920,159 @@ class WardrivingEngine:
             return 'Espressif' in result.stdout or 'espressif' in result.stdout.lower()
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # Continuous USB-serial device monitor (GPS + companions, hot-plug)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _enumerate_serial_devices():
+        """Return {stable_id: node} for every present USB-serial device.
+
+        stable_id is the /dev/serial/by-id basename when available (it encodes
+        vendor + serial, so it survives ttyACM* renumbering on hubs/replug);
+        otherwise the real device node path. This lets the monitor tell a
+        re-enumeration (same id, new node) from a genuine add/remove.
+        """
+        import glob as _glob
+        devices = {}
+        seen_nodes = set()
+        by_id = '/dev/serial/by-id'
+        try:
+            if os.path.isdir(by_id):
+                for entry in os.listdir(by_id):
+                    node = os.path.realpath(os.path.join(by_id, entry))
+                    if os.path.exists(node):
+                        devices[entry] = node
+                        seen_nodes.add(node)
+        except Exception:
+            pass
+        try:
+            for node in _glob.glob('/dev/ttyACM*') + _glob.glob('/dev/ttyUSB*'):
+                real = os.path.realpath(node)
+                if real not in seen_nodes:
+                    devices[real] = real
+                    seen_nodes.add(real)
+        except Exception:
+            pass
+        return devices
+
+    @staticmethod
+    def _usb_props(node):
+        """Return (vid, pid, descriptive_string) from udev for a serial node.
+        Uses `-q property` (ID_VENDOR_ID/ID_MODEL_ID/ID_SERIAL/…) — reliable and
+        does NOT open the port (so it never resets an ESP)."""
+        try:
+            r = subprocess.run(
+                ['udevadm', 'info', '-q', 'property', '--name', node],
+                capture_output=True, text=True, timeout=3
+            )
+            props = {}
+            for line in r.stdout.splitlines():
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    props[k] = v
+            vid = (props.get('ID_VENDOR_ID') or '').lower()
+            pid = (props.get('ID_MODEL_ID') or '').lower()
+            desc = ' '.join(filter(None, (
+                props.get('ID_SERIAL'), props.get('ID_VENDOR'),
+                props.get('ID_MODEL'), props.get('ID_MODEL_FROM_DATABASE'),
+                props.get('ID_VENDOR_FROM_DATABASE'),
+            ))).lower()
+            return vid, pid, desc
+        except Exception:
+            return '', '', ''
+
+    def _classify_serial_port(self, node):
+        """Classify a newly-seen serial port: 'gps' | 'companion' | 'unknown'.
+
+        udev-attribute first (no port open). Only truly ambiguous generic
+        bridges (CP210x/CH340/FTDI) get a short, bounded NMEA probe — and a
+        device with no GPS/ESP/bridge markers is left alone so Ragnar never
+        hijacks an unrelated USB-serial gadget.
+        """
+        vid, _pid, desc = self._usb_props(node)
+        # GPS markers (u-blox VID 1546, or a GPS/GNSS product string).
+        if vid == '1546' or any(k in desc for k in ('u-blox', 'ublox', 'gnss', 'gps', 'nmea')):
+            return 'gps'
+        # Espressif / companion markers.
+        if vid == '303a' or 'espressif' in desc or 'usb jtag' in desc:
+            return 'companion'
+        # Ambiguous USB-UART bridge (common on ESP/GPS dev boards): probe NMEA.
+        if vid in ('10c4', '1a86', '0403', '067b') or not vid:
+            try:
+                from gps_manager import _probe_nmea
+                if _probe_nmea(node, timeout_per_baud=1.0):
+                    return 'gps'
+            except Exception:
+                pass
+            # A bridge that isn't a GPS is almost always an ESP companion board.
+            return 'companion'
+        return 'unknown'
+
+    def _attach_device(self, role, node):
+        """Attach the right handler for a newly-classified device."""
+        if role == 'gps':
+            if self._gps is None:
+                return False
+            if self._gps.attach(node):
+                logger.info(f"[usb-monitor] GPS attached on {node}")
+                return True
+            logger.warning(f"[usb-monitor] GPS attach failed on {node}")
+            return False
+        if role == 'companion':
+            if self._start_companion_thread(node) is not None:
+                logger.info(f"[usb-monitor] companion attached on {node}")
+                return True
+            return False
+        return False
+
+    def _detach_device(self, entry):
+        """Tear down the handler for a device that was unplugged."""
+        role, node = entry.get('role'), entry.get('node')
+        if role == 'gps' and self._gps is not None:
+            logger.info(f"[usb-monitor] GPS unplugged ({node}) — detaching")
+            self._gps.detach()
+        elif role == 'companion':
+            logger.info(f"[usb-monitor] companion unplugged ({node}) — stopping listener")
+            self.stop_serial(node)
+
+    def _device_monitor_loop(self):
+        """Poll the USB-serial device set ~every 1.5 s; attach/detach GPS and
+        companion handlers as devices appear, disappear, or re-enumerate."""
+        logger.info("[usb-monitor] started")
+        while self._running:
+            try:
+                present = self._enumerate_serial_devices()
+                managed = self._managed_devices
+
+                # Removals: a managed device id is no longer present.
+                for dev_id in list(managed.keys()):
+                    if dev_id not in present:
+                        self._detach_device(managed.pop(dev_id))
+
+                # Additions / re-enumerations.
+                for dev_id, node in present.items():
+                    cur = managed.get(dev_id)
+                    if cur is None:
+                        role = self._classify_serial_port(node)
+                        if role == 'unknown':
+                            # Record so we don't re-probe an unrelated gadget every tick.
+                            managed[dev_id] = {'role': 'unknown', 'node': node}
+                        elif self._attach_device(role, node):
+                            managed[dev_id] = {'role': role, 'node': node}
+                    elif cur['node'] != node:
+                        # Same device, new tty node (re-enumeration) → re-point.
+                        self._detach_device(cur)
+                        role = cur['role'] if cur['role'] != 'unknown' else self._classify_serial_port(node)
+                        if role != 'unknown' and self._attach_device(role, node):
+                            managed[dev_id] = {'role': role, 'node': node}
+                        else:
+                            managed[dev_id] = {'role': 'unknown', 'node': node}
+            except Exception as e:
+                logger.debug(f"[usb-monitor] tick error: {e}")
+            time.sleep(1.5)
+        logger.info("[usb-monitor] stopped")
 
     def _get_interface_info(self, iface):
         """Get detailed info about a WiFi interface (bands, manufacturer, USB/built-in)."""
