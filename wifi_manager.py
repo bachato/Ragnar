@@ -119,6 +119,10 @@ class WiFiManager:
         self.ap_interface = self.default_wifi_interface
         self.ap_ip = "192.168.4.1"
         self.ap_subnet = "192.168.4.0/24"
+        # Wardriving AP (KEY1 on the e-paper) — brought up on a spare adapter
+        # so wardriving keeps running. Track prior state for clean teardown.
+        self._wardrive_ap_prev_interface = None
+        self._wardrive_ap_paused = False
         
         # Control flags
         self.should_exit = False
@@ -2362,6 +2366,107 @@ class WiFiManager:
             self.ap_logger.error(f"Traceback: {traceback.format_exc()}")
             return False
     
+    def _wardriving_engine(self):
+        """Return the running wardriving engine instance, or None."""
+        try:
+            ragnar = getattr(self.shared_data, 'ragnar_instance', None)
+            engine = getattr(ragnar, '_wd_engine', None) if ragnar else None
+            if engine is not None and getattr(engine, '_running', False):
+                return engine
+        except Exception:
+            pass
+        return None
+
+    def _find_wardrive_ap_interface(self):
+        """Pick a managed WiFi adapter for AP use that wardriving is NOT
+        scanning on. Prefer the default interface when it is free, otherwise
+        any other adapter. Returns the interface name, or None when every
+        adapter is busy wardriving (caller then falls back to pausing).
+        """
+        try:
+            engine = self._wardriving_engine()
+            busy = set(getattr(engine, 'interfaces', []) or []) if engine else set()
+            names = [i.get('name', '') for i in gather_wifi_interfaces(self.default_wifi_interface)]
+            names = [n for n in names if n]
+            if self.default_wifi_interface in names and self.default_wifi_interface not in busy:
+                return self.default_wifi_interface
+            for name in names:
+                if name not in busy:
+                    return name
+        except Exception as exc:
+            self.logger.debug(f"Wardrive AP interface detection failed: {exc}")
+        return None
+
+    def start_wardrive_ap(self):
+        """Bring up AP mode on a spare adapter so a phone can watch the live
+        wardriving page, WITHOUT stopping wardriving. Falls back to pausing
+        wardriving on the default interface if no spare adapter is free.
+
+        Acts as a toggle: a second call while the wardrive AP is up tears it
+        down again. Safe to call from a button-handler thread.
+        """
+        if getattr(self.shared_data, 'wardrive_ap_active', False) or self.ap_mode_active:
+            return self.stop_wardrive_ap()
+
+        spare = self._find_wardrive_ap_interface()
+        self._wardrive_ap_paused = False
+        if spare is None:
+            engine = self._wardriving_engine()
+            if engine is not None:
+                self.logger.warning("Wardrive AP: no spare WiFi adapter, pausing wardriving")
+                try:
+                    engine.stop()
+                    self._wardrive_ap_paused = True
+                except Exception as e:
+                    self.logger.error(f"Wardrive AP: failed to pause wardriving: {e}")
+            spare = self.default_wifi_interface
+
+        self._wardrive_ap_prev_interface = self.ap_interface
+        self.ap_interface = spare
+        self.logger.info(f"Wardrive AP: starting on {spare} (SSID={self.ap_ssid})")
+        if self.start_ap_mode():
+            self.shared_data.wardrive_ap_active = True
+            self.logger.info(
+                f"Wardrive AP up: join '{self.ap_ssid}' then open http://{self.ap_ip}:8000/")
+            return True
+
+        # Start failed — restore prior interface and resume wardriving if paused.
+        self.ap_interface = self._wardrive_ap_prev_interface or self.default_wifi_interface
+        if self._wardrive_ap_paused:
+            self._resume_wardriving_after_ap()
+            self._wardrive_ap_paused = False
+        self.logger.error("Wardrive AP: failed to start AP mode")
+        return False
+
+    def stop_wardrive_ap(self):
+        """Tear down the wardriving AP and restore the prior interface/state."""
+        try:
+            self.stop_ap_mode()
+        finally:
+            if self._wardrive_ap_prev_interface:
+                self.ap_interface = self._wardrive_ap_prev_interface
+                self._wardrive_ap_prev_interface = None
+            self.shared_data.wardrive_ap_active = False
+            if self._wardrive_ap_paused:
+                self._resume_wardriving_after_ap()
+                self._wardrive_ap_paused = False
+        self.logger.info("Wardrive AP stopped")
+        return True
+
+    def _resume_wardriving_after_ap(self):
+        """Restart wardriving that was paused to free the AP interface."""
+        try:
+            ragnar = getattr(self.shared_data, 'ragnar_instance', None)
+            engine = getattr(ragnar, '_wd_engine', None) if ragnar else None
+            if engine is None:
+                return
+            device_name = self.shared_data.config.get('wardriving_device_name', 'Ragnar')
+            gps_port = self.shared_data.config.get('wardriving_gps_port', '') or None
+            engine.start(device_name=device_name, gps_port=gps_port)
+            self.logger.info("Wardriving resumed after AP teardown")
+        except Exception as e:
+            self.logger.error(f"Failed to resume wardriving after AP: {e}")
+
     def _create_hostapd_config(self):
         """Create hostapd configuration file"""
         try:

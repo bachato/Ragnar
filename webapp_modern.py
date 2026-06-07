@@ -3177,11 +3177,21 @@ def auth_regenerate_recovery():
 def index():
     """Serve the main dashboard page or captive portal for AP clients"""
     if is_ap_client_request():
+        # KEY1 wardriving AP: land straight on the minimal wardriving page.
+        if getattr(shared_data, 'wardrive_ap_active', False):
+            return send_from_directory('web', 'wardrive_mobile.html')
         # Serve captive portal for AP clients
         return send_from_directory('web', 'captive_portal.html')
     else:
         # Serve main dashboard for regular users
         return send_from_directory('web', 'index_modern.html')
+
+
+# Minimal wardriving-only page (served by the KEY1 phone-access AP)
+@app.route('/wardrive')
+def wardrive_mobile():
+    """Lightweight, offline-safe live wardriving page (stats + canvas map)."""
+    return send_from_directory('web', 'wardrive_mobile.html')
 
 
 # Add explicit captive portal route
