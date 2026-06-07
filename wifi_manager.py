@@ -2378,21 +2378,26 @@ class WiFiManager:
         return None
 
     def _find_wardrive_ap_interface(self):
-        """Pick a managed WiFi adapter for AP use that wardriving is NOT
-        scanning on. Prefer the default interface when it is free, otherwise
-        any other adapter. Returns the interface name, or None when every
-        adapter is busy wardriving (caller then falls back to pausing).
+        """Pick a WiFi adapter to host the KEY1 AP on.
+
+        Preference order, so wardriving AND an active WiFi uplink keep running
+        whenever the hardware allows:
+          1. a radio used by neither wardriving nor the live WiFi connection;
+          2. any radio not used by wardriving (may be the WiFi uplink — the
+             caller drops that connection cleanly before taking it over);
+          3. None — every radio is busy wardriving (caller pauses wardriving).
         """
         try:
             engine = self._wardriving_engine()
             busy = set(getattr(engine, 'interfaces', []) or []) if engine else set()
+            station = self.default_wifi_interface if getattr(self, 'wifi_connected', False) else None
             names = [i.get('name', '') for i in gather_wifi_interfaces(self.default_wifi_interface)]
-            names = [n for n in names if n]
-            if self.default_wifi_interface in names and self.default_wifi_interface not in busy:
-                return self.default_wifi_interface
-            for name in names:
-                if name not in busy:
+            free = [n for n in names if n and n not in busy]
+            for name in free:
+                if name != station:
                     return name
+            if free:
+                return free[0]
         except Exception as exc:
             self.logger.debug(f"Wardrive AP interface detection failed: {exc}")
         return None
@@ -2420,6 +2425,15 @@ class WiFiManager:
                 except Exception as e:
                     self.logger.error(f"Wardrive AP: failed to pause wardriving: {e}")
             spare = self.default_wifi_interface
+
+        # If the only free radio is the live WiFi uplink, drop it cleanly first —
+        # a single chip can't be both a station and an AP.
+        if getattr(self, 'wifi_connected', False) and spare == self.default_wifi_interface:
+            self.logger.info(f"Wardrive AP: reclaiming {spare} from the WiFi uplink (WiFi will drop)")
+            try:
+                self.disconnect_wifi()
+            except Exception as e:
+                self.logger.warning(f"Wardrive AP: disconnect_wifi failed: {e}")
 
         self._wardrive_ap_prev_interface = self.ap_interface
         self.ap_interface = spare
