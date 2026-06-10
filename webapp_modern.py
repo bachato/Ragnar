@@ -6589,6 +6589,7 @@ def wardriving_status():
         engine = _get_wardriving_engine()
         status = engine.get_status()
         status['enabled'] = True
+        status['allow_backfill'] = bool(shared_data.config.get('wardriving_allow_backfill', False))
         return jsonify(status)
     except Exception as e:
         logger.error(f"Wardriving status error: {e}")
@@ -6912,8 +6913,17 @@ def wardriving_cells():
 def wardriving_backfill_gps():
     """Backfill missing GPS positions on networks / BT / cell rows from the
     session's gps_track table by interpolating each row's first_seen
-    timestamp. Covers brief GPS dropouts and the warm-up window before TTFF."""
+    timestamp. Covers brief GPS dropouts and the warm-up window before TTFF.
+
+    Gated behind the `wardriving_allow_backfill` config flag (off by default):
+    backfilled positions are estimates, not allowed in WDGWARS, and are
+    excluded from WiGLE export once written."""
     try:
+        if not shared_data.config.get('wardriving_allow_backfill', False):
+            return jsonify({
+                'error': 'GPS backfill is disabled. Enable it in Config → Wardriving. '
+                         'Backfill is not allowed in WDGWARS and backfilled rows are excluded from WiGLE export.'
+            }), 403
         engine = _get_wardriving_engine()
         body = request.get_json(silent=True) or {}
         session_id = request.args.get('session_id') or body.get('session_id')

@@ -4021,6 +4021,9 @@ async function loadConfigData() {
         // Load wardriving on-boot toggle state (card is in config page)
         loadWardrivingOnBootState();
 
+        // Load GPS-backfill opt-in state (gates the map Backfill GPS button)
+        loadWardrivingBackfillState();
+
         // Load on-screen kiosk state + service badge
         loadKioskState();
 
@@ -15732,6 +15735,9 @@ function updateWardrivingUI(status) {
     _wardrivingRunning = !!status.running;
     updateWardrivingToggleButton();
 
+    // Map "Backfill GPS" button is only shown when enabled in config
+    applyWardrivingBackfillVisibility(!!status.allow_backfill);
+
     if (status.running) {
         if (badge) { badge.textContent = 'Running'; badge.className = 'px-2 py-1 bg-emerald-600 bg-opacity-30 text-emerald-400 text-xs rounded-full animate-pulse'; }
     } else {
@@ -16199,6 +16205,43 @@ async function loadWardrivingOnBootState() {
         const data = await res.json();
         const cb = document.getElementById('wardriving-on-boot');
         if (cb) cb.checked = !!data.wardriving_on_boot;
+    } catch (e) { /* silent */ }
+}
+
+// GPS backfill is gated: the map "Backfill GPS" button stays hidden until the
+// user opts in here. Backfilled positions are estimates (not WDGWARS-legal) and
+// are excluded from WiGLE export, so this defaults off.
+function applyWardrivingBackfillVisibility(allow) {
+    const btn = document.getElementById('wd-map-backfill-btn');
+    if (btn) btn.classList.toggle('hidden', !allow);
+}
+
+async function toggleWardrivingBackfill() {
+    const cb = document.getElementById('wardriving-allow-backfill');
+    if (!cb) return;
+    const enabled = !!cb.checked;
+    try {
+        await postAPI('/api/config', { wardriving_allow_backfill: enabled });
+        applyWardrivingBackfillVisibility(enabled);
+        addConsoleMessage(
+            'GPS backfill ' + (enabled ? 'enabled — backfilled data is excluded from WiGLE export' : 'disabled'),
+            enabled ? 'warning' : 'info'
+        );
+    } catch (e) {
+        console.error('[Wardriving] backfill toggle error:', e);
+        addConsoleMessage('Failed to update GPS backfill setting', 'error');
+        cb.checked = !enabled;
+    }
+}
+
+async function loadWardrivingBackfillState() {
+    try {
+        const res = await fetch('/api/config');
+        const cfg = await res.json();
+        const allow = !!cfg.wardriving_allow_backfill;
+        const cb = document.getElementById('wardriving-allow-backfill');
+        if (cb) cb.checked = allow;
+        applyWardrivingBackfillVisibility(allow);
     } catch (e) { /* silent */ }
 }
 

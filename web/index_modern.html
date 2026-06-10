@@ -4016,23 +4016,26 @@
                         <label class="text-xs text-gray-400">Min Signal:</label>
                         <input type="range" id="wd-map-filter-signal" min="-100" max="-30" value="-100" oninput="document.getElementById('wd-map-signal-val').textContent=this.value+' dBm'; applyWardrivingMapFilters()" class="w-24">
                         <span id="wd-map-signal-val" class="text-xs text-gray-300">-100 dBm</span>
-                        <button onclick="backfillWardrivingGps()" id="wd-map-backfill-btn" title="Estimate positions for networks scanned during GPS dropouts by interpolating from the recorded GPS track"
-                            class="ml-auto bg-emerald-700 hover:bg-emerald-600 text-white text-xs rounded px-2 py-1 border border-emerald-800 flex items-center gap-1">
-                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                            </svg>
-                            Backfill GPS
-                        </button>
-                        <button onclick="toggleWardrivingMapFullscreen()" id="wd-map-fs-btn" title="Toggle fullscreen (Esc to exit)"
-                            class="bg-slate-700 hover:bg-slate-600 text-white text-xs rounded px-2 py-1 border border-slate-600 flex items-center gap-1">
-                            <svg id="wd-map-fs-icon-enter" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4"/>
-                            </svg>
-                            <svg id="wd-map-fs-icon-exit" class="w-3.5 h-3.5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 4v4H5M15 4v4h4M9 20v-4H5M15 20v-4h4"/>
-                            </svg>
-                            <span id="wd-map-fs-label">Fullscreen</span>
-                        </button>
+                        <div class="ml-auto flex items-center gap-2">
+                            <!-- Hidden unless GPS backfill is enabled in Config → Wardriving -->
+                            <button onclick="backfillWardrivingGps()" id="wd-map-backfill-btn" title="Estimate positions for networks scanned during GPS dropouts by interpolating from the recorded GPS track. Not allowed in WDGWARS — backfilled rows are excluded from WiGLE export."
+                                class="hidden bg-emerald-700 hover:bg-emerald-600 text-white text-xs rounded px-2 py-1 border border-emerald-800 flex items-center gap-1">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                </svg>
+                                Backfill GPS
+                            </button>
+                            <button onclick="toggleWardrivingMapFullscreen()" id="wd-map-fs-btn" title="Toggle fullscreen (Esc to exit)"
+                                class="bg-slate-700 hover:bg-slate-600 text-white text-xs rounded px-2 py-1 border border-slate-600 flex items-center gap-1">
+                                <svg id="wd-map-fs-icon-enter" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4"/>
+                                </svg>
+                                <svg id="wd-map-fs-icon-exit" class="w-3.5 h-3.5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 4v4H5M15 4v4h4M9 20v-4H5M15 20v-4h4"/>
+                                </svg>
+                                <span id="wd-map-fs-label">Fullscreen</span>
+                            </button>
+                        </div>
                     </div>
                     <div id="wd-map" style="height: 450px; border-radius: 0.75rem; z-index: 1;"></div>
                     <div class="text-xs text-gray-500 mt-1 text-right" id="wd-map-info"></div>
@@ -4314,6 +4317,25 @@
                             </div>
                             <div class="text-xs text-gray-500">
                                 Ragnar will enter wardriving mode immediately on power-on — ideal for mobile/walk setups.
+                            </div>
+                        </div>
+
+                        <!-- GPS Backfill Card -->
+                        <div class="glass rounded-lg p-4 border border-amber-900/40">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">Allow GPS Backfill</h4>
+                                <label class="toggle-switch relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="wardriving-allow-backfill" class="sr-only peer" onchange="toggleWardrivingBackfill()">
+                                    <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                                </label>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-2">
+                                Reveals the “Backfill GPS” button on the wardriving map, which estimates positions for
+                                devices seen during GPS dropouts by interpolating from the recorded track.
+                            </div>
+                            <div class="flex items-start gap-2 text-xs text-amber-400 bg-amber-900/20 rounded px-2 py-2">
+                                <svg class="w-4 h-4 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+                                <span>Backfill GPS is <strong>not allowed in WDGWARS</strong>. WiGLE export will be disabled for any data that has been backfilled.</span>
                             </div>
                         </div>
 

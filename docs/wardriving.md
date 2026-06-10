@@ -327,6 +327,8 @@ Each session writes one row to `gps_track` every 5 s while GPS has a fix:
 gps_track (timestamp, latitude, longitude, altitude, speed_kmh, satellites, hdop)
 ```
 
+> **Opt-in only.** Backfilled positions are *estimates*, not observed fixes, and are **not allowed in WDGWARS**. The "Backfill GPS" map button is hidden by default; enable it under **Config → Wardriving → Allow GPS Backfill** (sets `wardriving_allow_backfill`). The endpoint returns `403` while the flag is off. Any row backfilled this way is flagged `gps_backfilled = 1` and is **excluded from WiGLE CSV export** (it still appears on the map and in KML).
+
 `POST /api/wardriving/backfill_gps` (or the "Backfill GPS" button) fills in missing positions on `networks`, `bluetooth_devices`, and `cells` rows by looking up each row's `first_seen` against the breadcrumb track:
 
 1. `bisect` the track to find the two trackpoints bracketing the row's timestamp.
