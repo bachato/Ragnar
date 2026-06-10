@@ -204,7 +204,8 @@ class WardrivingSession:
                     scan_count INTEGER DEFAULT 1,
                     interface TEXT DEFAULT '',
                     band TEXT DEFAULT '2.4GHz',
-                    is_camera INTEGER DEFAULT 0
+                    is_camera INTEGER DEFAULT 0,
+                    gps_backfilled INTEGER DEFAULT 0
                 )
             """)
             conn.execute("""
@@ -271,7 +272,8 @@ class WardrivingSession:
                     pending_count INTEGER DEFAULT 0,
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL,
-                    scan_count INTEGER DEFAULT 1
+                    scan_count INTEGER DEFAULT 1,
+                    gps_backfilled INTEGER DEFAULT 0
                 )
             """)
             conn.execute("""
@@ -286,9 +288,10 @@ class WardrivingSession:
                 ('best_rssi',     '-100'),
                 ('best_lat',      'NULL'),
                 ('best_lon',      'NULL'),
-                ('pending_lat',   'NULL'),
-                ('pending_lon',   'NULL'),
-                ('pending_count', '0'),
+                ('pending_lat',     'NULL'),
+                ('pending_lon',     'NULL'),
+                ('pending_count',   '0'),
+                ('gps_backfilled',  '0'),
             )
             for _name, _default in _BT_MIGRATE_COLS:
                 assert _name.replace('_', '').isalnum(), f'unsafe column name: {_name!r}'
@@ -316,12 +319,23 @@ class WardrivingSession:
                     longitude REAL,
                     first_seen TEXT NOT NULL,
                     last_seen TEXT NOT NULL,
-                    scan_count INTEGER DEFAULT 1
+                    scan_count INTEGER DEFAULT 1,
+                    gps_backfilled INTEGER DEFAULT 0
                 )
             """)
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cell ON cell_towers(cell_id)
             """)
+            # Migrate older networks / cell_towers tables that predate the
+            # GPS-backfill flag. Table names here are hardcoded literals, so
+            # the f-string interpolation carries no injection risk.
+            for _tbl in ('networks', 'cell_towers'):
+                try:
+                    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_tbl})").fetchall()}
+                    if 'gps_backfilled' not in cols:
+                        conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN gps_backfilled INTEGER DEFAULT 0")
+                except Exception:
+                    pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS gps_track (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -907,7 +921,8 @@ class WardrivingSession:
                                 "latitude = COALESCE(latitude, ?), "
                                 "longitude = COALESCE(longitude, ?), "
                                 "altitude = COALESCE(altitude, ?), "
-                                "best_lat = ?, best_lon = ? WHERE bssid = ?",
+                                "best_lat = ?, best_lon = ?, "
+                                "gps_backfilled = 1 WHERE bssid = ?",
                                 (pos[0], pos[1], pos[2], pos[0], pos[1], r['bssid'])
                             )
                             result['wifi'] += 1
@@ -925,7 +940,8 @@ class WardrivingSession:
                                     "latitude = ?, longitude = ?, "
                                     "altitude = COALESCE(altitude, ?), "
                                     "best_lat = COALESCE(best_lat, ?), "
-                                    "best_lon = COALESCE(best_lon, ?) WHERE mac = ?",
+                                    "best_lon = COALESCE(best_lon, ?), "
+                                    "gps_backfilled = 1 WHERE mac = ?",
                                     (pos[0], pos[1], pos[2], pos[0], pos[1], r['mac'])
                                 )
                                 result['bluetooth'] += 1
@@ -941,8 +957,8 @@ class WardrivingSession:
                             pos = _pos_at(_parse_iso(r['first_seen']))
                             if pos:
                                 conn.execute(
-                                    "UPDATE cell_towers SET latitude = ?, longitude = ? "
-                                    "WHERE cell_id = ?",
+                                    "UPDATE cell_towers SET latitude = ?, longitude = ?, "
+                                    "gps_backfilled = 1 WHERE cell_id = ?",
                                     (pos[0], pos[1], r['cell_id'])
                                 )
                                 result['cells'] += 1
@@ -959,7 +975,11 @@ class WardrivingSession:
         return result
 
     def export_wigle_csv(self, device_name='Ragnar'):
-        """Export session to WiGLE CSV format string including WiFi, BT, and cell."""
+        """Export session to WiGLE CSV format string including WiFi, BT, and cell.
+
+        Rows whose position was estimated via backfill_gps_from_track
+        (gps_backfilled = 1) are excluded — interpolated coordinates are not
+        permitted in WiGLE submissions (WDGWARS rules)."""
         lines = []
         dn = device_name or 'Ragnar'
         lines.append(f'WigleWifi-1.4,appRelease=Ragnar,model=RaspberryPi,release=1.0,device={dn},display=EPD,board=RPi,brand=Ragnar')
@@ -969,8 +989,11 @@ class WardrivingSession:
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.row_factory = sqlite3.Row
-                    # WiFi networks
-                    rows = conn.execute("SELECT * FROM networks ORDER BY first_seen").fetchall()
+                    # WiFi networks (skip backfilled positions)
+                    rows = conn.execute(
+                        "SELECT * FROM networks WHERE COALESCE(gps_backfilled, 0) = 0 "
+                        "ORDER BY first_seen"
+                    ).fetchall()
                     for row in rows:
                         r = dict(row)
                         lines.append(','.join([
@@ -988,7 +1011,10 @@ class WardrivingSession:
                         ]))
                     # Bluetooth devices
                     try:
-                        bt_rows = conn.execute("SELECT * FROM bluetooth_devices ORDER BY first_seen").fetchall()
+                        bt_rows = conn.execute(
+                            "SELECT * FROM bluetooth_devices WHERE COALESCE(gps_backfilled, 0) = 0 "
+                            "ORDER BY first_seen"
+                        ).fetchall()
                         for row in bt_rows:
                             r = dict(row)
                             lines.append(','.join([
@@ -1008,7 +1034,10 @@ class WardrivingSession:
                         pass
                     # Cell towers
                     try:
-                        cell_rows = conn.execute("SELECT * FROM cell_towers ORDER BY first_seen").fetchall()
+                        cell_rows = conn.execute(
+                            "SELECT * FROM cell_towers WHERE COALESCE(gps_backfilled, 0) = 0 "
+                            "ORDER BY first_seen"
+                        ).fetchall()
                         for row in cell_rows:
                             r = dict(row)
                             lines.append(','.join([
