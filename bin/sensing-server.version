@@ -1,0 +1,5 @@
+source_repo=https://github.com/PierreGode/RuView.git
+source_commit=d785d490894d53e5a619ea98e96ce873cff301ec
+crate=wifi-densepose-sensing-server
+arch=aarch64
+vendored_utc=2026-06-26T13:23:15Z

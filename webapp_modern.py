@@ -128,6 +128,217 @@ def check_authentication():
             return jsonify({'error': 'Unauthorized', 'auth_required': True}), 401
         return redirect('/login')
 
+# ============================================================================
+# RUSENSE PROXY
+# Relay the RuView WiFi-CSI sensing-server to the embedded RuSense tab so the
+# browser only ever talks to Ragnar's own origin. Upstream defaults to the
+# local sensing-server (HTTP + raw WebSocket on :3000); override via env.
+# Imports are guarded: a missing dep degrades the proxy, never crashes Ragnar.
+# ============================================================================
+try:
+    import requests as _rusense_requests
+except Exception:  # pragma: no cover
+    _rusense_requests = None
+try:
+    import simple_websocket as _rusense_ws
+except Exception:  # pragma: no cover
+    _rusense_ws = None
+
+RUSENSE_UPSTREAM_HTTP = os.environ.get('RUSENSE_UPSTREAM_HTTP', 'http://127.0.0.1:3000')
+RUSENSE_UPSTREAM_WS = os.environ.get('RUSENSE_UPSTREAM_WS', 'ws://127.0.0.1:3000/ws/sensing')
+
+
+@app.route('/ws/sensing', websocket=True)
+def rusense_ws_proxy():
+    """Bridge the browser's raw WebSocket to the sensing-server's /ws/sensing."""
+    if _rusense_ws is None:
+        return Response('RuSense WebSocket support unavailable', status=503)
+    if request.environ.get('HTTP_UPGRADE', '').lower() != 'websocket':
+        return Response('RuSense WebSocket endpoint', status=426)
+    try:
+        client = _rusense_ws.Server(request.environ)
+    except Exception as exc:
+        logger.warning(f"[rusense] client ws upgrade failed: {exc}")
+        return ''
+
+    try:
+        upstream = _rusense_ws.Client(RUSENSE_UPSTREAM_WS)
+    except Exception as exc:
+        logger.info(f"[rusense] upstream sensing-server unavailable: {exc}")
+        try:
+            client.send(json.dumps({'type': 'error', 'error': 'sensing-server unavailable'}))
+        except Exception:
+            pass
+        client.close()
+        return ''
+
+    stop = threading.Event()
+
+    def pump_upstream_to_client():
+        try:
+            while not stop.is_set():
+                msg = upstream.receive(timeout=1)
+                if msg is None:
+                    if not upstream.connected:
+                        break
+                    continue
+                client.send(msg)
+        except Exception:
+            pass
+        finally:
+            stop.set()
+
+    pump = threading.Thread(target=pump_upstream_to_client, daemon=True)
+    pump.start()
+
+    try:
+        while not stop.is_set():
+            data = client.receive(timeout=1)
+            if data is None:
+                if not client.connected:
+                    break
+                continue
+            upstream.send(data)
+    except Exception:
+        pass
+    finally:
+        stop.set()
+        try:
+            upstream.close()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
+    return ''
+
+
+@app.route('/api/v1/<path:subpath>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+def rusense_api_proxy(subpath):
+    """Relay RuView REST calls (/api/v1/*) to the sensing-server."""
+    if _rusense_requests is None:
+        return jsonify({'error': 'proxy unavailable'}), 503
+    url = f"{RUSENSE_UPSTREAM_HTTP}/api/v1/{subpath}"
+    try:
+        resp = _rusense_requests.request(
+            method=request.method,
+            url=url,
+            params=request.args,
+            data=request.get_data(),
+            headers={'Content-Type': request.headers.get('Content-Type', 'application/json')},
+            timeout=8,
+        )
+    except _rusense_requests.RequestException as exc:
+        return jsonify({'error': 'sensing-server unavailable', 'detail': str(exc)}), 502
+    excluded = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
+    headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
+    return Response(resp.content, status=resp.status_code, headers=headers)
+
+
+# ── Sensing backend lifecycle (bundled sensing-server) ───────────────────────
+# Ragnar ships the sensing engine itself, so the config page can install/start
+# it without any external RuView checkout. These routes drive the install and
+# uninstall scripts and report service state.
+SENSING_INSTALL_SCRIPT = os.path.join(shared_data.currentdir, 'scripts', 'install_sensing.sh')
+SENSING_UNINSTALL_SCRIPT = os.path.join(shared_data.currentdir, 'scripts', 'uninstall_sensing.sh')
+SENSING_INSTALL_LOG = os.path.join(shared_data.currentdir, 'data', 'sensing_install.log')
+SENSING_UNIT = 'ragnar-sensing.service'
+_sensing_install_lock = threading.Lock()
+_sensing_installing = False
+
+
+def _sensing_unit_state():
+    """Return (installed, active) for the bundled sensing service."""
+    try:
+        installed = subprocess.run(
+            ['systemctl', 'list-unit-files', SENSING_UNIT],
+            capture_output=True, text=True, timeout=5
+        ).stdout.find(SENSING_UNIT) != -1
+        active = subprocess.run(
+            ['systemctl', 'is-active', SENSING_UNIT],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip() == 'active'
+        return installed, active
+    except Exception:
+        return False, False
+
+
+def _run_sensing_script(script_path, arg=None):
+    """Run an install/uninstall script in the background, logging to SENSING_INSTALL_LOG."""
+    global _sensing_installing
+    cmd = ['bash', script_path] if os.geteuid() == 0 else ['sudo', '-n', 'bash', script_path]
+    if arg:
+        cmd.append(arg)
+    try:
+        with open(SENSING_INSTALL_LOG, 'a') as logf:
+            logf.write(f"\n=== run {os.path.basename(script_path)} {arg or ''} ===\n")
+            logf.flush()
+            subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                           env={**os.environ, 'SENSING_INSTALL_LOG': SENSING_INSTALL_LOG},
+                           timeout=3600)
+    except Exception as exc:
+        logger.error(f"sensing script {script_path} failed: {exc}")
+    finally:
+        with _sensing_install_lock:
+            _sensing_installing = False
+
+
+@app.route('/api/sensing/status', methods=['GET'])
+def sensing_status():
+    """Report whether the bundled sensing backend is installed and running."""
+    installed, active = _sensing_unit_state()
+    arch = os.uname().machine
+    has_prebuilt = (arch == 'aarch64' and
+                    os.path.exists(os.path.join(shared_data.currentdir, 'bin', 'sensing-server')))
+    with _sensing_install_lock:
+        installing = _sensing_installing
+    return jsonify({
+        'success': True, 'installed': installed, 'active': active,
+        'installing': installing, 'arch': arch, 'has_prebuilt': has_prebuilt,
+    })
+
+
+@app.route('/api/sensing/install', methods=['POST'])
+def sensing_install():
+    """Install (or rebuild) the bundled sensing backend in the background."""
+    global _sensing_installing
+    with _sensing_install_lock:
+        if _sensing_installing:
+            return jsonify({'success': True, 'message': 'Install already in progress', 'installing': True})
+        _sensing_installing = True
+    rebuild = bool((request.get_json(silent=True) or {}).get('rebuild'))
+    open(SENSING_INSTALL_LOG, 'w').close()  # fresh log per run
+    threading.Thread(target=_run_sensing_script,
+                     args=(SENSING_INSTALL_SCRIPT, '--rebuild' if rebuild else None),
+                     daemon=True, name='sensing-install').start()
+    return jsonify({'success': True, 'message': 'Sensing backend install started', 'installing': True})
+
+
+@app.route('/api/sensing/uninstall', methods=['POST'])
+def sensing_uninstall():
+    """Stop and remove the bundled sensing backend."""
+    threading.Thread(target=_run_sensing_script, args=(SENSING_UNINSTALL_SCRIPT,),
+                     daemon=True, name='sensing-uninstall').start()
+    return jsonify({'success': True, 'message': 'Sensing backend uninstall started'})
+
+
+@app.route('/api/sensing/install-log', methods=['GET'])
+def sensing_install_log():
+    """Return the live install/uninstall log and current service state."""
+    log = ''
+    try:
+        with open(SENSING_INSTALL_LOG, 'r') as f:
+            log = f.read()[-8000:]
+    except FileNotFoundError:
+        pass
+    installed, active = _sensing_unit_state()
+    with _sensing_install_lock:
+        installing = _sensing_installing
+    return jsonify({'success': True, 'log': log, 'installing': installing,
+                    'installed': installed, 'active': active})
+
+
 # Initialize web utilities
 web_utils = WebUtils(shared_data, logger)
 

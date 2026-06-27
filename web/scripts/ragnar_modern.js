@@ -597,6 +597,7 @@ document.addEventListener('DOMContentLoaded', function() {
     initializePwnUI();
     initializePwnagotchiVisibility();
     handleHeadlessMode();
+    applyRusenseTabVisibility();
 
 });
 
@@ -802,6 +803,165 @@ function initializeTabs() {
     showTab('dashboard');
 }
 
+// ── RuSense (native RuView WiFi-CSI console, Shadow-DOM island) ─────────────
+// The RuView SPA is served from /web/rusense/ and mounted into a shadow root
+// under #rusense-host, so its compiled Tailwind never collides with Ragnar's
+// styles. Sensing data is proxied by this Flask app (/ws/sensing, /api/v1/*).
+const RUSENSE_SUBTABS = ['dashboard', 'sensing', 'nodes', 'training', 'about'];
+let _rusenseLoader = null;        // resolved loader module
+let _rusenseLoading = null;       // in-flight import() promise
+let _rusenseCurrent = 'dashboard';
+
+function _setRusenseActive(name) {
+    RUSENSE_SUBTABS.forEach(k =>
+        _setSubtabActive(document.getElementById('rusense-subtab-' + k), k === name));
+}
+
+function loadRusenseLoader() {
+    if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
+    if (!_rusenseLoading) {
+        _rusenseLoading = import('/web/rusense/app/loader.js')
+            .then(m => { _rusenseLoader = m; return m; })
+            .catch(err => { _rusenseLoading = null; throw err; });
+    }
+    return _rusenseLoading;
+}
+
+function showRusenseSubtab(name) {
+    if (!RUSENSE_SUBTABS.includes(name)) name = 'dashboard';
+    _rusenseCurrent = name;
+    _setRusenseActive(name);
+    const host = document.getElementById('rusense-host');
+    loadRusenseLoader()
+        .then(m => m.init(host, name))
+        .catch(err => {
+            console.error('[rusense] loader failed', err);
+            const hint = document.getElementById('rusense-offline-hint');
+            if (hint) {
+                hint.textContent = 'RuSense UI failed to load: ' + (err && err.message);
+                hint.classList.remove('hidden');
+            }
+        });
+}
+
+function initRusense() {
+    showRusenseSubtab(_rusenseCurrent);
+    // Reachability hint: /api/v1/status is proxied to the sensing-server.
+    const hint = document.getElementById('rusense-offline-hint');
+    if (hint) {
+        fetch('/api/v1/status', { cache: 'no-store' })
+            .then(r => hint.classList.toggle('hidden', r.ok))
+            .catch(() => hint.classList.remove('hidden'));
+    }
+}
+
+// ── Bundled sensing backend: install / uninstall from the RuSense tab ────────
+let _sensingLogTimer = null;
+
+function refreshSensingInstallCard() {
+    const card = document.getElementById('sensing-install-card');
+    if (!card) return;
+    fetch('/api/sensing/status', { cache: 'no-store' })
+        .then(r => r.json())
+        .then(s => {
+            const badge = document.getElementById('sensing-status-badge');
+            const installBtn = document.getElementById('sensing-install-btn');
+            const rebuildBtn = document.getElementById('sensing-rebuild-btn');
+            const uninstallBtn = document.getElementById('sensing-uninstall-btn');
+            const archNote = document.getElementById('sensing-arch-note');
+            // Always visible in the RuSense tab: doubles as a status + management panel
+            // (Install when absent, Reinstall / Uninstall when present).
+            card.classList.remove('hidden');
+            if (archNote) {
+                archNote.textContent = s.has_prebuilt
+                    ? 'Prebuilt binary bundled for this device (' + s.arch + ') — installs instantly.'
+                    : 'No prebuilt binary for ' + s.arch + ' — install will fetch Rust and compile from source (slow).';
+            }
+            if (badge) {
+                let txt = 'not installed', cls = 'bg-gray-700 text-gray-300';
+                if (s.installing) { txt = 'installing…'; cls = 'bg-amber-700 text-amber-100'; }
+                else if (s.installed && s.active) { txt = 'running'; cls = 'bg-green-700 text-green-100'; }
+                else if (s.installed) { txt = 'stopped'; cls = 'bg-red-700 text-red-100'; }
+                badge.textContent = txt;
+                badge.className = 'text-xs px-2 py-0.5 rounded ' + cls;
+            }
+            const busy = !!s.installing;
+            if (installBtn) { installBtn.disabled = busy; installBtn.textContent = s.installed ? 'Reinstall' : 'Install'; }
+            if (rebuildBtn) rebuildBtn.disabled = busy;
+            if (uninstallBtn) { uninstallBtn.classList.toggle('hidden', !s.installed); uninstallBtn.disabled = busy; }
+            if (s.installing) startSensingLogPoll();
+        })
+        .catch(() => {});
+}
+
+function installSensingBackend(rebuild) {
+    const logEl = document.getElementById('sensing-install-log');
+    if (logEl) { logEl.classList.remove('hidden'); logEl.textContent = 'Starting…'; }
+    fetch('/api/sensing/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rebuild: !!rebuild })
+    }).then(() => startSensingLogPoll()).catch(() => {});
+}
+
+function uninstallSensingBackend() {
+    if (!confirm('Stop and remove the bundled sensing backend?')) return;
+    fetch('/api/sensing/uninstall', { method: 'POST' })
+        .then(() => startSensingLogPoll()).catch(() => {});
+}
+
+function startSensingLogPoll() {
+    if (_sensingLogTimer) return;
+    const logEl = document.getElementById('sensing-install-log');
+    if (logEl) logEl.classList.remove('hidden');
+    const tick = () => {
+        fetch('/api/sensing/install-log', { cache: 'no-store' })
+            .then(r => r.json())
+            .then(s => {
+                if (logEl && s.log) { logEl.textContent = s.log; logEl.scrollTop = logEl.scrollHeight; }
+                if (!s.installing) {
+                    clearInterval(_sensingLogTimer); _sensingLogTimer = null;
+                    refreshSensingInstallCard();
+                    if (s.installed && s.active) {
+                        const hint = document.getElementById('rusense-offline-hint');
+                        if (hint) hint.classList.add('hidden');
+                        showRusenseSubtab(_rusenseCurrent);
+                    }
+                }
+            }).catch(() => {});
+    };
+    tick();
+    _sensingLogTimer = setInterval(tick, 2000);
+}
+
+// ── RuSense tab visibility (toggle lives in Settings; hidden by default) ─────
+const RUSENSE_TAB_KEY = 'rusense_tab_visible';
+
+function _rusenseTabVisible() {
+    return localStorage.getItem(RUSENSE_TAB_KEY) === '1';
+}
+
+function syncRusenseTabToggle() {
+    const cb = document.getElementById('rusense-tab-enabled');
+    if (cb) cb.checked = _rusenseTabVisible();
+}
+
+function applyRusenseTabVisibility() {
+    const visible = _rusenseTabVisible();
+    document.querySelectorAll('.rusense-nav').forEach(btn => btn.classList.toggle('hidden', !visible));
+    // If the tab is hidden while it's the active one, fall back to the dashboard.
+    if (!visible && typeof currentTab !== 'undefined' && currentTab === 'rusense') {
+        showTab('dashboard');
+    }
+    syncRusenseTabToggle();
+}
+
+function onRusenseTabToggled(cb) {
+    localStorage.setItem(RUSENSE_TAB_KEY, cb.checked ? '1' : '0');
+    applyRusenseTabVisibility();
+    if (cb.checked) showTab('rusense');
+}
+
 function showTab(tabName) {
     // Backward-compat: these tabs are now sub-tabs of Network / Discovered
     if (tabName === 'networks') { showTab('network'); showNetworkSubtab('archive'); return; }
@@ -809,6 +969,10 @@ function showTab(tabName) {
     if (tabName === 'credentials') { showTab('discovered'); showDiscoveredSubtab('credentials'); return; }
 
     currentTab = tabName;
+
+    if (_rusenseLoader && tabName !== 'rusense') {
+        try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ }
+    }
 
     if (systemMonitoringInterval && tabName !== 'system') {
         clearInterval(systemMonitoringInterval);
@@ -836,7 +1000,11 @@ function showTab(tabName) {
     }
     
     loadTabData(tabName);
-    
+
+    if (tabName === 'config') {
+        try { refreshSensingInstallCard(); syncRusenseTabToggle(); } catch (e) { /* ignore */ }
+    }
+
     const mobileMenu = document.getElementById('mobile-menu');
     if (mobileMenu) {
         mobileMenu.classList.add('hidden');
@@ -1180,6 +1348,9 @@ async function loadTabData(tabName) {
     const alreadyPreloaded = preloadedTabs.has(tabName);
     
     switch(tabName) {
+        case 'rusense':
+            initRusense();
+            break;
         case 'dashboard':
             // Load dashboard stats immediately, defer console logs
             await loadDashboardData();

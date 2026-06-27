@@ -332,6 +332,14 @@
                     <button onclick="showTab('discovered')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="discovered">
                         Discovered
                     </button>
+                    <button onclick="showTab('rusense')" class="rusense-nav nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="rusense">
+                        <span class="flex items-center space-x-1">
+                            <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M5.281 13.575a9.5 9.5 0 0113.438 0M2.45 10.745a13.5 13.5 0 0119.1 0M12 20h.01"></path>
+                            </svg>
+                            <span>RuSense</span>
+                        </span>
+                    </button>
                     <button id="pentest-nav-btn" onclick="showTab('pentest')"
                             class="nav-btn px-3 py-1.5 rounded-lg transition-colors text-[15px] whitespace-nowrap pentest-nav-btn hidden"
                             data-tab="pentest">
@@ -405,6 +413,7 @@
                 <button onclick="showTab('dashboard')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Dashboard</button>
                 <button onclick="showTab('network')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Network</button>
                 <button onclick="showTab('discovered')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Discovered</button>
+                <button onclick="showTab('rusense')" class="rusense-nav block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">RuSense</button>
                 <button onclick="showTab('pentest')"
                         id="mobile-pentest-nav"
                         class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 pentest-nav-btn hidden"
@@ -4206,6 +4215,45 @@
                             </div>
                         </div>
 
+                        <!-- WiFi Sensing (RuSense) Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">WiFi Sensing (RuSense)</h4>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="rusense-tab-enabled" class="sr-only peer" onchange="onRusenseTabToggled(this)">
+                                    <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+                                </label>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-3">
+                                Show the <strong>RuSense</strong> tab in the top navigation (WiFi-CSI presence &amp; vital-sign sensing). Off by default.
+                            </div>
+
+                            <!-- Bundled sensing-backend installer / management -->
+                            <div id="sensing-install-card" class="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+                                <div class="flex items-start justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <div class="flex items-center gap-2">
+                                            <span class="text-sm font-medium text-gray-200">Sensing backend</span>
+                                            <span id="sensing-status-badge" class="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300">checking…</span>
+                                        </div>
+                                        <p class="text-xs text-gray-400 mt-1">
+                                            Ragnar bundles the WiFi-CSI sensing engine — install it to run sensing on this host, no separate project required.
+                                            <span id="sensing-arch-note" class="block text-xs text-gray-500 mt-1"></span>
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                        <button id="sensing-install-btn" onclick="installSensingBackend(false)"
+                                            class="px-3 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium">Install</button>
+                                        <button id="sensing-rebuild-btn" onclick="installSensingBackend(true)"
+                                            class="px-3 py-1.5 rounded-lg bg-slate-600 hover:bg-slate-500 text-white text-xs font-medium">Build from source</button>
+                                        <button id="sensing-uninstall-btn" onclick="uninstallSensingBackend()"
+                                            class="hidden px-3 py-1.5 rounded-lg bg-red-700 hover:bg-red-600 text-white text-xs font-medium">Uninstall</button>
+                                    </div>
+                                </div>
+                                <pre id="sensing-install-log" class="hidden mt-3 max-h-48 overflow-auto rounded bg-black/50 p-2 text-xs text-gray-300 whitespace-pre-wrap"></pre>
+                            </div>
+                        </div>
+
                         <!-- On-screen Kiosk Card -->
                         <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
@@ -5063,6 +5111,34 @@
             </div>
         </div>
         
+        <!-- RuSense Tab (native RuView WiFi-CSI console; mounted in a Shadow DOM island) -->
+        <div id="rusense-tab" class="tab-content hidden">
+            <div class="mb-4 flex items-center justify-between flex-wrap gap-3">
+                <div>
+                    <h2 class="text-2xl font-bold text-white flex items-center gap-2">
+                        <svg class="w-6 h-6 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M5.281 13.575a9.5 9.5 0 0113.438 0M2.45 10.745a13.5 13.5 0 0119.1 0M12 20h.01"></path>
+                        </svg>
+                        RuSense
+                    </h2>
+                    <p class="text-sm text-gray-400 mt-1">WiFi CSI presence, vital-sign &amp; pose sensing</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-1 mb-3 overflow-x-auto">
+                <button id="rusense-subtab-dashboard" onclick="showRusenseSubtab('dashboard')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Dashboard</button>
+                <button id="rusense-subtab-sensing" onclick="showRusenseSubtab('sensing')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Sensing</button>
+                <button id="rusense-subtab-nodes" onclick="showRusenseSubtab('nodes')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Nodes</button>
+                <button id="rusense-subtab-training" onclick="showRusenseSubtab('training')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Training</button>
+                <button id="rusense-subtab-about" onclick="showRusenseSubtab('about')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">About</button>
+            </div>
+            <p id="rusense-offline-hint" class="hidden text-sm text-amber-300 mb-3">
+                Sensing backend not reachable. Ensure the sensing-server is running on this host (port 3000)
+                so Ragnar can proxy its CSI stream.
+            </p>
+            <!-- Shadow DOM island: RuView's compiled Tailwind is fully isolated from Ragnar here. -->
+            <div id="rusense-host" class="block w-full"></div>
+        </div>
+
     </main>
 
     <!-- Kiosk wardriving live view (rendered only when body.kiosk-mode is set
@@ -5186,7 +5262,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260531d"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260627-sensing-settings"></script>
 
 </body>
 </html>
