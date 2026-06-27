@@ -7,7 +7,7 @@ import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js';
 import sensing from './views/sensing.js';
 import nodes from './views/nodes.js';
-import training from './views/training.js';
+import training from './views/training.js?v=20260627-fs2';
 import about from './views/about.js';
 
 const VIEWS = { dashboard, sensing, nodes, training, about };

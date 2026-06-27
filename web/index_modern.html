@@ -291,6 +291,18 @@
             min-height: 0;
         }
         body.wd-map-fs-open { overflow: hidden; }
+        /* Observatory iframe expanded to fill the whole viewport (escapes the dashboard layout). */
+        #observatory-frame.observatory-fullscreen {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            min-height: 100vh !important;
+            margin: 0 !important;
+            border: none !important;
+            border-radius: 0 !important;
+            z-index: 99999 !important;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
@@ -4225,7 +4237,7 @@
                                 </label>
                             </div>
                             <div class="text-sm text-gray-400 mb-3">
-                                Show the <strong>RuSense</strong> tab in the top navigation (WiFi-CSI presence &amp; vital-sign sensing). Off by default.
+                                Show the <strong>RuSense</strong> tab in the top navigation — WiFi-CSI presence, vital-sign sensing, and the 3D <strong>Observatory</strong> sub-tab. Off by default.
                             </div>
 
                             <!-- Bundled sensing-backend installer / management -->
@@ -5130,6 +5142,7 @@
                 <button id="rusense-subtab-nodes" onclick="showRusenseSubtab('nodes')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Nodes</button>
                 <button id="rusense-subtab-training" onclick="showRusenseSubtab('training')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Training</button>
                 <button id="rusense-subtab-about" onclick="showRusenseSubtab('about')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">About</button>
+                <button id="rusense-subtab-observatory" onclick="showRusenseSubtab('observatory')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Observatory</button>
             </div>
             <p id="rusense-offline-hint" class="hidden text-sm text-amber-300 mb-3">
                 Sensing backend not reachable. Ensure the sensing-server is running on this host (port 3000)
@@ -5137,6 +5150,12 @@
             </p>
             <!-- Shadow DOM island: RuView's compiled Tailwind is fully isolated from Ragnar here. -->
             <div id="rusense-host" class="block w-full"></div>
+            <!-- Observatory sub-tab: full-page WebGL app (iframe). Hidden until its sub-tab is active;
+                 src is set lazily by showRusenseSubtab() so WebGL + WS only run while viewed. -->
+            <iframe id="observatory-frame" title="RuView Observatory"
+                class="hidden w-full rounded-xl border border-slate-700 bg-black"
+                style="height:calc(100vh - 220px);min-height:560px;"
+                allow="fullscreen"></iframe>
         </div>
 
     </main>
@@ -5262,7 +5281,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260627-sensing-settings"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260627-fs2"></script>
 
 </body>
 </html>

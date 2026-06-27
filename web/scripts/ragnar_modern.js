@@ -807,7 +807,7 @@ function initializeTabs() {
 // The RuView SPA is served from /web/rusense/ and mounted into a shadow root
 // under #rusense-host, so its compiled Tailwind never collides with Ragnar's
 // styles. Sensing data is proxied by this Flask app (/ws/sensing, /api/v1/*).
-const RUSENSE_SUBTABS = ['dashboard', 'sensing', 'nodes', 'training', 'about'];
+const RUSENSE_SUBTABS = ['dashboard', 'sensing', 'nodes', 'training', 'about', 'observatory'];
 let _rusenseLoader = null;        // resolved loader module
 let _rusenseLoading = null;       // in-flight import() promise
 let _rusenseCurrent = 'dashboard';
@@ -820,18 +820,64 @@ function _setRusenseActive(name) {
 function loadRusenseLoader() {
     if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
     if (!_rusenseLoading) {
-        _rusenseLoading = import('/web/rusense/app/loader.js')
+        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260627-fs2')
             .then(m => { _rusenseLoader = m; return m; })
             .catch(err => { _rusenseLoading = null; throw err; });
     }
     return _rusenseLoading;
 }
 
+// Let the Observatory iframe ask the dashboard to expand it to the full
+// viewport (it cannot escape its own container from inside the iframe).
+let _observatoryFsInit = false;
+function initObservatoryFullscreenBridge() {
+    if (_observatoryFsInit) return;
+    _observatoryFsInit = true;
+    window.addEventListener('message', (e) => {
+        if (!e.data || e.data.type !== 'observatory-fullscreen') return;
+        const obs = document.getElementById('observatory-frame');
+        if (!obs) return;
+        const expanded = obs.classList.toggle('observatory-fullscreen');
+        if (expanded) {
+            const req = obs.requestFullscreen || obs.webkitRequestFullscreen;
+            if (req) Promise.resolve(req.call(obs)).catch(() => { /* CSS overlay still applies */ });
+        } else {
+            const exit = document.exitFullscreen || document.webkitExitFullscreen;
+            if (exit && (document.fullscreenElement || document.webkitFullscreenElement)) {
+                Promise.resolve(exit.call(document)).catch(() => {});
+            }
+        }
+    });
+    // Keep the CSS overlay in sync when the user leaves OS fullscreen via Esc.
+    document.addEventListener('fullscreenchange', () => {
+        const obs = document.getElementById('observatory-frame');
+        if (obs && !document.fullscreenElement) obs.classList.remove('observatory-fullscreen');
+    });
+}
+initObservatoryFullscreenBridge();
+
 function showRusenseSubtab(name) {
     if (!RUSENSE_SUBTABS.includes(name)) name = 'dashboard';
     _rusenseCurrent = name;
     _setRusenseActive(name);
+
     const host = document.getElementById('rusense-host');
+    const obs = document.getElementById('observatory-frame');
+
+    if (name === 'observatory') {
+        // Full-page WebGL app: show the iframe and hide the shadow-island views.
+        if (host) host.classList.add('hidden');
+        if (obs) {
+            obs.classList.remove('hidden');
+            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260627-fs2';
+        }
+        if (_rusenseLoader) { try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ } }
+        return;
+    }
+
+    // Regular shadow-island view: stop/hide the Observatory iframe, show the host.
+    if (obs) { obs.classList.add('hidden'); if (obs.getAttribute('src')) obs.removeAttribute('src'); }
+    if (host) host.classList.remove('hidden');
     loadRusenseLoader()
         .then(m => m.init(host, name))
         .catch(err => {
@@ -972,6 +1018,12 @@ function showTab(tabName) {
 
     if (_rusenseLoader && tabName !== 'rusense') {
         try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ }
+    }
+
+    // Leaving RuSense: stop the Observatory iframe (WebGL + WS) if it was open.
+    if (tabName !== 'rusense') {
+        const _obsFrame = document.getElementById('observatory-frame');
+        if (_obsFrame && _obsFrame.getAttribute('src')) _obsFrame.removeAttribute('src');
     }
 
     if (systemMonitoringInterval && tabName !== 'system') {
