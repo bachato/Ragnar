@@ -221,3 +221,8 @@ data/networks/skynet_5g/
 data/networks/default/output/
 data/networks/default/ssid.txt
 data/wardriving/
+
+# Local backups & vendored tools (not part of the repo)
+*.bak-rusense
+*.original
+tools/
