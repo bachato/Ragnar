@@ -7,7 +7,7 @@ name: Deploy RuSense CSI Node Flasher (ESP32-S3 / C6)
 
 on:
   push:
-    branches: [main]
+    branches: [View, main]
     paths:
       - 'rusense_flasher/**'
       - '.github/workflows/build-rusense-flasher.yml'
