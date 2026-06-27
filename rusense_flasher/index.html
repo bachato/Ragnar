@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RuSense — CSI Node Flasher (ESP32-S3 / C6)</title>
+    <meta name="description" content="Forge the RuSense WiFi-CSI sensor-node firmware onto your ESP32-S3 or ESP32-C6 directly from your browser. Captures 2.4 GHz Channel State Information and reports to a RuSense / RuView server for presence, motion and people-counting." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Russo+One&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="css/style.css?v=rusense1" />
+  </head>
+  <body>
+    <div class="rune-strip" aria-hidden="true">
+      ᚱ ᚨ ᚷ ᚾ ᚨ ᚱ &nbsp;·&nbsp; ᚱ ᚢ ᛋ ᛖ ᚾ ᛋ ᛖ &nbsp;·&nbsp; ᚲ ᛋ ᛁ
+    </div>
+
+    <div class="page">
+
+      <!-- Header -->
+      <header class="site-header">
+        <div class="logo-mark" aria-hidden="true">📡</div>
+        <span class="brand">RAGNAR &mdash; <span>RuSense CSI Node</span></span>
+      </header>
+
+      <!-- Hero -->
+      <div class="hero-title">
+        <div class="rune-divider" aria-hidden="true">ᚦ &nbsp; ✦ &nbsp; ᚦ</div>
+        <h1>Forge a <span>Sensor Node</span></h1>
+        <p class="tagline">WiFi CSI &nbsp;⚔&nbsp; 2.4&nbsp;GHz mesh &nbsp;⚔&nbsp; presence · motion · people-count</p>
+        <p class="desc">
+          Two longships to choose from. Either board listens to 2.4&nbsp;GHz WiFi
+          Channel&nbsp;State&nbsp;Information &mdash; up to 114 subcarriers at ~100&nbsp;Hz &mdash;
+          and reports back to your RuSense server, where it surfaces under the
+          <strong>Nodes</strong> tab once provisioned. Pick a board, plug it in, raise the sails.
+        </p>
+      </div>
+
+      <!-- ───────── ESP32-S3 (production) ───────── -->
+      <section class="flash-panel" id="csi-s3">
+        <h2>📡 ESP32-S3 CSI Node <span class="panel-sub">(production · the workhorse)</span></h2>
+        <p>
+          Dual-core LX7 @240&nbsp;MHz, 8&nbsp;MB flash. The recommended platform for live CSI
+          sensing &mdash; the steadiest, best-tested ship in the fleet. Plug it into USB, provision
+          it to your RuSense server, and it starts streaming CSI immediately.
+        </p>
+
+        <div class="prereq">
+          <div class="prereq-title">Before the forge fires</div>
+          <ol>
+            <li>Close Arduino IDE, Serial Monitor, or any other app holding the port</li>
+            <li>Use a <strong>data-capable</strong> USB-C cable (charge-only cables are runes that do nothing)</li>
+            <li>Click Forge and pick <code>USB JTAG/serial debug unit</code> from the port list</li>
+            <li>If the board isn&rsquo;t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong></li>
+          </ol>
+        </div>
+
+        <div class="chip-badges">
+          <span class="chip-badge"><span class="dot"></span>ESP32-S3 &middot; 8&nbsp;MB flash</span>
+        </div>
+
+        <div class="flash-buttons">
+          <button class="btn-flash" onclick="flashDevice('manifest-csi-s3.json')">
+            🔨 Forge S3 CSI Node
+          </button>
+        </div>
+      </section>
+
+      <!-- ───────── ESP32-C6 (Wi-Fi 6 research) ───────── -->
+      <section class="flash-panel" id="csi-c6">
+        <h2>🛰️ ESP32-C6 CSI Node <span class="panel-sub">(Wi-Fi 6 · the scout)</span></h2>
+        <p>
+          RISC-V @160&nbsp;MHz, 4&nbsp;MB flash, dual-band Wi-Fi&nbsp;6 (802.11ax) and 802.15.4.
+          The research target &mdash; HE-LTF subcarrier tagging and a wider channel view for
+          experiments. Same CSI-node firmware, tuned for the C6 radio.
+        </p>
+
+        <div class="prereq">
+          <div class="prereq-title">Before the forge fires</div>
+          <ol>
+            <li>Close Arduino IDE, Serial Monitor, or any other app holding the port</li>
+            <li>Use a <strong>data-capable</strong> USB-C cable (charge-only cables are runes that do nothing)</li>
+            <li>Click Forge and pick <code>USB JTAG/serial debug unit</code> from the port list</li>
+            <li>If the board isn&rsquo;t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong></li>
+          </ol>
+        </div>
+
+        <div class="chip-badges">
+          <span class="chip-badge"><span class="dot"></span>ESP32-C6 &middot; 4&nbsp;MB flash &middot; Wi-Fi&nbsp;6</span>
+        </div>
+
+        <div class="flash-buttons">
+          <button class="btn-flash" onclick="flashDevice('manifest-csi-c6.json')">
+            🔨 Forge C6 CSI Node
+          </button>
+        </div>
+      </section>
+
+      <!-- Shared serial monitor button -->
+      <section class="flash-panel" id="serial-tools">
+        <h2>📡 Skald&rsquo;s Ear <span class="panel-sub">(serial monitor)</span></h2>
+        <p>
+          Open a browser-based serial monitor for any forged CSI node. Default baud is
+          <code>115200</code>. On boot the node announces itself, then emits CSI capture
+          rate and status lines &mdash; handy for confirming packets-per-second before you
+          provision the node to your RuSense server.
+        </p>
+        <div class="flash-buttons">
+          <button class="btn-logs" onclick="openLogs()">📡 Open Skald&rsquo;s Ear</button>
+        </div>
+      </section>
+
+      <!-- Browser warning -->
+      <div id="browserWarn" class="browser-warn">
+        Web Serial only sails in Chromium-based browsers (Chrome, Edge, Opera) on
+        desktop. Firefox and Safari are unworthy ships for this voyage.
+      </div>
+
+      <!-- Footer -->
+      <footer class="footer">
+        <div>Band: <code>2.4&nbsp;GHz</code> &middot; Subcarriers: <code>up to 114</code> &middot; Rate: <code>~100&nbsp;Hz</code></div>
+        <div>Firmware: <code id="build">&mdash;</code></div>
+        <div>
+          <a href="https://github.com/PierreGode/Ragnar" target="_blank" rel="noopener">Ragnar</a>
+          &nbsp;⚔&nbsp;
+          <a href="https://github.com/PierreGode/RuView" target="_blank" rel="noopener">RuView / RuSense firmware</a>
+        </div>
+        <div class="skal">Skál&nbsp;📡</div>
+      </footer>
+
+    </div>
+
+    <!-- Serial monitor overlay -->
+    <div id="serial-overlay" class="flash-overlay" hidden>
+      <div class="flash-dialog serial-dialog">
+        <h3>📡 Skald&rsquo;s Ear</h3>
+        <div class="serial-baud">
+          <label for="serial-baud-select">Baud:</label>
+          <select id="serial-baud-select">
+            <option value="9600">9600</option>
+            <option value="38400">38400</option>
+            <option value="57600">57600</option>
+            <option value="115200" selected>115200</option>
+            <option value="230400">230400</option>
+            <option value="460800">460800</option>
+            <option value="921600">921600</option>
+          </select>
+        </div>
+        <pre id="serial-log" class="flash-log serial-log-area"></pre>
+        <div class="serial-input-row">
+          <input id="serial-input" type="text" placeholder="Whisper a command…" autocomplete="off" />
+          <button id="serial-send" class="btn-flash btn-small">Send</button>
+        </div>
+        <div class="serial-actions">
+          <button id="serial-clear" class="btn-logs btn-small">Clear</button>
+          <button id="serial-close" class="btn-logs btn-small">Disconnect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Flash overlay -->
+    <div id="flash-overlay" class="flash-overlay" hidden>
+      <div class="flash-dialog">
+        <h3>🔨 Forging CSI Node</h3>
+        <div class="flash-progress-track">
+          <div id="flash-bar" class="flash-progress-fill"></div>
+        </div>
+        <p id="flash-pct" class="flash-pct"></p>
+        <p id="flash-status" class="flash-status">Stoking the forge…</p>
+        <pre id="flash-log" class="flash-log"></pre>
+        <div id="flash-confirm-row" class="flash-confirm-row" hidden>
+          <button id="flash-confirm-yes" class="btn-flash">🔨 Strike Now</button>
+          <button id="flash-confirm-no" class="btn-logs btn-small">Cancel</button>
+        </div>
+        <button id="flash-close" class="btn-flash" hidden>Close</button>
+      </div>
+    </div>
+
+    <script type="module" src="js/flasher.js"></script>
+  </body>
+</html>
