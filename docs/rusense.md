@@ -139,6 +139,16 @@ Configure them in the RuSense **Settings** tab. Available triggers:
 A configurable **cooldown** prevents a flapping signal from spamming you, and each
 trigger can be toggled independently under a master on/off switch.
 
+To suppress false positives, an event only fires when **two guards** are both met:
+
+- **Minimum confidence** — the detector must be at least this confident (default 80%);
+  low-confidence flickers are ignored.
+- **Must last** — the condition has to hold continuously for at least this long
+  (default 2 seconds) before an alert is sent.
+
+Both are adjustable in the Settings tab (`rusense_notify_min_confidence` and
+`rusense_notify_sustain_s`).
+
 Alerts reuse Ragnar's existing **Pushover** account: set your **User Key** and **API
 Token** once under the main dashboard's **Config → Pushover Notifications**, then enable
 the RuSense triggers in the Settings tab. Use **Send test notification** to confirm

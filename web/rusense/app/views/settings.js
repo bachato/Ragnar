@@ -91,6 +91,28 @@ export default {
           ${TOGGLES.map(([k, l, h]) => row(k, l, h, c[k])).join('')}
         </div>
 
+        <div class="card card-pad space-y-3">
+          <h3 class="card-title">Sensitivity (false-positive guards)</h3>
+          <p class="text-xs text-ink-muted">An event only fires when the detector is confident enough <em>and</em>
+            the condition holds long enough — this filters out brief flickers.</p>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <label class="block">
+              <span class="block text-sm font-medium mb-1">Minimum confidence (%)</span>
+              <input type="number" id="st-minconf" min="50" max="99" step="1"
+                value="${Math.round(Number(c.rusense_notify_min_confidence ?? 0.8) * 100)}"
+                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              <span class="block text-xs text-ink-muted mt-1">Ignore detections below this confidence.</span>
+            </label>
+            <label class="block">
+              <span class="block text-sm font-medium mb-1">Must last (seconds)</span>
+              <input type="number" id="st-sustain" min="0" max="30" step="1"
+                value="${Number(c.rusense_notify_sustain_s ?? 2)}"
+                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              <span class="block text-xs text-ink-muted mt-1">Condition must persist this long before alerting.</span>
+            </label>
+          </div>
+        </div>
+
         <div class="card card-pad grid gap-4 sm:grid-cols-2">
           <label class="block">
             <span class="block text-sm font-medium mb-1">People-count threshold</span>
@@ -129,6 +151,8 @@ export default {
       }
       payload.rusense_notify_people_threshold = clampInt($('#st-threshold'), 1, 20, 1);
       payload.rusense_notify_cooldown_s = clampInt($('#st-cooldown'), 5, 3600, 60);
+      payload.rusense_notify_min_confidence = clampInt($('#st-minconf'), 50, 99, 80) / 100;
+      payload.rusense_notify_sustain_s = clampInt($('#st-sustain'), 0, 30, 2);
 
       const r = await req('POST', '/api/config', payload);
       toast(r.ok ? 'Settings saved' : ((r.data && r.data.error) || 'Could not save settings'),

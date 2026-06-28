@@ -244,13 +244,16 @@ def rusense_api_proxy(subpath):
 # Edge detection lives here; enable/per-kind/cooldown gating lives in
 # PushoverService.notify_rusense(). The user configures it in the RuSense tab's
 # Settings view (rusense_notify_* keys), which persists via /api/config.
+# False-positive guards: an event only fires when the classifier confidence is
+# at/above rusense_notify_min_confidence AND the condition has held continuously
+# for at least rusense_notify_sustain_s (debounce). A momentary blip or a
+# low-confidence flicker never alerts.
 _rusense_notify_state = {
-    'initialized': False,        # sensing baseline established (suppress first-read alerts)
-    'present': None,             # last known presence bool
-    'motion_active': False,      # was motion 'active' last tick
-    'people_over': False,        # was people count >= threshold last tick
+    # name -> {'confirmed': bool|None, 'pending': bool|None, 'since': float}
+    'signals': {},
+    'node_active': set(),        # confirmed-active node_ids
+    'node_missing_since': {},    # node_id -> first-missing timestamp (debounce offline)
     'nodes_initialized': False,  # node baseline established
-    'active_nodes': set(),       # node_ids seen 'active' last tick (for offline edge detect)
 }
 _rusense_notify_lock = threading.Lock()
 
@@ -282,18 +285,59 @@ def _rusense_pushover():
     return po
 
 
+def _rusense_debounce(name, raw, now, sustain):
+    """Debounced edge detector for one boolean signal. Returns (rose, fell):
+    True only when the *confirmed* state flips this call (never on the initial
+    baseline). A change is confirmed only after `raw` differs from the confirmed
+    value continuously for `sustain` seconds. Pass raw=None for samples that
+    shouldn't count (e.g. confidence too low) — they neither advance nor reset
+    a pending timer. Caller must hold _rusense_notify_lock."""
+    sig = _rusense_notify_state['signals'].setdefault(
+        name, {'confirmed': None, 'pending': None, 'since': 0.0})
+    if raw is None:
+        return False, False
+    if sig['confirmed'] is None:
+        sig['confirmed'] = raw          # establish baseline silently
+        sig['pending'] = None
+        return False, False
+    if raw == sig['confirmed']:
+        sig['pending'] = None           # condition reverted — back to stable
+        return False, False
+    # raw differs from the confirmed state — start/continue the debounce timer
+    if sig['pending'] != raw:
+        sig['pending'] = raw
+        sig['since'] = now
+        return False, False
+    if now - sig['since'] >= sustain:
+        sig['confirmed'] = raw
+        sig['pending'] = None
+        return raw is True, raw is False
+    return False, False
+
+
 def _rusense_check_once():
-    """One evaluation pass: read sensing + nodes, fire alerts on transitions."""
+    """One evaluation pass: read sensing + nodes, fire alerts on *confirmed*
+    transitions. Returns True when alerts are enabled (drives loop cadence)."""
     po = _rusense_pushover()
     if po is None:
-        return
+        return False
     # Cheap master gate — the config flag is a dict lookup, so check it before
     # is_enabled() (which reads .env) to keep the idle loop near-free when alerts
     # are off. notify_rusense() re-checks each per-kind flag before sending.
     if not shared_data.config.get('rusense_notify_enabled', False):
-        return
+        return False
     if not po.is_enabled():
-        return
+        return False
+
+    try:
+        min_conf = float(shared_data.config.get('rusense_notify_min_confidence', 0.8))
+    except (TypeError, ValueError):
+        min_conf = 0.8
+    try:
+        sustain = float(shared_data.config.get('rusense_notify_sustain_s', 2))
+    except (TypeError, ValueError):
+        sustain = 2.0
+    now = time.time()
 
     # ── Presence / motion / people, from the latest sensing frame ──
     latest = _rusense_get('/api/v1/sensing/latest')
@@ -301,6 +345,16 @@ def _rusense_check_once():
         cls = latest.get('classification') or {}
         present = bool(cls.get('presence'))
         motion_active = (cls.get('motion_level') or '') == 'active'
+        conf = cls.get('confidence')
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            conf = None
+        # Confidence may arrive as 0..1 or 0..100; normalise to a fraction.
+        if conf is not None and conf > 1.0:
+            conf = conf / 100.0
+        confident = conf is not None and conf >= min_conf
+
         people = latest.get('estimated_persons')
         if people is None:
             persons = latest.get('persons')
@@ -315,60 +369,68 @@ def _rusense_check_once():
             threshold = 1
         people_over = people >= threshold if threshold > 0 else people > 0
 
+        # Only confident samples advance the debounce; a low-confidence read is
+        # passed as None so it neither fires nor resets a pending timer.
         with _rusense_notify_lock:
-            initialized = _rusense_notify_state['initialized']
-            prev_present = _rusense_notify_state['present']
-            prev_motion = _rusense_notify_state['motion_active']
-            prev_over = _rusense_notify_state['people_over']
-            _rusense_notify_state['present'] = present
-            _rusense_notify_state['motion_active'] = motion_active
-            _rusense_notify_state['people_over'] = people_over
-            _rusense_notify_state['initialized'] = True
+            p_rose, p_fell = _rusense_debounce('presence', present if confident else None, now, sustain)
+            m_rose, _m_fell = _rusense_debounce('motion', motion_active if confident else None, now, sustain)
+            o_rose, _o_fell = _rusense_debounce('people', people_over if confident else None, now, sustain)
 
-        # First successful read just establishes the baseline — never alert,
-        # so enabling alerts (or a restart) can't fire a spurious "occupied".
-        if initialized:
-            if present != prev_present:
-                if present:
-                    who = f"{people} people" if people > 1 else "Someone"
-                    po.notify_rusense(
-                        'presence',
-                        f"\U0001F441️ {who} detected — a monitored space is now occupied.",
-                        title="RuSense — Presence", priority=1)
-                else:
-                    po.notify_rusense(
-                        'presence',
-                        "\U0001F6E1️ A monitored space is now empty.",
-                        title="RuSense — Empty")
-            if motion_active and not prev_motion:
-                po.notify_rusense(
-                    'motion',
-                    "\U0001F3C3 Motion detected in a monitored space.",
-                    title="RuSense — Motion")
-            if people_over and not prev_over:
-                po.notify_rusense(
-                    'people',
-                    f"\U0001F465 {people} people detected (threshold {threshold}).",
-                    title="RuSense — People", priority=1)
+        if p_rose:
+            who = f"{people} people" if people > 1 else "Someone"
+            po.notify_rusense(
+                'presence',
+                f"\U0001F441️ {who} detected — a monitored space is now occupied.",
+                title="RuSense — Presence", priority=1)
+        elif p_fell:
+            po.notify_rusense(
+                'presence',
+                "\U0001F6E1️ A monitored space is now empty.",
+                title="RuSense — Empty")
+        if m_rose:
+            po.notify_rusense(
+                'motion',
+                "\U0001F3C3 Motion detected in a monitored space.",
+                title="RuSense — Motion")
+        if o_rose:
+            po.notify_rusense(
+                'people',
+                f"\U0001F465 {people} people detected (threshold {threshold}).",
+                title="RuSense — People", priority=1)
 
-    # ── CSI node offline detection, from the nodes roster ──
+    # ── CSI node offline detection (debounced: must be gone for `sustain`) ──
     nodes = _rusense_get('/api/v1/nodes')
     if isinstance(nodes, dict) and isinstance(nodes.get('nodes'), list):
         active_now = {str(n.get('node_id')) for n in nodes['nodes']
                       if n.get('status') == 'active' and n.get('node_id') is not None}
+        newly_offline = []
         with _rusense_notify_lock:
-            nodes_initialized = _rusense_notify_state['nodes_initialized']
-            prev_active = _rusense_notify_state['active_nodes']
-            _rusense_notify_state['active_nodes'] = active_now
-            _rusense_notify_state['nodes_initialized'] = True
-        if nodes_initialized:
-            went_offline = prev_active - active_now
-            if went_offline:
-                ids = ", ".join(f"#{x}" for x in sorted(went_offline))
-                po.notify_rusense(
-                    'node_offline',
-                    f"\U0001F4E1 CSI sensor node(s) offline: {ids}. Sensing coverage reduced.",
-                    title="RuSense — Node Offline", priority=1)
+            if not _rusense_notify_state['nodes_initialized']:
+                _rusense_notify_state['node_active'] = set(active_now)
+                _rusense_notify_state['nodes_initialized'] = True
+            else:
+                confirmed = _rusense_notify_state['node_active']
+                missing_since = _rusense_notify_state['node_missing_since']
+                for nid in active_now:
+                    missing_since.pop(nid, None)           # back online — clear timer
+                for nid in list(confirmed):
+                    if nid in active_now:
+                        continue
+                    t0 = missing_since.get(nid)
+                    if t0 is None:
+                        missing_since[nid] = now           # start offline debounce
+                    elif now - t0 >= sustain:
+                        newly_offline.append(nid)
+                        missing_since.pop(nid, None)
+                # confirmed-active = (previously confirmed ∪ now active) − confirmed-offline
+                _rusense_notify_state['node_active'] = (confirmed | active_now) - set(newly_offline)
+        if newly_offline:
+            ids = ", ".join(f"#{x}" for x in sorted(newly_offline))
+            po.notify_rusense(
+                'node_offline',
+                f"\U0001F4E1 CSI sensor node(s) offline: {ids}. Sensing coverage reduced.",
+                title="RuSense — Node Offline", priority=1)
+    return True
 
 
 def _rusense_notify_loop():
@@ -378,11 +440,14 @@ def _rusense_notify_loop():
     # Let the sensing-server and pushover service settle before the first read.
     _time.sleep(10)
     while True:
+        active = False
         try:
-            _rusense_check_once()
+            active = _rusense_check_once()
         except Exception as exc:
             logger.debug(f"[rusense] notify check failed: {exc}")
-        _time.sleep(3)
+        # Poll ~1 Hz when enabled so the sustain window is measured accurately;
+        # idle slowly when alerts are off.
+        _time.sleep(1 if active else 5)
 
 
 # ── Sensing backend lifecycle (bundled sensing-server) ───────────────────────

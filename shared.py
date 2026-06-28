@@ -742,6 +742,11 @@ class SharedData:
             "rusense_notify_people_threshold": 1,   # alert when count >= this
             "rusense_notify_node_offline": True,    # a CSI node stops streaming
             "rusense_notify_cooldown_s": 60,        # min seconds between same-kind alerts
+            # False-positive guards: an event only fires when the classifier
+            # confidence is at/above this fraction AND the condition has held
+            # continuously for at least this many seconds (debounce).
+            "rusense_notify_min_confidence": 0.8,   # 0..1; require >= 80% confidence
+            "rusense_notify_sustain_s": 2,          # condition must persist this long
 
             "__title_pwnagotchi__": "Pwnagotchi Integration",
             "pwnagotchi_installed": False,

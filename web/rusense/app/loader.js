@@ -7,8 +7,8 @@ import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js';
 import sensing from './views/sensing.js';
 import nodes from './views/nodes.js';
-import training from './views/training.js?v=20260628-alerts';
-import settings from './views/settings.js?v=20260628-alerts';
+import training from './views/training.js?v=20260628-debounce';
+import settings from './views/settings.js?v=20260628-debounce';
 import about from './views/about.js';
 
 const VIEWS = { dashboard, sensing, nodes, training, settings, about };
