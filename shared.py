@@ -730,6 +730,19 @@ class SharedData:
             "pushover_notify_device_lost": False,
             "pushover_notify_device_back_online": False,
 
+            "__title_rusense_pushover__": "RuSense Sensing Alerts",
+            # Master switch for camera-free (WiFi-CSI) surveillance alerts. Sent
+            # via the same Pushover account/keys as the security alerts above —
+            # these toggles only gate the RuSense events. Requires Pushover keys
+            # to be configured and pushover_enabled to be on.
+            "rusense_notify_enabled": False,
+            "rusense_notify_presence": True,        # room goes empty <-> occupied
+            "rusense_notify_motion": False,         # significant (active) motion
+            "rusense_notify_people": False,         # people count crosses threshold
+            "rusense_notify_people_threshold": 1,   # alert when count >= this
+            "rusense_notify_node_offline": True,    # a CSI node stops streaming
+            "rusense_notify_cooldown_s": 60,        # min seconds between same-kind alerts
+
             "__title_pwnagotchi__": "Pwnagotchi Integration",
             "pwnagotchi_installed": False,
             "pwnagotchi_mode": "ragnar",

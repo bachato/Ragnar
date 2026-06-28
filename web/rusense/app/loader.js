@@ -7,10 +7,11 @@ import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js';
 import sensing from './views/sensing.js';
 import nodes from './views/nodes.js';
-import training from './views/training.js?v=20260627-fs2';
+import training from './views/training.js?v=20260628-alerts';
+import settings from './views/settings.js?v=20260628-alerts';
 import about from './views/about.js';
 
-const VIEWS = { dashboard, sensing, nodes, training, about };
+const VIEWS = { dashboard, sensing, nodes, training, settings, about };
 const CSS_HREF = new URL('../assets/app.css', import.meta.url).href;
 
 let shadow = null;

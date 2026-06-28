@@ -236,6 +236,155 @@ def rusense_api_proxy(subpath):
     return Response(resp.content, status=resp.status_code, headers=headers)
 
 
+# ── RuSense sensing alerts (camera-free surveillance notifications) ──────────
+# A lightweight background poller that watches the sensing-server's live output
+# and fires Pushover alerts on meaningful transitions: room occupied/empty,
+# motion onset, people-count threshold crossed, and CSI node offline. Running
+# server-side means alerts fire even when nobody has the RuSense tab open.
+# Edge detection lives here; enable/per-kind/cooldown gating lives in
+# PushoverService.notify_rusense(). The user configures it in the RuSense tab's
+# Settings view (rusense_notify_* keys), which persists via /api/config.
+_rusense_notify_state = {
+    'initialized': False,        # sensing baseline established (suppress first-read alerts)
+    'present': None,             # last known presence bool
+    'motion_active': False,      # was motion 'active' last tick
+    'people_over': False,        # was people count >= threshold last tick
+    'nodes_initialized': False,  # node baseline established
+    'active_nodes': set(),       # node_ids seen 'active' last tick (for offline edge detect)
+}
+_rusense_notify_lock = threading.Lock()
+
+
+def _rusense_get(path):
+    """GET JSON from the local sensing-server; None on any failure."""
+    if _rusense_requests is None:
+        return None
+    try:
+        resp = _rusense_requests.get(f"{RUSENSE_UPSTREAM_HTTP}{path}", timeout=4)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _rusense_pushover():
+    """Return the shared PushoverService, creating it once if needed."""
+    po = getattr(shared_data, '_pushover_service', None)
+    if po is None:
+        try:
+            from pushover_service import PushoverService
+            po = PushoverService(shared_data)
+            shared_data._pushover_service = po
+        except Exception as exc:
+            logger.debug(f"[rusense] pushover init failed: {exc}")
+            return None
+    return po
+
+
+def _rusense_check_once():
+    """One evaluation pass: read sensing + nodes, fire alerts on transitions."""
+    po = _rusense_pushover()
+    if po is None:
+        return
+    # Cheap master gate — the config flag is a dict lookup, so check it before
+    # is_enabled() (which reads .env) to keep the idle loop near-free when alerts
+    # are off. notify_rusense() re-checks each per-kind flag before sending.
+    if not shared_data.config.get('rusense_notify_enabled', False):
+        return
+    if not po.is_enabled():
+        return
+
+    # ── Presence / motion / people, from the latest sensing frame ──
+    latest = _rusense_get('/api/v1/sensing/latest')
+    if latest:
+        cls = latest.get('classification') or {}
+        present = bool(cls.get('presence'))
+        motion_active = (cls.get('motion_level') or '') == 'active'
+        people = latest.get('estimated_persons')
+        if people is None:
+            persons = latest.get('persons')
+            people = len(persons) if isinstance(persons, list) else (1 if present else 0)
+        try:
+            people = int(people)
+        except (TypeError, ValueError):
+            people = 1 if present else 0
+        try:
+            threshold = int(shared_data.config.get('rusense_notify_people_threshold', 1))
+        except (TypeError, ValueError):
+            threshold = 1
+        people_over = people >= threshold if threshold > 0 else people > 0
+
+        with _rusense_notify_lock:
+            initialized = _rusense_notify_state['initialized']
+            prev_present = _rusense_notify_state['present']
+            prev_motion = _rusense_notify_state['motion_active']
+            prev_over = _rusense_notify_state['people_over']
+            _rusense_notify_state['present'] = present
+            _rusense_notify_state['motion_active'] = motion_active
+            _rusense_notify_state['people_over'] = people_over
+            _rusense_notify_state['initialized'] = True
+
+        # First successful read just establishes the baseline — never alert,
+        # so enabling alerts (or a restart) can't fire a spurious "occupied".
+        if initialized:
+            if present != prev_present:
+                if present:
+                    who = f"{people} people" if people > 1 else "Someone"
+                    po.notify_rusense(
+                        'presence',
+                        f"\U0001F441️ {who} detected — a monitored space is now occupied.",
+                        title="RuSense — Presence", priority=1)
+                else:
+                    po.notify_rusense(
+                        'presence',
+                        "\U0001F6E1️ A monitored space is now empty.",
+                        title="RuSense — Empty")
+            if motion_active and not prev_motion:
+                po.notify_rusense(
+                    'motion',
+                    "\U0001F3C3 Motion detected in a monitored space.",
+                    title="RuSense — Motion")
+            if people_over and not prev_over:
+                po.notify_rusense(
+                    'people',
+                    f"\U0001F465 {people} people detected (threshold {threshold}).",
+                    title="RuSense — People", priority=1)
+
+    # ── CSI node offline detection, from the nodes roster ──
+    nodes = _rusense_get('/api/v1/nodes')
+    if isinstance(nodes, dict) and isinstance(nodes.get('nodes'), list):
+        active_now = {str(n.get('node_id')) for n in nodes['nodes']
+                      if n.get('status') == 'active' and n.get('node_id') is not None}
+        with _rusense_notify_lock:
+            nodes_initialized = _rusense_notify_state['nodes_initialized']
+            prev_active = _rusense_notify_state['active_nodes']
+            _rusense_notify_state['active_nodes'] = active_now
+            _rusense_notify_state['nodes_initialized'] = True
+        if nodes_initialized:
+            went_offline = prev_active - active_now
+            if went_offline:
+                ids = ", ".join(f"#{x}" for x in sorted(went_offline))
+                po.notify_rusense(
+                    'node_offline',
+                    f"\U0001F4E1 CSI sensor node(s) offline: {ids}. Sensing coverage reduced.",
+                    title="RuSense — Node Offline", priority=1)
+
+
+def _rusense_notify_loop():
+    """Background poller for RuSense sensing alerts. Runs for the life of the
+    process; does real work only when alerts are enabled (cheap idle otherwise)."""
+    import time as _time
+    # Let the sensing-server and pushover service settle before the first read.
+    _time.sleep(10)
+    while True:
+        try:
+            _rusense_check_once()
+        except Exception as exc:
+            logger.debug(f"[rusense] notify check failed: {exc}")
+        _time.sleep(3)
+
+
 # ── Sensing backend lifecycle (bundled sensing-server) ───────────────────────
 # Ragnar ships the sensing engine itself, so the config page can install/start
 # it without any external RuView checkout. These routes drive the install and
@@ -18106,6 +18255,7 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         socketio.start_background_task(background_sync_loop)
         socketio.start_background_task(background_arp_scan_loop)
         socketio.start_background_task(background_health_monitor)
+        socketio.start_background_task(_rusense_notify_loop)
 
         logger.info("✅ All background threads started successfully")
 

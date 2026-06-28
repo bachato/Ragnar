@@ -248,3 +248,55 @@ class PushoverService:
             return
         msg = f"🗝️ {new_count} new credential(s) captured! (total: {total})"
         threading.Thread(target=self.send, args=(msg, "Ragnar — Credentials"), daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # RuSense (WiFi-CSI camera-free surveillance) alerts
+    # ------------------------------------------------------------------
+    # Maps each RuSense event kind to the config flag that gates it. The
+    # background sensing monitor in webapp_modern.py does the edge detection
+    # (empty<->occupied, motion onset, count threshold, node offline) and calls
+    # notify_rusense(); this layer enforces enable/config gating and a per-kind
+    # cooldown so a flapping signal can't spam the Pushover account.
+    _RUSENSE_FLAGS = {
+        "presence": "rusense_notify_presence",
+        "motion": "rusense_notify_motion",
+        "people": "rusense_notify_people",
+        "node_offline": "rusense_notify_node_offline",
+    }
+
+    def rusense_enabled(self, kind):
+        """True when RuSense alerts are on, Pushover is usable, and `kind` is enabled."""
+        if not self.is_enabled():
+            return False
+        if not self.shared_data.config.get("rusense_notify_enabled", False):
+            return False
+        flag = self._RUSENSE_FLAGS.get(kind)
+        return bool(flag and self.shared_data.config.get(flag, False))
+
+    def notify_rusense(self, kind, message, title="Ragnar — RuSense", priority=0, sound="pushover"):
+        """Send a RuSense sensing alert if `kind` is enabled and off cooldown.
+
+        Returns True if a send was dispatched, False if gated/throttled. The
+        actual HTTP POST happens on a daemon thread so the caller's monitor
+        loop never blocks on the network.
+        """
+        if not self.rusense_enabled(kind):
+            return False
+        # Per-kind cooldown — suppress repeats of the SAME event kind within the
+        # configured window. Distinct kinds never throttle each other.
+        if not hasattr(self, "_rusense_last_sent"):
+            self._rusense_last_sent = {}
+        try:
+            cooldown = float(self.shared_data.config.get("rusense_notify_cooldown_s", 60))
+        except (TypeError, ValueError):
+            cooldown = 60.0
+        now = time.time()
+        with self._lock:
+            last = self._rusense_last_sent.get(kind, 0.0)
+            if now - last < cooldown:
+                return False
+            self._rusense_last_sent[kind] = now
+        threading.Thread(
+            target=self.send, args=(message, title, priority, sound), daemon=True
+        ).start()
+        return True

@@ -171,6 +171,23 @@ Ragnar auto-detects available tools and enables corresponding features in the we
 
 ---
 
+## 📡 RuSense — Camera-Free Surveillance
+
+RuSense turns ordinary 2.4 GHz WiFi into a **no-camera surveillance** system for home,
+office, and anywhere a lens is unwelcome. ESP32 sensor nodes read **WiFi Channel State
+Information (CSI)** — the tiny distortions a moving body imprints on radio waves — and a
+bundled sensing engine reports **presence, motion, people-count**, and (with a trained
+model) **coarse pose and resting vital signs**. No images are ever captured; it works in
+the dark and through walls.
+
+- **Flash a sensor node from your browser** — no toolchain needed: **[RuSense Flasher](https://pierregode.github.io/Ragnar/)** (ESP32-S3 / C6, Chrome/Edge).
+- **Install the backend:** `sudo ./scripts/install_sensing.sh` (runs as `ragnar-sensing.service`).
+- **View it** under the RuSense tabs in the web dashboard at `http://<ragnar-ip>:8000`.
+
+Powered by [RuView](https://github.com/PierreGode/RuView). Full details: **[RuSense Guide](docs/rusense.md)**.
+
+---
+
 ## 🐝 Ragnar + Pwnagotchi Side by Side
 
 A bundled helper script plus dashboard controls make swapping between Ragnar and Pwnagotchi painless:
@@ -281,6 +298,7 @@ Ragnar is built on the shoulders of great work by others:
 |---|---|---|
 | [Bjorn](https://github.com/infinition/Bjorn) | infinition | Original project that Ragnar is forked from |
 | [PagerBjorn / Loki](https://github.com/pineapple-pager-projects/pineapple_pager_loki) | [brAinphreAk](https://github.com/brainphreak) | WiFi Pineapple Pager adaptation layer — display system, hardware control wrapper (`pagerctl.py`), pager menu UI, and all MIPS-compiled binaries and libraries |
+| [RuView](https://github.com/PierreGode/RuView) | PierreGode | WiFi-CSI sensing engine and ESP32 CSI-node firmware behind [RuSense](docs/rusense.md) — camera-free presence, motion, people-count, pose and vital-sign sensing |
 
 ---
 
