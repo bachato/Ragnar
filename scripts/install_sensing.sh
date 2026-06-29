@@ -45,6 +45,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 log()  { echo "[install_sensing] $*"; }
 fail() { echo "[install_sensing][ERROR] $*" >&2; exit 1; }
 as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+as_user() { local u="$1"; shift; if [ "$(id -un)" = "$u" ]; then "$@"; else sudo -u "$u" -H "$@"; fi; }
 
 log "=== Ragnar sensing backend install $(date -u +%FT%TZ) ==="
 log "Ragnar dir : $RAGNAR_DIR"
@@ -71,7 +72,7 @@ else
         CARGO_BIN="/home/$RUN_USER/.cargo/bin/cargo"
     else
         log "Installing Rust toolchain via rustup (user: $RUN_USER)…"
-        as_root -u "$RUN_USER" bash -c \
+        as_user "$RUN_USER" bash -c \
             "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
         CARGO_BIN="/home/$RUN_USER/.cargo/bin/cargo"
     fi
@@ -81,13 +82,13 @@ else
     # Fetch pinned source (shallow) into a build cache owned by RUN_USER.
     SRC_DIR="/home/$RUN_USER/.cache/ragnar-sensing-src"
     if [ ! -d "$SRC_DIR/.git" ]; then
-        as_root -u "$RUN_USER" git clone --filter=blob:none "$RUVIEW_REPO" "$SRC_DIR"
+        as_user "$RUN_USER" git clone --filter=blob:none "$RUVIEW_REPO" "$SRC_DIR"
     fi
-    as_root -u "$RUN_USER" git -C "$SRC_DIR" fetch --all --tags
-    as_root -u "$RUN_USER" git -C "$SRC_DIR" checkout "$RUVIEW_PIN"
+    as_user "$RUN_USER" git -C "$SRC_DIR" fetch --all --tags
+    as_user "$RUN_USER" git -C "$SRC_DIR" checkout "$RUVIEW_PIN"
 
     log "Compiling $RUVIEW_CRATE (this can take a while on a Pi)…"
-    as_root -u "$RUN_USER" bash -c \
+    as_user "$RUN_USER" bash -c \
         "cd '$SRC_DIR/v2' && '$CARGO_BIN' build --release --package '$RUVIEW_CRATE'"
 
     BUILT="$SRC_DIR/v2/target/release/sensing-server"
