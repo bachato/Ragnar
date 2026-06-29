@@ -232,6 +232,26 @@ def rusense_api_proxy(subpath):
         )
     except _rusense_requests.RequestException as exc:
         return jsonify({'error': 'sensing-server unavailable', 'detail': str(exc)}), 502
+
+    # Fallback for recording deletion: the bundled sensing-server's
+    # DELETE /api/v1/recording/{id} returns 404 for recordings it scanned from
+    # disk (it only tracks ones created in the current session), so the UI's ✕
+    # never works. When that happens, remove the .jsonl from data/recordings
+    # ourselves so delete is reliable for any id (including names with spaces).
+    if (request.method == 'DELETE' and resp.status_code == 404
+            and subpath.startswith('recording/')):
+        rid = subpath[len('recording/'):]
+        rec_dir = os.path.normpath(os.path.join(shared_data.currentdir, 'data', 'recordings'))
+        target = os.path.normpath(os.path.join(rec_dir, rid + '.jsonl'))
+        # Guard against path traversal — must stay inside data/recordings.
+        if target.startswith(rec_dir + os.sep) and os.path.isfile(target):
+            try:
+                os.remove(target)
+                logger.info(f"[rusense] deleted recording via fallback: {rid}")
+                return jsonify({'success': True, 'deleted': rid})
+            except OSError as exc:
+                return jsonify({'success': False, 'error': str(exc)}), 500
+
     excluded = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
     headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
     return Response(resp.content, status=resp.status_code, headers=headers)
