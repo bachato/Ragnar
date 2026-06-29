@@ -756,6 +756,14 @@ class SharedData:
             "rusense_node_positions": {},           # {node_id: {"x":.., "y":.., "z":..}}
             "rusense_node_names": {},               # {node_id: "friendly name"} (used in alerts)
             "rusense_geofence_window": 30,          # RSSI samples/node (~30s @ 1Hz poll)
+            # Show the RuSense tab in the top navigation. Stored server-side so
+            # the choice is shared across every browser/device, like the rest of
+            # the settings here (the toggle lives in Config -> WiFi Sensing).
+            "rusense_tab_visible": False,
+            # Visual/scene settings for the 3D Observatory (rendering, wireframe,
+            # scene, room size, node map). Mirrored here from the browser so they
+            # persist for everyone; shape: {"version": <str>, "settings": {...}}.
+            "rusense_observatory_settings": {},
 
             "__title_pwnagotchi__": "Pwnagotchi Integration",
             "pwnagotchi_installed": False,

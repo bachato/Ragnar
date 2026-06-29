@@ -598,6 +598,9 @@ document.addEventListener('DOMContentLoaded', function() {
     initializePwnagotchiVisibility();
     handleHeadlessMode();
     applyRusenseTabVisibility();
+    // localStorage gave us an instant paint above; now reconcile with the
+    // server (the shared source of truth) without blocking startup.
+    syncRusenseTabFromServer();
 
 });
 
@@ -981,6 +984,9 @@ function startSensingLogPoll() {
 }
 
 // ── RuSense tab visibility (toggle lives in Settings; hidden by default) ─────
+// Stored server-side under the same key so the choice is shared across every
+// browser/device (like Ragnar's other settings). localStorage is a local cache
+// for instant first paint; the server value is synced in on load and wins.
 const RUSENSE_TAB_KEY = 'rusense_tab_visible';
 
 function _rusenseTabVisible() {
@@ -1002,9 +1008,25 @@ function applyRusenseTabVisibility() {
     syncRusenseTabToggle();
 }
 
+// Seed the local cache from the server config so a save on any device shows up
+// here. Accepts an already-fetched config to avoid an extra round-trip; fetches
+// one itself otherwise. Server wins when the key is present.
+async function syncRusenseTabFromServer(config) {
+    try {
+        const cfg = config || await fetchAPI('/api/config');
+        if (cfg && Object.prototype.hasOwnProperty.call(cfg, RUSENSE_TAB_KEY)) {
+            localStorage.setItem(RUSENSE_TAB_KEY, cfg[RUSENSE_TAB_KEY] ? '1' : '0');
+            applyRusenseTabVisibility();
+        }
+    } catch (e) { /* offline — keep the localStorage value */ }
+}
+
 function onRusenseTabToggled(cb) {
     localStorage.setItem(RUSENSE_TAB_KEY, cb.checked ? '1' : '0');
     applyRusenseTabVisibility();
+    // Persist server-side so it's shared/persistent for everyone, not just here.
+    postAPI('/api/config', { [RUSENSE_TAB_KEY]: cb.checked })
+        .catch(err => console.warn('Failed to persist RuSense tab visibility:', err));
     if (cb.checked) showTab('rusense');
 }
 
@@ -4218,6 +4240,9 @@ async function loadConfigData() {
     try {
         const config = await fetchAPI('/api/config');
         displayConfigForm(config);
+
+        // Reflect the server-stored RuSense tab visibility on the toggle here.
+        syncRusenseTabFromServer(config);
 
         // Load AI configuration
         loadAIConfiguration(config);
