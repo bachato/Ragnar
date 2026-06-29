@@ -29,6 +29,18 @@ async function req(method, url, body) {
   }
 }
 
+// Debounced push of node-corner positions to Ragnar's backend config, so the
+// server-side geofence (which confines the Pushover alerts) reasons over the
+// SAME node map the Observatory uses. The positions live in localStorage for
+// the 3D view; this mirrors them to the server where the alert loop can read.
+let _posSyncTimer = null;
+function syncNodePositionsToBackend(positions) {
+  clearTimeout(_posSyncTimer);
+  _posSyncTimer = setTimeout(() => {
+    req('POST', '/api/config', { rusense_node_positions: positions || {} });
+  }, 800);
+}
+
 // Each alert kind: config key + label + helper text.
 const TOGGLES = [
   ['rusense_notify_presence', 'Presence / occupancy', 'When a monitored space goes from empty to occupied (and back).'],
@@ -307,6 +319,22 @@ export default {
           </label>
         </div>
 
+        <div class="card card-pad space-y-1">
+          <label class="flex items-start justify-between gap-4 py-1 cursor-pointer">
+            <span class="min-w-0">
+              <span class="block text-sm font-semibold">Confine alerts to the room (geofence)</span>
+              <span class="block text-xs text-ink-muted">Suppress motion/presence/people alerts whose signature points
+                <em>outside</em> the room — hallway walk-bys and through-wall neighbours. Needs <strong>≥3 nodes mapped
+                with X/Y</strong> in the Observatory → <em>Room &amp; Nodes</em> section below; with fewer it's a no-op.
+                The "room empty" alert is never suppressed.</span>
+            </span>
+            <input type="checkbox" id="st-geofence" data-key="rusense_geofence_enabled"
+              ${(c.rusense_geofence_enabled ?? true) ? 'checked' : ''}
+              class="mt-1 shrink-0 w-6 h-6 accent-brand-400 cursor-pointer" />
+          </label>
+          <p id="st-geofence-status" class="text-xs text-ink-muted pt-1">Checking geofence status…</p>
+        </div>
+
         <div class="flex flex-wrap gap-3">
           <button id="st-save" class="btn-primary">Save settings</button>
           <button id="st-test" class="btn-ghost">Send test notification</button>
@@ -333,11 +361,33 @@ export default {
       payload.rusense_notify_cooldown_s = clampInt($('#st-cooldown'), 5, 3600, 60);
       payload.rusense_notify_min_confidence = clampInt($('#st-minconf'), 50, 99, 80) / 100;
       payload.rusense_notify_sustain_s = clampInt($('#st-sustain'), 0, 30, 2);
+      payload.rusense_geofence_enabled = $('#st-geofence').checked;
+      // Reconcile the node map to the backend on every save (positions also
+      // auto-sync as you edit them in the Observatory section below).
+      try { payload.rusense_node_positions = loadObsSettings().nodePositions || {}; } catch { /* ignore */ }
 
       const r = await req('POST', '/api/config', payload);
       toast(r.ok ? 'Settings saved' : ((r.data && r.data.error) || 'Could not save settings'),
         r.ok ? 'ok' : 'bad');
+      refreshGeofenceStatus();
     });
+
+    // Live geofence diagnostic — shows whether confinement is actually active.
+    const refreshGeofenceStatus = async () => {
+      const el = $('#st-geofence-status');
+      if (!el) return;
+      const g = await fetchJSON('/api/rusense/geofence');
+      if (!g) { el.textContent = 'Geofence status unavailable (sensing backend offline?).'; return; }
+      if (!g.enabled) { el.textContent = 'Geofence is OFF — alerts are not confined to the room.'; return; }
+      if ((g.mapped_nodes || 0) < 3) {
+        el.textContent = `Geofence ON but only ${g.mapped_nodes || 0} node(s) mapped — needs ≥3 to confine (currently a no-op).`;
+        return;
+      }
+      const v = g.verdict || {};
+      el.textContent = `Geofence ON · ${g.mapped_nodes} nodes mapped · live: ${v.reason || '—'} `
+        + `(hot ${v.hot_count ?? '—'}, energy ${v.total ?? '—'}).`;
+    };
+    refreshGeofenceStatus();
 
     $('#st-test').addEventListener('click', async () => {
       const r = await req('POST', '/api/pushover/test');
@@ -537,6 +587,7 @@ export default {
           if (!s.nodePositions[id] || typeof s.nodePositions[id] !== 'object') s.nodePositions[id] = {};
           s.nodePositions[id][axis] = v;
           saveObsSettings(s);
+          syncNodePositionsToBackend(s.nodePositions);
         });
       });
     };

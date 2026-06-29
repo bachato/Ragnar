@@ -747,6 +747,14 @@ class SharedData:
             # continuously for at least this many seconds (debounce).
             "rusense_notify_min_confidence": 0.8,   # 0..1; require >= 80% confidence
             "rusense_notify_sustain_s": 2,          # condition must persist this long
+            # Perimeter geofence: confine motion/presence/people alerts to the
+            # polygon of mapped node corners. Rejects disturbances whose spatial
+            # signature points outside the room (hallway walk-bys, through-wall
+            # neighbours). Needs >= 3 nodes mapped with X/Y in the Settings tab;
+            # with fewer mapped it is a no-op and alerts behave as before.
+            "rusense_geofence_enabled": True,
+            "rusense_node_positions": {},           # {node_id: {"x":.., "y":.., "z":..}}
+            "rusense_geofence_window": 30,          # RSSI samples/node (~30s @ 1Hz poll)
 
             "__title_pwnagotchi__": "Pwnagotchi Integration",
             "pwnagotchi_installed": False,

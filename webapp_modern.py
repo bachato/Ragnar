@@ -18,6 +18,7 @@ import signal
 import logging
 import threading
 import time
+import math
 import subprocess
 import re
 import io
@@ -254,8 +255,125 @@ _rusense_notify_state = {
     'node_active': set(),        # confirmed-active node_ids
     'node_missing_since': {},    # node_id -> first-missing timestamp (debounce offline)
     'nodes_initialized': False,  # node baseline established
+    'rssi_windows': {},          # node_id -> recent rssi_dbm samples (for geofence)
+    'last_geofence': None,       # last geofence verdict (for the debug endpoint)
 }
 _rusense_notify_lock = threading.Lock()
+
+
+# ── Geofence (server-side port of web/rusense/services/geofence.service.js) ──
+# Confines motion/presence/people alerts to the polygon of mapped node corners,
+# rejecting disturbances whose spatial signature points outside the room
+# (hallway walk-bys, through-wall neighbours). Same math as the browser
+# prototype so the on-screen verdict and the alert gate agree. Tunables mirror
+# the JS GEOFENCE_DEFAULTS; the window size is config-driven (backend polls ~1 Hz,
+# not at frame rate, so it samples RSSI more coarsely than the browser does).
+_GF_DBM_SCALE = 2.0              # dBm of RSSI std mapping to ~0.63 disturbance
+_GF_HOT_THRESHOLD = 0.35         # a node counts as "disturbed" above this (0..1)
+_GF_MIN_HOT_NODES = 2            # corroboration floor — kills single-corner walk-bys
+_GF_INSET_FRACTION = 0.08        # shrink polygon toward centre; boundary leans "outside"
+_GF_MIN_TOTAL_DISTURBANCE = 0.5  # floor so idle jitter stays quiet
+
+
+def _gf_finite(v):
+    try:
+        return v is not None and math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _gf_std(arr):
+    n = len(arr)
+    if n < 2:
+        return 0.0
+    m = sum(arr) / n
+    return math.sqrt(sum((x - m) ** 2 for x in arr) / n)
+
+
+def _gf_convex_hull(pts):
+    """Andrew's monotone chain. pts=[{'x','y','id'}] -> ordered ring."""
+    p = sorted(pts, key=lambda q: (q['x'], q['y']))
+    if len(p) < 3:
+        return p
+    def cross(o, a, b):
+        return (a['x']-o['x'])*(b['y']-o['y']) - (a['y']-o['y'])*(b['x']-o['x'])
+    lower = []
+    for q in p:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], q) <= 0:
+            lower.pop()
+        lower.append(q)
+    upper = []
+    for q in reversed(p):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], q) <= 0:
+            upper.pop()
+        upper.append(q)
+    return lower[:-1] + upper[:-1]
+
+
+def _gf_point_in_polygon(pt, poly):
+    if not poly or len(poly) < 3:
+        return False
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]['x'], poly[i]['y']
+        xj, yj = poly[j]['x'], poly[j]['y']
+        if ((yi > pt['y']) != (yj > pt['y'])) and \
+           (pt['x'] < (xj - xi) * (pt['y'] - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _gf_inset(poly, frac):
+    if not poly or len(poly) < 3 or not frac:
+        return poly
+    n = len(poly)
+    cx = sum(p['x'] for p in poly) / n
+    cy = sum(p['y'] for p in poly) / n
+    return [{'x': p['x'] + (cx - p['x']) * frac, 'y': p['y'] + (cy - p['y']) * frac}
+            for p in poly]
+
+
+def _rusense_geofence_verdict(positions, windows):
+    """Port of evaluateGeofence(). positions={id:{x,y,z}}, windows={id:[rssi…]}.
+    Returns a dict incl. ok, energetic, corroborated, interior, inside_perimeter,
+    reason, hot_count, total. ok=False when fewer than 3 corners are mapped."""
+    nodes = []
+    for nid, pos in (positions or {}).items():
+        if not isinstance(pos, dict) or not _gf_finite(pos.get('x')) or not _gf_finite(pos.get('y')):
+            continue
+        win = windows.get(str(nid)) or []
+        disturbance = 1.0 - math.exp(-_gf_std(win) / (_GF_DBM_SCALE or 1e-9))
+        nodes.append({'id': str(nid), 'x': float(pos['x']), 'y': float(pos['y']),
+                      'disturbance': disturbance, 'hot': disturbance >= _GF_HOT_THRESHOLD})
+    if len(nodes) < 3:
+        return {'ok': False, 'reason': 'need >=3 mapped node corners', 'inside_perimeter': False,
+                'energetic': False, 'corroborated': False, 'interior': False,
+                'hot_count': 0, 'total': 0.0, 'mapped': len(nodes)}
+    hull = _gf_convex_hull(nodes)
+    inset = _gf_inset(hull, _GF_INSET_FRACTION)
+    total = sum(n['disturbance'] for n in nodes)
+    centroid = None
+    if total > 1e-6:
+        centroid = {'x': sum(n['x'] * n['disturbance'] for n in nodes) / total,
+                    'y': sum(n['y'] * n['disturbance'] for n in nodes) / total}
+    hot_count = sum(1 for n in nodes if n['hot'])
+    interior = _gf_point_in_polygon(centroid, inset) if centroid else False
+    corroborated = hot_count >= _GF_MIN_HOT_NODES
+    energetic = total >= _GF_MIN_TOTAL_DISTURBANCE
+    inside_perimeter = interior and corroborated and energetic
+    if not energetic:
+        reason = 'quiet'
+    elif not corroborated:
+        reason = f'edge/outside — only {hot_count} corner(s) disturbed'
+    elif not interior:
+        reason = 'disturbance centroid outside perimeter'
+    else:
+        reason = 'inside perimeter'
+    return {'ok': True, 'reason': reason, 'inside_perimeter': inside_perimeter,
+            'energetic': energetic, 'corroborated': corroborated, 'interior': interior,
+            'hot_count': hot_count, 'total': round(total, 3), 'mapped': len(nodes)}
 
 
 def _rusense_get(path):
@@ -337,7 +455,52 @@ def _rusense_check_once():
         sustain = float(shared_data.config.get('rusense_notify_sustain_s', 2))
     except (TypeError, ValueError):
         sustain = 2.0
+    try:
+        gf_window = int(shared_data.config.get('rusense_geofence_window', 30))
+    except (TypeError, ValueError):
+        gf_window = 30
+    gf_window = max(4, min(600, gf_window))
+    gf_enabled = bool(shared_data.config.get('rusense_geofence_enabled', True))
     now = time.time()
+
+    # ── Nodes first: the roster feeds BOTH the geofence RSSI windows and the
+    #    offline detector, so fetch it once and reuse it. ──
+    nodes = _rusense_get('/api/v1/nodes')
+    node_list = nodes.get('nodes') if isinstance(nodes, dict) else None
+    if not isinstance(node_list, list):
+        node_list = None
+
+    # Extend per-node RSSI windows and evaluate the geofence verdict. A "ghost"
+    # is a disturbance with real energy that is NOT corroborated/interior — i.e.
+    # a walk-by or through-wall neighbour. When detected we suppress the
+    # occupied/motion/people RISE alerts (the "empty" alert is never a ghost).
+    block_motion = False
+    if node_list is not None:
+        with _rusense_notify_lock:
+            windows = _rusense_notify_state['rssi_windows']
+            seen = set()
+            for n in node_list:
+                nid, rssi = n.get('node_id'), n.get('rssi_dbm')
+                if nid is None or rssi is None:
+                    continue
+                key = str(nid)
+                seen.add(key)
+                try:
+                    val = float(rssi)
+                except (TypeError, ValueError):
+                    continue
+                w = windows.setdefault(key, [])
+                w.append(val)
+                if len(w) > gf_window:
+                    del w[:-gf_window]
+            for key in list(windows.keys()):   # drop windows for vanished nodes
+                if key not in seen:
+                    del windows[key]
+            positions = shared_data.config.get('rusense_node_positions') or {}
+            verdict = _rusense_geofence_verdict(positions, windows) if gf_enabled else None
+            _rusense_notify_state['last_geofence'] = verdict
+        if verdict and verdict.get('ok') and verdict.get('energetic') and not verdict.get('inside_perimeter'):
+            block_motion = True
 
     # ── Presence / motion / people, from the latest sensing frame ──
     latest = _rusense_get('/api/v1/sensing/latest')
@@ -376,7 +539,11 @@ def _rusense_check_once():
             m_rose, _m_fell = _rusense_debounce('motion', motion_active if confident else None, now, sustain)
             o_rose, _o_fell = _rusense_debounce('people', people_over if confident else None, now, sustain)
 
-        if p_rose:
+        if (p_rose or m_rose or o_rose) and block_motion:
+            logger.info(f"[rusense] geofence suppressed alert — {verdict.get('reason')} "
+                        f"(hot={verdict.get('hot_count')}, total={verdict.get('total')})")
+
+        if p_rose and not block_motion:
             who = f"{people} people" if people > 1 else "Someone"
             po.notify_rusense(
                 'presence',
@@ -387,21 +554,20 @@ def _rusense_check_once():
                 'presence',
                 "\U0001F6E1️ A monitored space is now empty.",
                 title="RuSense — Empty")
-        if m_rose:
+        if m_rose and not block_motion:
             po.notify_rusense(
                 'motion',
                 "\U0001F3C3 Motion detected in a monitored space.",
                 title="RuSense — Motion")
-        if o_rose:
+        if o_rose and not block_motion:
             po.notify_rusense(
                 'people',
                 f"\U0001F465 {people} people detected (threshold {threshold}).",
                 title="RuSense — People", priority=1)
 
     # ── CSI node offline detection (debounced: must be gone for `sustain`) ──
-    nodes = _rusense_get('/api/v1/nodes')
-    if isinstance(nodes, dict) and isinstance(nodes.get('nodes'), list):
-        active_now = {str(n.get('node_id')) for n in nodes['nodes']
+    if node_list is not None:
+        active_now = {str(n.get('node_id')) for n in node_list
                       if n.get('status') == 'active' and n.get('node_id') is not None}
         newly_offline = []
         with _rusense_notify_lock:
@@ -448,6 +614,25 @@ def _rusense_notify_loop():
         # Poll ~1 Hz when enabled so the sustain window is measured accurately;
         # idle slowly when alerts are off.
         _time.sleep(1 if active else 5)
+
+
+@app.route('/api/rusense/geofence', methods=['GET'])
+def rusense_geofence_status():
+    """Diagnostic: the geofence's last verdict + how many node corners are
+    mapped. Lets you validate that alert confinement is actually working."""
+    with _rusense_notify_lock:
+        verdict = _rusense_notify_state.get('last_geofence')
+    positions = shared_data.config.get('rusense_node_positions') or {}
+    mapped = sum(1 for p in positions.values()
+                 if isinstance(p, dict) and _gf_finite(p.get('x')) and _gf_finite(p.get('y')))
+    return jsonify({
+        'enabled': bool(shared_data.config.get('rusense_geofence_enabled', True)),
+        'mapped_nodes': mapped,
+        'active': bool(verdict and verdict.get('ok')),
+        'verdict': verdict,
+        'note': ('Geofence gates alerts only with >=3 node corners mapped (X/Y) in '
+                 'the Settings tab. With fewer mapped it is a no-op.'),
+    })
 
 
 # ── Sensing backend lifecycle (bundled sensing-server) ───────────────────────
