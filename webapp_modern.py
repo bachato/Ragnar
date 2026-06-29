@@ -475,7 +475,17 @@ def _rusense_check_once():
     # a walk-by or through-wall neighbour. When detected we suppress the
     # occupied/motion/people RISE alerts (the "empty" alert is never a ghost).
     block_motion = False
+    node_people = None
     if node_list is not None:
+        # Per-node person_count is the only count the engine exposes (there is no
+        # reliable aggregate). It ghosts on individual nodes, so take the MEDIAN
+        # across active nodes — a single node spiking (e.g. node 2 → 3) can't move
+        # the median, so a count is only believed when a majority of nodes agree.
+        counts = sorted(int(n['person_count']) for n in node_list
+                        if n.get('status') == 'active'
+                        and isinstance(n.get('person_count'), (int, float)))
+        if counts:
+            node_people = counts[(len(counts) - 1) // 2]   # lower median (conservative)
         with _rusense_notify_lock:
             windows = _rusense_notify_state['rssi_windows']
             seen = set()
@@ -518,14 +528,21 @@ def _rusense_check_once():
             conf = conf / 100.0
         confident = conf is not None and conf >= min_conf
 
-        people = latest.get('estimated_persons')
-        if people is None:
-            persons = latest.get('persons')
-            people = len(persons) if isinstance(persons, list) else (1 if present else 0)
-        try:
-            people = int(people)
-        except (TypeError, ValueError):
-            people = 1 if present else 0
+        # Prefer the corroborated per-node median (node_people); fall back to any
+        # top-level count field the engine might provide, then to presence.
+        if node_people is not None:
+            people = node_people
+        else:
+            people = latest.get('estimated_persons')
+            if people is None:
+                people = latest.get('total_persons')
+            if people is None:
+                persons = latest.get('persons')
+                people = len(persons) if isinstance(persons, list) else (1 if present else 0)
+            try:
+                people = int(people)
+            except (TypeError, ValueError):
+                people = 1 if present else 0
         try:
             threshold = int(shared_data.config.get('rusense_notify_people_threshold', 1))
         except (TypeError, ValueError):

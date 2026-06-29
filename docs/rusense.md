@@ -133,26 +133,59 @@ Configure them in the RuSense **Settings** tab. Available triggers:
 
 - **Presence / occupancy** — a monitored space goes from empty to occupied (and back).
 - **Motion** — significant (active) motion is detected.
-- **People-count threshold** — the estimated number of people crosses a value you set.
+- **People-count threshold** — the number of people crosses a value you set. The engine
+  exposes only a *per-node* count (which ghosts on individual nodes), so RuSense uses the
+  **median across active nodes** — a single node spiking can't move the median, so a count
+  is only believed when a majority of nodes agree.
 - **Node offline** — a provisioned CSI sensor node stops streaming.
 
 A configurable **cooldown** prevents a flapping signal from spamming you, and each
 trigger can be toggled independently under a master on/off switch.
 
-To suppress false positives, an event only fires when **two guards** are both met:
+To suppress false positives, an event only fires when **all** of these hold:
 
 - **Minimum confidence** — the detector must be at least this confident (default 80%);
-  low-confidence flickers are ignored.
+  low-confidence flickers are ignored. (`rusense_notify_min_confidence`)
 - **Must last** — the condition has to hold continuously for at least this long
-  (default 2 seconds) before an alert is sent.
+  (default 2 seconds) before an alert is sent. (`rusense_notify_sustain_s`)
+- **Geofence** — the disturbance must sit *inside* the mapped room perimeter, not be a
+  hallway walk-by or through-wall neighbour. See [Geofence](#geofence--confining-alerts-to-the-room).
 
-Both are adjustable in the Settings tab (`rusense_notify_min_confidence` and
-`rusense_notify_sustain_s`).
+All are adjustable in the Settings tab.
 
 Alerts reuse Ragnar's existing **Pushover** account: set your **User Key** and **API
 Token** once under the main dashboard's **Config → Pushover Notifications**, then enable
 the RuSense triggers in the Settings tab. Use **Send test notification** to confirm
 delivery. (Config keys: `rusense_notify_*` in `shared.py`.)
+
+> [!IMPORTANT]
+> The alert monitor runs inside the `ragnar` service process. After you change alert
+> settings **or pull new code**, restart it so the changes take effect:
+> ```bash
+> sudo systemctl restart ragnar
+> ```
+
+### Geofence — confining alerts to the room
+
+The biggest source of false alerts is motion *outside* the room — neighbours through a
+wall, people in the hallway. The **geofence** rejects these: it treats each node as a
+disturbance sensor anchored at its mapped corner and only lets an alert through when the
+disturbance is **corroborated and interior** to the polygon of node corners. A lone-node
+or edge-pinned disturbance (a walk-by) is suppressed. The "room empty" alert is never
+suppressed.
+
+To use it:
+
+1. Map each node's **X / Y** corner position in **Settings → Observatory → Room & Nodes**
+   (these auto-sync to the backend). You need **≥ 3 nodes mapped**; with fewer the geofence
+   is a no-op and alerts behave as before.
+2. Leave **"Confine alerts to the room (geofence)"** enabled in the Settings tab.
+3. Validate it live: `GET /api/rusense/geofence` (or the status line under the toggle)
+   shows the current verdict — `inside perimeter`, `edge/outside`, or `quiet`.
+
+It's a coarse RSSI-based filter, not a hard RF wall (2.4 GHz leaks through walls); tune the
+`_GF_*` constants in `webapp_modern.py` if ghosts persist. Config keys:
+`rusense_geofence_enabled`, `rusense_node_positions`, `rusense_geofence_window`.
 
 ### Two training paths
 
