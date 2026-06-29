@@ -102,6 +102,16 @@ fi
 "$INSTALL_BIN" --help >/dev/null 2>&1 || fail "$INSTALL_BIN failed to execute"
 log "Binary installed at $INSTALL_BIN"
 
+# ── 1b. Runtime data directories ─────────────────────────────────────────────
+# The sensing-server writes recordings/models to data/ relative to its
+# WorkingDirectory. git does not track empty directories, so on a fresh clone
+# these don't exist and "recording create" fails with ENOENT (os error 2).
+# Create them up front, owned by the run user. (The unit also recreates them on
+# every start via ExecStartPre, so a deleted/replaced repo dir self-heals.)
+as_root install -d -o "$RUN_USER" -g "$RUN_USER" \
+    "$RAGNAR_DIR/data/recordings" "$RAGNAR_DIR/data/models"
+log "Ensured data dirs: data/recordings, data/models (owner $RUN_USER)"
+
 # ── 2. Step aside any external RuView unit (port conflict) ───────────────────
 # Unconditional + "|| true": harmless if the unit is absent, and avoids a
 # pipefail/SIGPIPE detection pitfall (grep -q closing the pipe early). This
@@ -125,6 +135,9 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 WorkingDirectory=$RAGNAR_DIR
+# Recreate the data dirs on every (re)start so a replaced/deleted repo dir or a
+# missing data/ self-heals — relative recording writes need these to exist.
+ExecStartPre=/bin/mkdir -p $RAGNAR_DIR/data/recordings $RAGNAR_DIR/data/models
 Environment=RUST_LOG=info
 Environment=SENSING_ALLOWED_HOSTS=$ALLOWED_HOSTS
 Environment=RUVIEW_PRESENCE_FLOOR=0.25
