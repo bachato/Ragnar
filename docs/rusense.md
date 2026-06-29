@@ -77,6 +77,16 @@ USB using the **RuSense CSI Node Flasher** (Web Serial / esptool-js):
 4. Click **Forge**, select the `USB JTAG/serial debug unit` port, and let it flash.
 5. If the board isn't detected, hold **BOOT** while tapping **RST**, then retry.
 
+> [!IMPORTANT]
+> **Don't mix S3 and C6 nodes in the same mesh — pick one chip type and use it for
+> every node.** The two chips capture different CSI widths (e.g. 128 vs 192
+> subcarriers), and the engine's multistatic fusion needs all nodes the same width.
+> A mixed fleet makes fusion fail and fall back to per-node processing, which costs
+> you accurate people-counting, positioning, pose and vital-signs. Presence/motion/
+> geofence still work, but for a clean setup keep the whole mesh **all-S3 or all-C6**.
+> **S3 is recommended** (steadier, best-tested); use C6 only if you specifically want
+> Wi-Fi 6 — and then make *every* node a C6.
+
 The firmware bins served by the flasher are vendored bit-identically from upstream
 **RuView** at a pinned commit (see `rusense_flasher/rusense-csi-node.version`).
 

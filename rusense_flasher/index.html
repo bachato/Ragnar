@@ -36,6 +36,15 @@
         </p>
       </div>
 
+      <!-- ───────── One chip type per mesh ───────── -->
+      <div style="max-width:720px;margin:0 auto 1.25rem;padding:.85rem 1.1rem;border:1px solid #b4791e;border-radius:.6rem;background:rgba(180,121,30,.12);color:#f4d9a6;font-size:.95rem;line-height:1.5">
+        ⚠️ <strong>Don't mix S3 and C6 in one mesh.</strong> Pick a single chip type and flash
+        <em>every</em> node the same — the two capture different CSI widths, and the server's
+        multistatic fusion needs them identical. A mixed fleet breaks fusion (you lose
+        accurate people-count, positioning, pose &amp; vital-signs). <strong>All-S3 is
+        recommended</strong>; choose C6 only if you want Wi-Fi&nbsp;6 — and then make them all C6.
+      </div>
+
       <!-- ───────── ESP32-S3 (production) ───────── -->
       <section class="flash-panel" id="csi-s3">
         <h2>📡 ESP32-S3 CSI Node <span class="panel-sub">(production · the workhorse)</span></h2>
