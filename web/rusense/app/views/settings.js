@@ -597,16 +597,16 @@ export default {
       };
 
       container.innerHTML = `
-        <div class="rounded-lg bg-ink-0 border border-ink-3 p-2">
+        <div class="rounded-lg bg-ink-0 border border-ink-3 p-2" style="max-width:50%">
           <svg id="node-plan" viewBox="0 0 ${roomX} ${roomY}" preserveAspectRatio="xMidYMid meet"
                style="width:100%;aspect-ratio:${roomX}/${roomY};display:block;touch-action:none">
             <rect x="0" y="0" width="${roomX}" height="${roomY}" fill="#0e1726" stroke="#334155" stroke-width="${span * 0.01}"/>
             ${grid}
             ${ids.map(handle).join('')}
           </svg>
-          <p class="text-xs text-ink-muted mt-1">Top-down view · room ${roomX}×${roomY} m. Drag each dot to where the node sits;
-            set room size under <em>Scene</em>. ≥3 nodes needed for the geofence.</p>
         </div>
+        <p class="text-xs text-ink-muted mt-1">Top-down view · room ${roomX}×${roomY} m. Drag each dot to where the node sits;
+          set room size under <em>Scene</em>. ≥3 nodes needed for the geofence.</p>
         <div id="node-rows" class="mt-2"></div>`;
 
       const rows = container.querySelector('#node-rows');
