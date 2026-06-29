@@ -8,7 +8,7 @@ import dashboard from './views/dashboard.js';
 import sensing from './views/sensing.js?v=20260628-geofence';
 import nodes from './views/nodes.js';
 import training from './views/training.js?v=20260628-debounce';
-import settings from './views/settings.js?v=20260629-geofence';
+import settings from './views/settings.js?v=20260629-nodeplan';
 import about from './views/about.js';
 
 const VIEWS = { dashboard, sensing, nodes, training, settings, about };

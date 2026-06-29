@@ -524,7 +524,13 @@ export default {
       URL.revokeObjectURL(a.href);
     });
 
-    // ── Per-node rows (label + X/Y/Z). Fetched once; "Refresh nodes" re-pulls.
+    // ── Interactive floor plan: drag node dots onto a top-down room square +
+    //    rename inline. Replaces the old X/Y/Z numeric grid (X/Y is what the
+    //    geofence uses; Z = height is a small optional field). Fetched once;
+    //    "Refresh nodes" re-pulls. SVG viewBox is in metres (0..roomX, 0..roomY)
+    //    so node coords map 1:1 to the picture.
+    const NODE_PALETTE = ['#38bdf8', '#f472b6', '#facc15', '#34d399', '#a78bfa', '#fb923c', '#f87171', '#22d3ee'];
+
     const renderNodes = async () => {
       const container = root.querySelector('#obs-node-list');
       const hint = root.querySelector('#obs-node-hint');
@@ -534,66 +540,157 @@ export default {
         const n = await fetchJSON('/api/v1/nodes');
         ids = (n?.nodes || []).map((x) => x.node_id).filter((x) => x != null);
       } catch { /* offline — keep whatever node overrides are already saved */ }
-      // Fall back to ids we already have overrides for, so saved layout is editable offline.
       if (!ids.length) {
         ids = [...new Set([...Object.keys(s.nodeLabels), ...Object.keys(s.nodePositions)])];
       }
-      // Stable numeric-ish sort.
       ids = [...new Set(ids.map(String))].sort((a, b) => {
         const na = Number(a), nb = Number(b);
         return (Number.isFinite(na) && Number.isFinite(nb)) ? na - nb : a.localeCompare(b);
       });
 
-      if (hint) hint.textContent = ids.length ? `${ids.length} node${ids.length > 1 ? 's' : ''}` : 'No nodes reporting — open the Observatory once nodes are live.';
-      container.innerHTML = '';
-      ids.forEach((id) => {
-        const pos = (s.nodePositions[id] && typeof s.nodePositions[id] === 'object') ? s.nodePositions[id] : {};
-        const wrap = document.createElement('div');
-        wrap.className = 'py-2 border-b border-ink-3 last:border-0 space-y-2';
-        wrap.innerHTML = `
-          <div class="text-xs uppercase tracking-wide text-ink-muted">Node ${id}</div>
-          <label class="flex items-center justify-between gap-3">
-            <span class="text-sm text-ink-soft shrink-0">Name</span>
-            <input type="text" data-node-name="${id}" placeholder="Node ${id}"
-              class="flex-1 min-w-0 max-w-[14rem] bg-ink-1 border border-ink-3 rounded-lg px-2.5 py-1.5 text-sm" />
-          </label>
-          <div>
-            <span class="block text-sm text-ink-soft mb-1">X / Y / Z (m)</span>
-            <div class="grid grid-cols-3 gap-1.5">
-              <input type="number" step="0.1" data-node-axis="x" data-node-id="${id}" value="${pos.x ?? ''}"
-                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-2 py-1.5 text-sm font-mono" />
-              <input type="number" step="0.1" data-node-axis="y" data-node-id="${id}" value="${pos.y ?? ''}"
-                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-2 py-1.5 text-sm font-mono" />
-              <input type="number" step="0.1" data-node-axis="z" data-node-id="${id}" value="${pos.z ?? ''}"
-                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-2 py-1.5 text-sm font-mono" />
-            </div>
-          </div>`;
-        container.appendChild(wrap);
-      });
+      const roomX = Number(s.roomX) > 0 ? Number(s.roomX) : 5;
+      const roomY = Number(s.roomY) > 0 ? Number(s.roomY) : 5;
+      const clampX = (v) => Math.max(0, Math.min(roomX, v));
+      const clampY = (v) => Math.max(0, Math.min(roomY, v));
 
-      $$('[data-node-name]', container).forEach((inp) => {
+      if (hint) hint.textContent = ids.length
+        ? `${ids.length} node${ids.length > 1 ? 's' : ''} · drag the dots to match your room`
+        : 'No nodes reporting — open the Observatory once nodes are live.';
+
+      // Auto-place any node without a saved (x,y) so it lands on the plan ready
+      // to drag (spread around the centre). Saved immediately so the geofence
+      // gets ≥3 corners without manual typing.
+      let placedAny = false;
+      ids.forEach((id, i) => {
+        const p = s.nodePositions[id];
+        if (!p || typeof p !== 'object' || !Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+          const ang = (i / Math.max(1, ids.length)) * Math.PI * 2;
+          s.nodePositions[id] = {
+            x: +clampX(roomX / 2 + Math.cos(ang) * roomX * 0.3).toFixed(2),
+            y: +clampY(roomY / 2 + Math.sin(ang) * roomY * 0.3).toFixed(2),
+            z: (p && Number.isFinite(p.z)) ? p.z : 0,
+          };
+          placedAny = true;
+        }
+      });
+      if (placedAny) { saveObsSettings(s); syncNodePositionsToBackend(s.nodePositions); }
+
+      const span = Math.max(roomX, roomY);
+      const r = span * 0.045;          // handle radius, metres
+      const fs = r * 1.5;              // label font size, metres
+      const sw = span * 0.005;         // grid stroke, metres
+      const pos = (id) => s.nodePositions[id];
+      const labelOf = (id) => (s.nodeLabels[id] && s.nodeLabels[id].trim()) || `#${id}`;
+
+      let grid = '';
+      for (let gx = 1; gx < roomX; gx++) grid += `<line x1="${gx}" y1="0" x2="${gx}" y2="${roomY}" stroke="#1e293b" stroke-width="${sw}"/>`;
+      for (let gy = 1; gy < roomY; gy++) grid += `<line x1="0" y1="${gy}" x2="${roomX}" y2="${gy}" stroke="#1e293b" stroke-width="${sw}"/>`;
+
+      const handle = (id, i) => {
+        const p = pos(id), c = NODE_PALETTE[i % NODE_PALETTE.length];
+        const cx = clampX(p.x), cy = clampY(p.y);
+        return `<g data-handle="${id}" style="cursor:grab">
+          <circle cx="${cx}" cy="${cy}" r="${r}" fill="${c}" fill-opacity="0.85" stroke="#0b0f12" stroke-width="${r * 0.18}"/>
+          <text x="${cx}" y="${cy - r * 1.35}" text-anchor="middle" font-size="${fs}" fill="#e8eef3"
+                style="pointer-events:none;font-weight:600">${labelOf(id)}</text>
+        </g>`;
+      };
+
+      container.innerHTML = `
+        <div class="rounded-lg bg-ink-0 border border-ink-3 p-2">
+          <svg id="node-plan" viewBox="0 0 ${roomX} ${roomY}" preserveAspectRatio="xMidYMid meet"
+               style="width:100%;aspect-ratio:${roomX}/${roomY};display:block;touch-action:none">
+            <rect x="0" y="0" width="${roomX}" height="${roomY}" fill="#0e1726" stroke="#334155" stroke-width="${span * 0.01}"/>
+            ${grid}
+            ${ids.map(handle).join('')}
+          </svg>
+          <p class="text-xs text-ink-muted mt-1">Top-down view · room ${roomX}×${roomY} m. Drag each dot to where the node sits;
+            set room size under <em>Scene</em>. ≥3 nodes needed for the geofence.</p>
+        </div>
+        <div id="node-rows" class="mt-2"></div>`;
+
+      const rows = container.querySelector('#node-rows');
+      rows.innerHTML = ids.map((id, i) => {
+        const c = NODE_PALETTE[i % NODE_PALETTE.length], p = pos(id);
+        return `<div class="flex flex-wrap items-center gap-2 py-2 border-b border-ink-3 last:border-0">
+          <span class="shrink-0 w-3 h-3 rounded-full" style="background:${c}"></span>
+          <input type="text" data-node-name="${id}" placeholder="Node ${id}"
+            class="flex-1 min-w-[8rem] bg-ink-1 border border-ink-3 rounded-lg px-2.5 py-1.5 text-sm" />
+          <span data-readout="${id}" class="shrink-0 text-xs font-mono text-ink-muted w-24 text-right">(${p.x.toFixed(1)}, ${p.y.toFixed(1)}) m</span>
+          <input type="number" step="0.1" data-node-z="${id}" value="${Number.isFinite(p.z) ? p.z : 0}" title="Height Z (m)"
+            class="shrink-0 w-16 bg-ink-1 border border-ink-3 rounded-lg px-2 py-1.5 text-sm font-mono" />
+        </div>`;
+      }).join('');
+
+      // Names — update both the saved label and the live plan text.
+      $$('[data-node-name]', rows).forEach((inp) => {
         const id = inp.dataset.nodeName;
         inp.value = s.nodeLabels[id] != null ? s.nodeLabels[id] : '';
         inp.addEventListener('input', () => {
           if (inp.value.length) s.nodeLabels[id] = inp.value; else delete s.nodeLabels[id];
           saveObsSettings(s);
+          const t = container.querySelector(`#node-plan g[data-handle="${id}"] text`);
+          if (t) t.textContent = inp.value.trim() || `#${id}`;
         });
       });
-      $$('[data-node-axis]', container).forEach((inp) => {
-        const id = inp.dataset.nodeId, axis = inp.dataset.nodeAxis;
+      // Z (height) — optional, used only by the 3D Observatory view.
+      $$('[data-node-z]', rows).forEach((inp) => {
+        const id = inp.dataset.nodeZ;
         inp.addEventListener('input', () => {
           const v = parseFloat(inp.value);
           if (!Number.isFinite(v)) return;
-          if (!s.nodePositions[id] || typeof s.nodePositions[id] !== 'object') s.nodePositions[id] = {};
-          s.nodePositions[id][axis] = v;
+          (s.nodePositions[id] || (s.nodePositions[id] = {})).z = v;
           saveObsSettings(s);
           syncNodePositionsToBackend(s.nodePositions);
         });
+      });
+
+      // Drag handles — pointer capture so the drag tracks outside the dot too.
+      const svg = container.querySelector('#node-plan');
+      const toMeters = (e) => {
+        const b = svg.getBoundingClientRect();
+        return { x: clampX((e.clientX - b.left) / b.width * roomX), y: clampY((e.clientY - b.top) / b.height * roomY) };
+      };
+      let drag = null;
+      svg.querySelectorAll('g[data-handle]').forEach((g) => {
+        const id = g.dataset.handle;
+        g.addEventListener('pointerdown', (e) => {
+          e.preventDefault();
+          drag = g; g.style.cursor = 'grabbing';
+          try { g.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+        });
+        g.addEventListener('pointermove', (e) => {
+          if (drag !== g) return;
+          const m = toMeters(e);
+          g.querySelector('circle').setAttribute('cx', m.x);
+          g.querySelector('circle').setAttribute('cy', m.y);
+          const t = g.querySelector('text');
+          t.setAttribute('x', m.x); t.setAttribute('y', m.y - r * 1.35);
+          const ro = container.querySelector(`[data-readout="${id}"]`);
+          if (ro) ro.textContent = `(${m.x.toFixed(1)}, ${m.y.toFixed(1)}) m`;
+          const p = s.nodePositions[id] || (s.nodePositions[id] = {});
+          p.x = +m.x.toFixed(2); p.y = +m.y.toFixed(2);
+          if (!Number.isFinite(p.z)) p.z = 0;
+        });
+        const end = (e) => {
+          if (drag !== g) return;
+          drag = null; g.style.cursor = 'grab';
+          try { g.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+          saveObsSettings(s);
+          syncNodePositionsToBackend(s.nodePositions);
+        };
+        g.addEventListener('pointerup', end);
+        g.addEventListener('pointercancel', end);
       });
     };
 
     const refreshBtn = root.querySelector('#obs-node-refresh');
     if (refreshBtn) refreshBtn.addEventListener('click', renderNodes);
+    // Re-draw the plan when the room size changes (on commit, not every keystroke).
+    ['roomX', 'roomY'].forEach((k) => {
+      const el = root.querySelector(`[data-obs-num="${k}"]`);
+      if (el) el.addEventListener('change', () => renderNodes());
+    });
     renderNodes();
   },
 };
