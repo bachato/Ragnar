@@ -173,6 +173,9 @@ export class HudController {
     const overlay = document.getElementById('settings-overlay');
     const btn = document.getElementById('settings-btn');
     const closeBtn = document.getElementById('settings-close');
+    // The settings dialog now lives in the RuSense Settings tab. If its
+    // markup has been removed from this page there is nothing to wire.
+    if (!overlay || !btn || !closeBtn) return;
     btn.addEventListener('click', () => this.toggleSettings());
     closeBtn.addEventListener('click', () => this.toggleSettings());
     overlay.addEventListener('click', (e) => { if (e.target === overlay) this.toggleSettings(); });
@@ -472,8 +475,10 @@ export class HudController {
   // ============================================================
 
   toggleSettings() {
+    const overlay = document.getElementById('settings-overlay');
+    if (!overlay) return;
     this._settingsOpen = !this._settingsOpen;
-    document.getElementById('settings-overlay').style.display = this._settingsOpen ? 'flex' : 'none';
+    overlay.style.display = this._settingsOpen ? 'flex' : 'none';
   }
 
   toggleFullscreen() {

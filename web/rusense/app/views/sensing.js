@@ -2,6 +2,7 @@
 import { icons } from '../icons.js';
 import { html, $, fmt, throttleLatest, vitalText } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
+import { geofenceService } from '../../services/geofence.service.js?v=20260628-geofence';
 
 // Teal→amber→red ramp for the field heatmap.
 function heat(v) {
@@ -30,6 +31,24 @@ export default {
           </div>
           <canvas id="sf-canvas" class="w-full rounded-lg bg-ink-0 aspect-[2/1]" aria-label="Signal field heatmap"></canvas>
           <p class="text-xs text-ink-muted">CSI energy map across the sensing grid. Brighter = stronger perturbation.</p>
+        </div>
+
+        <div class="card card-pad space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="card-title">Perimeter geofence <span class="text-xs text-ink-muted font-normal">prototype</span></h2>
+            <span id="gf-verdict" class="badge-mut">—</span>
+          </div>
+          <canvas id="gf-canvas" class="w-full rounded-lg bg-ink-0 aspect-[3/2]" aria-label="Room geofence plan"></canvas>
+          <div class="grid grid-cols-3 gap-3 text-sm">
+            <div class="stat"><span class="stat-label">Disturbed corners</span><span class="stat-value" id="gf-hot">—</span></div>
+            <div class="stat"><span class="stat-label">Disturbance</span><span class="stat-value" id="gf-total">—</span></div>
+            <div class="stat"><span class="stat-label">Inside score</span><span class="stat-value" id="gf-score">—</span></div>
+          </div>
+          <p class="text-xs text-ink-muted" id="gf-note">
+            Motion is confined to the polygon of mapped node corners (Settings → node X/Y).
+            A disturbance that lights up only one corner — a hallway walk-by — is rejected as outside.
+            Coarse zone-level filter, not a hard RF wall.
+          </p>
         </div>
 
         <div class="grid gap-4 sm:grid-cols-2">
@@ -80,6 +99,83 @@ export default {
       }
     };
 
+    // --- Geofence floor-plan ---------------------------------------------
+    const gfCanvas = $('#gf-canvas');
+    const gfCtx = gfCanvas.getContext('2d');
+    const gfResize = () => { gfCanvas.width = gfCanvas.clientWidth; gfCanvas.height = gfCanvas.clientHeight; };
+    gfResize();
+    window.addEventListener('resize', gfResize);
+
+    let lastVerdict = null;
+    const drawGeofence = (v) => {
+      const W = gfCanvas.width, H = gfCanvas.height, pad = 28;
+      gfCtx.clearRect(0, 0, W, H);
+      if (!v || !v.ok || !v.polygon.length) {
+        gfCtx.fillStyle = '#7b8794';
+        gfCtx.font = '13px system-ui, sans-serif';
+        gfCtx.textAlign = 'center';
+        gfCtx.fillText(v?.reason || 'map node corners in Settings', W / 2, H / 2);
+        return;
+      }
+      // World→screen: fit polygon (+ nodes) bounds into the padded canvas, y up.
+      const pts = v.nodes;
+      const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const sx = (maxX - minX) || 1, sy = (maxY - minY) || 1;
+      const scale = Math.min((W - 2 * pad) / sx, (H - 2 * pad) / sy);
+      const ox = (W - sx * scale) / 2, oy = (H - sy * scale) / 2;
+      const tx = (x) => ox + (x - minX) * scale;
+      const ty = (y) => H - (oy + (y - minY) * scale); // flip y
+
+      const ring = (poly, stroke, fill) => {
+        if (poly.length < 2) return;
+        gfCtx.beginPath();
+        poly.forEach((p, i) => { const X = tx(p.x), Y = ty(p.y); i ? gfCtx.lineTo(X, Y) : gfCtx.moveTo(X, Y); });
+        gfCtx.closePath();
+        if (fill) { gfCtx.fillStyle = fill; gfCtx.fill(); }
+        if (stroke) { gfCtx.strokeStyle = stroke; gfCtx.lineWidth = 2; gfCtx.stroke(); }
+      };
+
+      // Perimeter (outer) + inset (effective fence).
+      ring(v.polygon, 'rgba(120,135,148,0.55)', 'rgba(33,128,141,0.06)');
+      ring(v.inset, 'rgba(120,135,148,0.25)', null);
+
+      // Node corners, coloured by disturbance.
+      for (const n of v.nodes) {
+        const X = tx(n.x), Y = ty(n.y);
+        gfCtx.beginPath(); gfCtx.arc(X, Y, n.hot ? 9 : 6, 0, Math.PI * 2);
+        gfCtx.fillStyle = heat(n.disturbance); gfCtx.fill();
+        if (n.hot) { gfCtx.strokeStyle = '#fff'; gfCtx.lineWidth = 1.5; gfCtx.stroke(); }
+        gfCtx.fillStyle = '#cdd6df'; gfCtx.font = '11px system-ui, sans-serif'; gfCtx.textAlign = 'center';
+        gfCtx.fillText(n.id, X, Y - 12);
+      }
+
+      // Disturbance centroid.
+      if (v.centroid) {
+        const X = tx(v.centroid.x), Y = ty(v.centroid.y);
+        gfCtx.beginPath(); gfCtx.arc(X, Y, 7, 0, Math.PI * 2);
+        gfCtx.fillStyle = v.insideMotion ? 'rgba(34,197,94,0.9)' : 'rgba(245,158,11,0.9)';
+        gfCtx.fill();
+        gfCtx.strokeStyle = '#0b0f12'; gfCtx.lineWidth = 2; gfCtx.stroke();
+      }
+    };
+
+    const offGeo = geofenceService.onVerdict(throttleLatest((v) => {
+      lastVerdict = v;
+      const badge = $('#gf-verdict');
+      if (badge) {
+        if (!v.ok) { badge.textContent = 'not mapped'; badge.className = 'badge-mut'; }
+        else if (v.insideMotion) { badge.textContent = 'MOTION INSIDE'; badge.className = 'badge-ok'; }
+        else { badge.textContent = v.reason; badge.className = 'badge-warn'; }
+      }
+      const set = (id, val) => { const e = $(id); if (e) e.textContent = val; };
+      set('#gf-hot', v.ok ? `${v.hotCount} / ${v.nodes.length}` : '—');
+      set('#gf-total', v.ok ? fmt.num(v.total, 2) : '—');
+      set('#gf-score', v.ok ? fmt.pct(v.score, 0) : '—');
+      drawGeofence(v);
+    }, 250));
+
     const off = sensingService.onData(throttleLatest((d) => {
       const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
       const c = d.classification || {}, f = d.features || {};
@@ -109,6 +205,10 @@ export default {
       draw(d.signal_field);
     }, 250));
 
-    return () => { off(); window.removeEventListener('resize', resize); };
+    return () => {
+      off(); offGeo();
+      window.removeEventListener('resize', resize);
+      window.removeEventListener('resize', gfResize);
+    };
   },
 };
