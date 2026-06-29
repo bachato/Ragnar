@@ -55,10 +55,24 @@ export default {
         <!-- Recording -->
         <div class="card card-pad space-y-3">
           <div class="flex items-center justify-between">
-            <h2 class="card-title">CSI recording</h2>
+            <div class="flex items-center gap-2">
+              <h2 class="card-title">CSI recording</h2>
+              <button id="rec-info-btn" type="button" aria-label="What does training do?" title="What does this do?"
+                class="shrink-0 w-5 h-5 grid place-items-center rounded-full border border-ink-3 text-ink-muted text-xs leading-none hover:text-ink-fg hover:border-ink-4">i</button>
+            </div>
             <span id="rec-state" class="badge-mut">idle</span>
           </div>
           <p class="text-xs text-ink-muted">Capture raw WiFi Channel State Information to disk. These recordings are the dataset the adaptive classifier learns from.</p>
+          <div id="rec-info" class="hidden rounded-lg bg-ink-1 border border-ink-3 p-3 text-xs text-ink-soft space-y-2">
+            <p><strong>Training teaches RuSense what <em>your</em> room looks like</strong> in different situations, so it can recognise them live. WiFi bounces off your walls and furniture in a way unique to your space, so it learns by example.</p>
+            <p>It's a 3-step loop:</p>
+            <ol class="list-decimal pl-4 space-y-1">
+              <li><strong>Record</strong> — capture a short clip while you act out one labelled situation: <em>empty room</em>, <em>one person sitting</em>, <em>walking</em>, <em>two people</em>… (one recording per situation; label it via the ground-truth control while recording).</li>
+              <li><strong>Train</strong> — the adaptive model learns the signal "fingerprint" of each situation for your room.</li>
+              <li><strong>Active</strong> — the trained model classifies what's happening in real time.</li>
+            </ol>
+            <p class="text-ink-muted">Tip: more and cleaner recordings = better accuracy, and a model only applies to the room you recorded it in.</p>
+          </div>
           <div class="flex gap-2">
             <input id="rec-id" placeholder="recording id (optional)" class="flex-1 rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400" />
             <button id="rec-start" class="btn-primary">Record</button>
@@ -126,6 +140,12 @@ export default {
     $('#m-refresh').addEventListener('click', loadModels);
 
     // ── Recording ──
+    const recInfoBtn = $('#rec-info-btn');
+    if (recInfoBtn) recInfoBtn.addEventListener('click', () => {
+      const el = $('#rec-info');
+      if (el) el.classList.toggle('hidden');
+    });
+
     const loadRecordings = async () => {
       const r = await fetchJSON('/api/v1/recording/list');
       const recs = r?.recordings || [];
