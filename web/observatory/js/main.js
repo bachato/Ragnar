@@ -17,7 +17,7 @@ import { PostProcessing } from './post-processing.js';
 import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
-import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES } from './hud-controller.js?v=20260628-obssettings2';
+import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES, seedObsFromServerConfig } from './hud-controller.js?v=20260629-obsserver';
 
 // ---- Palette ----
 const C = {
@@ -941,4 +941,15 @@ class Observatory {
   }
 }
 
-new Observatory();
+// Seed the shared settings from the server config (written by the RuSense
+// Settings tab or this view's own dialog) BEFORE building the scene, so the
+// Observatory reflects values saved on any device — not just this browser's
+// localStorage. Falls back to the localStorage seed in the constructor if the
+// config endpoint is unreachable.
+(async () => {
+  try {
+    const res = await fetch('/api/config');
+    if (res.ok) seedObsFromServerConfig(await res.json());
+  } catch { /* offline — constructor's localStorage seed still applies */ }
+  new Observatory();
+})();

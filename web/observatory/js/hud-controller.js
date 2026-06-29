@@ -39,6 +39,51 @@ export const DEFAULTS = {
 
 export const SETTINGS_VERSION = '9';
 
+// ── Server-side persistence (shared across browsers / devices) ───────────────
+// The visual/scene settings historically lived only in localStorage, so a save
+// was per-browser and never reached anyone else. To match Ragnar's main
+// settings ("persistent for everyone") we ALSO mirror the whole blob into the
+// server config under this key, versioned so a future SETTINGS_VERSION bump
+// cleanly invalidates a stale server copy. localStorage stays the fast local
+// cache; the server is the shared source of truth seeded on load.
+export const OBS_CONFIG_KEY = 'rusense_observatory_settings';
+const OBS_LS_KEY = 'ruview-observatory-settings';
+const OBS_LS_VER_KEY = 'ruview-settings-version';
+
+// Seed localStorage from the server config so the existing localStorage read
+// paths (the Observatory constructor + the Settings tab) transparently pick up
+// the shared values. Server wins on load — that's what makes a save by one
+// device visible to every other. Returns true if it actually seeded.
+export function seedObsFromServerConfig(cfg) {
+  try {
+    const blob = cfg && cfg[OBS_CONFIG_KEY];
+    if (blob && typeof blob === 'object' && blob.version === SETTINGS_VERSION
+        && blob.settings && typeof blob.settings === 'object') {
+      localStorage.setItem(OBS_LS_VER_KEY, SETTINGS_VERSION);
+      localStorage.setItem(OBS_LS_KEY, JSON.stringify(blob.settings));
+      return true;
+    }
+  } catch { /* storage/parse trouble — fall back to whatever is already local */ }
+  return false;
+}
+
+// Debounced push of the whole settings blob to the server config. Coalesces the
+// rapid-fire saves from slider drags into a single request; each call snapshots
+// the latest state, so the request that fires carries the newest values.
+let _obsPushTimer = null;
+export function pushObsSettingsToServer(settings) {
+  clearTimeout(_obsPushTimer);
+  let snapshot;
+  try { snapshot = JSON.parse(JSON.stringify(settings || {})); } catch { return; }
+  _obsPushTimer = setTimeout(() => {
+    fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [OBS_CONFIG_KEY]: { version: SETTINGS_VERSION, settings: snapshot } }),
+    }).catch(() => { /* offline — localStorage still holds the change locally */ });
+  }, 800);
+}
+
 export const PRESETS = {
   foundation: {},
   cinematic: {
@@ -517,6 +562,9 @@ export class HudController {
     try {
       localStorage.setItem('ruview-observatory-settings', JSON.stringify(this._obs.settings));
     } catch {}
+    // Mirror to the server so edits made in this dialog persist for everyone,
+    // not just this browser (debounced; see pushObsSettingsToServer).
+    pushObsSettingsToServer(this._obs.settings);
   }
 
   applyPreset(preset) {

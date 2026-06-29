@@ -5,12 +5,16 @@
 //
 // The Observatory section edits the SAME localStorage the Observatory itself
 // reads on boot (keys 'ruview-observatory-settings' + 'ruview-settings-version',
-// see observatory/js/main.js). The 3D scene only exists inside the Observatory
-// iframe, so changes here are saved instantly and take effect the next time the
-// Observatory sub-tab is opened (there is no live scene on this tab to preview).
+// see observatory/js/main.js) AND mirrors the whole blob to the server config
+// (key 'rusense_observatory_settings') so the values persist for everyone — like
+// Ragnar's main settings — instead of being trapped in one browser. localStorage
+// is the local cache; the server is the shared source of truth, seeded on load.
+// The 3D scene only exists inside the Observatory iframe, so changes here are
+// saved instantly and take effect the next time the Observatory sub-tab is opened
+// (there is no live scene on this tab to preview).
 import { icons } from '../icons.js';
 import { html, $, $$, fetchJSON, toast } from '../lib.js';
-import { DEFAULTS, PRESETS, SETTINGS_VERSION } from '../../../observatory/js/hud-controller.js?v=20260628-obssettings2';
+import { DEFAULTS, PRESETS, SETTINGS_VERSION, seedObsFromServerConfig, pushObsSettingsToServer } from '../../../observatory/js/hud-controller.js?v=20260629-obsserver';
 
 // Action helper that — unlike fetchJSON — keeps HTTP ok/fail and the JSON body
 // separate, so we never toast a false success (mirrors training.js).
@@ -94,6 +98,9 @@ function saveObsSettings(s) {
     localStorage.setItem(OBS_VER_KEY, SETTINGS_VERSION);
     localStorage.setItem(OBS_KEY, JSON.stringify(s));
   } catch { /* storage full / disabled — silently ignore */ }
+  // Mirror to the server config (debounced) so these settings persist for
+  // everyone, like Ragnar's main settings — not just in this browser.
+  pushObsSettingsToServer(s);
 }
 
 // Trim float noise for the value readouts next to sliders.
@@ -418,6 +425,9 @@ export default {
   // Bind every Observatory control to the shared localStorage. Pure
   // read-on-build + write-on-change — no timers, so this view stays static.
   wireObservatory(root, cfg) {
+    // Server is the shared source of truth: seed localStorage from the config
+    // we just fetched so a save made on any device shows up here, then read.
+    seedObsFromServerConfig(cfg);
     let s = loadObsSettings();
 
     // Backend is the durable source of truth for node names/positions across
