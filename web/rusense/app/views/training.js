@@ -67,14 +67,14 @@ export default {
             <p><strong>Training teaches RuSense what <em>your</em> room looks like</strong> in different situations, so it can recognise them live. WiFi bounces off your walls and furniture in a way unique to your space, so it learns by example.</p>
             <p>It's a 3-step loop:</p>
             <ol class="list-decimal pl-4 space-y-1">
-              <li><strong>Record</strong> — capture a short clip while you act out one labelled situation: <em>empty room</em>, <em>one person sitting</em>, <em>walking</em>, <em>two people</em>… (one recording per situation; label it via the ground-truth control while recording).</li>
-              <li><strong>Train</strong> — the adaptive model learns the signal "fingerprint" of each situation for your room.</li>
+              <li><strong>Record</strong> — one clip per situation, and <strong>name each one <code>train_&lt;label&gt;</code></strong> — e.g. <code>train_empty</code>, <code>train_walking</code>, <code>train_two_people</code>. <em>Only <code>train_*</code> recordings are used for training</em>; the text after <code>train_</code> becomes the class name.</li>
+              <li><strong>Train</strong> — click <em>Train adaptive model</em>; it learns the signal "fingerprint" of each <code>train_*</code> class for your room. (There's no separate "select" step — it uses all <code>train_*</code> recordings.)</li>
               <li><strong>Active</strong> — the trained model classifies what's happening in real time.</li>
             </ol>
-            <p class="text-ink-muted">Tip: more and cleaner recordings = better accuracy, and a model only applies to the room you recorded it in.</p>
+            <p class="text-ink-muted">Tip: record at least 2 classes (e.g. <code>train_empty</code> + <code>train_present</code>), give each a good clip, and remember a model only applies to the room you recorded it in. Recordings without the <code>train_</code> prefix are kept but ignored by training.</p>
           </div>
           <div class="flex gap-2">
-            <input id="rec-id" placeholder="recording id (optional)" class="flex-1 rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400" />
+            <input id="rec-id" placeholder="id — use train_&lt;label&gt; to train (e.g. train_empty)" class="flex-1 rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400" />
             <button id="rec-start" class="btn-primary">Record</button>
             <button id="rec-stop" class="btn-ghost">Stop</button>
           </div>
@@ -87,7 +87,7 @@ export default {
             <h2 class="card-title">Adaptive training <span class="badge-mut ml-1">on-device</span></h2>
             <span id="ad-status" class="badge-mut">—</span>
           </div>
-          <p class="text-xs text-ink-muted">Fits a lightweight classifier to <em>this</em> environment from captured CSI (per-class signal statistics). Fast, runs on the Pi, and becomes the active model immediately. Label frames live via the ground-truth control while recording.</p>
+          <p class="text-xs text-ink-muted">Fits a lightweight classifier to <em>this</em> environment from captured CSI (per-class signal statistics). Fast, runs on the Pi, and becomes the active model immediately. Trains on your <code>train_*</code> recordings — one class per label (e.g. <code>train_empty</code>, <code>train_present</code>).</p>
           <div id="ad-stats" class="text-xs font-mono text-ink-muted"></div>
           <div class="flex gap-2">
             <button id="ad-train" class="btn-primary flex-1">Train adaptive model</button>
