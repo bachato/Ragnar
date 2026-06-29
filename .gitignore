@@ -226,3 +226,20 @@ data/wardriving/
 *.bak-rusense
 *.original
 tools/
+
+# ── RuSense (WiFi-CSI) user data — captured/trained per install, never commit ──
+# raw CSI recordings (can be tens of MB+)
+data/recordings/
+# locally-trained adaptive sensing model
+data/adaptive_model.json
+# locally-trained / downloaded sensing models
+data/models/
+
+# Vulnerability scanner templates (downloaded per install by the installer)
+nuclei-templates/
+
+# Per-install runtime state that must not be shared between users
+# last-selected network (UI state)
+data/networks/.last_ssid
+# runtime logs (nmap.log etc.)
+var/log/
