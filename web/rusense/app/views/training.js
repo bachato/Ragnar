@@ -67,16 +67,30 @@ export default {
             <p><strong>Training teaches RuSense what <em>your</em> room looks like</strong> in different situations, so it can recognise them live. WiFi bounces off your walls and furniture in a way unique to your space, so it learns by example.</p>
             <p>It's a 3-step loop:</p>
             <ol class="list-decimal pl-4 space-y-1">
-              <li><strong>Record</strong> — one clip per situation, and <strong>name each one <code>train_&lt;label&gt;</code></strong> — e.g. <code>train_empty</code>, <code>train_walking</code>, <code>train_two_people</code>. <em>Only <code>train_*</code> recordings are used for training</em>; the text after <code>train_</code> becomes the class name.</li>
+              <li><strong>Record</strong> — pick a scenario from the dropdown (Empty room, Walking, Two people…) and record one clip for each. Each scenario maps to a <code>train_&lt;label&gt;</code> class the trainer uses; pick <em>Custom name…</em> for anything not listed.</li>
               <li><strong>Train</strong> — click <em>Train adaptive model</em>; it learns the signal "fingerprint" of each <code>train_*</code> class for your room. (There's no separate "select" step — it uses all <code>train_*</code> recordings.)</li>
               <li><strong>Active</strong> — the trained model classifies what's happening in real time.</li>
             </ol>
             <p class="text-ink-muted">Tip: record at least 2 classes (e.g. <code>train_empty</code> + <code>train_present</code>), give each a good clip, and remember a model only applies to the room you recorded it in. Recordings without the <code>train_</code> prefix are kept but ignored by training.</p>
           </div>
-          <div class="flex gap-2">
-            <input id="rec-id" placeholder="id — use train_&lt;label&gt; to train (e.g. train_empty)" class="flex-1 rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400" />
-            <button id="rec-start" class="btn-primary">Record</button>
-            <button id="rec-stop" class="btn-ghost">Stop</button>
+          <div class="space-y-2">
+            <div class="flex gap-2">
+              <select id="rec-id" class="flex-1 rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400">
+                <option value="" disabled selected>Choose a scenario…</option>
+                <option value="train_empty">Empty room</option>
+                <option value="train_present">Person present (still)</option>
+                <option value="train_walking">Walking</option>
+                <option value="train_sitting">Sitting</option>
+                <option value="train_standing">Standing</option>
+                <option value="train_two_people">Two people</option>
+                <option value="train_sleeping">Lying / sleeping</option>
+                <option value="__custom__">Custom name…</option>
+              </select>
+              <button id="rec-start" class="btn-primary">Record</button>
+              <button id="rec-stop" class="btn-ghost">Stop</button>
+            </div>
+            <input id="rec-id-custom" placeholder="train_&lt;label&gt; (e.g. train_running)"
+              class="hidden w-full rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400" />
           </div>
           <div id="rec-list" class="space-y-2"></div>
         </div>
@@ -171,11 +185,25 @@ export default {
       el.textContent = recording ? 'recording' : 'idle';
       el.className = recording ? 'badge-bad' : 'badge-mut';
     };
+    // Scenario dropdown: "Custom name…" reveals a free-text field.
+    const recSelect = $('#rec-id'), recCustom = $('#rec-id-custom');
+    if (recSelect) recSelect.addEventListener('change', () => {
+      const isCustom = recSelect.value === '__custom__';
+      if (recCustom) {
+        recCustom.classList.toggle('hidden', !isCustom);
+        if (isCustom) recCustom.focus();
+      }
+    });
     $('#rec-start').addEventListener('click', async () => {
-      const id = $('#rec-id').value.trim();
-      const r = await post('/api/v1/recording/start', id ? { id } : {});
+      let id = recSelect ? recSelect.value : '';
+      if (id === '__custom__') id = (recCustom?.value || '').trim();
+      if (!id || id === '__custom__') {
+        toast('Pick a scenario (or enter a custom name) first', 'warn');
+        return;
+      }
+      const r = await post('/api/v1/recording/start', { id });
       const started = r.ok && r.data?.success !== false;
-      toast(started ? 'Recording started' : msgOf(r, 'Could not start recording'), started ? 'ok' : 'bad');
+      toast(started ? `Recording "${id}"` : msgOf(r, 'Could not start recording'), started ? 'ok' : 'bad');
       if (started) setRecState(true);
       loadRecordings();
     });

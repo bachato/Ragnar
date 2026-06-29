@@ -7,7 +7,7 @@ import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js';
 import sensing from './views/sensing.js?v=20260628-geofence';
 import nodes from './views/nodes.js';
-import training from './views/training.js?v=20260629-trainprefix';
+import training from './views/training.js?v=20260629-traindropdown';
 import settings from './views/settings.js?v=20260629-nodenames';
 import about from './views/about.js';
 
