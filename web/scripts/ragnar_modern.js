@@ -807,7 +807,7 @@ function initializeTabs() {
 // The RuView SPA is served from /web/rusense/ and mounted into a shadow root
 // under #rusense-host, so its compiled Tailwind never collides with Ragnar's
 // styles. Sensing data is proxied by this Flask app (/ws/sensing, /api/v1/*).
-const RUSENSE_SUBTABS = ['dashboard', 'sensing', 'nodes', 'training', 'settings', 'about', 'observatory'];
+const RUSENSE_SUBTABS = ['dashboard', 'observatory', 'sensing', 'nodes', 'training', 'settings', 'about'];
 let _rusenseLoader = null;        // resolved loader module
 let _rusenseLoading = null;       // in-flight import() promise
 let _rusenseCurrent = 'dashboard';
@@ -820,7 +820,7 @@ function _setRusenseActive(name) {
 function loadRusenseLoader() {
     if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
     if (!_rusenseLoading) {
-        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260628-debounce')
+        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260629-taborder')
             .then(m => { _rusenseLoader = m; return m; })
             .catch(err => { _rusenseLoading = null; throw err; });
     }
@@ -869,7 +869,7 @@ function showRusenseSubtab(name) {
         if (host) host.classList.add('hidden');
         if (obs) {
             obs.classList.remove('hidden');
-            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260628-debounce';
+            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260629-taborder';
         }
         if (_rusenseLoader) { try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ } }
         return;
