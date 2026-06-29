@@ -389,6 +389,16 @@ def _rusense_get(path):
         return None
 
 
+def _rusense_node_label(nid):
+    """Friendly node name from config (set in the Settings floor plan), else #id.
+    Persisted in rusense_node_names so alerts say "Living room" not "#2"."""
+    names = shared_data.config.get('rusense_node_names') or {}
+    name = names.get(str(nid))
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return f"#{nid}"
+
+
 def _rusense_pushover():
     """Return the shared PushoverService, creating it once if needed."""
     po = getattr(shared_data, '_pushover_service', None)
@@ -608,7 +618,7 @@ def _rusense_check_once():
                 # confirmed-active = (previously confirmed ∪ now active) − confirmed-offline
                 _rusense_notify_state['node_active'] = (confirmed | active_now) - set(newly_offline)
         if newly_offline:
-            ids = ", ".join(f"#{x}" for x in sorted(newly_offline))
+            ids = ", ".join(_rusense_node_label(x) for x in sorted(newly_offline))
             po.notify_rusense(
                 'node_offline',
                 f"\U0001F4E1 CSI sensor node(s) offline: {ids}. Sensing coverage reduced.",

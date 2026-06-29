@@ -754,6 +754,7 @@ class SharedData:
             # with fewer mapped it is a no-op and alerts behave as before.
             "rusense_geofence_enabled": True,
             "rusense_node_positions": {},           # {node_id: {"x":.., "y":.., "z":..}}
+            "rusense_node_names": {},               # {node_id: "friendly name"} (used in alerts)
             "rusense_geofence_window": 30,          # RSSI samples/node (~30s @ 1Hz poll)
 
             "__title_pwnagotchi__": "Pwnagotchi Integration",

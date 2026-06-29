@@ -41,6 +41,16 @@ function syncNodePositionsToBackend(positions) {
   }, 800);
 }
 
+// Node names are not just a UI label — mirror them to the backend too, so
+// server-side alerts (e.g. "node offline") can say "Living room" instead of "#2".
+let _nameSyncTimer = null;
+function syncNodeNamesToBackend(names) {
+  clearTimeout(_nameSyncTimer);
+  _nameSyncTimer = setTimeout(() => {
+    req('POST', '/api/config', { rusense_node_names: names || {} });
+  }, 800);
+}
+
 // Each alert kind: config key + label + helper text.
 const TOGGLES = [
   ['rusense_notify_presence', 'Presence / occupancy', 'When a monitored space goes from empty to occupied (and back).'],
@@ -362,9 +372,13 @@ export default {
       payload.rusense_notify_min_confidence = clampInt($('#st-minconf'), 50, 99, 80) / 100;
       payload.rusense_notify_sustain_s = clampInt($('#st-sustain'), 0, 30, 2);
       payload.rusense_geofence_enabled = $('#st-geofence').checked;
-      // Reconcile the node map to the backend on every save (positions also
-      // auto-sync as you edit them in the Observatory section below).
-      try { payload.rusense_node_positions = loadObsSettings().nodePositions || {}; } catch { /* ignore */ }
+      // Reconcile the node map to the backend on every save (positions + names
+      // also auto-sync as you edit them in the Observatory section below).
+      try {
+        const obs = loadObsSettings();
+        payload.rusense_node_positions = obs.nodePositions || {};
+        payload.rusense_node_names = obs.nodeLabels || {};
+      } catch { /* ignore */ }
 
       const r = await req('POST', '/api/config', payload);
       toast(r.ok ? 'Settings saved' : ((r.data && r.data.error) || 'Could not save settings'),
@@ -396,14 +410,29 @@ export default {
         ok ? 'ok' : 'bad');
     });
 
-    // ── Wire the Observatory controls ──
-    this.wireObservatory(root);
+    // ── Wire the Observatory controls (pass config so node names/positions
+    //    saved on another device seed this browser) ──
+    this.wireObservatory(root, c);
   },
 
   // Bind every Observatory control to the shared localStorage. Pure
   // read-on-build + write-on-change — no timers, so this view stays static.
-  wireObservatory(root) {
+  wireObservatory(root, cfg) {
     let s = loadObsSettings();
+
+    // Backend is the durable source of truth for node names/positions across
+    // browsers. Seed any the local store is missing (never overwrite a local
+    // edit) so a fresh device shows the saved map instead of blank labels.
+    const bNames = (cfg && cfg.rusense_node_names) || {};
+    const bPos = (cfg && cfg.rusense_node_positions) || {};
+    let seeded = false;
+    for (const [id, nm] of Object.entries(bNames)) {
+      if (s.nodeLabels[id] == null && typeof nm === 'string' && nm.trim()) { s.nodeLabels[id] = nm; seeded = true; }
+    }
+    for (const [id, p] of Object.entries(bPos)) {
+      if (!s.nodePositions[id] && p && typeof p === 'object') { s.nodePositions[id] = p; seeded = true; }
+    }
+    if (seeded) saveObsSettings(s);
 
     const syncRange = (key) => {
       const inp = root.querySelector(`[data-obs-range="${key}"]`);
@@ -629,6 +658,7 @@ export default {
         inp.addEventListener('input', () => {
           if (inp.value.length) s.nodeLabels[id] = inp.value; else delete s.nodeLabels[id];
           saveObsSettings(s);
+          syncNodeNamesToBackend(s.nodeLabels);
           const t = container.querySelector(`#node-plan g[data-handle="${id}"] text`);
           if (t) t.textContent = inp.value.trim() || `#${id}`;
         });
