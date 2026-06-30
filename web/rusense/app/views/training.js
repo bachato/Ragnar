@@ -75,7 +75,7 @@ export default {
           </div>
           <div class="space-y-2">
             <div class="flex gap-2">
-              <select id="rec-id" class="flex-1 rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400">
+              <select id="rec-id" class="flex-1 min-w-0 rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400">
                 <option value="" disabled selected>Choose a scenario…</option>
                 <option value="train_empty">Empty room</option>
                 <option value="train_present">Person present (still)</option>
@@ -86,8 +86,8 @@ export default {
                 <option value="train_sleeping">Lying / sleeping</option>
                 <option value="__custom__">Custom name…</option>
               </select>
-              <button id="rec-start" class="btn-primary">Record</button>
-              <button id="rec-stop" class="btn-ghost">Stop</button>
+              <button id="rec-start" class="btn-primary shrink-0">Record</button>
+              <button id="rec-stop" class="btn-ghost shrink-0">Stop</button>
             </div>
             <input id="rec-id-custom" placeholder="train_&lt;label&gt; (e.g. train_running)"
               class="hidden w-full rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400" />

@@ -5,9 +5,9 @@
 import { html, setQueryRoot } from './lib.js';
 import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js';
-import sensing from './views/sensing.js?v=20260628-geofence';
+import sensing from './views/sensing.js?v=20260630-geofencefit';
 import nodes from './views/nodes.js';
-import training from './views/training.js?v=20260629-traindropdown';
+import training from './views/training.js?v=20260630-recfit';
 import settings from './views/settings.js?v=20260629-obsserver';
 import about from './views/about.js';
 

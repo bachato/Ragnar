@@ -34,9 +34,9 @@ export default {
         </div>
 
         <div class="card card-pad space-y-3">
-          <div class="flex items-center justify-between">
+          <div class="flex items-center justify-between gap-2">
             <h2 class="card-title">Perimeter geofence <span class="text-xs text-ink-muted font-normal">prototype</span></h2>
-            <span id="gf-verdict" class="badge-mut">—</span>
+            <span id="gf-verdict" class="badge-mut shrink-0" style="min-width:7.5rem;justify-content:center">—</span>
           </div>
           <canvas id="gf-canvas" class="w-full rounded-lg bg-ink-0 aspect-[3/2]" aria-label="Room geofence plan"></canvas>
           <div class="grid grid-cols-3 gap-3 text-sm">
@@ -44,6 +44,7 @@ export default {
             <div class="stat"><span class="stat-label">Disturbance</span><span class="stat-value" id="gf-total">—</span></div>
             <div class="stat"><span class="stat-label">Inside score</span><span class="stat-value" id="gf-score">—</span></div>
           </div>
+          <p class="text-xs text-ink-muted truncate" id="gf-reason" title="">—</p>
           <p class="text-xs text-ink-muted" id="gf-note">
             Motion is confined to the polygon of mapped node corners (Settings → node X/Y).
             A disturbance that lights up only one corner — a hallway walk-by — is rejected as outside.
@@ -165,14 +166,17 @@ export default {
       lastVerdict = v;
       const badge = $('#gf-verdict');
       if (badge) {
-        if (!v.ok) { badge.textContent = 'not mapped'; badge.className = 'badge-mut'; }
-        else if (v.insideMotion) { badge.textContent = 'MOTION INSIDE'; badge.className = 'badge-ok'; }
-        else { badge.textContent = v.reason; badge.className = 'badge-warn'; }
+        if (!v.ok) { badge.textContent = 'not mapped'; badge.className = 'badge-mut shrink-0'; }
+        else if (v.insideMotion) { badge.textContent = 'MOTION INSIDE'; badge.className = 'badge-ok shrink-0'; }
+        else if (v.reason === 'quiet') { badge.textContent = 'quiet'; badge.className = 'badge-mut shrink-0'; }
+        else { badge.textContent = 'outside'; badge.className = 'badge-warn shrink-0'; }
       }
       const set = (id, val) => { const e = $(id); if (e) e.textContent = val; };
       set('#gf-hot', v.ok ? `${v.hotCount} / ${v.nodes.length}` : '—');
       set('#gf-total', v.ok ? fmt.num(v.total, 2) : '—');
       set('#gf-score', v.ok ? fmt.pct(v.score, 0) : '—');
+      const reason = $('#gf-reason');
+      if (reason) { reason.textContent = v.reason || '—'; reason.title = v.reason || ''; }
       drawGeofence(v);
     }, 250));
 
