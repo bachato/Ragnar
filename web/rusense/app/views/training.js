@@ -28,6 +28,24 @@ function msgOf(r, fallback) {
   return (r && r.data && (r.data.error || r.data.message || r.data.detail)) || fallback;
 }
 
+const REC_STATE_KEY = 'rusense-rec-state';
+let recState = (() => {
+  try { const s = JSON.parse(localStorage.getItem(REC_STATE_KEY) || 'null'); return s && s.active ? s : null; }
+  catch { return null; }
+})();
+function persistRecState() {
+  try {
+    if (recState && recState.active) localStorage.setItem(REC_STATE_KEY, JSON.stringify(recState));
+    else localStorage.removeItem(REC_STATE_KEY);
+  } catch { /* storage unavailable — module-scope state still carries the session */ }
+}
+function fmtElapsed(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const s = total % 60, m = Math.floor(total / 60) % 60, h = Math.floor(total / 3600);
+  const pad = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 function modelCard(m, activeId) {
   const id = m.id ?? m.name ?? '?';
   const isActive = activeId && id === activeId;
@@ -91,6 +109,11 @@ export default {
             </div>
             <input id="rec-id-custom" placeholder="train_&lt;label&gt; (e.g. train_running)"
               class="hidden w-full rounded-lg bg-ink-1 border border-ink-3 px-3 py-2.5 text-sm focus-visible:ring-2 focus-visible:ring-brand-400" />
+          </div>
+          <div id="rec-live" class="hidden flex items-center gap-3 rounded-lg bg-bad/20 border border-ink-3 p-2.5 text-sm">
+            <span class="dot bg-bad pulse-live shrink-0"></span>
+            <span class="flex-1 min-w-0 truncate font-mono" id="rec-live-id">—</span>
+            <span class="shrink-0 font-mono text-xs text-ink-muted" id="rec-live-meta">0:00</span>
           </div>
           <div id="rec-list" class="space-y-2"></div>
         </div>
@@ -163,13 +186,24 @@ export default {
     const loadRecordings = async () => {
       const r = await fetchJSON('/api/v1/recording/list');
       const recs = r?.recordings || [];
+      if (recState && recState.active) {
+        const live = recs.find((x) => (x.id ?? x.name) === recState.id);
+        if (live) {
+          if (live.frames != null) { recState.frames = live.frames; persistRecState(); renderRecLive(); }
+        } else {
+          setRecState(false);
+        }
+      }
       const box = $('#rec-list');
       box.innerHTML = recs.length ? recs.map((rec) => {
         const id = rec.id ?? rec.name ?? rec;
+        const isLive = !!(recState && recState.active && id === recState.id);
+        const meta = rec.frames != null ? `${fmt.int(rec.frames)} frames`
+          : (rec.size_mb != null ? `${fmt.num(rec.size_mb, 1)} MB` : '');
         return `<div class="flex items-center gap-3 rounded-lg bg-ink-1 border border-ink-3 p-2.5 text-sm">
-          <span class="flex-1 truncate font-mono">${id}</span>
-          ${rec.size_mb ? `<span class="text-xs text-ink-muted">${fmt.num(rec.size_mb, 1)} MB</span>` : ''}
-          <button data-rid="${id}" class="btn-danger !py-1 !px-2.5 text-xs">✕</button>
+          <span class="flex-1 truncate font-mono">${id}${isLive ? ' <span class="badge-bad ml-1">recording</span>' : ''}</span>
+          ${meta ? `<span class="text-xs text-ink-muted shrink-0">${meta}</span>` : ''}
+          <button data-rid="${id}" class="btn-danger !py-1 !px-2.5 text-xs shrink-0"${isLive ? ' disabled' : ''}>✕</button>
         </div>`;
       }).join('') : '<div class="text-sm text-ink-muted">No recordings yet.</div>';
     };
@@ -180,10 +214,42 @@ export default {
       toast(r.ok ? 'Recording deleted' : msgOf(r, 'Could not delete recording'), r.ok ? 'warn' : 'bad');
       loadRecordings();
     });
-    const setRecState = (recording) => {
+    let liveTimer = null;
+    const renderRecLive = () => {
+      const box = $('#rec-live');
+      if (!box) return;
+      if (!recState || !recState.active) { box.classList.add('hidden'); return; }
+      box.classList.remove('hidden');
+      const idEl = $('#rec-live-id');
+      if (idEl) idEl.textContent = recState.id || '—';
+      const metaEl = $('#rec-live-meta');
+      if (metaEl) {
+        const parts = [];
+        if (recState.startedAt) parts.push(fmtElapsed(Date.now() - recState.startedAt));
+        if (recState.frames != null) parts.push(`${fmt.int(recState.frames)} frames`);
+        metaEl.textContent = parts.join(' · ') || 'recording';
+      }
+    };
+    const setRecState = (recording, info) => {
+      if (recording) {
+        recState = {
+          active: true,
+          id: (info && info.id) || (recState && recState.id) || '?',
+          startedAt: (info && info.startedAt) || (recState && recState.startedAt) || null,
+          frames: (info && info.frames != null) ? info.frames : (recState ? recState.frames : null),
+        };
+      } else {
+        recState = null;
+      }
+      persistRecState();
       const el = $('#rec-state');
-      el.textContent = recording ? 'recording' : 'idle';
-      el.className = recording ? 'badge-bad' : 'badge-mut';
+      if (el) {
+        el.textContent = recording ? 'recording' : 'idle';
+        el.className = recording ? 'badge-bad' : 'badge-mut';
+      }
+      renderRecLive();
+      if (recording && !liveTimer) liveTimer = setInterval(renderRecLive, 1000);
+      if (!recording && liveTimer) { clearInterval(liveTimer); liveTimer = null; }
     };
     // Scenario dropdown: "Custom name…" reveals a free-text field.
     const recSelect = $('#rec-id'), recCustom = $('#rec-id-custom');
@@ -203,14 +269,23 @@ export default {
       }
       const r = await post('/api/v1/recording/start', { id });
       const started = r.ok && r.data?.success !== false;
-      toast(started ? `Recording "${id}"` : msgOf(r, 'Could not start recording'), started ? 'ok' : 'bad');
-      if (started) setRecState(true);
+      if (started) {
+        toast(`Recording "${id}"`, 'ok');
+        setRecState(true, { id, startedAt: Date.now(), frames: 0 });
+      } else if (r.data?.recording_id) {
+        toast(msgOf(r, 'A recording is already active'), 'warn');
+        setRecState(true, { id: r.data.recording_id });
+      } else {
+        toast(msgOf(r, 'Could not start recording'), 'bad');
+      }
       loadRecordings();
     });
     $('#rec-stop').addEventListener('click', async () => {
       const r = await post('/api/v1/recording/stop');
-      toast(r.ok ? 'Recording stopped' : msgOf(r, 'Could not stop recording'), r.ok ? 'ok' : 'bad');
-      if (r.ok) setRecState(false);
+      const stopped = r.ok && r.data?.success !== false;
+      const alreadyIdle = r.ok && /no recording/i.test(String(r.data?.error || ''));
+      toast(stopped ? 'Recording stopped' : msgOf(r, 'Could not stop recording'), stopped ? 'ok' : 'bad');
+      if (stopped || alreadyIdle) setRecState(false);
       loadRecordings();
     });
 
@@ -266,8 +341,16 @@ export default {
       loadTrain();
     });
 
+    if (recState && recState.active) setRecState(true, recState);
+
     loadModels(); loadRecordings(); loadTrain(); loadAdaptive();
-    const t = setInterval(() => { loadTrain(); loadAdaptive(); }, 4000);
-    return () => clearInterval(t);
+    const t = setInterval(() => {
+      loadTrain(); loadAdaptive();
+      if (recState && recState.active) loadRecordings();
+    }, 4000);
+    return () => {
+      clearInterval(t);
+      if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+    };
   },
 };
