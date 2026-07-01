@@ -47,6 +47,26 @@
         </p>
       </div>
 
+      <!-- WiFi / server provisioning (top — but run it AFTER forging) -->
+      <section class="flash-panel" id="provision">
+        <h2>🛰️ Provision WiFi <span class="panel-sub">(do this after forging)</span></h2>
+        <p>
+          Forging <strong>erases</strong> the node's saved config, so it falls back to the wrong
+          defaults and won't connect. Enter your <strong>2.4&nbsp;GHz</strong> WiFi and the
+          <strong>RuSense server IP</strong> (your Ragnar box), then write it to the node. Works for
+          both S3 and C6.
+        </p>
+        <div class="prov-fields">
+          <input id="prov-ssid" type="text" placeholder="WiFi SSID (2.4 GHz)" autocomplete="off" />
+          <input id="prov-pass" type="password" placeholder="WiFi password" autocomplete="off" />
+          <input id="prov-ip" type="text" placeholder="Server IP — e.g. 192.168.1.20" autocomplete="off" />
+          <input id="prov-port" type="number" value="5005" min="1" max="65535" placeholder="Port" />
+        </div>
+        <div class="flash-buttons">
+          <button class="btn-flash" onclick="provisionDevice()">🛰️ Write WiFi config</button>
+        </div>
+      </section>
+
       <!-- ───────── One chip type per mesh ───────── -->
       <div style="max-width:720px;margin:0 auto 1.25rem;padding:.85rem 1.1rem;border:1px solid #b4791e;border-radius:.6rem;background:rgba(180,121,30,.12);color:#f4d9a6;font-size:.95rem;line-height:1.5">
         ⚠️ <strong>Don't mix S3 and C6 in one mesh.</strong> Pick a single chip type and flash
@@ -116,29 +136,9 @@
         </div>
       </section>
 
-      <!-- WiFi / server provisioning -->
-      <section class="flash-panel" id="provision">
-        <h2>🛰️ Provision WiFi <span class="panel-sub">(do this after forging)</span></h2>
-        <p>
-          Forging <strong>erases</strong> the node's saved config, so it falls back to the wrong
-          defaults and won't connect. Enter your <strong>2.4&nbsp;GHz</strong> WiFi and the
-          <strong>RuSense server IP</strong> (your Ragnar box), then write it to the node. Works for
-          both S3 and C6.
-        </p>
-        <div class="prov-fields">
-          <input id="prov-ssid" type="text" placeholder="WiFi SSID (2.4 GHz)" autocomplete="off" />
-          <input id="prov-pass" type="password" placeholder="WiFi password" autocomplete="off" />
-          <input id="prov-ip" type="text" placeholder="Server IP — e.g. 192.168.1.20" autocomplete="off" />
-          <input id="prov-port" type="number" value="5005" min="1" max="65535" placeholder="Port" />
-        </div>
-        <div class="flash-buttons">
-          <button class="btn-flash" onclick="provisionDevice()">🛰️ Write WiFi config</button>
-        </div>
-      </section>
-
       <!-- Shared serial monitor button -->
       <section class="flash-panel" id="serial-tools">
-        <h2>📡 Skald&rsquo;s Ear <span class="panel-sub">(serial monitor)</span></h2>
+        <h2>📡 Skald&rsquo;s Ear <span class="panel-sub"><strong>(serial monitor)</strong></span></h2>
         <p>
           Open a browser-based serial monitor for any forged CSI node. Default baud is
           <code>115200</code>. On boot the node announces itself, then emits CSI capture
