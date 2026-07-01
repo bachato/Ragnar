@@ -27,7 +27,7 @@ function ensureShadow(host) {
   const link = document.createElement('link');
   link.rel = 'stylesheet';
   link.href = CSS_HREF;
-  shadow.appendChild(link);
+  // (appended below, once the reveal gate is wired to its load event)
 
   // Layout containment: a live value changing inside one card can't reflow its
   // neighbours, and tabular figures keep numeric widths constant frame-to-frame.
@@ -49,7 +49,7 @@ function ensureShadow(host) {
   const surface = document.createElement('div');
   surface.style.cssText =
     'background:#0b0f12;color:#e8eef3;min-height:60vh;border-radius:.75rem;' +
-    'font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;';
+    'font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;visibility:hidden;';
 
   viewEl = document.createElement('main');
   viewEl.id = 'view';
@@ -62,7 +62,16 @@ function ensureShadow(host) {
     'fixed bottom-4 inset-x-0 z-50 flex flex-col items-center gap-2 px-4 pointer-events-none';
   surface.appendChild(toastRoot);
 
+  // Keep the island hidden until its stylesheet has applied, so the view never
+  // flashes unstyled ("terminal" look). app.css is prefetched in the page <head>,
+  // so on a warm cache this reveals within a frame — no skeleton, no real delay.
+  const reveal = () => { surface.style.visibility = 'visible'; };
+  link.addEventListener('load', reveal, { once: true });
+  link.addEventListener('error', reveal, { once: true });
+  setTimeout(reveal, 800); // safety net if the load event never fires
+  shadow.appendChild(link);
   shadow.appendChild(surface);
+  if (link.sheet) reveal(); // already cached & parsed — reveal immediately
 
   // Route $/$$ and toast() lookups into this shadow root.
   setQueryRoot(shadow);

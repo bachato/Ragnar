@@ -8,6 +8,9 @@
     
     <!-- Tailwind CSS (local build) -->
     <link rel="stylesheet" href="/css/tailwind.css">
+    <!-- Warm the RuSense island's stylesheet during page load so opening the
+         RuSense tab renders styled instantly (no unstyled "terminal" flash). -->
+    <link rel="preload" href="/web/rusense/assets/app.css" as="style">
 
     <!-- Socket.IO Client -->
     <script src="https://cdn.socket.io/4.8.3/socket.io.min.js"></script>
@@ -5383,7 +5386,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260701-netdiag2"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260701-foucfix"></script>
 
 </body>
 </html>
