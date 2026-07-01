@@ -738,7 +738,9 @@ body {
   #key-hints { display: none; }
   #capabilities-bar { display: none; }
   .settings-dialog { width: 95vw; }
-  .data-panel { width: 44vw; max-width: 240px; padding: 10px 12px; }
-  #panel-vitals { left: 10px; right: auto; top: auto; bottom: 14px; transform: none; }
-  #panel-signal { right: 10px; left: auto; top: auto; bottom: 14px; transform: none; }
+  /* Compact, mostly-transparent cards pinned to the bottom corners so they sit
+     lightly over the 3D scene: 30% smaller (scale .7) and 70%-transparent bg. */
+  .data-panel { width: 44vw; max-width: 240px; padding: 10px 12px; background: rgba(8, 16, 28, 0.3); }
+  #panel-vitals { left: 10px; right: auto; top: auto; bottom: 14px; transform: scale(0.7); transform-origin: bottom left; }
+  #panel-signal { right: 10px; left: auto; top: auto; bottom: 14px; transform: scale(0.7); transform-origin: bottom right; }
 }
