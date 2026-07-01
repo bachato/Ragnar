@@ -546,7 +546,24 @@ def _rusense_check_once():
     latest = _rusense_get('/api/v1/sensing/latest')
     if latest:
         cls = latest.get('classification') or {}
-        present = bool(cls.get('presence'))
+        present_agg = bool(cls.get('presence'))
+        # A *motionless* body (someone sitting still on a couch) makes the
+        # aggregate `presence` boolean flicker to False — and it does so even
+        # at high confidence, so those samples clear the confidence gate and
+        # confirm a premature "empty". The reliable signal in that case is the
+        # per-node motion level: the node that can see the person holds
+        # "present_still" the whole time. So treat the space as occupied if the
+        # aggregate says so OR any non-stale active node still sees a body.
+        # "Empty" can then only be declared once *no* node sees anyone.
+        node_present = False
+        for nf in (latest.get('node_features') or []):
+            if nf.get('stale'):
+                continue
+            ncls = nf.get('classification') or {}
+            if ncls.get('presence') or str(ncls.get('motion_level') or '').startswith('present'):
+                node_present = True
+                break
+        present = present_agg or node_present
         motion_active = (cls.get('motion_level') or '') == 'active'
         conf = cls.get('confidence')
         try:
