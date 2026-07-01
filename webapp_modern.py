@@ -316,8 +316,18 @@ def _rusense_model_active():
     cache = _rusense_notify_state.get('model_active_cache')
     if cache and (now - cache[1]) < 30:
         return cache[0]
+    # Two independent kinds of model calibrate confidence:
+    #   • a loaded deep .rvf model  -> /api/v1/models/active .active
+    #   • the on-device ADAPTIVE classifier -> /api/v1/adaptive/status .loaded
+    # The adaptive one is NOT reported by models/active, so both must be checked
+    # (missing the adaptive endpoint made this gate think a trained room was
+    # "model-less" and wrongly relax to 0).
     info = _rusense_get('/api/v1/models/active')
     active = bool(isinstance(info, dict) and info.get('active'))
+    if not active:
+        ad = _rusense_get('/api/v1/adaptive/status')
+        active = bool(isinstance(ad, dict) and (ad.get('loaded') or ad.get('trained')
+                      or ad.get('trained_frames') or ad.get('classes')))
     _rusense_notify_state['model_active_cache'] = (active, now)
     return active
 
