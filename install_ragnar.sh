@@ -514,10 +514,32 @@ install_dependencies() {
     # Configure WiFi interfaces
     log "INFO" "Configuring WiFi interfaces..."
 
-    # Ensure WiFi is not blocked by rfkill
+    # Ensure no radios are soft-blocked by rfkill. New USB dongles (Bluetooth,
+    # and extra WiFi adapters used for monitor mode / packet injection) come up
+    # soft-blocked and stay dead until unblocked, so we unblock *all* radios,
+    # not just the built-in WiFi.
     if command -v rfkill >/dev/null 2>&1; then
-        rfkill unblock wifi
-        log "SUCCESS" "WiFi unblocked via rfkill"
+        rfkill unblock all
+        log "SUCCESS" "All radios unblocked via rfkill"
+
+        # Make it persistent: a one-time unblock does not survive reboots or
+        # cover dongles hot-plugged later. This udev rule re-runs the unblock
+        # whenever any radio device appears (at boot and on hot-plug), so a
+        # fresh clone/install "just works" without manual `rfkill unblock all`.
+        local rfkill_bin
+        rfkill_bin="$(command -v rfkill)"
+        cat > /etc/udev/rules.d/99-ragnar-rfkill.rules << EOF
+# Ragnar: auto-unblock every radio when it appears (boot + hot-plug).
+# USB Bluetooth and monitor-mode/injection WiFi dongles are soft-blocked by
+# default and stay dead until unblocked.
+SUBSYSTEM=="rfkill", ACTION=="add", RUN+="$rfkill_bin unblock all"
+EOF
+        chmod 644 /etc/udev/rules.d/99-ragnar-rfkill.rules
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules 2>/dev/null || true
+            udevadm trigger --subsystem-match=rfkill 2>/dev/null || true
+        fi
+        log "SUCCESS" "Installed persistent rfkill-unblock udev rule (survives reboot + hot-plug)"
     else
         log "WARNING" "rfkill not available - WiFi blocking status unknown"
     fi
