@@ -489,6 +489,178 @@ def _rusense_close_sighting(now):
         _rusense_persist_sightings_unlocked()
 
 
+# ── Vitals history ───────────────────────────────────────────────────────────
+# Long-horizon record of heart-rate / breathing / activity for health trending
+# (the dashboard trend card). Instant vitals are inherently sparse — the engine
+# needs ~15s+ of a STILL subject per confident reading — so the health value is
+# the TREND: a resting breathing rate drifting up over days signals illness
+# earlier than any single reading. ~1 Hz passes are aggregated into fixed
+# buckets so a full week stays a few hundred KB on disk. Recorded in EVERY mode
+# (security/health) — the data is cheap and you want it even if the mode flips.
+_rusense_vitals_lock = threading.Lock()
+_RUSENSE_VITALS_BUCKET_S = 300       # one aggregate per 5 minutes
+_RUSENSE_VITALS_MAX_BUCKETS = 2016   # 7 days of 5-min buckets
+_RUSENSE_VITALS_MIN_CONF = 0.3       # parity with the UI vital display gate
+
+
+def _rusense_vitals_file():
+    return os.path.join(shared_data.datadir, 'rusense_vitals_history.json')
+
+
+def _rusense_vitals_unlocked():
+    """Return the in-memory bucket list, loading it from disk on first use.
+    Caller must hold _rusense_vitals_lock."""
+    lst = _rusense_notify_state.get('vitals_history')
+    if lst is not None:
+        return lst
+    lst = []
+    try:
+        with open(_rusense_vitals_file(), 'r') as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, list):
+            lst = loaded[-_RUSENSE_VITALS_MAX_BUCKETS:]
+    except (OSError, ValueError):
+        lst = []
+    _rusense_notify_state['vitals_history'] = lst
+    return lst
+
+
+def _rusense_persist_vitals_unlocked():
+    """Atomically write the bucket list (same pattern as the sightings ring).
+    Caller must hold the lock."""
+    lst = _rusense_notify_state.get('vitals_history') or []
+    path = _rusense_vitals_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, 'w') as fh:
+            json.dump(lst, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.error(f"[rusense] failed to persist vitals history: {exc}")
+
+
+def _rusense_vitals_record(now, vs, present):
+    """Fold one ~1 Hz notify pass into the current 5-min bucket; when the
+    bucket rolls over, compact the finished one into the persisted history.
+    Every pass contributes to the activity duty; HR/BR contribute only at
+    display-grade confidence (>= 0.3 — below that the engine is guessing).
+    A restart loses at most the one in-progress bucket."""
+    bucket_t = int(now - (now % _RUSENSE_VITALS_BUCKET_S))
+    with _rusense_vitals_lock:
+        cur = _rusense_notify_state.get('vitals_bucket')
+        if cur is not None and cur['t'] != bucket_t:
+            # Bucket rolled — finalize the finished one (avg/min/max/counts).
+            n = cur['n']
+            rec = {'t': cur['t'], 'n': n,
+                   'duty': round(cur['pres'] / n, 3) if n else 0.0}
+            if cur['hr_n']:
+                rec['hr'] = round(cur['hr_sum'] / cur['hr_n'], 1)
+                rec['hr_min'] = round(cur['hr_min'], 1)
+                rec['hr_max'] = round(cur['hr_max'], 1)
+                rec['hr_n'] = cur['hr_n']
+            if cur['br_n']:
+                rec['br'] = round(cur['br_sum'] / cur['br_n'], 1)
+                rec['br_min'] = round(cur['br_min'], 1)
+                rec['br_max'] = round(cur['br_max'], 1)
+                rec['br_n'] = cur['br_n']
+            lst = _rusense_vitals_unlocked()
+            lst.append(rec)
+            if len(lst) > _RUSENSE_VITALS_MAX_BUCKETS:
+                del lst[:-_RUSENSE_VITALS_MAX_BUCKETS]
+            _rusense_persist_vitals_unlocked()
+            cur = None
+        if cur is None:
+            cur = {'t': bucket_t, 'n': 0, 'pres': 0,
+                   'hr_sum': 0.0, 'hr_n': 0, 'hr_min': None, 'hr_max': None,
+                   'br_sum': 0.0, 'br_n': 0, 'br_min': None, 'br_max': None}
+            _rusense_notify_state['vitals_bucket'] = cur
+        cur['n'] += 1
+        if present:
+            cur['pres'] += 1
+        if isinstance(vs, dict):
+            try:
+                hr = vs.get('heart_rate_bpm')
+                hc = float(vs.get('heartbeat_confidence') or 0)
+                if hr is not None and hc >= _RUSENSE_VITALS_MIN_CONF:
+                    hr = float(hr)
+                    cur['hr_sum'] += hr
+                    cur['hr_n'] += 1
+                    cur['hr_min'] = hr if cur['hr_min'] is None else min(cur['hr_min'], hr)
+                    cur['hr_max'] = hr if cur['hr_max'] is None else max(cur['hr_max'], hr)
+            except (TypeError, ValueError):
+                pass
+            try:
+                br = vs.get('breathing_rate_bpm')
+                bc = float(vs.get('breathing_confidence') or 0)
+                if br is not None and bc >= _RUSENSE_VITALS_MIN_CONF:
+                    br = float(br)
+                    cur['br_sum'] += br
+                    cur['br_n'] += 1
+                    cur['br_min'] = br if cur['br_min'] is None else min(cur['br_min'], br)
+                    cur['br_max'] = br if cur['br_max'] is None else max(cur['br_max'], br)
+            except (TypeError, ValueError):
+                pass
+
+
+def _rusense_inactivity_check(po, notify_on, now, present):
+    """Health-mode safety net — the INVERSE of the presence alert. Fires when a
+    home that should be occupied shows NO activity for N awake-hours (a fall,
+    not getting out of bed). The quiet/sleep window is excluded: the gap is
+    measured from the LATER of the last real activity or this morning's
+    quiet-end, so 8h of normal sleep never trips a 4h limit at wake-up. One
+    alert per inactivity episode per day; any activity re-arms it. Only the
+    ~1 Hz notify loop touches this state, so no lock is needed."""
+    if present:
+        _rusense_notify_state['last_activity_ts'] = now
+        _rusense_notify_state['inactivity_alerted'] = False
+        return
+    if not shared_data.config.get('rusense_notify_inactivity', False):
+        return
+    try:
+        limit_h = float(shared_data.config.get('rusense_inactivity_hours', 4))
+    except (TypeError, ValueError):
+        limit_h = 4.0
+    limit_h = max(0.5, limit_h)
+    try:
+        q0 = int(shared_data.config.get('rusense_quiet_start', 22)) % 24
+        q1 = int(shared_data.config.get('rusense_quiet_end', 7)) % 24
+    except (TypeError, ValueError):
+        q0, q1 = 22, 7
+    lt = time.localtime(now)
+    in_quiet = (lt.tm_hour >= q0 or lt.tm_hour < q1) if q0 > q1 else (q0 <= lt.tm_hour < q1)
+    if in_quiet:
+        return          # sleeping is not inactivity
+    last = _rusense_notify_state.get('last_activity_ts')
+    if last is None:
+        # Process start counts as activity, so a reboot never fires stale.
+        _rusense_notify_state['last_activity_ts'] = now
+        return
+    # This morning's quiet-end, as an epoch baseline (only if already past).
+    day_start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, q1, 0, 0,
+                             lt.tm_wday, lt.tm_yday, -1))
+    baseline = max(last, day_start) if day_start <= now else last
+    gap_h = (now - baseline) / 3600.0
+    if gap_h < limit_h:
+        # Each morning the baseline resets to quiet-end, dropping the gap below
+        # the limit again — re-arming here gives one fresh alert per day while
+        # the inactivity persists.
+        _rusense_notify_state['inactivity_alerted'] = False
+        return
+    if _rusense_notify_state.get('inactivity_alerted'):
+        return
+    _rusense_notify_state['inactivity_alerted'] = True
+    logger.info(f"[rusense] inactivity confirmed: {gap_h:.1f}h without activity "
+                f"(limit {limit_h:g}h, quiet {q0:02d}-{q1:02d})")
+    if notify_on:
+        po.notify_rusense(
+            'inactivity',
+            f"\u26A0\uFE0F No activity detected for {gap_h:.0f}+ hours during awake "
+            f"time — a monitored space that is normally occupied has gone quiet. "
+            f"Consider checking in.",
+            title="RuSense — Inactivity", priority=1)
+
+
 # ── Geofence (server-side port of web/rusense/services/geofence.service.js) ──
 # Confines motion/presence/people alerts to the polygon of mapped node corners,
 # rejecting disturbances whose spatial signature points outside the room
@@ -848,6 +1020,9 @@ def _rusense_check_once():
                         f"(hot={verdict.get('hot_count')}, total={verdict.get('total')})")
 
         vitals = latest.get('vital_signs') if isinstance(latest, dict) else None
+        # Health trending: every pass feeds the vitals/activity history
+        # (confident HR/BR + raw presence duty), independent of alerts.
+        _rusense_vitals_record(now, vitals, present)
         # Sighting lifecycle with a grace window (deferred close): a brief
         # presence fall does NOT close the episode immediately — it is held
         # 'pending' so a re-entry within _RUSENSE_SIGHTING_MERGE_S resumes the
@@ -903,6 +1078,9 @@ def _rusense_check_once():
                 'people',
                 f"\U0001F465 {people} people detected (threshold {threshold}).",
                 title="RuSense — People", priority=1)
+        # ── Inactivity (health): inverse of the presence alert — fires when an
+        #    expected-occupied home shows no activity for N awake-hours. ──
+        _rusense_inactivity_check(po, notify_on, now, present)
 
     # ── CSI node offline detection (debounced: must be gone for `sustain`) ──
     if node_list is not None:
@@ -992,6 +1170,24 @@ def rusense_sightings():
            or (s.get('confidence') or 0) >= min_conf]
     lst = lst[::-1]  # newest first
     return jsonify({'success': True, 'count': len(lst), 'sightings': lst})
+
+
+@app.route('/api/rusense/vitals-history', methods=['GET'])
+def rusense_vitals_history():
+    """Aggregated heart-rate / breathing / activity buckets for the dashboard
+    trend card. ?hours=24 (default), capped at 168 = the full 7-day ring.
+    Local route — NOT under /api/v1/* (which proxies to the sensing-server)."""
+    try:
+        hours = float(request.args.get('hours', 24))
+    except (TypeError, ValueError):
+        hours = 24.0
+    hours = max(1.0, min(168.0, hours))
+    cutoff = time.time() - hours * 3600
+    with _rusense_vitals_lock:
+        buckets = [b for b in _rusense_vitals_unlocked()
+                   if isinstance(b, dict) and (b.get('t') or 0) >= cutoff]
+    return jsonify({'success': True, 'bucket_s': _RUSENSE_VITALS_BUCKET_S,
+                    'hours': hours, 'count': len(buckets), 'buckets': buckets})
 
 
 # ── Sensing backend lifecycle (bundled sensing-server) ───────────────────────
@@ -4336,7 +4532,10 @@ def update_config():
             try:
                 import serial  # noqa: F401
             except ImportError:
-                import subprocess
+                # NB: no local `import subprocess` here — a function-local
+                # import would shadow the module-level one for this whole
+                # function and break the _delayed_restart closure below
+                # (NameError: free variable 'subprocess').
                 logger.info("Installing pyserial for wardriving GPS support...")
                 try:
                     subprocess.check_call(

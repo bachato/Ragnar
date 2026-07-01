@@ -735,6 +735,12 @@ class SharedData:
             # via the same Pushover account/keys as the security alerts above —
             # these toggles only gate the RuSense events. Requires Pushover keys
             # to be configured and pushover_enabled to be on.
+            # What the space is watched FOR. 'security' = expected-empty,
+            # alert when someone appears; 'health' = expected-occupied
+            # (wellness), alert on inactivity + lead with vitals trends;
+            # 'both' = presence and inactivity alerts together. Picking a mode
+            # in Settings presets the alert toggles below (still tunable).
+            "rusense_mode": "security",
             "rusense_notify_enabled": False,
             "rusense_notify_presence": True,        # room goes empty <-> occupied
             "rusense_notify_motion": False,         # significant (active) motion
@@ -747,6 +753,14 @@ class SharedData:
             # continuously for at least this many seconds (debounce).
             "rusense_notify_min_confidence": 0.95,  # 0..1; require >= 95% confidence
             "rusense_notify_sustain_s": 2,          # condition must persist this long
+            # Health-mode safety net (the INVERSE of the presence alert): fire
+            # when a home that should be occupied shows NO activity for this
+            # many hours of awake time. The quiet (sleep) window is excluded —
+            # the timer only runs outside it, so a normal night never trips it.
+            "rusense_notify_inactivity": False,     # no-activity-for-N-hours alert
+            "rusense_inactivity_hours": 4,          # awake hours without activity
+            "rusense_quiet_start": 22,              # sleep window start (local hour)
+            "rusense_quiet_end": 7,                 # sleep window end (local hour)
             # Perimeter geofence: confine motion/presence/people alerts to the
             # polygon of mapped node corners. Rejects disturbances whose spatial
             # signature points outside the room (hallway walk-bys, through-wall

@@ -215,6 +215,7 @@ data/.zap_api_key
 data/ragnar_auth.db
 data/gamification.json
 data/rusense_sightings.json
+data/rusense_vitals_history.json
 data/lynis_pentest_timestamps.json
 data/netkb.csv.migrated_backup
 data/network_data/network_skynet_5G.csv

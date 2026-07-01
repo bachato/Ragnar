@@ -151,7 +151,40 @@ RuSense can send a **Pushover** push notification when it detects activity — s
 camera-free space can still alert your phone. Alerts are evaluated **server-side**, so
 they fire even when no browser has the RuSense tab open.
 
-Configure them in the RuSense **Settings** tab. Available triggers:
+### Monitoring modes
+
+The **Monitoring mode** selector at the top of the Settings tab decides the *direction*
+of the alerts — the same sensing, inverted logic:
+
+- **Security** *(default)* — the space is expected **empty**: alert when someone
+  **appears** (presence/motion/people). What you want for a home you're away from.
+- **Health** — the space is expected **occupied** (wellness monitoring, e.g. an elderly
+  relative living alone): presence alerts would fire on every normal movement, so they're
+  off; instead an **inactivity** alert fires when the home shows *no* activity for a set
+  number of awake hours (a fall, not getting out of bed), and the Dashboard leads with
+  the **Health trends** card. A configurable **quiet window** (default 22:00–07:00)
+  excludes sleep — the timer only runs outside it and restarts each morning, so a normal
+  night never alerts.
+- **Both** — presence *and* inactivity alerts together, for a space that's empty at
+  some hours and occupied at others.
+
+Picking a mode presets the alert toggles; you can still fine-tune each one afterwards.
+(Config keys: `rusense_mode`, `rusense_notify_inactivity`, `rusense_inactivity_hours`,
+`rusense_quiet_start`, `rusense_quiet_end`.)
+
+### Health trends (vitals history)
+
+Independent of mode, the backend aggregates every confident heart-rate / breathing
+reading plus the presence duty into **5-minute buckets**, kept for **7 days**
+(`data/rusense_vitals_history.json`, endpoint `/api/rusense/vitals-history`). The
+Dashboard's **Health trends** card charts them (24h/7d) with **resting averages**
+(overnight readings when available). Instant vitals are inherently sparse — the engine
+needs ~15 s+ of a *still* subject per confident reading — so the health value is the
+*trend*: a resting breathing rate drifting up over days signals illness earlier than any
+single reading ever could. RuSense is wellness tracking, **not a medical device** — use
+it for trends and check-ins, never for emergencies or diagnosis.
+
+Configure alerts in the RuSense **Settings** tab. Available triggers:
 
 - **Presence / occupancy** — a monitored space goes from empty to occupied (and back).
 - **Motion** — significant (active) motion is detected.
@@ -160,6 +193,8 @@ Configure them in the RuSense **Settings** tab. Available triggers:
   **median across active nodes** — a single node spiking can't move the median, so a count
   is only believed when a majority of nodes agree.
 - **Node offline** — a provisioned CSI sensor node stops streaming.
+- **Inactivity (health)** — the inverse of presence: an expected-occupied space shows
+  **no** activity for the configured awake hours. Sleep hours (quiet window) never count.
 
 A configurable **cooldown** prevents a flapping signal from spamming you, and each
 trigger can be toggled independently under a master on/off switch.

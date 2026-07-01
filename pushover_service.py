@@ -47,7 +47,8 @@ class PushoverService:
                 rows = cursor.fetchall()
                 with self._lock:
                     for row in rows:
-                        ip = row[0] if isinstance(row, (list, tuple)) else row.get('ip', '')
+                        # sqlite3.Row supports index access but has no .get()
+                        ip = row[0] if row else ''
                         if ip:
                             self._notified_devices.add(ip)
                 # Load current vuln count as baseline (so we only alert on genuinely new ones)
@@ -262,6 +263,7 @@ class PushoverService:
         "motion": "rusense_notify_motion",
         "people": "rusense_notify_people",
         "node_offline": "rusense_notify_node_offline",
+        "inactivity": "rusense_notify_inactivity",
     }
 
     def rusense_enabled(self, kind):

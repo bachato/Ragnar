@@ -124,6 +124,7 @@ export default {
           <p class="text-sm text-ink-soft">RuSense sends a <strong>Pushover</strong> push when it detects activity — evaluated <strong>server-side</strong>, so alerts fire even with no browser open.</p>
           ${stepList([
             'Set your Pushover <strong>User Key + API Token</strong> once under the main dashboard\'s <strong>Config → Pushover Notifications</strong>.',
+            'Pick a <strong>Monitoring mode</strong> in Settings: <strong>Security</strong> (space should be empty — alert when someone appears), <strong>Health</strong> (space should be occupied — alert when it goes quiet, e.g. checking in on grandparents), or <strong>Both</strong>.',
             'Enable the triggers you want in the RuSense <strong>Settings</strong> tab (a master switch plus per-trigger toggles).',
             'Use <strong>Send test notification</strong> to confirm delivery.',
           ])}
@@ -133,9 +134,10 @@ export default {
             '<strong>Motion</strong> — significant active motion is detected.',
             '<strong>People-count threshold</strong> — the count crosses a value you set (median across active nodes, so one spiking node can\'t trip it).',
             '<strong>Node offline</strong> — a provisioned CSI node stops streaming.',
+            '<strong>Inactivity (health)</strong> — the inverse of presence: an expected-occupied space shows <em>no</em> activity for the set awake hours. The quiet (sleep) window never counts, so a normal night stays silent.',
           ])}
           ${callout('False-positive guards', 'An alert only fires when <strong>all</strong> hold: minimum confidence (default 80%), the condition lasts a sustain window (default 2 s), and the disturbance is inside the geofence. A cooldown stops a flapping signal from spamming you.')}
-          <p class="text-sm text-ink-soft">Every confirmed presence alert is also logged to the Dashboard\'s <strong>Recent sightings</strong> — with how long the person was seen — so you can review a detection even after they\'ve left.</p>
+          <p class="text-sm text-ink-soft">Every confirmed presence alert is also logged to the Dashboard\'s <strong>Recent sightings</strong> — with how long the person was seen — so you can review a detection even after they\'ve left. The Dashboard\'s <strong>Health trends</strong> card additionally charts 7 days of heart-rate / breathing / activity history with resting averages — wellness tracking, <em>not</em> a medical device.</p>
           <p class="text-xs text-ink-muted">The alert monitor runs inside the <span class="font-mono">ragnar</span> service. After changing alert settings or pulling new code, restart it: <span class="font-mono">sudo systemctl restart ragnar</span>.</p>
         </div>
 

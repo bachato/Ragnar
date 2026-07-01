@@ -61,6 +61,7 @@ const TOGGLES = [
   ['rusense_notify_motion', 'Motion', 'When significant (active) motion is detected.'],
   ['rusense_notify_people', 'People-count threshold', 'When the estimated number of people crosses the threshold below.'],
   ['rusense_notify_node_offline', 'Node offline', 'When a provisioned CSI sensor node stops streaming.'],
+  ['rusense_notify_inactivity', 'Inactivity (health)', 'The inverse of presence: when an expected-occupied space shows NO activity for the awake-hours set below. For wellness monitoring.'],
 ];
 
 function row(key, label, help, checked) {
@@ -292,6 +293,26 @@ export default {
           </label>
         </div>
 
+        <div class="card card-pad space-y-2">
+          <h3 class="card-title mb-1">Monitoring mode</h3>
+          <p class="text-xs text-ink-muted">What is this space watched for? Picking a mode presets the alert
+            toggles below — the direction of the alerts is what changes. Fine-tune afterwards if you like.</p>
+          <div id="st-mode" class="grid gap-2 sm:grid-cols-3">
+            <button type="button" data-mode="security" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer">
+              <span class="block text-sm font-semibold">\u{1F6E1}\uFE0F Security</span>
+              <span class="block text-xs text-ink-muted">Space should be EMPTY — alert when someone appears.</span>
+            </button>
+            <button type="button" data-mode="health" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer">
+              <span class="block text-sm font-semibold">\u2764\uFE0F Health</span>
+              <span class="block text-xs text-ink-muted">Space should be OCCUPIED — alert when it goes quiet; lead with vitals trends.</span>
+            </button>
+            <button type="button" data-mode="both" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer">
+              <span class="block text-sm font-semibold">\u2696\uFE0F Both</span>
+              <span class="block text-xs text-ink-muted">Empty at times, occupied at others — presence and inactivity alerts together.</span>
+            </button>
+          </div>
+        </div>
+
         <div class="card card-pad space-y-1">
           <h3 class="card-title mb-1">Alert on</h3>
           ${TOGGLES.map(([k, l, h]) => row(k, l, h, c[k])).join('')}
@@ -336,6 +357,36 @@ export default {
           </label>
         </div>
 
+        <div class="card card-pad space-y-3">
+          <h3 class="card-title">Health monitoring</h3>
+          <p class="text-xs text-ink-muted">Settings for the inactivity alert. Sleep hours are excluded — the
+            no-activity timer only runs outside the quiet window, so a normal night never alerts. Each morning it
+            restarts at the quiet-window end.</p>
+          <div class="grid gap-4 sm:grid-cols-3">
+            <label class="block">
+              <span class="block text-sm font-medium mb-1">Alert after (hours)</span>
+              <input type="number" id="st-inact-hours" min="1" max="24" step="1"
+                value="${Number(c.rusense_inactivity_hours ?? 4)}"
+                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              <span class="block text-xs text-ink-muted mt-1">Awake hours with no activity seen.</span>
+            </label>
+            <label class="block">
+              <span class="block text-sm font-medium mb-1">Quiet from (hour)</span>
+              <input type="number" id="st-quiet-start" min="0" max="23" step="1"
+                value="${Number(c.rusense_quiet_start ?? 22)}"
+                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              <span class="block text-xs text-ink-muted mt-1">Bedtime — the timer pauses.</span>
+            </label>
+            <label class="block">
+              <span class="block text-sm font-medium mb-1">Quiet until (hour)</span>
+              <input type="number" id="st-quiet-end" min="0" max="23" step="1"
+                value="${Number(c.rusense_quiet_end ?? 7)}"
+                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              <span class="block text-xs text-ink-muted mt-1">Wake-up — the timer resumes.</span>
+            </label>
+          </div>
+        </div>
+
         <div class="card card-pad space-y-1">
           <label class="flex items-start justify-between gap-4 py-1 cursor-pointer">
             <span class="min-w-0">
@@ -368,6 +419,35 @@ export default {
       return Math.max(lo, Math.min(hi, v));
     };
 
+    // ── Monitoring mode: presets the DIRECTION of the alerts. Security =
+    //    expected-empty (alert on someone appearing); Health = expected-
+    //    occupied (alert on inactivity). Clicking a mode flips the toggles
+    //    above; Save persists the mode + toggles together. ──
+    let mode = ['security', 'health', 'both'].includes(c.rusense_mode) ? c.rusense_mode : 'security';
+    const MODE_PRESETS = {
+      security: { rusense_notify_presence: true, rusense_notify_motion: false,
+                  rusense_notify_people: false, rusense_notify_inactivity: false },
+      health: { rusense_notify_presence: false, rusense_notify_motion: false,
+                rusense_notify_people: false, rusense_notify_inactivity: true },
+      both: { rusense_notify_presence: true, rusense_notify_inactivity: true },
+    };
+    const paintMode = () => {
+      root.querySelectorAll('#st-mode button').forEach((b) => {
+        const on = b.dataset.mode === mode;
+        b.className = 'text-left rounded-lg border px-3 py-2 cursor-pointer '
+          + (on ? 'border-brand-400 bg-brand-400/10' : 'border-ink-3');
+      });
+    };
+    paintMode();
+    root.querySelectorAll('#st-mode button').forEach((b) => b.addEventListener('click', () => {
+      mode = b.dataset.mode;
+      paintMode();
+      for (const [k, v] of Object.entries(MODE_PRESETS[mode] || {})) {
+        const box = root.querySelector(`input[data-key="${k}"]`);
+        if (box) box.checked = v;
+      }
+    }));
+
     $('#st-save').addEventListener('click', async () => {
       const payload = { rusense_notify_enabled: $('#st-master').checked };
       for (const [k] of TOGGLES) {
@@ -378,6 +458,10 @@ export default {
       payload.rusense_notify_cooldown_s = clampInt($('#st-cooldown'), 5, 3600, 60);
       payload.rusense_notify_min_confidence = clampInt($('#st-minconf'), 50, 99, 95) / 100;
       payload.rusense_notify_sustain_s = clampInt($('#st-sustain'), 0, 30, 2);
+      payload.rusense_mode = mode;
+      payload.rusense_inactivity_hours = clampInt($('#st-inact-hours'), 1, 24, 4);
+      payload.rusense_quiet_start = clampInt($('#st-quiet-start'), 0, 23, 22);
+      payload.rusense_quiet_end = clampInt($('#st-quiet-end'), 0, 23, 7);
       payload.rusense_geofence_enabled = $('#st-geofence').checked;
       // Reconcile the node map to the backend on every save (positions + names
       // also auto-sync as you edit them in the Observatory section below).

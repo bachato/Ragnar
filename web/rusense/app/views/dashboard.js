@@ -30,6 +30,56 @@ function fmtDuration(sec) {
   return `${h}h ${m % 60}m`;
 }
 
+// Path for a sparse trend series: x is positioned by bucket TIME (not index) so
+// gaps in coverage render as gaps in the line, and missing values lift the pen.
+function trendPath(buckets, key, t0, t1, w, h, lo, hi) {
+  const span = (t1 - t0) || 1, vspan = (hi - lo) || 1;
+  let d = '', pen = false;
+  for (const b of buckets) {
+    const v = b[key];
+    if (v == null) { pen = false; continue; }
+    const x = ((b.t - t0) / span) * w;
+    const y = h - 2 - ((v - lo) / vspan) * (h - 4);
+    d += `${pen ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`;
+    pen = true;
+  }
+  return d;
+}
+
+// Dots for the same series — vitals are sparse enough that an isolated bucket
+// (a single confident reading between long gaps) would be an invisible
+// zero-length path segment without a marker.
+function trendDots(buckets, key, t0, t1, w, h, lo, hi) {
+  const span = (t1 - t0) || 1, vspan = (hi - lo) || 1;
+  return buckets.map((b) => {
+    const v = b[key];
+    if (v == null) return '';
+    const x = ((b.t - t0) / span) * w;
+    const y = h - 2 - ((v - lo) / vspan) * (h - 4);
+    return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="1.6"/>`;
+  }).join('');
+}
+
+// Coarsen 5-min buckets into larger groups (weighted by sample counts) so the
+// 7-day view draws ~340 points instead of 2016.
+function mergeBuckets(buckets, groupS) {
+  const out = new Map();
+  for (const b of buckets) {
+    const t = b.t - (b.t % groupS);
+    const g = out.get(t) || { t, n: 0, pres: 0, hrS: 0, hrN: 0, brS: 0, brN: 0 };
+    g.n += b.n || 0;
+    g.pres += (b.duty || 0) * (b.n || 0);
+    if (b.hr != null) { g.hrS += b.hr * (b.hr_n || 1); g.hrN += b.hr_n || 1; }
+    if (b.br != null) { g.brS += b.br * (b.br_n || 1); g.brN += b.br_n || 1; }
+    out.set(t, g);
+  }
+  return [...out.values()].sort((a, b) => a.t - b.t).map((g) => ({
+    t: g.t, n: g.n, duty: g.n ? g.pres / g.n : 0,
+    hr: g.hrN ? g.hrS / g.hrN : null, hr_n: g.hrN || 0,
+    br: g.brN ? g.brS / g.brN : null, br_n: g.brN || 0,
+  }));
+}
+
 export default {
   id: 'dashboard',
   label: 'Dashboard',
@@ -51,8 +101,19 @@ export default {
     // Custom node names live in Ragnar config (set in Settings), not in the
     // sensing-server's /api/v1/nodes roster — fetch them once to label nodes.
     this._nodeNames = {};
-    fetchJSON('/api/config').then((c) => { this._nodeNames = (c && c.rusense_node_names) || {}; });
+    fetchJSON('/api/config').then((c) => {
+      this._nodeNames = (c && c.rusense_node_names) || {};
+      // Health mode leads with the trends: lift the card above the signal grid
+      // (the sparse instant readings matter less than the long-horizon trend).
+      if (c && c.rusense_mode === 'health') {
+        const tc = $('#trends-card'), grid = $('#dash-grid');
+        if (tc && grid && grid.parentNode) grid.parentNode.insertBefore(tc, grid);
+      }
+    });
     this._sightings = [];
+    this._trendHours = 24;
+    this._trendBuckets = [];
+    this._trendBucketS = 300;
 
     root.appendChild(html`
       <section class="space-y-5">
@@ -74,7 +135,7 @@ export default {
           ${bigStat('Heart rate', 'stat-hr', 'bpm')}
         </div>
 
-        <div class="grid gap-4 lg:grid-cols-2">
+        <div id="dash-grid" class="grid gap-4 lg:grid-cols-2">
           <!-- Signal -->
           <div class="card card-pad space-y-4">
             <div class="flex items-center justify-between">
@@ -115,6 +176,22 @@ export default {
             <span class="text-xs text-ink-muted">last 5 · presence alerts</span>
           </div>
           <div id="sightings-body">
+            <div class="text-sm text-ink-muted py-2">Loading…</div>
+          </div>
+        </div>
+
+        <!-- Health trends — long-horizon vitals/activity from the history ring.
+             The health value is the TREND (resting rates drifting over days),
+             not any single sparse reading. -->
+        <div id="trends-card" class="card card-pad space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="card-title">Health trends</h2>
+            <div class="flex items-center gap-1">
+              <button id="trend-24h" class="badge-ok">24h</button>
+              <button id="trend-7d" class="badge-mut">7d</button>
+            </div>
+          </div>
+          <div id="trend-body">
             <div class="text-sm text-ink-muted py-2">Loading…</div>
           </div>
         </div>
@@ -174,21 +251,98 @@ export default {
       this.renderVitals();
     };
 
-    refreshHealth(); refreshVitals(); refreshSightings();
+    const refreshTrends = async () => {
+      const r = await fetchJSON(`/api/rusense/vitals-history?hours=${this._trendHours}`);
+      if (!r || !Array.isArray(r.buckets)) return;
+      this._trendBucketS = r.bucket_s || 300;
+      // 7d = 2016 raw buckets; coarsen to 30-min groups for a sane path.
+      this._trendBuckets = this._trendHours > 48 ? mergeBuckets(r.buckets, 1800) : r.buckets;
+      this.renderTrends();
+    };
+    const setRange = (hours) => {
+      this._trendHours = hours;
+      const b24 = $('#trend-24h'), b7 = $('#trend-7d');
+      if (b24) b24.className = hours === 24 ? 'badge-ok' : 'badge-mut';
+      if (b7) b7.className = hours === 168 ? 'badge-ok' : 'badge-mut';
+      refreshTrends();
+    };
+    const b24 = $('#trend-24h'), b7 = $('#trend-7d');
+    if (b24) b24.addEventListener('click', () => setRange(24));
+    if (b7) b7.addEventListener('click', () => setRange(168));
+
+    refreshHealth(); refreshVitals(); refreshSightings(); refreshTrends();
     const t1 = setInterval(refreshHealth, 5000);
     const t2 = setInterval(refreshSightings, 7000);
     const t3 = setInterval(refreshVitals, 4000);
     // Re-render on a steady tick so a held value still clears to "—" after the
     // hold window even if frames/polls stop arriving (stalled stream).
     const t4 = setInterval(() => { this.renderVitals(); this.renderSightings(); }, 1000);
+    const t5 = setInterval(refreshTrends, 60000);
 
-    return () => { off(); offP(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
+    return () => { off(); offP(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); clearInterval(t5); };
   },
 
   renderVitals() {
     const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
     set('#stat-br', this._brHold.text());
     set('#stat-hr', this._hrHold.text());
+  },
+
+  // Health trends: three sparse-tolerant sparklines (HR / breathing / activity)
+  // + resting averages. Vitals only exist while a subject is STILL, so the
+  // charts show dots-with-gaps by design — the trend line matters, not density.
+  renderTrends() {
+    const body = $('#trend-body'); if (!body) return;
+    const bks = this._trendBuckets || [];
+    const t1 = Date.now() / 1000, t0 = t1 - this._trendHours * 3600;
+    if (!bks.length) {
+      body.innerHTML = '<div class="text-sm text-ink-muted py-2">Collecting history — trends appear after a few minutes of sensing.</div>';
+      return;
+    }
+    const hrB = bks.filter((b) => b.hr != null);
+    const brB = bks.filter((b) => b.br != null);
+    // Resting rate = overnight readings (00:00–06:00 local) when there are any;
+    // otherwise all confident readings in range. Weighted by reading count.
+    const resting = (arr, key, nKey) => {
+      let pool = arr.filter((b) => { const h = new Date(b.t * 1000).getHours(); return h < 6; });
+      if (!pool.length) pool = arr;
+      let sum = 0, n = 0;
+      for (const b of pool) { const w = b[nKey] || 1; sum += b[key] * w; n += w; }
+      return n ? sum / n : null;
+    };
+    const restHr = hrB.length ? resting(hrB, 'hr', 'hr_n') : null;
+    const restBr = brB.length ? resting(brB, 'br', 'br_n') : null;
+    const activeS = bks.reduce((a, b) => a + (b.duty || 0) * this._trendBucketS, 0);
+    const range = (arr, key, pad, floor) => {
+      if (!arr.length) return [0, 1];
+      const vs = arr.map((b) => b[key]);
+      return [Math.max(floor, Math.min(...vs) - pad), Math.max(...vs) + pad];
+    };
+    const [hrLo, hrHi] = range(hrB, 'hr', 5, 30);
+    const [brLo, brHi] = range(brB, 'br', 2, 4);
+    const last = (arr, key, f) => (arr.length ? f(arr[arr.length - 1][key]) : '—');
+    const chart = (label, latest, series, key, lo, hi, color, dots) => `
+      <div class="space-y-1">
+        <div class="flex items-baseline justify-between text-sm">
+          <span class="text-ink-muted">${label}</span>
+          <span class="font-mono">${latest}</span>
+        </div>
+        <svg viewBox="0 0 300 40" preserveAspectRatio="none" class="w-full h-10 ${color}">
+          <path d="${trendPath(series, key, t0, t1, 300, 40, lo, hi)}" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          ${dots ? `<g fill="currentColor">${trendDots(series, key, t0, t1, 300, 40, lo, hi)}</g>` : ''}
+        </svg>
+      </div>`;
+    body.innerHTML = `
+      <div class="grid gap-4 sm:grid-cols-3">
+        ${chart('Heart rate', last(hrB, 'hr', (v) => `${Math.round(v)} bpm`), hrB, 'hr', hrLo, hrHi, 'text-bad', true)}
+        ${chart('Breathing', last(brB, 'br', (v) => `${Number(v).toFixed(1)} bpm`), brB, 'br', brLo, brHi, 'text-brand-400', true)}
+        ${chart('Activity', last(bks, 'duty', (v) => `${Math.round(v * 100)}%`), bks, 'duty', 0, 1, 'text-ok', false)}
+      </div>
+      <div class="grid grid-cols-3 gap-3 text-sm pt-2 border-t border-ink-3">
+        <div><div class="text-ink-muted text-xs">Resting heart rate</div><div class="font-mono">${restHr != null ? `${Math.round(restHr)} bpm` : '—'}</div></div>
+        <div><div class="text-ink-muted text-xs">Resting breathing</div><div class="font-mono">${restBr != null ? `${restBr.toFixed(1)} bpm` : '—'}</div></div>
+        <div><div class="text-ink-muted text-xs">Active time</div><div class="font-mono">${fmtDuration(activeS)}</div></div>
+      </div>`;
   },
 
   // Render the sightings table from cached rows. Called on each 7s fetch and on
