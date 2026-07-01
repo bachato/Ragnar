@@ -9,7 +9,7 @@ import sensing from './views/sensing.js?v=20260701-presencehold';
 import nodes from './views/nodes.js?v=20260701-nodenames';
 import training from './views/training.js?v=20260630-recstate';
 import settings from './views/settings.js?v=20260629-obsserver';
-import about from './views/about.js?v=20260701-aboutguide';
+import about from './views/about.js?v=20260701-credits';
 
 const VIEWS = { dashboard, sensing, nodes, training, settings, about };
 const CSS_HREF = new URL('../assets/app.css', import.meta.url).href;

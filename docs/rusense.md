@@ -245,13 +245,15 @@ RuSense can learn in two different ways:
 
 ## Credits
 
-RuSense is powered by **[RuView](https://github.com/PierreGode/RuView)** — the
-WiFi-CSI DensePose sensing engine (crate `wifi-densepose-sensing-server`) by
-PierreGode. Ragnar vendors RuView's prebuilt sensing server and the ESP32 CSI-node
-firmware; all of the CSI ingestion, inference, pose estimation and training logic
-originates there. Full credit and thanks to the RuView project.
+RuSense is powered by **[RuView](https://github.com/ruvnet/ruview)** — the WiFi-CSI
+DensePose sensing engine (crate `wifi-densepose-sensing-server`), created by
+**ruvnet**. All of the CSI ingestion, inference, pose estimation and training logic
+originates there. Ragnar vendors RuView's prebuilt sensing server and the ESP32
+CSI-node firmware (from the [PierreGode/RuView](https://github.com/PierreGode/RuView)
+fork). Full credit and thanks to the RuView project.
 
-- Sensing engine & firmware: **[github.com/PierreGode/RuView](https://github.com/PierreGode/RuView)**
+- Source project: **[github.com/ruvnet/ruview](https://github.com/ruvnet/ruview)** (ruvnet)
+- Fork Ragnar vendors bins from: [github.com/PierreGode/RuView](https://github.com/PierreGode/RuView)
 - This integration lives in Ragnar: see the [README](../README.md).
 
 ---

@@ -5,7 +5,8 @@ import { icons } from '../icons.js';
 import { html } from '../lib.js';
 
 const FLASHER_URL = 'https://pierregode.github.io/Ragnar/';
-const RUVIEW_URL = 'https://github.com/PierreGode/RuView';
+const RUVIEW_URL = 'https://github.com/ruvnet/ruview';          // the source project (by ruvnet)
+const RUVIEW_FORK_URL = 'https://github.com/PierreGode/RuView';  // the fork Ragnar vendors bins from
 
 const PIPELINE = [
   ['CSI input', 'Channel State Information from the WiFi antenna array'],
@@ -53,7 +54,7 @@ export default {
           </div>
           <a href="${RUVIEW_URL}" target="_blank" rel="noopener" class="block rounded-lg border border-brand-500/30 bg-brand-500/10 p-3 text-sm">
             <span class="font-semibold text-brand-300">⚡ Powered by RuView</span>
-            <span class="text-ink-soft"> — the WiFi-CSI DensePose sensing engine and ESP32 CSI-node firmware behind RuSense. All the sensing magic is theirs.</span>
+            <span class="text-ink-soft"> — the WiFi-CSI DensePose sensing engine and ESP32 CSI-node firmware behind RuSense, by ruvnet. All the sensing magic is theirs.</span>
           </a>
         </div>
 
@@ -179,8 +180,8 @@ export default {
         <!-- Credits -->
         <div class="card card-pad space-y-3">
           <h3 class="card-title">Credits — RuView</h3>
-          <p class="text-sm text-ink-soft">RuSense is powered by <a href="${RUVIEW_URL}" target="_blank" rel="noopener" class="text-brand-300 font-semibold">RuView</a> — the WiFi-CSI DensePose sensing engine (crate <span class="font-mono">wifi-densepose-sensing-server</span>) by PierreGode. Ragnar simply vendors RuView's prebuilt sensing server and its ESP32 CSI-node firmware: <strong>all of the CSI ingestion, inference, pose estimation and training logic originates there.</strong> Full credit and thanks to the RuView project.</p>
-          <div>${linkBtn(RUVIEW_URL, 'github.com/PierreGode/RuView →', true)}</div>
+          <p class="text-sm text-ink-soft">RuSense is powered by <a href="${RUVIEW_URL}" target="_blank" rel="noopener" class="text-brand-300 font-semibold">RuView</a> — the WiFi-CSI DensePose sensing engine (crate <span class="font-mono">wifi-densepose-sensing-server</span>), created by <strong>ruvnet</strong>. <strong>All of the CSI ingestion, inference, pose estimation and training logic originates there.</strong> Ragnar just vendors RuView's prebuilt sensing server and ESP32 CSI-node firmware (via the <a href="${RUVIEW_FORK_URL}" target="_blank" rel="noopener" class="text-brand-300">PierreGode/RuView</a> fork). Full credit and thanks to the RuView project.</p>
+          <div>${linkBtn(RUVIEW_URL, 'github.com/ruvnet/ruview →', true)}</div>
         </div>
 
         <!-- Links -->
