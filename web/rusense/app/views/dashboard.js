@@ -1,6 +1,6 @@
 // Dashboard — live operator overview. No marketing; leads with real data.
 import { icons } from '../icons.js';
-import { html, $, fetchJSON, fmt, setMeter, sparkPath, throttleLatest } from '../lib.js';
+import { html, $, fetchJSON, fmt, sparkPath, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
 import { makePresenceHold } from '../presence-hold.js?v=20260701-presencehold';
@@ -31,6 +31,10 @@ export default {
     this._lastPeople = 0;
     this._lastMotion = '';
     this._presSig = null;
+    // Custom node names live in Ragnar config (set in Settings), not in the
+    // sensing-server's /api/v1/nodes roster — fetch them once to label nodes.
+    this._nodeNames = {};
+    fetchJSON('/api/config').then((c) => { this._nodeNames = (c && c.rusense_node_names) || {}; });
 
     root.appendChild(html`
       <section class="space-y-5">
@@ -70,24 +74,30 @@ export default {
             </dl>
           </div>
 
-          <!-- System health -->
+          <!-- RuSense + node health -->
           <div class="card card-pad space-y-4">
-            <h2 class="card-title">System</h2>
-            <div class="space-y-3">
-              ${['CPU', 'Memory', 'Disk'].map((m) => `
-                <div>
-                  <div class="flex justify-between text-sm mb-1">
-                    <span class="text-ink-muted">${m}</span><span id="sys-${m.toLowerCase()}-val" class="font-mono">—</span>
-                  </div>
-                  <div class="meter"><span id="sys-${m.toLowerCase()}" style="width:0%"></span></div>
-                </div>`).join('')}
+            <div class="flex items-center justify-between">
+              <h2 class="card-title">RuSense health</h2>
+              <span id="rs-backend" class="badge-mut">—</span>
             </div>
-            <div class="flex items-center justify-between pt-1 border-t border-ink-3">
-              <span class="text-sm text-ink-muted">Active nodes</span>
-              <a href="#nodes" class="text-sm font-semibold text-brand-300">
-                <span id="nodes-active">—</span> online →
-              </a>
+            <dl class="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+              <div class="flex justify-between"><dt class="text-ink-muted">Source</dt><dd id="rs-source" class="font-mono">—</dd></div>
+              <div class="flex justify-between"><dt class="text-ink-muted">Nodes online</dt><dd id="rs-nodes" class="font-mono">—</dd></div>
+            </dl>
+            <div id="rs-node-list" class="space-y-2 pt-1 border-t border-ink-3 text-sm">
+              <div class="text-ink-muted">Loading nodes…</div>
             </div>
+          </div>
+        </div>
+
+        <!-- Recent sightings — a reviewable log of confirmed presence alerts -->
+        <div class="card card-pad space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="card-title">Recent sightings</h2>
+            <span class="text-xs text-ink-muted">last 5 · presence alerts</span>
+          </div>
+          <div id="sightings-body">
+            <div class="text-sm text-ink-muted py-2">Loading…</div>
           </div>
         </div>
       </section>`);
@@ -100,22 +110,67 @@ export default {
     // from a separate un-throttled listener (cheap: no DOM unless state changes).
     const offP = sensingService.onData((d) => this.applyPresence(d));
 
-    const refreshSystem = async () => {
-      const m = await fetchJSON('/health/metrics');
-      const sm = m?.system_metrics;
-      if (!sm) return;
-      const set = (k, pct) => {
-        const v = (pct ?? 0) / 100;
-        const valEl = $(`#sys-${k}-val`); const barEl = $(`#sys-${k}`);
-        if (valEl) valEl.textContent = `${(pct ?? 0).toFixed(1)}%`;
-        if (barEl) setMeter(barEl, v);
-      };
-      set('cpu', sm.cpu?.percent); set('memory', sm.memory?.percent); set('disk', sm.disk?.percent);
+    // RuSense backend + node health (replaces generic host CPU/mem/disk).
+    const refreshHealth = async () => {
+      const [st, svc, n] = await Promise.all([
+        fetchJSON('/api/v1/status'),
+        fetchJSON('/api/sensing/status'),
+        fetchJSON('/api/v1/nodes'),
+      ]);
+      const be = $('#rs-backend');
+      if (be) {
+        const running = svc?.active === true;
+        be.textContent = running ? (st?.status || 'running') : (st ? 'reachable' : 'unreachable');
+        be.className = running ? 'badge-ok' : (st ? 'badge-warn' : 'badge-bad');
+      }
+      const src = $('#rs-source'); if (src) src.textContent = st?.source || '—';
+      const nodes = (n?.nodes || []).slice().sort((a, b) => (a.node_id || 0) - (b.node_id || 0));
+      const active = nodes.filter((x) => x.status === 'active').length;
+      const ne = $('#rs-nodes'); if (ne) ne.textContent = `${active}/${nodes.length}`;
+      const list = $('#rs-node-list');
+      if (list) {
+        list.innerHTML = nodes.length ? nodes.map((x) => {
+          const on = x.status === 'active';
+          const rssi = x.rssi_dbm != null ? `${Number(x.rssi_dbm).toFixed(0)} dBm` : '—';
+          const nm = this._nodeNames[String(x.node_id)];
+          const label = nm ? `${nm} <span class="text-ink-muted">#${x.node_id}</span>` : `Node ${x.node_id}`;
+          return `<div class="flex items-center justify-between">
+            <span class="flex items-center gap-2"><span class="dot w-2 h-2 ${on ? 'bg-ok' : 'bg-bad'}"></span>${label}</span>
+            <span class="font-mono text-ink-soft">${rssi}</span>
+          </div>`;
+        }).join('') : '<div class="text-ink-muted">No nodes reporting</div>';
+      }
     };
-    const refreshNodes = async () => {
-      const n = await fetchJSON('/api/v1/nodes');
-      const active = (n?.nodes || []).filter((x) => x.status === 'active').length;
-      const el = $('#nodes-active'); if (el) el.textContent = String(active);
+    const fmtLocal = (ts) => {
+      try {
+        return new Date(ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      } catch { return '—'; }
+    };
+    const refreshSightings = async () => {
+      const r = await fetchJSON('/api/rusense/sightings');
+      const body = $('#sightings-body'); if (!body) return;
+      const rows = (r?.sightings || []).slice(0, 5);
+      if (!rows.length) {
+        body.innerHTML = '<div class="text-sm text-ink-muted py-2">No sightings yet — confirmed presence alerts will appear here.</div>';
+        return;
+      }
+      const cell = (v) => `<td class="text-right font-mono py-2">${v}</td>`;
+      body.innerHTML = `<table class="w-full text-sm">
+        <thead><tr class="text-ink-muted">
+          <th class="text-left font-semibold py-2">Time</th>
+          <th class="text-right font-semibold py-2">Confidence</th>
+          <th class="text-right font-semibold py-2">Heart rate</th>
+          <th class="text-right font-semibold py-2">Breathing</th>
+        </tr></thead>
+        <tbody>${rows.map((s) => {
+          const conf = s.confidence != null ? `${Math.round(s.confidence * 100)}%` : '—';
+          const hr = s.hr != null ? `${Math.round(s.hr)} bpm` : '—';
+          const br = s.br != null ? `${Number(s.br).toFixed(1)} bpm` : '—';
+          const live = s.ended_ts == null ? ' <span class="text-ok">• live</span>' : '';
+          return `<tr class="border-t border-ink-3">
+            <td class="text-left font-mono text-ink-soft py-2">${fmtLocal(s.ts)}${live}</td>
+            ${cell(conf)}${cell(hr)}${cell(br)}</tr>`;
+        }).join('')}</tbody></table>`;
     };
     const refreshVitals = async () => {
       // Vitals may not ride every WS frame — poll the dedicated endpoint.
@@ -127,9 +182,9 @@ export default {
       this.renderVitals();
     };
 
-    refreshSystem(); refreshNodes(); refreshVitals();
-    const t1 = setInterval(refreshSystem, 5000);
-    const t2 = setInterval(refreshNodes, 5000);
+    refreshHealth(); refreshVitals(); refreshSightings();
+    const t1 = setInterval(refreshHealth, 5000);
+    const t2 = setInterval(refreshSightings, 7000);
     const t3 = setInterval(refreshVitals, 4000);
     // Re-render on a steady tick so a held value still clears to "—" after the
     // hold window even if frames/polls stop arriving (stalled stream).

@@ -2,10 +2,12 @@
 import { icons } from '../icons.js';
 import { html, $, fetchJSON, fmt } from '../lib.js';
 
-function nodeRow(n) {
+function nodeRow(n, names = {}) {
   const active = n.status === 'active';
+  const nm = names[String(n.node_id)];
+  const label = nm ? `${nm} <span class="text-ink-muted text-xs">#${n.node_id}</span>` : `#${n.node_id}`;
   return `<tr class="border-b border-ink-3 last:border-0">
-    <td class="py-2.5 pr-3 font-mono">#${n.node_id}</td>
+    <td class="py-2.5 pr-3 font-mono">${label}</td>
     <td class="py-2.5 pr-3"><span class="${active ? 'badge-ok' : 'badge-bad'}"><span class="dot ${active ? 'bg-ok' : 'bg-bad'}"></span>${n.status}</span></td>
     <td class="py-2.5 pr-3 font-mono text-right">${fmt.dbm(n.rssi_dbm)}</td>
     <td class="py-2.5 pr-3 text-ink-soft">${(n.motion_level || '—').replace(/_/g, ' ')}</td>
@@ -20,6 +22,11 @@ export default {
   icon: icons.nodes,
 
   async mount(root) {
+    // Custom node names come from Ragnar config (Settings), not the sensing
+    // roster; load them once so the table shows names instead of just "#id".
+    let nodeNames = {};
+    fetchJSON('/api/config').then((c) => { nodeNames = (c && c.rusense_node_names) || {}; });
+
     root.appendChild(html`
       <section class="space-y-5">
         <div class="grid grid-cols-3 gap-3">
@@ -69,7 +76,7 @@ export default {
       $('#n-online').textContent = online;
       $('#n-stale').textContent = list.length - online;
       body.innerHTML = list.length
-        ? list.map(nodeRow).join('')
+        ? list.map((n) => nodeRow(n, nodeNames)).join('')
         : '<tr><td colspan="6" class="py-6 text-center text-ink-muted">No nodes reporting. Power on an ESP32 CSI node and provision it to this server.</td></tr>';
     };
     const refreshMesh = async () => {

@@ -731,7 +731,14 @@ body {
 }
 
 @media (max-width: 800px) {
-  .data-panel { display: none; }
+  /* Keep the data panels visible on phones — pin them to the bottom corners as
+     compact cards instead of hiding them (the old `display:none` made Vital
+     Signs and WiFi Signal vanish). Free the bottom row by hiding the key hints
+     and capabilities bar. */
   #key-hints { display: none; }
+  #capabilities-bar { display: none; }
   .settings-dialog { width: 95vw; }
+  .data-panel { width: 44vw; max-width: 240px; padding: 10px 12px; }
+  #panel-vitals { left: 10px; right: auto; top: auto; bottom: 14px; transform: none; }
+  #panel-signal { right: 10px; left: auto; top: auto; bottom: 14px; transform: none; }
 }
