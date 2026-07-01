@@ -9,6 +9,17 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Russo+One&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="css/style.css?v=rusense1" />
+    <style>
+      .prov-fields { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; margin: .5rem 0 1rem; }
+      .prov-fields #prov-port { grid-column: 1 / -1; max-width: 8rem; }
+      .prov-fields input {
+        width: 100%; box-sizing: border-box; padding: .6rem .7rem; border-radius: 8px;
+        border: 1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.25);
+        color: #e8eef3; font-size: .95rem;
+      }
+      .prov-fields input::placeholder { color: #7f8ea3; }
+      @media (max-width: 560px) { .prov-fields { grid-template-columns: 1fr; } }
+    </style>
   </head>
   <body>
     <div class="rune-strip" aria-hidden="true">
@@ -105,6 +116,26 @@
         </div>
       </section>
 
+      <!-- WiFi / server provisioning -->
+      <section class="flash-panel" id="provision">
+        <h2>🛰️ Provision WiFi <span class="panel-sub">(do this after forging)</span></h2>
+        <p>
+          Forging <strong>erases</strong> the node's saved config, so it falls back to the wrong
+          defaults and won't connect. Enter your <strong>2.4&nbsp;GHz</strong> WiFi and the
+          <strong>RuSense server IP</strong> (your Ragnar box), then write it to the node. Works for
+          both S3 and C6.
+        </p>
+        <div class="prov-fields">
+          <input id="prov-ssid" type="text" placeholder="WiFi SSID (2.4 GHz)" autocomplete="off" />
+          <input id="prov-pass" type="password" placeholder="WiFi password" autocomplete="off" />
+          <input id="prov-ip" type="text" placeholder="Server IP — e.g. 192.168.1.20" autocomplete="off" />
+          <input id="prov-port" type="number" value="5005" min="1" max="65535" placeholder="Port" />
+        </div>
+        <div class="flash-buttons">
+          <button class="btn-flash" onclick="provisionDevice()">🛰️ Write WiFi config</button>
+        </div>
+      </section>
+
       <!-- Shared serial monitor button -->
       <section class="flash-panel" id="serial-tools">
         <h2>📡 Skald&rsquo;s Ear <span class="panel-sub">(serial monitor)</span></h2>
@@ -185,6 +216,7 @@
       </div>
     </div>
 
+    <script src="js/nvs_gen.js"></script>
     <script type="module" src="js/flasher.js"></script>
   </body>
 </html>

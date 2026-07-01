@@ -196,6 +196,80 @@ window.flashDevice = async function (manifestPath) {
   }
 };
 
+/* ── WiFi / server provisioning ──
+ * Flashing erases NVS, so a freshly-forged node falls back to compiled defaults
+ * (wrong SSID + server 192.168.1.100) and never connects. This writes the real
+ * WiFi + server into the csi_cfg NVS namespace at 0x9000 — the exact partition
+ * RuView's provision.py produces (nvs_gen.js is byte-verified against it). */
+window.provisionDevice = async function () {
+  if (!("serial" in navigator)) {
+    alert("Web Serial is not supported in this browser.\nUse Chrome, Edge, or Opera on desktop.");
+    return;
+  }
+  const ssid = ($("prov-ssid").value || "").trim();
+  const password = $("prov-pass").value || "";               // don't trim — passwords may hold spaces
+  const targetIp = ($("prov-ip").value || "").trim();
+  const targetPort = parseInt($("prov-port").value, 10) || 5005;
+  if (!ssid)     { alert("Enter your 2.4 GHz WiFi SSID."); return; }
+  if (!targetIp) { alert("Enter the RuSense server IP (your Ragnar box's address)."); return; }
+  if (typeof window.buildCsiCfgNvs !== "function") { alert("Provisioning module failed to load."); return; }
+
+  showFlashOverlay();
+  let transport = null;
+  try {
+    setStatus("Select the CSI node's serial port…");
+    let port;
+    try { port = await navigator.serial.requestPort(); }
+    catch (_) { setStatus("No port selected."); $("flash-close").hidden = false; return; }
+
+    setStatus("Loading flasher library…");
+    const { ESPLoader, Transport } = await getEsptool();
+
+    setStatus("Building provisioning data…");
+    const nvs = window.buildCsiCfgNvs({ ssid, password, target_ip: targetIp, target_port: targetPort });
+    log("WiFi SSID : " + ssid);
+    log("Server    : " + targetIp + ":" + targetPort);
+    log("NVS       : " + nvs.length + " bytes @ 0x9000 (csi_cfg)");
+
+    setStatus("Connecting…");
+    transport = new Transport(port, true);
+    const terminal = { clean() {}, writeLine(data) { log(data); }, write() {} };
+    const loader = new ESPLoader({ transport, baudrate: 115200, terminal });
+    const chip = await loader.main();
+    log("Connected: " + chip);
+
+    setStatus("Ready — press Flash Now to write the WiFi config");
+    log("\nThis writes ONLY the WiFi/server config (NVS @ 0x9000).");
+    log("Flash the firmware first with Forge if you haven't.\n");
+    const confirmed = await waitForConfirm();
+    if (!confirmed) {
+      setStatus("Provisioning cancelled.");
+      await transport.disconnect();
+      $("flash-close").hidden = false;
+      return;
+    }
+
+    setStatus("Writing WiFi config…");
+    await loader.writeFlash({
+      fileArray: [{ data: nvs, address: 0x9000 }],
+      flashSize: "keep", flashMode: "keep", flashFreq: "keep",
+      eraseAll: false, compress: true,          // only the NVS sectors — firmware untouched
+      reportProgress(_i, written, total) { setProgress((written / total) * 100); },
+    });
+    setProgress(100);
+    log("\n✅ WiFi config written.");
+    log("Press RST — the node should join \"" + ssid + "\" and stream to " + targetIp + ":" + targetPort + ".");
+    setStatus("Provisioned — press RST to reboot.");
+    await transport.disconnect();
+  } catch (err) {
+    log("\n❌ Error: " + err.message);
+    setStatus("Error: " + err.message);
+    if (transport) { try { await transport.disconnect(); } catch (_) {} }
+  } finally {
+    $("flash-close").hidden = false;
+  }
+};
+
 /* ── Serial monitor ── */
 let serialPort    = null;
 let serialReader  = null;

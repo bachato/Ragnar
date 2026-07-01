@@ -76,6 +76,12 @@ USB using the **RuSense CSI Node Flasher** (Web Serial / esptool-js):
    - **ESP32-C6** *(Wi-Fi 6 research)* — RISC-V, 4 MB flash, dual-band 802.11ax for experiments.
 4. Click **Forge**, select the `USB JTAG/serial debug unit` port, and let it flash.
 5. If the board isn't detected, hold **BOOT** while tapping **RST**, then retry.
+6. **Provision WiFi** — flashing **erases** the node's saved config, so a fresh node
+   falls back to wrong defaults and never connects. In the flasher's **🛰️ Provision
+   WiFi** panel, enter your **2.4 GHz** SSID + password and your **Ragnar box's IP**
+   (the RuSense server), then **Write WiFi config**. This writes the `csi_cfg` NVS at
+   `0x9000` (the same partition RuView's `provision.py` produces) without touching the
+   firmware. Press **RST** — the node joins your WiFi and starts streaming.
 
 > [!IMPORTANT]
 > **Don't mix S3 and C6 nodes in the same mesh — pick one chip type and use it for
