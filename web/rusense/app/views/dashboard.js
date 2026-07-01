@@ -58,12 +58,12 @@ export default {
       <section class="space-y-5">
         <!-- Presence banner -->
         <div id="presence-card" class="card card-pad flex items-center gap-4">
-          <span id="presence-dot" class="dot w-3.5 h-3.5 bg-ink-4 rs-pulse"></span>
+          <span id="presence-dot" class="dot w-3.5 h-3.5 bg-ink-4"></span>
           <div class="flex-1">
-            <div id="presence-text" class="text-lg font-semibold flex items-center gap-2"><span class="rs-spin text-ink-muted"></span>Connecting…</div>
-            <div id="presence-sub" class="text-sm text-ink-muted">Waiting for the sensing stream</div>
+            <div id="presence-text" class="text-lg font-semibold">Waiting for data…</div>
+            <div id="presence-sub" class="text-sm text-ink-muted">Connecting to sensing stream</div>
           </div>
-          <span id="motion-badge" class="badge-mut rs-pulse">—</span>
+          <span id="motion-badge" class="badge-mut">—</span>
         </div>
 
         <!-- Key live stats -->

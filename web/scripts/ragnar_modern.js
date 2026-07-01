@@ -823,7 +823,7 @@ function _setRusenseActive(name) {
 function loadRusenseLoader() {
     if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
     if (!_rusenseLoading) {
-        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260701-skeleton')
+        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260701-alertdefaults')
             .then(m => { _rusenseLoader = m; return m; })
             .catch(err => { _rusenseLoading = null; throw err; });
     }
@@ -1654,44 +1654,6 @@ async function preloadAllTabs() {
     }
 }
 
-// ── Instant loading skeleton for slow/optional tabs ─────────────────────────
-// Traffic / Adv-Vuln / Wardriving fetch their content on open and left the tab
-// blank for ~500ms. Show a shimmer skeleton the instant the tab opens and clear
-// it once the data has rendered, so the tab feels instant. Styled inline (the
-// Tailwind build only ships used classes), matching the app's slate palette.
-function _ensureTabSkelStyle() {
-    if (document.getElementById('tabskel-style')) return;
-    const s = document.createElement('style');
-    s.id = 'tabskel-style';
-    s.textContent =
-        '.tabskel{position:absolute;inset:0;z-index:20;padding:1rem;display:flex;flex-direction:column;gap:.75rem;background:rgb(15,23,42)}' +
-        '.tabskel-row{display:grid;grid-template-columns:repeat(2,1fr);gap:.75rem}' +
-        '@media(min-width:1024px){.tabskel-row{grid-template-columns:repeat(4,1fr)}}' +
-        '.tabskel-box{background:rgb(30,41,59);border-radius:.6rem;position:relative;overflow:hidden}' +
-        '.tabskel-box::after{content:"";position:absolute;inset:0;transform:translateX(-100%);' +
-        'background:linear-gradient(90deg,transparent,rgba(148,163,184,.12),transparent);animation:tabskel-sh 1.3s infinite}' +
-        '@keyframes tabskel-sh{100%{transform:translateX(100%)}}';
-    document.head.appendChild(s);
-}
-function showTabSkeleton(tabName) {
-    _ensureTabSkelStyle();
-    const el = document.getElementById(`${tabName}-tab`);
-    if (!el || el.querySelector(':scope > .tabskel')) return;
-    if (getComputedStyle(el).position === 'static') { el.style.position = 'relative'; el.dataset.skelPos = '1'; }
-    const box = (h) => `<div class="tabskel-box" style="height:${h}"></div>`;
-    const o = document.createElement('div');
-    o.className = 'tabskel';
-    o.innerHTML = box('56px') + `<div class="tabskel-row">${box('76px').repeat(4)}</div>` + box('320px');
-    el.appendChild(o);
-}
-function hideTabSkeleton(tabName) {
-    const el = document.getElementById(`${tabName}-tab`);
-    if (!el) return;
-    const o = el.querySelector(':scope > .tabskel');
-    if (o) o.remove();
-    if (el.dataset.skelPos) { el.style.position = ''; delete el.dataset.skelPos; }
-}
-
 async function loadTabData(tabName) {
     // If tab was already preloaded, skip reloading unless it's a dynamic tab
     // System and netkb always load (they use polling/intervals)
@@ -1779,22 +1741,13 @@ async function loadTabData(tabName) {
             }
             break;
         case 'traffic':
-            showTabSkeleton('traffic'); // instant shimmer while the fetches run
-            Promise.resolve().then(loadTrafficAnalysisData)
-                .catch((e) => console.warn('traffic load failed', e))
-                .finally(() => hideTabSkeleton('traffic'));
+            loadTrafficAnalysisData(); // Non-blocking - tab shows immediately, data fills in
             break;
         case 'adv-vuln':
-            showTabSkeleton('adv-vuln');
-            Promise.resolve().then(loadAdvancedVulnData)
-                .catch((e) => console.warn('adv-vuln load failed', e))
-                .finally(() => hideTabSkeleton('adv-vuln'));
+            loadAdvancedVulnData(); // Non-blocking - tab shows immediately, data fills in
             break;
         case 'wardriving':
-            showTabSkeleton('wardriving');
-            Promise.resolve().then(loadWardrivingData)
-                .catch((e) => console.warn('wardriving load failed', e))
-                .finally(() => hideTabSkeleton('wardriving'));
+            loadWardrivingData();
             break;
         case 'network-map':
             if (!_mapInitialized) { loadNetworkMap(); }
