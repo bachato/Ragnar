@@ -289,6 +289,124 @@ _rusense_notify_state = {
 }
 _rusense_notify_lock = threading.Lock()
 
+# ── Sightings log ──────────────────────────────────────────────────────────
+# A reviewable history of the same confirmed presence events that fire the
+# Pushover "occupied" alert, so a person who has already left is still on record
+# with the vitals seen during their stay. Persisted as a small ring buffer so it
+# survives restarts. One "sighting" spans an occupancy episode: it is opened at
+# the confirmed presence rise, its heart-rate / breathing are filled in on later
+# passes (vitals lag first detection), and it is closed at the presence fall.
+_rusense_sightings_lock = threading.Lock()
+_RUSENSE_SIGHTINGS_MAX = 50
+
+
+def _rusense_sightings_file():
+    return os.path.join(shared_data.datadir, 'rusense_sightings.json')
+
+
+def _rusense_sightings_unlocked():
+    """Return the in-memory sightings list, loading it from disk on first use.
+    Caller must hold _rusense_sightings_lock."""
+    lst = _rusense_notify_state.get('sightings')
+    if lst is not None:
+        return lst
+    lst = []
+    try:
+        with open(_rusense_sightings_file(), 'r') as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, list):
+            lst = loaded[-_RUSENSE_SIGHTINGS_MAX:]
+    except (OSError, ValueError):
+        lst = []
+    _rusense_notify_state['sightings'] = lst
+    return lst
+
+
+def _rusense_persist_sightings_unlocked():
+    """Atomically write the sightings list. Caller must hold the lock."""
+    lst = _rusense_notify_state.get('sightings') or []
+    path = _rusense_sightings_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, 'w') as fh:
+            json.dump(lst, fh, indent=2)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.error(f"[rusense] failed to persist sightings: {exc}")
+
+
+def _rusense_merge_vitals(rec, vs):
+    """Fold a vital-signs reading into an open sighting, keeping the highest-
+    confidence heart-rate / breathing seen so far. Returns True if changed."""
+    if not isinstance(vs, dict):
+        return False
+    changed = False
+    try:
+        hr, hc = vs.get('heart_rate_bpm'), float(vs.get('heartbeat_confidence') or 0)
+        if hr is not None and hc > 0 and hc >= float(rec.get('hr_conf') or 0):
+            rec['hr'], rec['hr_conf'] = round(float(hr)), round(hc, 3)
+            changed = True
+    except (TypeError, ValueError):
+        pass
+    try:
+        br, bc = vs.get('breathing_rate_bpm'), float(vs.get('breathing_confidence') or 0)
+        if br is not None and bc > 0 and bc >= float(rec.get('br_conf') or 0):
+            rec['br'], rec['br_conf'] = round(float(br), 1), round(bc, 3)
+            changed = True
+    except (TypeError, ValueError):
+        pass
+    return changed
+
+
+def _rusense_open_sighting(now, conf, people, motion_level, vs):
+    """Record a new sighting at a confirmed presence rise and keep it 'open'."""
+    with _rusense_sightings_lock:
+        lst = _rusense_sightings_unlocked()
+        rec = {
+            'ts': round(float(now), 3),          # epoch seconds (rendered local-time client-side)
+            'confidence': round(float(conf or 0), 3),
+            'people': int(people or 0),
+            'motion_level': str(motion_level or ''),
+            'hr': None, 'hr_conf': 0.0,
+            'br': None, 'br_conf': 0.0,
+            'ended_ts': None,
+        }
+        _rusense_merge_vitals(rec, vs)
+        lst.append(rec)
+        if len(lst) > _RUSENSE_SIGHTINGS_MAX:
+            del lst[:-_RUSENSE_SIGHTINGS_MAX]
+        _rusense_notify_state['open_sighting'] = rec
+        _rusense_persist_sightings_unlocked()
+
+
+def _rusense_update_sighting(conf, vs):
+    """Fill in vitals / bump peak confidence on the open sighting, if any."""
+    with _rusense_sightings_lock:
+        rec = _rusense_notify_state.get('open_sighting')
+        if not rec:
+            return
+        changed = _rusense_merge_vitals(rec, vs)
+        try:
+            if conf is not None and float(conf) > float(rec.get('confidence') or 0):
+                rec['confidence'] = round(float(conf), 3)
+                changed = True
+        except (TypeError, ValueError):
+            pass
+        if changed:
+            _rusense_persist_sightings_unlocked()
+
+
+def _rusense_close_sighting(now):
+    """Mark the open sighting ended at a confirmed presence fall."""
+    with _rusense_sightings_lock:
+        rec = _rusense_notify_state.get('open_sighting')
+        if not rec:
+            return
+        rec['ended_ts'] = round(float(now), 3)
+        _rusense_notify_state['open_sighting'] = None
+        _rusense_persist_sightings_unlocked()
+
 
 # ── Geofence (server-side port of web/rusense/services/geofence.service.js) ──
 # Confines motion/presence/people alerts to the polygon of mapped node corners,
@@ -476,15 +594,14 @@ def _rusense_check_once():
     """One evaluation pass: read sensing + nodes, fire alerts on *confirmed*
     transitions. Returns True when alerts are enabled (drives loop cadence)."""
     po = _rusense_pushover()
-    if po is None:
-        return False
-    # Cheap master gate — the config flag is a dict lookup, so check it before
-    # is_enabled() (which reads .env) to keep the idle loop near-free when alerts
-    # are off. notify_rusense() re-checks each per-kind flag before sending.
-    if not shared_data.config.get('rusense_notify_enabled', False):
-        return False
-    if not po.is_enabled():
-        return False
+    # Phone alerts require Pushover configured + enabled + the master flag. The
+    # sighting history is logged regardless, so this gates only the notify sends
+    # (guarded at each call site) — the sensing read + debounce always run.
+    notify_on = bool(
+        shared_data.config.get('rusense_notify_enabled', False)   # cheap dict lookup first
+        and po is not None
+        and po.is_enabled()                                       # reads .env — only if flag on
+    )
 
     try:
         min_conf = float(shared_data.config.get('rusense_notify_min_confidence', 0.8))
@@ -616,23 +733,34 @@ def _rusense_check_once():
             logger.info(f"[rusense] geofence suppressed alert — {verdict.get('reason')} "
                         f"(hot={verdict.get('hot_count')}, total={verdict.get('total')})")
 
+        vitals = latest.get('vital_signs') if isinstance(latest, dict) else None
         if p_rose and not block_motion:
-            who = f"{people} people" if people > 1 else "Someone"
-            po.notify_rusense(
-                'presence',
-                f"\U0001F441️ {who} detected — a monitored space is now occupied.",
-                title="RuSense — Presence", priority=1)
+            if notify_on:
+                who = f"{people} people" if people > 1 else "Someone"
+                po.notify_rusense(
+                    'presence',
+                    f"\U0001F441️ {who} detected — a monitored space is now occupied.",
+                    title="RuSense — Presence", priority=1)
+            # Log the sighting whether or not the phone alert fired, so it stays
+            # reviewable after the person leaves (geofence walk-by is not logged).
+            _rusense_open_sighting(now, conf, people, cls.get('motion_level'), vitals)
         elif p_fell:
-            po.notify_rusense(
-                'presence',
-                "\U0001F6E1️ A monitored space is now empty.",
-                title="RuSense — Empty")
-        if m_rose and not block_motion:
+            if notify_on:
+                po.notify_rusense(
+                    'presence',
+                    "\U0001F6E1️ A monitored space is now empty.",
+                    title="RuSense — Empty")
+            _rusense_close_sighting(now)
+        # Vitals lag first detection, so keep filling in the open sighting while
+        # the space stays occupied (no-op when there is no open sighting).
+        if present:
+            _rusense_update_sighting(conf if confident else None, vitals)
+        if notify_on and m_rose and not block_motion:
             po.notify_rusense(
                 'motion',
                 "\U0001F3C3 Motion detected in a monitored space.",
                 title="RuSense — Motion")
-        if o_rose and not block_motion:
+        if notify_on and o_rose and not block_motion:
             po.notify_rusense(
                 'people',
                 f"\U0001F465 {people} people detected (threshold {threshold}).",
@@ -663,18 +791,21 @@ def _rusense_check_once():
                         missing_since.pop(nid, None)
                 # confirmed-active = (previously confirmed ∪ now active) − confirmed-offline
                 _rusense_notify_state['node_active'] = (confirmed | active_now) - set(newly_offline)
-        if newly_offline:
+        if notify_on and newly_offline:
             ids = ", ".join(_rusense_node_label(x) for x in sorted(newly_offline))
             po.notify_rusense(
                 'node_offline',
                 f"\U0001F4E1 CSI sensor node(s) offline: {ids}. Sensing coverage reduced.",
                 title="RuSense — Node Offline", priority=1)
-    return True
+    # Poll ~1 Hz whenever the sensing backend is reachable so sightings capture
+    # accurately; fall back to the slow idle cadence only when it is unreachable.
+    return bool(latest) or (node_list is not None)
 
 
 def _rusense_notify_loop():
-    """Background poller for RuSense sensing alerts. Runs for the life of the
-    process; does real work only when alerts are enabled (cheap idle otherwise)."""
+    """Background poller for RuSense sensing. Runs for the life of the process;
+    records the sighting history whenever the sensing backend is reachable and
+    additionally sends Pushover alerts when those are enabled."""
     import time as _time
     # Let the sensing-server and pushover service settle before the first read.
     _time.sleep(10)
@@ -684,8 +815,8 @@ def _rusense_notify_loop():
             active = _rusense_check_once()
         except Exception as exc:
             logger.debug(f"[rusense] notify check failed: {exc}")
-        # Poll ~1 Hz when enabled so the sustain window is measured accurately;
-        # idle slowly when alerts are off.
+        # Poll ~1 Hz while the backend is reachable so the sustain window and
+        # sighting vitals are captured accurately; idle slowly when it is not.
         _time.sleep(1 if active else 5)
 
 
@@ -706,6 +837,17 @@ def rusense_geofence_status():
         'note': ('Geofence gates alerts only with >=3 node corners mapped (X/Y) in '
                  'the Settings tab. With fewer mapped it is a no-op.'),
     })
+
+
+@app.route('/api/rusense/sightings', methods=['GET'])
+def rusense_sightings():
+    """Recent presence sightings, newest first — a reviewable history of the
+    confirmed occupancy events that also fire the Pushover alert, with the
+    heart-rate / breathing seen during each stay. Survives the person leaving."""
+    with _rusense_sightings_lock:
+        lst = list(_rusense_sightings_unlocked())
+    lst = lst[::-1]  # newest first
+    return jsonify({'success': True, 'count': len(lst), 'sightings': lst})
 
 
 # ── Sensing backend lifecycle (bundled sensing-server) ───────────────────────
