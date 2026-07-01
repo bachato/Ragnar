@@ -1128,55 +1128,55 @@
 
             <!-- ===================== Diagnostics ===================== -->
             <div id="net-sub-diagnostics" class="net-subview hidden">
-                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
-                    <div class="glass rounded-xl p-6">
+                    <div class="glass rounded-xl p-4 sm:p-6">
                         <h3 class="text-lg font-semibold mb-1">Ping</h3>
                         <p class="text-sm text-gray-400 mb-3">ICMP reachability &amp; round-trip time.</p>
-                        <div class="flex gap-2">
-                            <input id="ping-target" type="text" placeholder="IP or hostname" class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPing()">
-                            <button onclick="runPing()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Ping</button>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="ping-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPing()">
+                            <button onclick="runPing()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Ping</button>
                         </div>
                         <pre id="ping-results" class="hidden mt-3 text-xs font-mono bg-slate-900/70 rounded p-3 overflow-x-auto whitespace-pre-wrap"></pre>
                     </div>
                     <!-- Traceroute -->
-                    <div class="glass rounded-xl p-6">
+                    <div class="glass rounded-xl p-4 sm:p-6">
                         <h3 class="text-lg font-semibold mb-1">Traceroute</h3>
                         <p class="text-sm text-gray-400 mb-3">Path (hops) to a destination.</p>
-                        <div class="flex gap-2">
-                            <input id="trace-target" type="text" placeholder="IP or hostname" class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runTraceroute()">
-                            <button onclick="runTraceroute()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Trace</button>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="trace-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runTraceroute()">
+                            <button onclick="runTraceroute()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Trace</button>
                         </div>
                         <pre id="trace-results" class="hidden mt-3 text-xs font-mono bg-slate-900/70 rounded p-3 overflow-x-auto whitespace-pre-wrap"></pre>
                     </div>
                     <!-- MTR -->
-                    <div class="glass rounded-xl p-6">
+                    <div class="glass rounded-xl p-4 sm:p-6">
                         <h3 class="text-lg font-semibold mb-1">MTR</h3>
                         <p class="text-sm text-gray-400 mb-3">Per-hop loss &amp; latency statistics.</p>
-                        <div class="flex gap-2">
-                            <input id="mtr-target" type="text" placeholder="IP or hostname" class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runMtr()">
-                            <button onclick="runMtr()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Run</button>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="mtr-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runMtr()">
+                            <button onclick="runMtr()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run</button>
                         </div>
                         <div id="mtr-results" class="hidden mt-3 overflow-x-auto"></div>
                     </div>
                     <!-- Whois -->
-                    <div class="glass rounded-xl p-6">
+                    <div class="glass rounded-xl p-4 sm:p-6">
                         <h3 class="text-lg font-semibold mb-1">Whois</h3>
                         <p class="text-sm text-gray-400 mb-3">Registration data for a domain or IP.</p>
-                        <div class="flex gap-2">
-                            <input id="whois-target" type="text" placeholder="domain or IP" class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runWhois()">
-                            <button onclick="runWhois()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Lookup</button>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="whois-target" type="text" inputmode="url" autocomplete="off" placeholder="domain or IP" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runWhois()">
+                            <button onclick="runWhois()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Lookup</button>
                         </div>
                         <pre id="whois-results" class="hidden mt-3 text-xs font-mono bg-slate-900/70 rounded p-3 overflow-x-auto whitespace-pre-wrap max-h-96"></pre>
                     </div>
                     <!-- Speed Test -->
-                    <div class="glass rounded-xl p-6 lg:col-span-2">
-                        <div class="flex items-center justify-between">
-                            <div>
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                            <div class="min-w-0">
                                 <h3 class="text-lg font-semibold mb-1">Internet Speed Test</h3>
                                 <p class="text-sm text-gray-400">Measures download, upload and latency (takes ~30s).</p>
                             </div>
-                            <button id="speedtest-btn" onclick="runSpeedtest()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Start Test</button>
+                            <button id="speedtest-btn" onclick="runSpeedtest()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Start Test</button>
                         </div>
                         <div id="speedtest-results" class="hidden mt-4"></div>
                     </div>
@@ -1185,25 +1185,25 @@
 
             <!-- ===================== Switch & L2 ===================== -->
             <div id="net-sub-switch" class="net-subview hidden">
-                <div class="glass rounded-xl p-6 mb-6">
-                    <div class="flex items-center justify-between mb-2">
-                        <div>
+                <div class="glass rounded-xl p-4 sm:p-6 mb-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
                             <h3 class="text-lg font-semibold">Switch Discovery (LLDP / CDP / EDP)</h3>
                             <p class="text-sm text-gray-400">Neighbouring switches: name, port, VLAN and management IP.</p>
                         </div>
-                        <button onclick="loadLldp()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Refresh</button>
+                        <button onclick="loadLldp()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button>
                     </div>
-                    <div id="lldp-results" class="mt-3 text-sm text-gray-400">Loading…</div>
+                    <div id="lldp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
-                <div class="glass rounded-xl p-6">
-                    <div class="flex items-center justify-between mb-2">
-                        <div>
+                <div class="glass rounded-xl p-4 sm:p-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
                             <h3 class="text-lg font-semibold">ARP Scan</h3>
                             <p class="text-sm text-gray-400">Discover live hosts on the local segment via ARP.</p>
                         </div>
-                        <div class="flex gap-2">
-                            <input id="arp-iface" type="text" placeholder="interface (e.g. eth0)" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm w-44">
-                            <button onclick="runArpScan()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Scan</button>
+                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                            <input id="arp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-44 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runArpScan()">
+                            <button onclick="runArpScan()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan</button>
                         </div>
                     </div>
                     <div id="arp-results" class="hidden mt-3 overflow-x-auto"></div>
@@ -1212,13 +1212,13 @@
 
             <!-- ===================== Interfaces ===================== -->
             <div id="net-sub-interfaces" class="net-subview hidden">
-                <div class="glass rounded-xl p-6">
-                    <div class="flex items-center justify-between mb-2">
-                        <div>
+                <div class="glass rounded-xl p-4 sm:p-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
                             <h3 class="text-lg font-semibold">Interfaces</h3>
                             <p class="text-sm text-gray-400">Link speed &amp; duplex, auto-negotiation, static/DHCP, addressing and VLAN.</p>
                         </div>
-                        <button onclick="loadInterfaces()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm">Refresh</button>
+                        <button onclick="loadInterfaces()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button>
                     </div>
                     <div id="interfaces-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
@@ -5383,7 +5383,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260701-netdiag"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260701-netdiag2"></script>
 
 </body>
 </html>

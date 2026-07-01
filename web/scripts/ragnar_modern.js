@@ -1187,7 +1187,7 @@ async function runMtr() {
                 <td class="px-3 py-1.5 text-right">${h.best}</td>
                 <td class="px-3 py-1.5 text-right">${h.worst}</td>
             </tr>`).join('');
-        out.innerHTML = `<table class="min-w-full text-sm">
+        out.innerHTML = `<table class="min-w-full text-sm whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Hop</th><th class="px-3 py-1.5">Host</th>
                 <th class="px-3 py-1.5 text-right">Loss</th><th class="px-3 py-1.5 text-right">Avg ms</th>
@@ -1218,7 +1218,7 @@ async function runSpeedtest() {
                 <div class="text-xs uppercase text-gray-500 mt-1">${label}</div>
             </div>`;
         out.innerHTML = `
-            <div class="grid grid-cols-3 gap-4 mb-3">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-3">
                 ${card('Download', data.download_mbps, 'Mbps')}
                 ${card('Upload', data.upload_mbps, 'Mbps')}
                 ${card('Ping', data.ping_ms, 'ms')}
@@ -1253,7 +1253,7 @@ async function loadLldp() {
                 <td class="px-3 py-1.5">${escapeHtml(String(n.vlan_id || '—'))}${n.vlan_name ? ' (' + escapeHtml(n.vlan_name) + ')' : ''}</td>
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.mgmt_ip || '—'))}</td>
             </tr>`).join('');
-        out.innerHTML = `<table class="min-w-full text-sm text-gray-300">
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Local IF</th><th class="px-3 py-1.5">Proto</th>
                 <th class="px-3 py-1.5">Switch</th><th class="px-3 py-1.5">Port</th>
@@ -1290,7 +1290,7 @@ async function runArpScan() {
                 <td class="px-3 py-1.5">${escapeHtml(String(h.vendor || '—'))}</td>
             </tr>`).join('');
         out.innerHTML = `<p class="text-xs text-gray-500 mb-2">${data.count} host(s) on ${escapeHtml(iface)}</p>
-            <table class="min-w-full text-sm text-gray-300">
+            <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">IP</th><th class="px-3 py-1.5">MAC</th><th class="px-3 py-1.5">Vendor</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
@@ -1337,7 +1337,7 @@ async function loadInterfaces() {
                 <td class="px-3 py-1.5">${vlan}</td>
             </tr>`;
         }).join('');
-        out.innerHTML = `<table class="min-w-full text-sm text-gray-300">
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">Type</th><th class="px-3 py-1.5">Link</th>
                 <th class="px-3 py-1.5">Speed/Duplex</th><th class="px-3 py-1.5 text-center">Auto-neg</th>
