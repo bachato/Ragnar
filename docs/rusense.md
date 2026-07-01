@@ -160,14 +160,26 @@ trigger can be toggled independently under a master on/off switch.
 
 To suppress false positives, an event only fires when **all** of these hold:
 
-- **Minimum confidence** — the detector must be at least this confident (default 80%);
+- **Minimum confidence** — the detector must be at least this confident (default **95%**);
   low-confidence flickers are ignored. (`rusense_notify_min_confidence`)
 - **Must last** — the condition has to hold continuously for at least this long
   (default 2 seconds) before an alert is sent. (`rusense_notify_sustain_s`)
 - **Geofence** — the disturbance must sit *inside* the mapped room perimeter, not be a
   hallway walk-by or through-wall neighbour. See [Geofence](#geofence--confining-alerts-to-the-room).
 
-All are adjustable in the Settings tab.
+All are adjustable in the Settings tab (defaults: 95% confidence, 2 s sustain, people
+threshold 1, 60 s cooldown).
+
+> [!NOTE]
+> **The confidence gate is model-aware.** Confidence is only *calibrated* — and so
+> only trustworthy as a filter — when an adaptive model is loaded (an occupied room
+> then reads ~1.0, an empty room stays low). **Model-less**, confidence is
+> uninformative (~0.5), so the alert/sighting confidence gate automatically **relaxes
+> to 0** and RuSense leans on the presence rule + sustain debounce instead. This means
+> a real occupant is **never missed for lack of a model**, while an empty room stays
+> quiet (the presence rule alone rejects the raw ~46 Hz flicker). Loading or unloading
+> a model retunes this within ~30 s — no setting to change. For best accuracy, keep a
+> trained model active (see [Training](#two-training-paths)).
 
 Alerts reuse Ragnar's existing **Pushover** account: set your **User Key** and **API
 Token** once under the main dashboard's **Config → Pushover Notifications**, then enable
@@ -196,6 +208,12 @@ first detection, so the highest-confidence reading of the episode is kept).
   backend is reachable, even with phone alerts switched off. It persists across restarts
   (a 50-entry ring buffer at `data/rusense_sightings.json`) and is served by
   `GET /api/rusense/sightings`.
+- **Phantom rejection.** A sighting is only kept once its **peak confidence** clears the
+  (model-aware) gate — with a model loaded that's 95%, so empty-room disturbances (which
+  cap ~86%) never make the log while a real occupant (~100%) does. Model-less the gate is
+  0 and the motion-corroborated presence rule does the filtering instead. A sighting is
+  vetted once, when it closes, and then kept — so one logged model-less survives a later
+  restart with a model loaded.
 
 ### Geofence — confining alerts to the room
 
@@ -229,6 +247,24 @@ RuSense can learn in two different ways:
 - **Deep-model dataset training** — heavy training from an external MM-Fi / Wi-Pose
   dataset into a `.rvf` model, for pose/vital-sign capable models. Done offline, not
   from live CSI.
+
+#### Recording classes (adaptive)
+
+The trainer is **discriminative**: it uses *every* `train_<label>` recording as a class
+and learns to tell them apart. So a single class isn't enough —
+
+> **Record at least two classes** to get a useful model, e.g. `train_empty` **and**
+> `train_present`. With only `train_empty` the classifier has nothing to contrast
+> against: it knows "empty" but was never shown what "occupied" looks like, so its
+> confidence stays uncalibrated (which is why the confidence gate above relaxes when no
+> proper model is active).
+
+Each extra class sharpens a capability — `train_present` (one still person) enables
+reliable occupied-vs-empty and vitals, `train_walking` teaches motion, `train_sitting` a
+still posture, `train_two_people` improves people-count (fused across nodes), and a
+`train_<custom>` clip covers anything else. Give each class a clip of comparable length,
+keep the room and node placement fixed, and remember a model **only applies to the room
+it was recorded in**.
 
 ---
 
