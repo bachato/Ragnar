@@ -260,6 +260,12 @@ package_candidates() {
         iputils-ping) echo "iputils-ping iputils" ;;
         libatlas-base-dev) echo "libatlas-base-dev atlas-devel" ;;
         arp-scan) echo "arp-scan arpscan" ;;
+        mtr-tiny) echo "mtr-tiny mtr" ;;
+        whois) echo "whois jwhois" ;;
+        speedtest-cli) echo "speedtest-cli python3-speedtest-cli python-speedtest-cli" ;;
+        lldpd) echo "lldpd" ;;
+        traceroute) echo "traceroute" ;;
+        ethtool) echo "ethtool" ;;
         bluez) echo "bluez" ;;
         hostapd) echo "hostapd" ;;
         dnsmasq) echo "dnsmasq" ;;
@@ -451,6 +457,12 @@ install_dependencies() {
         "sqlite3"
         "arp-scan"
         "tcpdump"
+        "traceroute"
+        "mtr-tiny"
+        "whois"
+        "lldpd"
+        "ethtool"
+        "speedtest-cli"
         "nikto"
         "sqlmap"
         "whatweb"
@@ -542,6 +554,23 @@ EOF
         log "SUCCESS" "Installed persistent rfkill-unblock udev rule (survives reboot + hot-plug)"
     else
         log "WARNING" "rfkill not available - WiFi blocking status unknown"
+    fi
+
+    # Configure lldpd for switch discovery (Network > Switch & L2 tab).
+    # Enable decoding of CDP (Cisco), EDP (Extreme), FDP (Foundry) and SONMP
+    # (Nortel) in addition to LLDP so non-LLDP switches are discovered too.
+    if command -v lldpd >/dev/null 2>&1 || command -v lldpctl >/dev/null 2>&1; then
+        mkdir -p /etc/default
+        cat > /etc/default/lldpd << 'EOF'
+# Ragnar: decode CDP (Cisco), EDP (Extreme), FDP (Foundry), SONMP (Nortel)
+# neighbours in addition to LLDP, so switch discovery covers non-LLDP gear.
+DAEMON_ARGS="-c -e -f -s"
+EOF
+        systemctl enable lldpd 2>/dev/null || true
+        systemctl restart lldpd 2>/dev/null || true
+        log "SUCCESS" "Configured lldpd (LLDP/CDP/EDP/FDP/SONMP) for switch discovery"
+    else
+        log "WARNING" "lldpd not available - switch discovery (Switch & L2 tab) will be limited"
     fi
 
     # Create basic wpa_supplicant configuration if it doesn't exist

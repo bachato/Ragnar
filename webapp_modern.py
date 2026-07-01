@@ -82,6 +82,15 @@ if flask_cors_available:
 # Initialize SocketIO for real-time updates
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
+# Register Network > Diagnostics / Switch & L2 / Interfaces API routes.
+# Kept in a separate module (network_diagnostics.py) to keep this file lean;
+# wrapped in try/except so a problem there can never take down the web app.
+try:
+    from network_diagnostics import register_network_diagnostics
+    register_network_diagnostics(app, logger)
+except Exception as _nd_err:  # pragma: no cover - defensive
+    logger.error(f"Failed to register network diagnostics routes: {_nd_err}")
+
 # ============================================================================
 # AUTHENTICATION MIDDLEWARE
 # ============================================================================

@@ -1095,7 +1095,10 @@ function _setSubtabActive(btn, active) {
 }
 
 function showNetworkSubtab(name) {
-    const views = { hosts: 'net-sub-hosts', archive: 'net-sub-archive', map: 'net-sub-map' };
+    const views = {
+        hosts: 'net-sub-hosts', archive: 'net-sub-archive', map: 'net-sub-map',
+        diagnostics: 'net-sub-diagnostics', switch: 'net-sub-switch', interfaces: 'net-sub-interfaces'
+    };
     Object.keys(views).forEach(key => {
         const el = document.getElementById(views[key]);
         if (el) el.classList.toggle('hidden', key !== name);
@@ -1107,6 +1110,242 @@ function showNetworkSubtab(name) {
         if (!_mapInitialized) { loadNetworkMap(); }
     } else if (name === 'hosts') {
         loadNetworkData();
+    } else if (name === 'switch') {
+        loadLldp();
+    } else if (name === 'interfaces') {
+        loadInterfaces();
+    }
+    // 'diagnostics' has no auto-load; tools run on demand.
+}
+
+// ============================================================================
+// Network diagnostics (Diagnostics / Switch & L2 / Interfaces sub-tabs)
+// Backend: /api/net/* (see network_diagnostics.py)
+// ============================================================================
+
+function _ndBusy(btn, busy, busyLabel) {
+    if (!btn) return;
+    if (busy) {
+        btn.dataset._orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.classList.add('opacity-60');
+        btn.innerHTML = '<span class="inline-block animate-spin">⟳</span> ' + (busyLabel || 'Running…');
+    } else {
+        btn.disabled = false;
+        btn.classList.remove('opacity-60');
+        if (btn.dataset._orig) btn.innerHTML = btn.dataset._orig;
+    }
+}
+
+async function _ndRunText(inputId, resultId, endpoint, verb) {
+    const input = document.getElementById(inputId);
+    const out = document.getElementById(resultId);
+    const target = (input.value || '').trim();
+    if (!target) { input.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, verb);
+    out.classList.remove('hidden');
+    out.textContent = verb + ' ' + target + '…';
+    try {
+        const data = await postAPI(endpoint, { target });
+        if (data.success) {
+            out.textContent = data.output || '(no output)';
+        } else {
+            out.textContent = 'Error: ' + (data.error || 'failed');
+        }
+    } catch (e) {
+        out.textContent = 'Failed: ' + e.message;
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+function runPing() { return _ndRunText('ping-target', 'ping-results', '/api/net/ping', 'Pinging'); }
+function runTraceroute() { return _ndRunText('trace-target', 'trace-results', '/api/net/traceroute', 'Tracing'); }
+function runWhois() { return _ndRunText('whois-target', 'whois-results', '/api/net/whois', 'Looking up'); }
+
+async function runMtr() {
+    const target = (document.getElementById('mtr-target').value || '').trim();
+    const out = document.getElementById('mtr-results');
+    if (!target) return;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Running…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running MTR to ' + escapeHtml(target) + '…</p>';
+    try {
+        const data = await postAPI('/api/net/mtr', { target });
+        if (!data.success) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        let rows = (data.hops || []).map(h => `
+            <tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 text-gray-400">${h.hop}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(h.host || '???'))}</td>
+                <td class="px-3 py-1.5 text-right ${h.loss_pct > 0 ? 'text-yellow-400' : ''}">${h.loss_pct}%</td>
+                <td class="px-3 py-1.5 text-right">${h.avg}</td>
+                <td class="px-3 py-1.5 text-right">${h.best}</td>
+                <td class="px-3 py-1.5 text-right">${h.worst}</td>
+            </tr>`).join('');
+        out.innerHTML = `<table class="min-w-full text-sm">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Hop</th><th class="px-3 py-1.5">Host</th>
+                <th class="px-3 py-1.5 text-right">Loss</th><th class="px-3 py-1.5 text-right">Avg ms</th>
+                <th class="px-3 py-1.5 text-right">Best</th><th class="px-3 py-1.5 text-right">Worst</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runSpeedtest() {
+    const btn = document.getElementById('speedtest-btn');
+    const out = document.getElementById('speedtest-results');
+    _ndBusy(btn, true, 'Testing…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running speed test (this can take ~30s)…</p>';
+    try {
+        const data = await postAPI('/api/net/speedtest', {});
+        if (!data.success) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        const card = (label, val, unit) => `
+            <div class="bg-slate-800 rounded-lg p-4 text-center">
+                <div class="text-2xl font-bold text-Ragnar-400">${val}<span class="text-sm text-gray-400"> ${unit}</span></div>
+                <div class="text-xs uppercase text-gray-500 mt-1">${label}</div>
+            </div>`;
+        out.innerHTML = `
+            <div class="grid grid-cols-3 gap-4 mb-3">
+                ${card('Download', data.download_mbps, 'Mbps')}
+                ${card('Upload', data.upload_mbps, 'Mbps')}
+                ${card('Ping', data.ping_ms, 'ms')}
+            </div>
+            <p class="text-xs text-gray-500">Server: ${escapeHtml(String(data.server || '—'))}${data.server_location ? ' (' + escapeHtml(data.server_location) + ')' : ''} · ISP: ${escapeHtml(String(data.isp || '—'))}</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function loadLldp() {
+    const out = document.getElementById('lldp-results');
+    out.innerHTML = '<p class="text-gray-400">Loading neighbours…</p>';
+    try {
+        const data = await fetchAPI('/api/net/lldp');
+        if (!data.success) {
+            out.innerHTML = '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        if (!data.neighbors || !data.neighbors.length) {
+            out.innerHTML = '<p class="text-gray-400">No switch neighbours discovered. ' + escapeHtml(data.note || '') + '</p>';
+            return;
+        }
+        const rows = data.neighbors.map(n => `
+            <tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.local_interface || '—'))}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(n.protocol || '—'))}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(n.switch_name || '—'))}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.port_descr || n.port_id || '—'))}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(n.vlan_id || '—'))}${n.vlan_name ? ' (' + escapeHtml(n.vlan_name) + ')' : ''}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.mgmt_ip || '—'))}</td>
+            </tr>`).join('');
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Local IF</th><th class="px-3 py-1.5">Proto</th>
+                <th class="px-3 py-1.5">Switch</th><th class="px-3 py-1.5">Port</th>
+                <th class="px-3 py-1.5">VLAN</th><th class="px-3 py-1.5">Mgmt IP</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+async function runArpScan() {
+    const ifaceEl = document.getElementById('arp-iface');
+    const out = document.getElementById('arp-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Scanning…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Scanning ' + escapeHtml(iface) + '…</p>';
+    try {
+        const data = await fetchAPI('/api/net/arp-scan?interface=' + encodeURIComponent(iface));
+        if (!data.success) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        if (!data.hosts.length) {
+            out.innerHTML = '<p class="text-sm text-gray-400">No hosts responded on ' + escapeHtml(iface) + '.</p>';
+            return;
+        }
+        const rows = data.hosts.map(h => `
+            <tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(h.ip)}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(h.mac)}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(h.vendor || '—'))}</td>
+            </tr>`).join('');
+        out.innerHTML = `<p class="text-xs text-gray-500 mb-2">${data.count} host(s) on ${escapeHtml(iface)}</p>
+            <table class="min-w-full text-sm text-gray-300">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">IP</th><th class="px-3 py-1.5">MAC</th><th class="px-3 py-1.5">Vendor</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function loadInterfaces() {
+    const out = document.getElementById('interfaces-results');
+    out.innerHTML = '<p class="text-gray-400">Loading…</p>';
+    try {
+        const data = await fetchAPI('/api/net/interfaces');
+        if (!data.success) {
+            out.innerHTML = '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        const methodBadge = (m) => {
+            const map = {
+                dhcp: 'bg-blue-900/50 text-blue-300', static: 'bg-purple-900/50 text-purple-300',
+                'dhcp-failed': 'bg-red-900/50 text-red-300', 'link-down': 'bg-slate-700 text-slate-400',
+                unknown: 'bg-slate-700 text-slate-400'
+            };
+            return `<span class="px-2 py-0.5 rounded text-xs ${map[m] || map.unknown}">${escapeHtml(m)}</span>`;
+        };
+        const rows = data.interfaces.map(i => {
+            const link = (i.link_detected === true) ? '<span class="text-green-400">up</span>'
+                : (i.link_detected === false) ? '<span class="text-gray-500">down</span>'
+                : escapeHtml(String(i.operstate || '—'));
+            const speed = i.speed ? escapeHtml(i.speed) + (i.duplex ? ' ' + escapeHtml(i.duplex) : '') : '—';
+            const autoneg = (i.autoneg === true) ? '✓' : (i.autoneg === false) ? '✗' : '—';
+            const vlan = i.vlan_id ? escapeHtml(String(i.vlan_id)) + (i.vlan_proto ? ' (' + escapeHtml(i.vlan_proto) + ')' : '') : '—';
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(i.name)}</td>
+                <td class="px-3 py-1.5">${escapeHtml(i.type)}</td>
+                <td class="px-3 py-1.5">${link}</td>
+                <td class="px-3 py-1.5">${speed}</td>
+                <td class="px-3 py-1.5 text-center">${autoneg}</td>
+                <td class="px-3 py-1.5">${methodBadge(i.ip_method)}</td>
+                <td class="px-3 py-1.5 font-mono">${i.ipv4.length ? i.ipv4.map(escapeHtml).join('<br>') : '—'}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(i.mac || '—'))}</td>
+                <td class="px-3 py-1.5">${vlan}</td>
+            </tr>`;
+        }).join('');
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">Type</th><th class="px-3 py-1.5">Link</th>
+                <th class="px-3 py-1.5">Speed/Duplex</th><th class="px-3 py-1.5 text-center">Auto-neg</th>
+                <th class="px-3 py-1.5">Addressing</th><th class="px-3 py-1.5">IPv4</th>
+                <th class="px-3 py-1.5">MAC</th><th class="px-3 py-1.5">VLAN</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     }
 }
 

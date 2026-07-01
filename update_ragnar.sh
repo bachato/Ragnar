@@ -194,6 +194,37 @@ else
     echo -e "${YELLOW}rfkill not available - skipping radio unblock.${NC}"
 fi
 
+echo -e "${BLUE}Step 6.9: Ensuring network diagnostic tools...${NC}"
+# Tools for the Network > Diagnostics / Switch & L2 / Interfaces tabs.
+# Idempotent so existing installs pick them up on update (Debian/apt).
+if command -v apt-get >/dev/null 2>&1; then
+    NET_PKGS=""
+    for pair in "traceroute:traceroute" "mtr:mtr-tiny" "whois:whois" "lldpctl:lldpd" "ethtool:ethtool" "speedtest-cli:speedtest-cli"; do
+        bin="${pair%%:*}"; pkg="${pair##*:}"
+        command -v "$bin" >/dev/null 2>&1 || NET_PKGS="$NET_PKGS $pkg"
+    done
+    if [ -n "$NET_PKGS" ]; then
+        echo -e "  Installing:$NET_PKGS"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y $NET_PKGS >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓${NC} Installed network tools" \
+            || echo -e "  ${YELLOW}!${NC} Some network tools failed to install"
+    else
+        echo -e "  ${GREEN}✓${NC} Network tools already present"
+    fi
+fi
+# Configure lldpd to also decode CDP/EDP/FDP/SONMP (non-LLDP switches)
+if command -v lldpd >/dev/null 2>&1 || command -v lldpctl >/dev/null 2>&1; then
+    mkdir -p /etc/default
+    cat > /etc/default/lldpd << 'LLDPEOF'
+# Ragnar: decode CDP (Cisco), EDP (Extreme), FDP (Foundry), SONMP (Nortel)
+# neighbours in addition to LLDP, so switch discovery covers non-LLDP gear.
+DAEMON_ARGS="-c -e -f -s"
+LLDPEOF
+    systemctl enable lldpd >/dev/null 2>&1 || true
+    systemctl restart lldpd >/dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓${NC} lldpd configured for switch discovery"
+fi
+
 echo -e "${BLUE}Step 7: Starting ragnar service...${NC}"
 systemctl start ragnar.service
 
