@@ -771,16 +771,16 @@ def _rusense_check_once():
             if ncls.get('presence') or str(ncls.get('motion_level') or '').startswith('present'):
                 node_present = True
                 break
-        # The aggregate `presence` boolean flickers True on an EMPTY room (~20% of
-        # frames, even at high confidence) — that phantom produced empty-room
-        # sightings/alerts. Trust it only when the engine's own motion classifier
-        # agrees there is *some* signature (present_*/active), OR a non-stale node
-        # still sees a body (the motionless-body case above). A `presence:true`
-        # sample whose motion_level reads "absent" and which no node corroborates
-        # is noise, not an occupant.
+        # Base presence on the engine's MOTION CLASSIFIER, not the raw `presence`
+        # boolean. Live data: a still couch subject reads motion_level
+        # present_still/present_moving on ~40% of 1 Hz samples while the boolean
+        # is mostly False (13%); the empty room reads present_* on only ~2%. So
+        # motion_level cleanly separates occupied from empty, and it also avoids
+        # the empty-room "presence:true + motion:absent" phantom (which never has
+        # a present_* motion level). A non-stale node seeing a body still counts.
         motion_level = str(cls.get('motion_level') or '')
         engine_present = motion_level.startswith('present') or motion_level == 'active'
-        present = (present_agg and engine_present) or node_present
+        present = engine_present or node_present
         motion_active = motion_level == 'active'
         conf = cls.get('confidence')
         try:
