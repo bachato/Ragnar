@@ -298,6 +298,13 @@ _rusense_notify_lock = threading.Lock()
 # passes (vitals lag first detection), and it is closed at the presence fall.
 _rusense_sightings_lock = threading.Lock()
 _RUSENSE_SIGHTINGS_MAX = 50
+# A sighting is only trusted (logged/shown) once its confidence reaches this.
+# Empty-room disturbances cap around ~0.86 even when they briefly read
+# present+moving; a real occupant reaches ~1.0. Gating on the episode's PEAK
+# confidence (not just the first frame) keeps brief-but-confident real presence
+# — including a moving person with no vitals — while dropping the low-confidence
+# vital-less blips. Tune here if real presence ever reads lower.
+_RUSENSE_SIGHTING_MIN_CONF = 0.95
 
 
 def _rusense_sightings_file():
@@ -326,6 +333,13 @@ def _rusense_sightings_unlocked():
         if isinstance(rec, dict) and rec.get('ended_ts') is None:
             rec['ended_ts'] = rec.get('last_seen') or rec.get('ts')
             dirty = True
+    # Prune previously-stored sightings that never cleared the confidence gate
+    # (e.g. old empty-room phantoms), so the policy applies retroactively.
+    pruned = [r for r in lst if not isinstance(r, dict)
+              or (r.get('confidence') or 0) >= _RUSENSE_SIGHTING_MIN_CONF]
+    if len(pruned) != len(lst):
+        lst = pruned
+        dirty = True
     _rusense_notify_state['sightings'] = lst
     if dirty:
         _rusense_persist_sightings_unlocked()
@@ -422,6 +436,13 @@ def _rusense_close_sighting(now):
         rec['ended_ts'] = round(float(now), 3)
         rec['last_seen'] = round(float(now), 3)
         _rusense_notify_state['open_sighting'] = None
+        # Discard the whole episode if it never reached trustworthy confidence —
+        # a brief, low-confidence, vital-less blip is empty-room noise, not an
+        # occupant. High-confidence episodes (incl. brief moving ones) are kept.
+        if (rec.get('confidence') or 0) < _RUSENSE_SIGHTING_MIN_CONF:
+            lst = _rusense_notify_state.get('sightings')
+            if isinstance(lst, list) and rec in lst:
+                lst.remove(rec)
         _rusense_persist_sightings_unlocked()
 
 
@@ -872,6 +893,9 @@ def rusense_sightings():
     heart-rate / breathing seen during each stay. Survives the person leaving."""
     with _rusense_sightings_lock:
         lst = list(_rusense_sightings_unlocked())
+    # Only surface trusted sightings — this also hides a still-open episode until
+    # its confidence crosses the gate (closed sub-threshold ones are pruned).
+    lst = [s for s in lst if (s.get('confidence') or 0) >= _RUSENSE_SIGHTING_MIN_CONF]
     lst = lst[::-1]  # newest first
     return jsonify({'success': True, 'count': len(lst), 'sightings': lst})
 
