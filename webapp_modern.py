@@ -307,6 +307,28 @@ _RUSENSE_SIGHTINGS_MAX = 50
 _RUSENSE_SIGHTING_MIN_CONF = 0.95
 
 
+def _rusense_model_active():
+    """Whether a trained model is active on the sensing-server (cached ~30s).
+    Confidence is only calibrated/trustworthy with a model loaded; model-less it
+    is uninformative (~0.5), so the confidence gates relax to avoid ever missing
+    real presence for lack of a model."""
+    now = time.time()
+    cache = _rusense_notify_state.get('model_active_cache')
+    if cache and (now - cache[1]) < 30:
+        return cache[0]
+    info = _rusense_get('/api/v1/models/active')
+    active = bool(isinstance(info, dict) and info.get('active'))
+    _rusense_notify_state['model_active_cache'] = (active, now)
+    return active
+
+
+def _rusense_sighting_min_conf():
+    """Confidence a sighting must reach to be trusted: the strict gate when a
+    model calibrates confidence, else 0 — model-less we trust the presence rule
+    + debounce instead so real presence is never dropped."""
+    return _RUSENSE_SIGHTING_MIN_CONF if _rusense_model_active() else 0.0
+
+
 def _rusense_sightings_file():
     return os.path.join(shared_data.datadir, 'rusense_sightings.json')
 
@@ -333,13 +355,10 @@ def _rusense_sightings_unlocked():
         if isinstance(rec, dict) and rec.get('ended_ts') is None:
             rec['ended_ts'] = rec.get('last_seen') or rec.get('ts')
             dirty = True
-    # Prune previously-stored sightings that never cleared the confidence gate
-    # (e.g. old empty-room phantoms), so the policy applies retroactively.
-    pruned = [r for r in lst if not isinstance(r, dict)
-              or (r.get('confidence') or 0) >= _RUSENSE_SIGHTING_MIN_CONF]
-    if len(pruned) != len(lst):
-        lst = pruned
-        dirty = True
+    # NB: we don't prune stored sightings by confidence on load — a sighting
+    # logged while model-less (low but valid confidence) must survive restarts.
+    # Qualification is decided once, at close time, against the gate then in
+    # effect; closed sightings are kept permanently.
     _rusense_notify_state['sightings'] = lst
     if dirty:
         _rusense_persist_sightings_unlocked()
@@ -429,6 +448,8 @@ def _rusense_update_sighting(now, conf, vs):
 
 def _rusense_close_sighting(now):
     """Mark the open sighting ended at a confirmed presence fall."""
+    # Resolve the gate OUTSIDE the lock (it may do a cached HTTP check).
+    min_conf = _rusense_sighting_min_conf()
     with _rusense_sightings_lock:
         rec = _rusense_notify_state.get('open_sighting')
         if not rec:
@@ -436,10 +457,11 @@ def _rusense_close_sighting(now):
         rec['ended_ts'] = round(float(now), 3)
         rec['last_seen'] = round(float(now), 3)
         _rusense_notify_state['open_sighting'] = None
-        # Discard the whole episode if it never reached trustworthy confidence —
-        # a brief, low-confidence, vital-less blip is empty-room noise, not an
-        # occupant. High-confidence episodes (incl. brief moving ones) are kept.
-        if (rec.get('confidence') or 0) < _RUSENSE_SIGHTING_MIN_CONF:
+        # Discard the episode only if a MODEL was calibrating confidence and it
+        # still never reached the gate (a low-confidence vital-less blip = noise).
+        # Model-less the gate is 0, so every confirmed episode is kept — we lean
+        # on the presence rule + debounce and never drop real presence.
+        if (rec.get('confidence') or 0) < min_conf:
             lst = _rusense_notify_state.get('sightings')
             if isinstance(lst, list) and rec in lst:
                 lst.remove(rec)
@@ -644,7 +666,13 @@ def _rusense_check_once():
     try:
         min_conf = float(shared_data.config.get('rusense_notify_min_confidence', 0.95))
     except (TypeError, ValueError):
-        min_conf = 0.8
+        min_conf = 0.95
+    # Confidence only means something with a trained model. Model-less it is
+    # uncalibrated (~0.5), so a high bar would silently drop real presence —
+    # relax the gate to 0 and lean on the motion-corroborated presence rule +
+    # sustain debounce instead. Never miss presence for lack of a model.
+    if not _rusense_model_active():
+        min_conf = 0.0
     try:
         sustain = float(shared_data.config.get('rusense_notify_sustain_s', 2))
     except (TypeError, ValueError):
@@ -891,11 +919,14 @@ def rusense_sightings():
     """Recent presence sightings, newest first — a reviewable history of the
     confirmed occupancy events that also fire the Pushover alert, with the
     heart-rate / breathing seen during each stay. Survives the person leaving."""
+    min_conf = _rusense_sighting_min_conf()
     with _rusense_sightings_lock:
         lst = list(_rusense_sightings_unlocked())
-    # Only surface trusted sightings — this also hides a still-open episode until
-    # its confidence crosses the gate (closed sub-threshold ones are pruned).
-    lst = [s for s in lst if (s.get('confidence') or 0) >= _RUSENSE_SIGHTING_MIN_CONF]
+    # Closed sightings were already vetted at close time and are shown as-is; a
+    # still-open episode is shown only once it clears the current gate (model-less
+    # the gate is 0, so it shows as soon as presence is confirmed).
+    lst = [s for s in lst if s.get('ended_ts') is not None
+           or (s.get('confidence') or 0) >= min_conf]
     lst = lst[::-1]  # newest first
     return jsonify({'success': True, 'count': len(lst), 'sightings': lst})
 
