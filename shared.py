@@ -745,7 +745,7 @@ class SharedData:
             # False-positive guards: an event only fires when the classifier
             # confidence is at/above this fraction AND the condition has held
             # continuously for at least this many seconds (debounce).
-            "rusense_notify_min_confidence": 0.8,   # 0..1; require >= 80% confidence
+            "rusense_notify_min_confidence": 0.95,  # 0..1; require >= 95% confidence
             "rusense_notify_sustain_s": 2,          # condition must persist this long
             # Perimeter geofence: confine motion/presence/people alerts to the
             # polygon of mapped node corners. Rejects disturbances whose spatial

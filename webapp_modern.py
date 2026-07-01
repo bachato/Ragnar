@@ -642,7 +642,7 @@ def _rusense_check_once():
     )
 
     try:
-        min_conf = float(shared_data.config.get('rusense_notify_min_confidence', 0.8))
+        min_conf = float(shared_data.config.get('rusense_notify_min_confidence', 0.95))
     except (TypeError, ValueError):
         min_conf = 0.8
     try:

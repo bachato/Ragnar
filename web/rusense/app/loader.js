@@ -8,7 +8,7 @@ import dashboard from './views/dashboard.js?v=20260701-seenfor';
 import sensing from './views/sensing.js?v=20260701-presencehold';
 import nodes from './views/nodes.js?v=20260701-nodenames';
 import training from './views/training.js?v=20260630-recstate';
-import settings from './views/settings.js?v=20260629-obsserver';
+import settings from './views/settings.js?v=20260701-alertdefaults';
 import about from './views/about.js?v=20260701-credits';
 
 const VIEWS = { dashboard, sensing, nodes, training, settings, about };
