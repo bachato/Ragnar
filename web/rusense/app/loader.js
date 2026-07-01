@@ -4,7 +4,7 @@
 // Navigation is driven by Ragnar's native sub-tab buttons (ragnar_modern.js).
 import { html, setQueryRoot } from './lib.js';
 import { sensingService } from '../services/sensing.service.js';
-import dashboard from './views/dashboard.js?v=20260701-seenfor';
+import dashboard from './views/dashboard.js?v=20260701-rsanim';
 import sensing from './views/sensing.js?v=20260701-presencehold';
 import nodes from './views/nodes.js?v=20260701-nodenames';
 import training from './views/training.js?v=20260630-recstate';
@@ -35,7 +35,13 @@ function ensureShadow(host) {
   stable.textContent =
     '.card,.stat{contain:layout}' +
     '.stat-value,.font-mono,dd{font-variant-numeric:tabular-nums}' +
-    '.stat-value{white-space:nowrap}';
+    '.stat-value{white-space:nowrap}' +
+    // Loading animation for the dashboard's pre-first-frame "Connecting…" state.
+    '@keyframes rs-pulse{0%,100%{opacity:.35}50%{opacity:.9}}' +
+    '.rs-pulse{animation:rs-pulse 1.1s ease-in-out infinite}' +
+    '@keyframes rs-spin{to{transform:rotate(360deg)}}' +
+    '.rs-spin{display:inline-block;width:.9rem;height:.9rem;border:2px solid currentColor;' +
+    'border-right-color:transparent;border-radius:9999px;animation:rs-spin .7s linear infinite;vertical-align:-1px}';
   shadow.appendChild(stable);
 
   // app.css `body{}` rules don't cross the shadow boundary — reproduce the
