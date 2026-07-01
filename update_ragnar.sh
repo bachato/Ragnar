@@ -170,6 +170,30 @@ else
     echo -e "${GREEN}No Pwnagotchi installation found or migration script missing. Skipping.${NC}"
 fi
 
+echo -e "${BLUE}Step 6.8: Ensuring radios are unblocked (rfkill)...${NC}"
+# USB Bluetooth and monitor-mode/injection WiFi dongles come up soft-blocked
+# and stay dead until unblocked. Unblock now and install a persistent udev
+# rule so it also works at boot and on hot-plug. Idempotent, so existing
+# installs pick this up on the next update.
+if command -v rfkill >/dev/null 2>&1; then
+    rfkill unblock all
+    RFKILL_BIN="$(command -v rfkill)"
+    cat > /etc/udev/rules.d/99-ragnar-rfkill.rules << RFEOF
+# Ragnar: auto-unblock every radio when it appears (boot + hot-plug).
+# USB Bluetooth and monitor-mode/injection WiFi dongles are soft-blocked by
+# default and stay dead until unblocked.
+SUBSYSTEM=="rfkill", ACTION=="add", RUN+="$RFKILL_BIN unblock all"
+RFEOF
+    chmod 644 /etc/udev/rules.d/99-ragnar-rfkill.rules
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=rfkill 2>/dev/null || true
+    fi
+    echo -e "${GREEN}All radios unblocked and persistent rfkill rule installed.${NC}"
+else
+    echo -e "${YELLOW}rfkill not available - skipping radio unblock.${NC}"
+fi
+
 echo -e "${BLUE}Step 7: Starting ragnar service...${NC}"
 systemctl start ragnar.service
 
