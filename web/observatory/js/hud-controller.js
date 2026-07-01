@@ -699,17 +699,26 @@ export class HudController {
     const brFresh = this._brHoldVal > 0 && (nowMs - (this._brHoldAt || 0)) <= HOLD_MS;
     const targetHr = hrFresh ? this._hrHoldVal : 0;
     const targetBr = brFresh ? this._brHoldVal : 0;
-    const targetConf = Math.round((cls.confidence || 0) * 100);
+    // Confidence strobes at the frame rate (0.85 → 0.52 → 0.85…) and snaps to
+    // "--" on any zero frame — the same fast-update flicker we smoothed for
+    // presence and vitals. Feed a time-gated EMA over *new* frames only and
+    // hold through the occasional zero, instead of jittering the % every frame.
+    const cts = data.timestamp;
+    if (cts == null || cts !== this._confLastTs) {
+      this._confLastTs = cts;
+      const c = Math.round((cls.confidence || 0) * 100);
+      if (c > 0) this._confEma = (this._confEma == null) ? c : this._confEma + 0.05 * (c - this._confEma);
+    }
 
     // Smooth lerp transitions (blend 4% per frame toward target — very stable)
     const lerpFactor = 0.04;
     this._lerpHr = targetHr > 0 ? lerp(this._lerpHr, targetHr, lerpFactor) : 0;
     this._lerpBr = targetBr > 0 ? lerp(this._lerpBr, targetBr, lerpFactor) : 0;
-    this._lerpConf = targetConf > 0 ? lerp(this._lerpConf, targetConf, lerpFactor) : 0;
+    this._lerpConf = this._confEma || 0;   // already smoothed via the EMA above
 
     const dispHr = this._lerpHr > 1 ? Math.round(this._lerpHr) : '--';
     const dispBr = this._lerpBr > 1 ? Math.round(this._lerpBr) : '--';
-    const dispConf = this._lerpConf > 1 ? Math.round(this._lerpConf) : '--';
+    const dispConf = this._confEma != null ? Math.round(this._confEma) : '--';
 
     this._setText('hr-value', dispHr);
     this._setText('br-value', dispBr);

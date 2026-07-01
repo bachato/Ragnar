@@ -17,7 +17,7 @@ import { PostProcessing } from './post-processing.js';
 import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
-import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES, seedObsFromServerConfig } from './hud-controller.js?v=20260701-presencehold';
+import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES, seedObsFromServerConfig } from './hud-controller.js?v=20260701-confsmooth';
 
 // ---- Palette ----
 const C = {
