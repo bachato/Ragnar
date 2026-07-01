@@ -3,6 +3,7 @@ import { icons } from '../icons.js';
 import { html, $, fetchJSON, fmt, setMeter, sparkPath, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
+import { makePresenceHold } from '../presence-hold.js?v=20260701-presencehold';
 
 function bigStat(label, id, unit = '') {
   return `<div class="stat">
@@ -23,6 +24,13 @@ export default {
     // 4 s REST poll feed the same holders, so they reinforce rather than fight.
     this._hrHold = makeVitalHold({ holdMs: 4000, decimals: 0 });
     this._brHold = makeVitalHold({ holdMs: 4000, decimals: 1 });
+    // Presence toggles 0↔1 at ~46 Hz (even in an empty room); smooth it with a
+    // duty-cycle hysteresis biased toward PRESENT. Fed at full frame rate below.
+    this._presence = makePresenceHold();
+    this._present = false;
+    this._lastPeople = 0;
+    this._lastMotion = '';
+    this._presSig = null;
 
     root.appendChild(html`
       <section class="space-y-5">
@@ -88,6 +96,9 @@ export default {
     // Frames can arrive 10-20×/s; coalesce to a calm cadence so the cards
     // don't re-render (and visibly jitter) several times a second.
     const off = sensingService.onData(throttleLatest((d) => this.applyFrame(d), 250));
+    // Presence needs the raw ~46 Hz signal to measure its duty cycle, so feed it
+    // from a separate un-throttled listener (cheap: no DOM unless state changes).
+    const offP = sensingService.onData((d) => this.applyPresence(d));
 
     const refreshSystem = async () => {
       const m = await fetchJSON('/health/metrics');
@@ -124,7 +135,7 @@ export default {
     // hold window even if frames/polls stop arriving (stalled stream).
     const t4 = setInterval(() => this.renderVitals(), 1000);
 
-    return () => { off(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
+    return () => { off(); offP(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
   },
 
   renderVitals() {
@@ -133,27 +144,45 @@ export default {
     set('#stat-hr', this._hrHold.text());
   },
 
-  applyFrame(d) {
+  // Full-rate presence: smooth the flickering boolean and only touch the DOM
+  // when the displayed state actually changes.
+  applyPresence(d) {
     if (!d || !d.classification) return;
     const c = d.classification;
-    const present = !!c.presence;
-    this._present = present;
-    const people = d.estimated_persons ?? (d.persons?.length) ?? (present ? 1 : 0);
+    this._present = this._presence.push(c);
+    // Remember the last "occupied" people count + motion label so the banner
+    // shows a stable value while presence is held (those raw fields flicker too).
+    const rawPeople = d.estimated_persons ?? (d.persons?.length) ?? null;
+    const ml = c.motion_level || '';
+    if (rawPeople != null && rawPeople > 0) this._lastPeople = rawPeople;
+    if (ml.startsWith('present') || ml === 'active') this._lastMotion = ml;
+
+    const present = this._present === true;
+    const people = present ? (this._lastPeople || 1) : 0;
+    const motion = present ? (this._lastMotion || 'present') : 'absent';
+    const sig = `${present}|${people}|${motion}|${d.source}`;
+    if (sig === this._presSig) return;
+    this._presSig = sig;
 
     const dot = $('#presence-dot'), txt = $('#presence-text'), sub = $('#presence-sub'), mb = $('#motion-badge');
     if (dot) dot.className = `dot w-3.5 h-3.5 ${present ? 'bg-ok pulse-live' : 'bg-ink-4'}`;
     if (txt) txt.textContent = present ? (people > 1 ? `${people} people present` : 'Person present') : 'Room empty';
-    if (sub) sub.textContent = d.source === 'simulated' ? 'Simulated data (no live hardware)' : `${(c.motion_level || 'unknown').replace(/_/g, ' ')} · source: ${d.source}`;
-    const ml = c.motion_level || 'absent';
+    if (sub) sub.textContent = d.source === 'simulated' ? 'Simulated data (no live hardware)' : `${motion.replace(/_/g, ' ')} · source: ${d.source}`;
     if (mb) {
-      const kind = ml === 'active' ? 'badge-ok' : ml.includes('still') || ml.includes('present') ? 'badge-warn' : 'badge-mut';
-      mb.className = kind; mb.textContent = ml.replace(/_/g, ' ');
+      const kind = motion === 'active' ? 'badge-ok' : (present ? 'badge-warn' : 'badge-mut');
+      mb.className = kind; mb.textContent = motion.replace(/_/g, ' ');
     }
+    const pe = $('#stat-people'); if (pe) pe.textContent = String(people);
+  },
+
+  applyFrame(d) {
+    if (!d || !d.classification) return;
+    const c = d.classification;
 
     const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
-    set('#stat-people', String(people));
     set('#stat-conf', fmt.pct(c.confidence, 0));
     const vs = d.vital_signs || {};
+    const present = this._present === true;
     this._brHold.push(vs.breathing_rate_bpm, vs.breathing_confidence, present);
     this._hrHold.push(vs.heart_rate_bpm, vs.heartbeat_confidence, present);
     this.renderVitals();

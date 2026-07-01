@@ -4,6 +4,7 @@ import { html, $, fmt, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { geofenceService } from '../../services/geofence.service.js?v=20260628-geofence';
 import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
+import { makePresenceHold } from '../presence-hold.js?v=20260701-presencehold';
 
 // Teal→amber→red ramp for the field heatmap.
 function heat(v) {
@@ -27,6 +28,10 @@ export default {
     // (below) clears them to "—" after holdMs so a stalled stream can't freeze.
     const hrHold = makeVitalHold({ holdMs: 4000, decimals: 0 });
     const brHold = makeVitalHold({ holdMs: 4000, decimals: 1 });
+    // Presence flickers 0↔1 at ~46 Hz; smooth it (duty-cycle hysteresis) from a
+    // full-rate listener below. smPresent is the smoothed state the rest reads.
+    const presence = makePresenceHold();
+    let smPresent = false, lastMotion = '', presSig = null;
 
     root.appendChild(html`
       <section class="space-y-5">
@@ -189,10 +194,9 @@ export default {
     const off = sensingService.onData(throttleLatest((d) => {
       const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
       const c = d.classification || {}, f = d.features || {};
-      const present = !!c.presence;
-      const pEl = $('#cls-presence');
-      if (pEl) { pEl.textContent = present ? 'PRESENT' : 'empty'; pEl.className = `font-mono ${present ? 'text-ok' : 'text-ink-muted'}`; }
-      set('#cls-motion', (c.motion_level || '—').replace(/_/g, ' '));
+      // Presence + motion are rendered by the full-rate smoother listener below;
+      // here we just reuse the smoothed state for vital gating.
+      const present = smPresent;
       set('#cls-conf', fmt.pct(c.confidence, 0));
       set('#cls-posture', d.posture || '—');
       set('#cls-quality', d.quality_verdict || (d.signal_quality_score != null ? fmt.num(d.signal_quality_score, 2) : '—'));
@@ -218,6 +222,22 @@ export default {
       draw(d.signal_field);
     }, 250));
 
+    // Full-rate presence smoother: feed every frame, update the presence/motion
+    // readout only when the smoothed state changes (no 46 Hz DOM churn).
+    const offP = sensingService.onData((d) => {
+      const c = d.classification || {};
+      smPresent = presence.push(c);
+      const ml = c.motion_level || '';
+      if (ml.startsWith('present') || ml === 'active') lastMotion = ml;
+      const motion = smPresent ? (lastMotion || 'present') : 'absent';
+      const sig = `${smPresent}|${motion}`;
+      if (sig === presSig) return;
+      presSig = sig;
+      const pEl = $('#cls-presence');
+      if (pEl) { pEl.textContent = smPresent ? 'PRESENT' : 'empty'; pEl.className = `font-mono ${smPresent ? 'text-ok' : 'text-ink-muted'}`; }
+      const mEl = $('#cls-motion'); if (mEl) mEl.textContent = motion.replace(/_/g, ' ');
+    });
+
     // Re-render held vitals on a steady tick so a stalled stream clears to "—"
     // after the hold window even without new frames.
     const vitalsTick = setInterval(() => {
@@ -227,7 +247,7 @@ export default {
     }, 1000);
 
     return () => {
-      off(); offGeo(); clearInterval(vitalsTick);
+      off(); offP(); offGeo(); clearInterval(vitalsTick);
       window.removeEventListener('resize', resize);
       window.removeEventListener('resize', gfResize);
     };

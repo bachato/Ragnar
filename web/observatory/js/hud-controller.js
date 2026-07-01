@@ -655,8 +655,50 @@ export class HudController {
     const autoIcon = document.getElementById('autoplay-icon');
     if (autoIcon) autoIcon.className = demoData._autoMode ? '' : 'hidden';
 
-    const targetHr = vs.heart_rate_bpm || 0;
-    const targetBr = vs.breathing_rate_bpm || 0;
+    // Hold the last CONFIDENT vital reading through brief gaps (a frame that
+    // carries bpm 0 / low confidence between the sensing-server's multi-second
+    // recomputes) instead of snapping the lerp to 0 and flickering to "--".
+    // Clear only after HOLD_MS of no confident reading. updateHUD runs every
+    // frame, so this staleness check re-evaluates continuously — no extra timer.
+    const HOLD_MS = 4000, MIN_CONF = 0.5;
+    const nowMs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    // Presence toggles 0↔1 at frame rate even in an empty room (~20% duty) at
+    // high confidence, so read a duty-cycle over a sliding window with
+    // hysteresis (biased toward PRESENT) instead of the raw boolean. Sample
+    // only new frames (by timestamp) so a stalled live stream can't latch.
+    const PRES_WIN = 2000, PRES_ON = 0.45, PRES_OFF = 0.25, PRES_LINGER = 4000, PRES_MIN = 10;
+    this._presSamples = this._presSamples || [];
+    const pts = data.timestamp;
+    if (pts == null || pts !== this._presLastTs) {
+      this._presLastTs = pts;
+      const ml0 = String(cls.motion_level || '');
+      const occ = !!cls.presence || ml0.startsWith('present') || ml0 === 'active';
+      this._presSamples.push({ t: nowMs, occ });
+      while (this._presSamples.length && this._presSamples[0].t < nowMs - PRES_WIN) this._presSamples.shift();
+      let hits = 0; for (const s of this._presSamples) if (s.occ) hits++;
+      const duty = this._presSamples.length ? hits / this._presSamples.length : 0;
+      if (!this._smPresent) { if (this._presSamples.length >= PRES_MIN && duty >= PRES_ON) { this._smPresent = true; this._presLastOccAt = nowMs; } }
+      else if (duty >= PRES_OFF) { this._presLastOccAt = nowMs; }
+      else if (nowMs - (this._presLastOccAt || 0) >= PRES_LINGER) { this._smPresent = false; }
+    }
+    const present = this._smPresent === true;
+    const mlNow = String(cls.motion_level || '');
+    if (present && (mlNow.startsWith('present') || mlNow === 'active')) this._presLastMotion = mlNow;
+    // Live sensing-server sends heartbeat_confidence; demo data uses heart_rate_confidence.
+    const hrConf = vs.heartbeat_confidence != null ? vs.heartbeat_confidence : vs.heart_rate_confidence;
+    const brConf = vs.breathing_confidence;
+    // Capture a reading only when present, positive, and not below the gate
+    // (missing confidence is treated as acceptable, not a block).
+    if (present && vs.heart_rate_bpm > 0 && !(Number(hrConf) < MIN_CONF)) {
+      this._hrHoldVal = vs.heart_rate_bpm; this._hrHoldAt = nowMs;
+    }
+    if (present && vs.breathing_rate_bpm > 0 && !(Number(brConf) < MIN_CONF)) {
+      this._brHoldVal = vs.breathing_rate_bpm; this._brHoldAt = nowMs;
+    }
+    const hrFresh = this._hrHoldVal > 0 && (nowMs - (this._hrHoldAt || 0)) <= HOLD_MS;
+    const brFresh = this._brHoldVal > 0 && (nowMs - (this._brHoldAt || 0)) <= HOLD_MS;
+    const targetHr = hrFresh ? this._hrHoldVal : 0;
+    const targetBr = brFresh ? this._brHoldVal : 0;
     const targetConf = Math.round((cls.confidence || 0) * 100);
 
     // Smooth lerp transitions (blend 4% per frame toward target — very stable)
@@ -690,17 +732,19 @@ export class HudController {
     this._setText('var-value', (feat.variance || 0).toFixed(2));
     this._setText('motion-value', (feat.motion_band_power || 0).toFixed(3));
 
-    // Mini person-count dots
-    const personCount = data.estimated_persons || 0;
+    // Mini person-count dots — gate on the smoothed presence and hold the last
+    // positive count so the dots don't strobe with the raw boolean.
+    if (data.estimated_persons > 0) this._presLastPeople = data.estimated_persons;
+    const personCount = present ? (this._presLastPeople || 1) : 0;
     this._updatePersonDots(personCount);
 
     const presEl = document.getElementById('presence-indicator');
     const presLabel = document.getElementById('presence-label');
     if (presEl) {
-      const ml = cls.motion_level || 'absent';
+      const ml = present ? (this._presLastMotion || 'present_still') : 'absent';
       presEl.className = 'presence-state';
-      if (ml === 'active') { presEl.classList.add('presence--active'); presLabel.textContent = 'ACTIVE'; }
-      else if (cls.presence) { presEl.classList.add('presence--present'); presLabel.textContent = 'PRESENT'; }
+      if (present && ml === 'active') { presEl.classList.add('presence--active'); presLabel.textContent = 'ACTIVE'; }
+      else if (present) { presEl.classList.add('presence--present'); presLabel.textContent = 'PRESENT'; }
       else { presEl.classList.add('presence--absent'); presLabel.textContent = 'ABSENT'; }
     }
 

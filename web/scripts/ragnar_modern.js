@@ -823,7 +823,7 @@ function _setRusenseActive(name) {
 function loadRusenseLoader() {
     if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
     if (!_rusenseLoading) {
-        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260701-vitalhold')
+        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260701-presencehold')
             .then(m => { _rusenseLoader = m; return m; })
             .catch(err => { _rusenseLoading = null; throw err; });
     }
@@ -872,7 +872,7 @@ function showRusenseSubtab(name) {
         if (host) host.classList.add('hidden');
         if (obs) {
             obs.classList.remove('hidden');
-            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260629-obsserver';
+            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260701-presencehold';
         }
         if (_rusenseLoader) { try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ } }
         return;
