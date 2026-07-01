@@ -318,7 +318,17 @@ def _rusense_sightings_unlocked():
             lst = loaded[-_RUSENSE_SIGHTINGS_MAX:]
     except (OSError, ValueError):
         lst = []
+    # Close any sighting left "open" by a previous run — we can no longer keep
+    # counting it, so lock its duration at the last time it was seen (else the
+    # UI would show it ticking "live" forever after a restart).
+    dirty = False
+    for rec in lst:
+        if isinstance(rec, dict) and rec.get('ended_ts') is None:
+            rec['ended_ts'] = rec.get('last_seen') or rec.get('ts')
+            dirty = True
     _rusense_notify_state['sightings'] = lst
+    if dirty:
+        _rusense_persist_sightings_unlocked()
     return lst
 
 
@@ -365,6 +375,7 @@ def _rusense_open_sighting(now, conf, people, motion_level, vs):
         lst = _rusense_sightings_unlocked()
         rec = {
             'ts': round(float(now), 3),          # epoch seconds (rendered local-time client-side)
+            'last_seen': round(float(now), 3),   # advanced each pass; locks the duration on close
             'confidence': round(float(conf or 0), 3),
             'people': int(people or 0),
             'motion_level': str(motion_level or ''),
@@ -380,8 +391,10 @@ def _rusense_open_sighting(now, conf, people, motion_level, vs):
         _rusense_persist_sightings_unlocked()
 
 
-def _rusense_update_sighting(conf, vs):
-    """Fill in vitals / bump peak confidence on the open sighting, if any."""
+def _rusense_update_sighting(now, conf, vs):
+    """Fill in vitals / bump peak confidence and advance last_seen on the open
+    sighting, if any. last_seen is persisted at most every ~5s (it changes every
+    pass) so a crash/restart still recovers a near-accurate duration."""
     with _rusense_sightings_lock:
         rec = _rusense_notify_state.get('open_sighting')
         if not rec:
@@ -393,7 +406,10 @@ def _rusense_update_sighting(conf, vs):
                 changed = True
         except (TypeError, ValueError):
             pass
-        if changed:
+        rec['last_seen'] = round(float(now), 3)
+        last_persist = _rusense_notify_state.get('last_sighting_persist', 0)
+        if changed or (now - last_persist) >= 5:
+            _rusense_notify_state['last_sighting_persist'] = now
             _rusense_persist_sightings_unlocked()
 
 
@@ -404,6 +420,7 @@ def _rusense_close_sighting(now):
         if not rec:
             return
         rec['ended_ts'] = round(float(now), 3)
+        rec['last_seen'] = round(float(now), 3)
         _rusense_notify_state['open_sighting'] = None
         _rusense_persist_sightings_unlocked()
 
@@ -754,7 +771,7 @@ def _rusense_check_once():
         # Vitals lag first detection, so keep filling in the open sighting while
         # the space stays occupied (no-op when there is no open sighting).
         if present:
-            _rusense_update_sighting(conf if confident else None, vitals)
+            _rusense_update_sighting(now, conf if confident else None, vitals)
         if notify_on and m_rose and not block_motion:
             po.notify_rusense(
                 'motion',

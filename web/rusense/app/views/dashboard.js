@@ -13,6 +13,23 @@ function bigStat(label, id, unit = '') {
   </div>`;
 }
 
+// Local-time timestamp for a sighting (epoch seconds).
+function fmtLocalTime(ts) {
+  try {
+    return new Date(ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch { return '—'; }
+}
+
+// Human "seen for" duration from a second count.
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 export default {
   id: 'dashboard',
   label: 'Dashboard',
@@ -35,6 +52,7 @@ export default {
     // sensing-server's /api/v1/nodes roster — fetch them once to label nodes.
     this._nodeNames = {};
     fetchJSON('/api/config').then((c) => { this._nodeNames = (c && c.rusense_node_names) || {}; });
+    this._sightings = [];
 
     root.appendChild(html`
       <section class="space-y-5">
@@ -141,36 +159,10 @@ export default {
         }).join('') : '<div class="text-ink-muted">No nodes reporting</div>';
       }
     };
-    const fmtLocal = (ts) => {
-      try {
-        return new Date(ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      } catch { return '—'; }
-    };
     const refreshSightings = async () => {
       const r = await fetchJSON('/api/rusense/sightings');
-      const body = $('#sightings-body'); if (!body) return;
-      const rows = (r?.sightings || []).slice(0, 5);
-      if (!rows.length) {
-        body.innerHTML = '<div class="text-sm text-ink-muted py-2">No sightings yet — confirmed presence alerts will appear here.</div>';
-        return;
-      }
-      const cell = (v) => `<td class="text-right font-mono py-2">${v}</td>`;
-      body.innerHTML = `<table class="w-full text-sm">
-        <thead><tr class="text-ink-muted">
-          <th class="text-left font-semibold py-2">Time</th>
-          <th class="text-right font-semibold py-2">Confidence</th>
-          <th class="text-right font-semibold py-2">Heart rate</th>
-          <th class="text-right font-semibold py-2">Breathing</th>
-        </tr></thead>
-        <tbody>${rows.map((s) => {
-          const conf = s.confidence != null ? `${Math.round(s.confidence * 100)}%` : '—';
-          const hr = s.hr != null ? `${Math.round(s.hr)} bpm` : '—';
-          const br = s.br != null ? `${Number(s.br).toFixed(1)} bpm` : '—';
-          const live = s.ended_ts == null ? ' <span class="text-ok">• live</span>' : '';
-          return `<tr class="border-t border-ink-3">
-            <td class="text-left font-mono text-ink-soft py-2">${fmtLocal(s.ts)}${live}</td>
-            ${cell(conf)}${cell(hr)}${cell(br)}</tr>`;
-        }).join('')}</tbody></table>`;
+      this._sightings = (r?.sightings || []).slice(0, 5);
+      this.renderSightings();
     };
     const refreshVitals = async () => {
       // Vitals may not ride every WS frame — poll the dedicated endpoint.
@@ -188,7 +180,7 @@ export default {
     const t3 = setInterval(refreshVitals, 4000);
     // Re-render on a steady tick so a held value still clears to "—" after the
     // hold window even if frames/polls stop arriving (stalled stream).
-    const t4 = setInterval(() => this.renderVitals(), 1000);
+    const t4 = setInterval(() => { this.renderVitals(); this.renderSightings(); }, 1000);
 
     return () => { off(); offP(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
   },
@@ -197,6 +189,42 @@ export default {
     const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
     set('#stat-br', this._brHold.text());
     set('#stat-hr', this._hrHold.text());
+  },
+
+  // Render the sightings table from cached rows. Called on each 7s fetch and on
+  // the 1s tick so the open sighting's "seen for" duration counts up live.
+  renderSightings() {
+    const body = $('#sightings-body'); if (!body) return;
+    const rows = this._sightings || [];
+    if (!rows.length) {
+      body.innerHTML = '<div class="text-sm text-ink-muted py-2">No sightings yet — confirmed presence alerts will appear here.</div>';
+      return;
+    }
+    const now = Date.now() / 1000;
+    const cell = (v) => `<td class="text-right font-mono py-2">${v}</td>`;
+    body.innerHTML = `<div class="overflow-x-auto -mx-1"><table class="w-full text-sm min-w-[480px]">
+      <thead><tr class="text-ink-muted">
+        <th class="text-left font-semibold py-2">Time</th>
+        <th class="text-right font-semibold py-2">Seen for</th>
+        <th class="text-right font-semibold py-2">Confidence</th>
+        <th class="text-right font-semibold py-2">Heart rate</th>
+        <th class="text-right font-semibold py-2">Breathing</th>
+      </tr></thead>
+      <tbody>${rows.map((s) => {
+        const conf = s.confidence != null ? `${Math.round(s.confidence * 100)}%` : '—';
+        const hr = s.hr != null ? `${Math.round(s.hr)} bpm` : '—';
+        const br = s.br != null ? `${Number(s.br).toFixed(1)} bpm` : '—';
+        const live = s.ended_ts == null;
+        const dur = live ? (now - s.ts) : (s.ended_ts - s.ts);
+        // Live = green; a very short locked sighting (<3s) is more likely a
+        // perimeter leak than a real occupant, so flag it amber.
+        const durCls = live ? 'text-ok' : (dur < 3 ? 'text-warn' : '');
+        const durText = live ? `${fmtDuration(dur)} · live` : fmtDuration(dur);
+        return `<tr class="border-t border-ink-3">
+          <td class="text-left font-mono text-ink-soft py-2">${fmtLocalTime(s.ts)}</td>
+          <td class="text-right font-mono py-2 ${durCls}">${durText}</td>
+          ${cell(conf)}${cell(hr)}${cell(br)}</tr>`;
+      }).join('')}</tbody></table></div>`;
   },
 
   // Full-rate presence: smooth the flickering boolean and only touch the DOM
