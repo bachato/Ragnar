@@ -309,6 +309,11 @@ _RUSENSE_PRES_WINDOW_S = 12.0    # rolling window (the notify loop samples ~1 Hz
 _RUSENSE_PRES_MIN_SAMPLES = 5    # need a partly-full window before confirming
 _RUSENSE_PRES_ON = 0.18          # duty ≥ this → PRESENT (clears empty, catches sitting)
 _RUSENSE_PRES_OFF = 0.08         # duty ≤ this → EMPTY (hysteresis)
+# Grace window that bridges a brief presence fall (perimeter excursion / duty dip)
+# back to a rise, so one continuous occupancy is ONE sighting instead of several
+# fragments. Backend analog of the frontend presence-hold's lingerMs. Live tests
+# showed real re-entry gaps of ~9-19s during in/out movement → 20s covers them.
+_RUSENSE_SIGHTING_MERGE_S = 20.0
 
 
 def _rusense_model_active():
@@ -843,23 +848,47 @@ def _rusense_check_once():
                         f"(hot={verdict.get('hot_count')}, total={verdict.get('total')})")
 
         vitals = latest.get('vital_signs') if isinstance(latest, dict) else None
-        if p_rose and not block_motion:
-            if notify_on:
-                who = f"{people} people" if people > 1 else "Someone"
-                po.notify_rusense(
-                    'presence',
-                    f"\U0001F441️ {who} detected — a monitored space is now occupied.",
-                    title="RuSense — Presence", priority=1)
-            # Log the sighting whether or not the phone alert fired, so it stays
-            # reviewable after the person leaves (geofence walk-by is not logged).
-            _rusense_open_sighting(now, conf, people, cls.get('motion_level'), vitals)
+        # Sighting lifecycle with a grace window (deferred close): a brief
+        # presence fall does NOT close the episode immediately — it is held
+        # 'pending' so a re-entry within _RUSENSE_SIGHTING_MERGE_S resumes the
+        # SAME sighting (no fragmentation, no spurious empty→presence alert pair).
+        pending = _rusense_notify_state.get('pending_close_ts')
+        if p_rose:
+            if (pending is not None
+                    and _rusense_notify_state.get('open_sighting') is not None
+                    and (now - pending) <= _RUSENSE_SIGHTING_MERGE_S):
+                # Brief gap bridged — the space was never really empty. Resume.
+                _rusense_notify_state['pending_close_ts'] = None
+            else:
+                # A genuinely new presence. Finalize any stale pending close first.
+                if pending is not None:
+                    _rusense_close_sighting(pending)
+                    _rusense_notify_state['pending_close_ts'] = None
+                if not block_motion:
+                    if notify_on:
+                        who = f"{people} people" if people > 1 else "Someone"
+                        po.notify_rusense(
+                            'presence',
+                            f"\U0001F441️ {who} detected — a monitored space is now occupied.",
+                            title="RuSense — Presence", priority=1)
+                    # Log the sighting whether or not the phone alert fired, so it
+                    # stays reviewable (geofence walk-by is not logged).
+                    _rusense_open_sighting(now, conf, people, cls.get('motion_level'), vitals)
         elif p_fell:
+            # Defer the close; finalized below if no re-entry within the window.
+            _rusense_notify_state['pending_close_ts'] = (
+                now if _rusense_notify_state.get('open_sighting') is not None else None)
+
+        # Finalize a deferred close once the grace window elapses with no re-entry.
+        pending = _rusense_notify_state.get('pending_close_ts')
+        if pending is not None and (now - pending) > _RUSENSE_SIGHTING_MERGE_S:
             if notify_on:
                 po.notify_rusense(
                     'presence',
                     "\U0001F6E1️ A monitored space is now empty.",
                     title="RuSense — Empty")
-            _rusense_close_sighting(now)
+            _rusense_close_sighting(pending)  # ends at the moment it actually fell
+            _rusense_notify_state['pending_close_ts'] = None
         # Vitals lag first detection, so keep filling in the open sighting while
         # the space stays occupied (no-op when there is no open sighting).
         if present:
