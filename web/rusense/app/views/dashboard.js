@@ -111,6 +111,8 @@ export default {
       }
     });
     this._sightings = [];
+    this._nodePeople = null;  // corroborated people count (median across nodes)
+    this._gf = null;          // last geofence verdict (5s poll)
     this._trendHours = 24;
     this._trendBuckets = [];
     this._trendBucketS = 300;
@@ -207,11 +209,16 @@ export default {
 
     // RuSense backend + node health (replaces generic host CPU/mem/disk).
     const refreshHealth = async () => {
-      const [st, svc, n] = await Promise.all([
+      const [st, svc, n, gf] = await Promise.all([
         fetchJSON('/api/v1/status'),
         fetchJSON('/api/sensing/status'),
         fetchJSON('/api/v1/nodes'),
+        fetchJSON('/api/rusense/geofence'),
       ]);
+      // Last geofence verdict — lets the presence banner tell "person in the
+      // room" apart from "through-wall disturbance" (same rule the backend
+      // uses to suppress alerts: energetic but NOT corroborated interior).
+      this._gf = (gf && gf.enabled && gf.verdict && gf.verdict.ok) ? gf.verdict : null;
       const be = $('#rs-backend');
       if (be) {
         const running = svc?.active === true;
@@ -221,6 +228,12 @@ export default {
       const src = $('#rs-source'); if (src) src.textContent = st?.source || '—';
       const nodes = (n?.nodes || []).slice().sort((a, b) => (a.node_id || 0) - (b.node_id || 0));
       const active = nodes.filter((x) => x.status === 'active').length;
+      // People: per-node person_count ghosts on single nodes, so use the LOWER
+      // MEDIAN across active nodes (same corroboration rule as the backend) —
+      // a count is only believed when a majority of nodes agree.
+      const counts = nodes.filter((x) => x.status === 'active' && typeof x.person_count === 'number')
+        .map((x) => x.person_count).sort((a, b) => a - b);
+      this._nodePeople = counts.length ? counts[Math.floor((counts.length - 1) / 2)] : null;
       const ne = $('#rs-nodes'); if (ne) ne.textContent = `${active}/${nodes.length}`;
       const list = $('#rs-node-list');
       if (list) {
@@ -394,23 +407,35 @@ export default {
     this._brHold.push(dvs.breathing_rate_bpm, dvs.breathing_confidence, this._present);
     this._hrHold.push(dvs.heart_rate_bpm, dvs.heartbeat_confidence, this._present);
     // Remember the last "occupied" people count + motion label so the banner
-    // shows a stable value while presence is held (those raw fields flicker too).
-    const rawPeople = d.estimated_persons ?? (d.persons?.length) ?? null;
+    // shows a stable value while presence is held. NEVER use persons[].length —
+    // the raw detection list flickers 1-4 with ghosts (live data) while the
+    // corroborated counts never leave 1. Node median first (majority-agreed),
+    // then the engine's own estimate.
+    const rawPeople = this._nodePeople ?? d.estimated_persons ?? null;
     const ml = c.motion_level || '';
     if (rawPeople != null && rawPeople > 0) this._lastPeople = rawPeople;
     if (ml.startsWith('present') || ml === 'active') this._lastMotion = ml;
 
     const present = this._present === true;
+    // Through-wall discrimination: presence duty can clear the gate for a body
+    // in the NEXT room (one node sees it through the wall). The geofence knows
+    // — real energy, zero interior corners — so show that as its own state
+    // instead of claiming "Person present". Same rule that suppresses alerts.
+    const gfOutside = present && this._gf && this._gf.energetic && !this._gf.inside_perimeter;
     const people = present ? (this._lastPeople || 1) : 0;
     const motion = present ? (this._lastMotion || 'present') : 'absent';
-    const sig = `${present}|${people}|${motion}|${d.source}`;
+    const sig = `${present}|${gfOutside}|${people}|${motion}|${d.source}`;
     if (sig === this._presSig) return;
     this._presSig = sig;
 
     const dot = $('#presence-dot'), txt = $('#presence-text'), sub = $('#presence-sub'), mb = $('#motion-badge');
-    if (dot) dot.className = `dot w-3.5 h-3.5 ${present ? 'bg-ok pulse-live' : 'bg-ink-4'}`;
-    if (txt) txt.textContent = present ? (people > 1 ? `${people} people present` : 'Person present') : 'Room empty';
-    if (sub) sub.textContent = d.source === 'simulated' ? 'Simulated data (no live hardware)' : `${motion.replace(/_/g, ' ')} · source: ${d.source}`;
+    if (dot) dot.className = `dot w-3.5 h-3.5 ${present ? (gfOutside ? 'bg-warn pulse-live' : 'bg-ok pulse-live') : 'bg-ink-4'}`;
+    if (txt) txt.textContent = !present ? 'Room empty'
+      : gfOutside ? 'Activity outside perimeter'
+      : (people > 1 ? `${people} people present` : 'Person present');
+    if (sub) sub.textContent = d.source === 'simulated' ? 'Simulated data (no live hardware)'
+      : gfOutside ? 'Disturbance not corroborated inside the room — next room or hallway (alerts suppressed)'
+      : `${motion.replace(/_/g, ' ')} · source: ${d.source}`;
     if (mb) {
       const kind = motion === 'active' ? 'badge-ok' : (present ? 'badge-warn' : 'badge-mut');
       mb.className = kind; mb.textContent = motion.replace(/_/g, ' ');
