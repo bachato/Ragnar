@@ -120,16 +120,22 @@ idempotent — safe to re-run.
 
 Open Ragnar's dashboard at `http://<ragnar-ip>:8000` and use the RuSense tabs:
 
-1. **Nodes** — provisioned CSI nodes appear here once they start streaming. Confirm
-   frames-per-second is climbing.
-2. **Live** — real-time presence, motion and people-count for the monitored space.
-3. **Training** — the **Record → Train → Active** loop. Record CSI while you act out
+1. **Dashboard** — the operator overview: a presence banner, key live stats
+   (people, confidence, breathing, heart rate), a **RuSense + node health** card
+   (backend status, source, and each node online/RSSI by its custom name), and a
+   **Recent sightings** log (see below).
+2. **Sensing** — real-time CSI features, classification, vital signs and the
+   signal-field heatmap for the monitored space.
+3. **Nodes** — provisioned CSI nodes appear here once they start streaming (confirm
+   frames-per-second is climbing). Shows each node's custom name, status, RSSI,
+   motion and last-seen. Name your nodes in the Settings tab.
+4. **Training** — the **Record → Train → Active** loop. Record CSI while you act out
    labelled scenarios (empty room, one person, two people, walking, sitting…), then
-   train a lightweight on-device adaptive classifier tuned to *your* space. Ground-truth
-   labels are set under the config endpoints.
-4. **Models** — load, activate, or unload trained models (`.rvf` containers and LoRA
-   profiles).
-5. **Settings** — configure **push notifications** for sensing events (see below).
+   train a lightweight on-device adaptive classifier tuned to *your* space. The same
+   tab's **Models** section loads, activates or unloads trained models (`.rvf`
+   containers and LoRA profiles).
+5. **Settings** — configure **push notifications** for sensing events (see below),
+   the **geofence**, and your **node names / positions** (Observatory → Room & Nodes).
 
 ---
 
@@ -174,6 +180,22 @@ delivery. (Config keys: `rusense_notify_*` in `shared.py`.)
 > ```bash
 > sudo systemctl restart ragnar
 > ```
+
+### Sighting history
+
+Every confirmed presence event is also written to a **sighting log**, shown as
+**Recent sightings** on the Dashboard — so a person who has already left is still on
+record. Each row shows the local **time**, how long they were **seen for**, the peak
+**confidence**, and the **heart rate / breathing** captured during the stay (vitals lag
+first detection, so the highest-confidence reading of the episode is kept).
+
+- The "seen for" timer **counts up live** while the space is occupied and **locks** to
+  the total when it goes empty. A very short locked sighting (under a few seconds) is
+  flagged — more likely a perimeter leak than a real occupant.
+- The log is **independent of Pushover**: sightings are recorded whenever the sensing
+  backend is reachable, even with phone alerts switched off. It persists across restarts
+  (a 50-entry ring buffer at `data/rusense_sightings.json`) and is served by
+  `GET /api/rusense/sightings`.
 
 ### Geofence — confining alerts to the room
 
