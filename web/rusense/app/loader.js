@@ -4,7 +4,7 @@
 // Navigation is driven by Ragnar's native sub-tab buttons (ragnar_modern.js).
 import { html, setQueryRoot } from './lib.js';
 import { sensingService } from '../services/sensing.service.js';
-import dashboard from './views/dashboard.js?v=20260701-seenfor';
+import dashboard from './views/dashboard.js?v=20260701-loadanim';
 import sensing from './views/sensing.js?v=20260701-presencehold';
 import nodes from './views/nodes.js?v=20260701-nodenames';
 import training from './views/training.js?v=20260630-recstate';
@@ -19,6 +19,21 @@ let viewEl = null;
 let current = null; // { route, cleanup }
 let activeRoute = null; // route currently shown or mid-mount (idempotency guard)
 let started = false;
+let cssReady = Promise.resolve(); // resolves once app.css has applied (avoids FOUC)
+
+/** Fill the view with self-styled skeleton cards — shown instantly while app.css
+ *  loads and the first frame arrives, so the tab never flashes unstyled. */
+function renderSkeleton() {
+  if (!viewEl) return;
+  const card = (h) => `<div class="rs-skel-card" style="height:${h}"></div>`;
+  viewEl.innerHTML =
+    '<div class="rs-skel">' +
+    card('64px') +
+    '<div class="rs-skel-stats">' + card('76px').repeat(4) + '</div>' +
+    '<div class="rs-skel-two">' + card('184px') + card('184px') + '</div>' +
+    card('120px') +
+    '</div>';
+}
 
 function ensureShadow(host) {
   if (shadow) return;
@@ -27,6 +42,11 @@ function ensureShadow(host) {
   const link = document.createElement('link');
   link.rel = 'stylesheet';
   link.href = CSS_HREF;
+  cssReady = new Promise((resolve) => {
+    link.addEventListener('load', resolve, { once: true });
+    link.addEventListener('error', resolve, { once: true });
+    setTimeout(resolve, 1500); // fallback so we never sit on the skeleton forever
+  });
   shadow.appendChild(link);
 
   // Layout containment: a live value changing inside one card can't reflow its
@@ -35,7 +55,24 @@ function ensureShadow(host) {
   stable.textContent =
     '.card,.stat{contain:layout}' +
     '.stat-value,.font-mono,dd{font-variant-numeric:tabular-nums}' +
-    '.stat-value{white-space:nowrap}';
+    '.stat-value{white-space:nowrap}' +
+    // Loading animation for the pre-first-frame state (shadow-isolated, so it
+    // works even before/without the Tailwind build applying).
+    '@keyframes rs-pulse{0%,100%{opacity:.35}50%{opacity:.9}}' +
+    '.rs-pulse{animation:rs-pulse 1.1s ease-in-out infinite}' +
+    '@keyframes rs-spin{to{transform:rotate(360deg)}}' +
+    '.rs-spin{display:inline-block;width:.9rem;height:.9rem;border:2px solid currentColor;' +
+    'border-right-color:transparent;border-radius:9999px;animation:rs-spin .7s linear infinite;vertical-align:-1px}' +
+    // Skeleton shown INSTANTLY (before app.css loads) so there's never a flash
+    // of unstyled "terminal" content. Fully self-styled — no Tailwind needed.
+    '.rs-skel{display:flex;flex-direction:column;gap:1rem;padding:1.25rem 1rem}' +
+    '.rs-skel-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:.75rem}' +
+    '.rs-skel-two{display:grid;grid-template-columns:1fr;gap:1rem}' +
+    '@media(min-width:1024px){.rs-skel-stats{grid-template-columns:repeat(4,1fr)}.rs-skel-two{grid-template-columns:1fr 1fr}}' +
+    '.rs-skel-card{background:#121820;border:1px solid #1e2730;border-radius:.75rem;position:relative;overflow:hidden}' +
+    '.rs-skel-card::after{content:"";position:absolute;inset:0;transform:translateX(-100%);' +
+    'background:linear-gradient(90deg,transparent,rgba(120,160,200,.08),transparent);animation:rs-shimmer 1.3s infinite}' +
+    '@keyframes rs-shimmer{100%{transform:translateX(100%)}}';
   shadow.appendChild(stable);
 
   // app.css `body{}` rules don't cross the shadow boundary — reproduce the
@@ -76,8 +113,13 @@ export async function show(routeId) {
   if (current && current.cleanup) {
     try { current.cleanup(); } catch (e) { console.warn('[rusense] cleanup', e); }
   }
-  viewEl.innerHTML = '';
+  // Show skeleton instantly, then wait for app.css to apply before mounting the
+  // real view — otherwise the raw markup flashes unstyled ("terminal" screen).
+  renderSkeleton();
   viewEl.scrollTo && viewEl.scrollTo(0, 0);
+  await cssReady;
+  if (activeRoute !== id) return id; // route changed while we waited
+  viewEl.innerHTML = '';
   let cleanup = null;
   try {
     cleanup = (await VIEWS[id].mount(viewEl)) || null;
