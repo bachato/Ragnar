@@ -1,8 +1,9 @@
 // Sensing — live CSI features, classification, vital signs + signal-field heatmap.
 import { icons } from '../icons.js';
-import { html, $, fmt, throttleLatest, vitalText } from '../lib.js';
+import { html, $, fmt, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { geofenceService } from '../../services/geofence.service.js?v=20260628-geofence';
+import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
 
 // Teal→amber→red ramp for the field heatmap.
 function heat(v) {
@@ -22,6 +23,11 @@ export default {
   icon: icons.sensing,
 
   async mount(root) {
+    // Hold vitals through brief confidence dips / dropped frames; a steady tick
+    // (below) clears them to "—" after holdMs so a stalled stream can't freeze.
+    const hrHold = makeVitalHold({ holdMs: 4000, decimals: 0 });
+    const brHold = makeVitalHold({ holdMs: 4000, decimals: 1 });
+
     root.appendChild(html`
       <section class="space-y-5">
         <div class="card card-pad space-y-3">
@@ -197,10 +203,13 @@ export default {
       set('#ft-spec', fmt.num(f.spectral_power, 4)); set('#ft-tick', fmt.int(d.tick));
 
       // Gate vitals on presence + confidence so an empty-room noise peak reads
-      // as "—", and always write so a transient phantom can't stick on screen.
+      // as "—", but hold the last confident value through brief dips instead of
+      // strobing value ↔ "—". The tick below clears it once genuinely stale.
       const vs = d.vital_signs || {};
-      set('#vs-br', vitalText(vs.breathing_rate_bpm, vs.breathing_confidence, 1, present));
-      set('#vs-hr', vitalText(vs.heart_rate_bpm, vs.heartbeat_confidence, 0, present));
+      brHold.push(vs.breathing_rate_bpm, vs.breathing_confidence, present);
+      hrHold.push(vs.heart_rate_bpm, vs.heartbeat_confidence, present);
+      set('#vs-br', brHold.text());
+      set('#vs-hr', hrHold.text());
       set('#vs-br-c', `confidence ${fmt.pct(vs.breathing_confidence, 0)}`);
       set('#vs-hr-c', `confidence ${fmt.pct(vs.heartbeat_confidence, 0)}`);
 
@@ -209,8 +218,16 @@ export default {
       draw(d.signal_field);
     }, 250));
 
+    // Re-render held vitals on a steady tick so a stalled stream clears to "—"
+    // after the hold window even without new frames.
+    const vitalsTick = setInterval(() => {
+      const brEl = $('#vs-br'), hrEl = $('#vs-hr');
+      if (brEl) brEl.textContent = brHold.text();
+      if (hrEl) hrEl.textContent = hrHold.text();
+    }, 1000);
+
     return () => {
-      off(); offGeo();
+      off(); offGeo(); clearInterval(vitalsTick);
       window.removeEventListener('resize', resize);
       window.removeEventListener('resize', gfResize);
     };

@@ -1,7 +1,8 @@
 // Dashboard — live operator overview. No marketing; leads with real data.
 import { icons } from '../icons.js';
-import { html, $, fetchJSON, fmt, setMeter, sparkPath, throttleLatest, vitalText } from '../lib.js';
+import { html, $, fetchJSON, fmt, setMeter, sparkPath, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
+import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
 
 function bigStat(label, id, unit = '') {
   return `<div class="stat">
@@ -17,6 +18,12 @@ export default {
   icon: icons.dashboard,
 
   async mount(root) {
+    // Hold vitals through brief confidence dips / dropped frames; clear to "—"
+    // only after holdMs of no confident reading. Both the live WS frames and the
+    // 4 s REST poll feed the same holders, so they reinforce rather than fight.
+    this._hrHold = makeVitalHold({ holdMs: 4000, decimals: 0 });
+    this._brHold = makeVitalHold({ holdMs: 4000, decimals: 1 });
+
     root.appendChild(html`
       <section class="space-y-5">
         <!-- Presence banner -->
@@ -104,17 +111,26 @@ export default {
       const v = await fetchJSON('/api/v1/vital-signs');
       const vs = v?.vital_signs; if (!vs) return;
       const present = this._present === true;
-      const setV = (id, t) => { const e = $(id); if (e) e.textContent = t; };
-      setV('#stat-br', vitalText(vs.breathing_rate_bpm, vs.breathing_confidence, 1, present));
-      setV('#stat-hr', vitalText(vs.heart_rate_bpm, vs.heartbeat_confidence, 0, present));
+      this._brHold.push(vs.breathing_rate_bpm, vs.breathing_confidence, present);
+      this._hrHold.push(vs.heart_rate_bpm, vs.heartbeat_confidence, present);
+      this.renderVitals();
     };
 
     refreshSystem(); refreshNodes(); refreshVitals();
     const t1 = setInterval(refreshSystem, 5000);
     const t2 = setInterval(refreshNodes, 5000);
     const t3 = setInterval(refreshVitals, 4000);
+    // Re-render on a steady tick so a held value still clears to "—" after the
+    // hold window even if frames/polls stop arriving (stalled stream).
+    const t4 = setInterval(() => this.renderVitals(), 1000);
 
-    return () => { off(); clearInterval(t1); clearInterval(t2); clearInterval(t3); };
+    return () => { off(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
+  },
+
+  renderVitals() {
+    const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
+    set('#stat-br', this._brHold.text());
+    set('#stat-hr', this._hrHold.text());
   },
 
   applyFrame(d) {
@@ -138,8 +154,9 @@ export default {
     set('#stat-people', String(people));
     set('#stat-conf', fmt.pct(c.confidence, 0));
     const vs = d.vital_signs || {};
-    set('#stat-br', vitalText(vs.breathing_rate_bpm, vs.breathing_confidence, 1, present));
-    set('#stat-hr', vitalText(vs.heart_rate_bpm, vs.heartbeat_confidence, 0, present));
+    this._brHold.push(vs.breathing_rate_bpm, vs.breathing_confidence, present);
+    this._hrHold.push(vs.heart_rate_bpm, vs.heartbeat_confidence, present);
+    this.renderVitals();
 
     const f = d.features || {};
     set('#f-var', fmt.num(f.variance, 3));
