@@ -298,13 +298,17 @@ _rusense_notify_lock = threading.Lock()
 # passes (vitals lag first detection), and it is closed at the presence fall.
 _rusense_sightings_lock = threading.Lock()
 _RUSENSE_SIGHTINGS_MAX = 50
-# A sighting is only trusted (logged/shown) once its confidence reaches this.
-# Empty-room disturbances cap around ~0.86 even when they briefly read
-# present+moving; a real occupant reaches ~1.0. Gating on the episode's PEAK
-# confidence (not just the first frame) keeps brief-but-confident real presence
-# — including a moving person with no vitals — while dropping the low-confidence
-# vital-less blips. Tune here if real presence ever reads lower.
-_RUSENSE_SIGHTING_MIN_CONF = 0.95
+
+# Presence is confirmed by the DUTY CYCLE of the raw presence signal, not by
+# confidence. Live tests: an empty room reads ~2% duty (≤20% in noisy windows)
+# at ~0.83 confidence; a STILL/sitting person reads ~35% duty at the SAME ~0.83
+# confidence; only a MOVING person's confidence rises (~1.0). So confidence
+# can't tell a still occupant from an empty room — duty can. These gate presence
+# for both alerts and the sightings log.
+_RUSENSE_PRES_WINDOW_S = 12.0    # rolling window (the notify loop samples ~1 Hz)
+_RUSENSE_PRES_MIN_SAMPLES = 5    # need a partly-full window before confirming
+_RUSENSE_PRES_ON = 0.18          # duty ≥ this → PRESENT (clears empty, catches sitting)
+_RUSENSE_PRES_OFF = 0.08         # duty ≤ this → EMPTY (hysteresis)
 
 
 def _rusense_model_active():
@@ -333,10 +337,12 @@ def _rusense_model_active():
 
 
 def _rusense_sighting_min_conf():
-    """Confidence a sighting must reach to be trusted: the strict gate when a
-    model calibrates confidence, else 0 — model-less we trust the presence rule
-    + debounce instead so real presence is never dropped."""
-    return _RUSENSE_SIGHTING_MIN_CONF if _rusense_model_active() else 0.0
+    """No confidence gate on sightings anymore — confidence can't distinguish a
+    still occupant from an empty room (both ~0.83). Presence is gated upstream by
+    the duty-cycle confirmation, so a confirmed sighting is already trustworthy.
+    Kept as a hook (returns 0 = keep all) so the endpoint/close/load code that
+    calls it stays unchanged."""
+    return 0.0
 
 
 def _rusense_sightings_file():
@@ -807,10 +813,28 @@ def _rusense_check_once():
             threshold = 1
         people_over = people >= threshold if threshold > 0 else people > 0
 
-        # Only confident samples advance the debounce; a low-confidence read is
-        # passed as None so it neither fires nor resets a pending timer.
         with _rusense_notify_lock:
-            p_rose, p_fell = _rusense_debounce('presence', present if confident else None, now, sustain)
+            # Presence: confidence can't tell a still occupant from an empty room
+            # (both ~0.83), so confirm by the DUTY CYCLE of the raw presence signal
+            # over a rolling window, with hysteresis. Empty ~2% < ON, sitting ~35%
+            # ≥ ON. This drives both the alert and the sighting log.
+            win = _rusense_notify_state.setdefault('presence_window', [])
+            win.append((now, bool(present)))
+            cutoff = now - _RUSENSE_PRES_WINDOW_S
+            while win and win[0][0] < cutoff:
+                win.pop(0)
+            duty = (sum(1 for _t, p in win if p) / len(win)) if win else 0.0
+            prev_state = _rusense_notify_state.get('presence_state', False)
+            new_state = prev_state
+            if not prev_state and len(win) >= _RUSENSE_PRES_MIN_SAMPLES and duty >= _RUSENSE_PRES_ON:
+                new_state = True
+            elif prev_state and duty <= _RUSENSE_PRES_OFF:
+                new_state = False
+            _rusense_notify_state['presence_state'] = new_state
+            p_rose = new_state and not prev_state
+            p_fell = prev_state and not new_state
+            # Motion / people keep the confidence-gated debounce — confidence is
+            # reliable for a MOVING person (~1.0), which is what these fire on.
             m_rose, _m_fell = _rusense_debounce('motion', motion_active if confident else None, now, sustain)
             o_rose, _o_fell = _rusense_debounce('people', people_over if confident else None, now, sustain)
 

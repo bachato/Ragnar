@@ -4,8 +4,8 @@
 // Navigation is driven by Ragnar's native sub-tab buttons (ragnar_modern.js).
 import { html, setQueryRoot } from './lib.js';
 import { sensingService } from '../services/sensing.service.js';
-import dashboard from './views/dashboard.js?v=20260701-rsanim';
-import sensing from './views/sensing.js?v=20260701-presencehold';
+import dashboard from './views/dashboard.js?v=20260701-vitfix';
+import sensing from './views/sensing.js?v=20260701-vitfix';
 import nodes from './views/nodes.js?v=20260701-nodenames';
 import training from './views/training.js?v=20260630-recstate';
 import settings from './views/settings.js?v=20260701-alertdefaults';

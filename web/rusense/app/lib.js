@@ -66,7 +66,7 @@ export const fmt = {
 /** Confidence below which a WiFi-CSI vital sign is treated as noise, not a
  *  reading. CSI vitals always produce *some* spectral peak (even on an empty
  *  room or through walls), so an unconfident value is a phantom, not a pulse. */
-export const VITAL_MIN_CONFIDENCE = 0.5;
+export const VITAL_MIN_CONFIDENCE = 0.3;
 
 /** Render a vital sign ONLY when someone is present AND the detector is
  *  confident; otherwise "—". Always returns a string so a stale reading clears

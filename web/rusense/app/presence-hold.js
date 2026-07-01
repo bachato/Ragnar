@@ -18,8 +18,9 @@
 // 20% duty; onFrac/offFrac are tunable per environment.
 export function makePresenceHold({
   windowMs = 2000,   // sliding window for the duty-cycle estimate
-  onFrac = 0.45,     // duty ≥ this flips to PRESENT (must clear the ~0.20 empty floor)
-  offFrac = 0.25,    // duty ≤ this (for lingerMs) flips back to EMPTY
+  onFrac = 0.18,     // duty ≥ this flips to PRESENT. Live data: empty ~2% (≤20% noisy),
+                     // a STILL/sitting person ~27-35% — 0.18 clears empty with margin, catches sitting.
+  offFrac = 0.08,    // duty ≤ this (for lingerMs) flips back to EMPTY
   lingerMs = 4000,   // once present, require the floor to hold this long before clearing
   minSamples = 10,   // don't let a lone startup spike (duty 1.0 of 1 sample) latch ON
 } = {}) {

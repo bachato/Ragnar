@@ -3,7 +3,7 @@ import { icons } from '../icons.js';
 import { html, $, fetchJSON, fmt, sparkPath, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
-import { makePresenceHold } from '../presence-hold.js?v=20260701-presencehold';
+import { makePresenceHold } from '../presence-hold.js?v=20260701-cal';
 
 function bigStat(label, id, unit = '') {
   return `<div class="stat">
@@ -39,8 +39,8 @@ export default {
     // Hold vitals through brief confidence dips / dropped frames; clear to "—"
     // only after holdMs of no confident reading. Both the live WS frames and the
     // 4 s REST poll feed the same holders, so they reinforce rather than fight.
-    this._hrHold = makeVitalHold({ holdMs: 4000, decimals: 0 });
-    this._brHold = makeVitalHold({ holdMs: 4000, decimals: 1 });
+    this._hrHold = makeVitalHold({ holdMs: 30000, decimals: 0 });
+    this._brHold = makeVitalHold({ holdMs: 30000, decimals: 1 });
     // Presence toggles 0↔1 at ~46 Hz (even in an empty room); smooth it with a
     // duty-cycle hysteresis biased toward PRESENT. Fed at full frame rate below.
     this._presence = makePresenceHold();
@@ -233,6 +233,12 @@ export default {
     if (!d || !d.classification) return;
     const c = d.classification;
     this._present = this._presence.push(c);
+    // Vitals arrive on rare, sparse frames (confident readings ~0.1% of frames),
+    // so push them here at FULL rate — the 250ms render throttle would drop them.
+    // The 30s hold then keeps the value on screen between confident readings.
+    const dvs = d.vital_signs || {};
+    this._brHold.push(dvs.breathing_rate_bpm, dvs.breathing_confidence, this._present);
+    this._hrHold.push(dvs.heart_rate_bpm, dvs.heartbeat_confidence, this._present);
     // Remember the last "occupied" people count + motion label so the banner
     // shows a stable value while presence is held (those raw fields flicker too).
     const rawPeople = d.estimated_persons ?? (d.persons?.length) ?? null;
@@ -264,10 +270,7 @@ export default {
 
     const set = (id, v) => { const e = $(id); if (e) e.textContent = v; };
     set('#stat-conf', fmt.pct(c.confidence, 0));
-    const vs = d.vital_signs || {};
-    const present = this._present === true;
-    this._brHold.push(vs.breathing_rate_bpm, vs.breathing_confidence, present);
-    this._hrHold.push(vs.heart_rate_bpm, vs.heartbeat_confidence, present);
+    // Vitals are pushed at full rate in applyPresence(); here we just re-render.
     this.renderVitals();
 
     const f = d.features || {};

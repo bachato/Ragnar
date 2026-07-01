@@ -660,13 +660,13 @@ export class HudController {
     // recomputes) instead of snapping the lerp to 0 and flickering to "--".
     // Clear only after HOLD_MS of no confident reading. updateHUD runs every
     // frame, so this staleness check re-evaluates continuously — no extra timer.
-    const HOLD_MS = 4000, MIN_CONF = 0.5;
+    const HOLD_MS = 30000, MIN_CONF = 0.3;
     const nowMs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     // Presence toggles 0↔1 at frame rate even in an empty room (~20% duty) at
     // high confidence, so read a duty-cycle over a sliding window with
     // hysteresis (biased toward PRESENT) instead of the raw boolean. Sample
     // only new frames (by timestamp) so a stalled live stream can't latch.
-    const PRES_WIN = 2000, PRES_ON = 0.45, PRES_OFF = 0.25, PRES_LINGER = 4000, PRES_MIN = 10;
+    const PRES_WIN = 2000, PRES_ON = 0.18, PRES_OFF = 0.08, PRES_LINGER = 4000, PRES_MIN = 10;
     this._presSamples = this._presSamples || [];
     const pts = data.timestamp;
     if (pts == null || pts !== this._presLastTs) {

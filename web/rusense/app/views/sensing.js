@@ -4,7 +4,7 @@ import { html, $, fmt, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { geofenceService } from '../../services/geofence.service.js?v=20260628-geofence';
 import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
-import { makePresenceHold } from '../presence-hold.js?v=20260701-presencehold';
+import { makePresenceHold } from '../presence-hold.js?v=20260701-cal';
 
 // Teal→amber→red ramp for the field heatmap.
 function heat(v) {
@@ -26,8 +26,8 @@ export default {
   async mount(root) {
     // Hold vitals through brief confidence dips / dropped frames; a steady tick
     // (below) clears them to "—" after holdMs so a stalled stream can't freeze.
-    const hrHold = makeVitalHold({ holdMs: 4000, decimals: 0 });
-    const brHold = makeVitalHold({ holdMs: 4000, decimals: 1 });
+    const hrHold = makeVitalHold({ holdMs: 30000, decimals: 0 });
+    const brHold = makeVitalHold({ holdMs: 30000, decimals: 1 });
     // Presence flickers 0↔1 at ~46 Hz; smooth it (duty-cycle hysteresis) from a
     // full-rate listener below. smPresent is the smoothed state the rest reads.
     const presence = makePresenceHold();
@@ -206,12 +206,10 @@ export default {
       set('#ft-freq', `${fmt.num(f.dominant_freq_hz, 2)} Hz`); set('#ft-cp', fmt.int(f.change_points));
       set('#ft-spec', fmt.num(f.spectral_power, 4)); set('#ft-tick', fmt.int(d.tick));
 
-      // Gate vitals on presence + confidence so an empty-room noise peak reads
-      // as "—", but hold the last confident value through brief dips instead of
-      // strobing value ↔ "—". The tick below clears it once genuinely stale.
+      // Vitals are pushed at FULL rate in the offP listener below (confident
+      // readings are sparse; this 250ms-throttled block would drop them). Here
+      // we just render the held value + live confidence.
       const vs = d.vital_signs || {};
-      brHold.push(vs.breathing_rate_bpm, vs.breathing_confidence, present);
-      hrHold.push(vs.heart_rate_bpm, vs.heartbeat_confidence, present);
       set('#vs-br', brHold.text());
       set('#vs-hr', hrHold.text());
       set('#vs-br-c', `confidence ${fmt.pct(vs.breathing_confidence, 0)}`);
@@ -227,6 +225,11 @@ export default {
     const offP = sensingService.onData((d) => {
       const c = d.classification || {};
       smPresent = presence.push(c);
+      // Vitals at full rate (sparse confident frames would be dropped by the
+      // throttle above); held 30s and rendered by the throttled block + tick.
+      const vvs = d.vital_signs || {};
+      brHold.push(vvs.breathing_rate_bpm, vvs.breathing_confidence, smPresent);
+      hrHold.push(vvs.heart_rate_bpm, vvs.heartbeat_confidence, smPresent);
       const ml = c.motion_level || '';
       if (ml.startsWith('present') || ml === 'active') lastMotion = ml;
       const motion = smPresent ? (lastMotion || 'present') : 'absent';
