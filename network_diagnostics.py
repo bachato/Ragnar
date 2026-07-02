@@ -180,6 +180,12 @@ def do_whois(target):
 def do_speedtest():
     """Run a bandwidth test. Supports both the Ookla `speedtest` CLI and the
     python `speedtest-cli`; returns download/upload in Mbps."""
+    # Self-heal: if neither client is present, install speedtest-cli on demand.
+    # A device updated from the UI may not have finished (or may have missed)
+    # background tool provisioning, and the old behaviour was to just error out
+    # telling the user to run the installer. Install it here so the button works.
+    if not _have('speedtest-cli') and not _have('speedtest'):
+        do_install_tool('speedtest-cli')
     if _have('speedtest-cli'):
         res = _run(['speedtest-cli', '--json'], timeout=120)
         if res['rc'] == 0:
