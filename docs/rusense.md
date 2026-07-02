@@ -158,6 +158,12 @@ of the alerts — the same sensing, inverted logic:
 
 - **Security** *(default)* — the space is expected **empty**: alert when someone
   **appears** (presence/motion/people). What you want for a home you're away from.
+  Optionally restrict these alerts to a **permitted schedule** (Settings → *Permitted
+  alert times*): chosen weekdays + a daily time window — e.g. an office watched only on
+  **weekends**, or a space only at **night**. Outside the window nothing is pushed
+  (sightings are still logged; node-offline warnings still fire). Config keys:
+  `rusense_alert_schedule_enabled`, `rusense_alert_days` (0=Sun..6=Sat), `rusense_alert_start`,
+  `rusense_alert_end` (start==end = all day; start>end wraps past midnight).
 - **Health** — the space is expected **occupied** (wellness monitoring, e.g. an elderly
   relative living alone): presence alerts would fire on every normal movement, so they're
   off; instead an **inactivity** alert fires when the home shows *no* activity for a set

@@ -661,6 +661,33 @@ def _rusense_inactivity_check(po, notify_on, now, present):
             title="RuSense — Inactivity", priority=1)
 
 
+def _rusense_within_alert_schedule(now):
+    """Whether SURVEILLANCE alerts (presence/motion/people) are permitted right
+    now. Off by default → always True (fire 24/7). When enabled, alerts fire
+    only on the selected weekdays within the daily time window (e.g. weekends
+    only, or nights only for an office that should then be empty). Sightings are
+    still recorded outside the window — only the phone push is held. Days use JS
+    getDay() convention (0=Sun..6=Sat) to match the Settings UI; the weekday is
+    read at the current clock time (an overnight window spanning midnight is
+    attributed to the day it lands on)."""
+    if not shared_data.config.get('rusense_alert_schedule_enabled', False):
+        return True
+    lt = time.localtime(now)
+    js_dow = (lt.tm_wday + 1) % 7          # tm_wday Mon=0..Sun=6 -> JS Sun=0..Sat=6
+    days = shared_data.config.get('rusense_alert_days')
+    if isinstance(days, (list, tuple)) and js_dow not in days:
+        return False
+    try:
+        start = int(shared_data.config.get('rusense_alert_start', 0)) % 24
+        end = int(shared_data.config.get('rusense_alert_end', 0)) % 24
+    except (TypeError, ValueError):
+        return True
+    if start == end:
+        return True                        # whole day
+    h = lt.tm_hour
+    return (start <= h < end) if start < end else (h >= start or h < end)
+
+
 # ── Geofence (server-side port of web/rusense/services/geofence.service.js) ──
 # Confines motion/presence/people alerts to the polygon of mapped node corners,
 # rejecting disturbances whose spatial signature points outside the room
@@ -877,6 +904,9 @@ def _rusense_check_once():
     gf_window = max(4, min(600, gf_window))
     gf_enabled = bool(shared_data.config.get('rusense_geofence_enabled', True))
     now = time.time()
+    # Surveillance alerts also respect the permitted-times schedule (if enabled);
+    # node-offline + inactivity keep plain notify_on (maintenance / health).
+    alerts_now = notify_on and _rusense_within_alert_schedule(now)
 
     # ── Nodes first: the roster feeds BOTH the geofence RSSI windows and the
     #    offline detector, so fetch it once and reuse it. ──
@@ -1040,7 +1070,7 @@ def _rusense_check_once():
                     _rusense_close_sighting(pending)
                     _rusense_notify_state['pending_close_ts'] = None
                 if not block_motion:
-                    if notify_on:
+                    if alerts_now:
                         who = f"{people} people" if people > 1 else "Someone"
                         po.notify_rusense(
                             'presence',
@@ -1057,7 +1087,7 @@ def _rusense_check_once():
         # Finalize a deferred close once the grace window elapses with no re-entry.
         pending = _rusense_notify_state.get('pending_close_ts')
         if pending is not None and (now - pending) > _RUSENSE_SIGHTING_MERGE_S:
-            if notify_on:
+            if alerts_now:
                 po.notify_rusense(
                     'presence',
                     "\U0001F6E1️ A monitored space is now empty.",
@@ -1068,12 +1098,12 @@ def _rusense_check_once():
         # the space stays occupied (no-op when there is no open sighting).
         if present:
             _rusense_update_sighting(now, conf if confident else None, vitals)
-        if notify_on and m_rose and not block_motion:
+        if alerts_now and m_rose and not block_motion:
             po.notify_rusense(
                 'motion',
                 "\U0001F3C3 Motion detected in a monitored space.",
                 title="RuSense — Motion")
-        if notify_on and o_rose and not block_motion:
+        if alerts_now and o_rose and not block_motion:
             po.notify_rusense(
                 'people',
                 f"\U0001F465 {people} people detected (threshold {threshold}).",

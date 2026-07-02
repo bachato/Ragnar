@@ -1215,6 +1215,16 @@
 
             <!-- ===================== Interfaces ===================== -->
             <div id="net-sub-interfaces" class="net-subview hidden">
+                <div class="glass rounded-xl p-4 sm:p-6 mb-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Network Identity</h3>
+                            <p class="text-sm text-gray-400">DNS domain &amp; search suffix, nameservers, this host&#39;s name/FQDN, and the default gateway.</p>
+                        </div>
+                        <button onclick="loadNetworkIdentity()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button>
+                    </div>
+                    <div id="net-identity-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
+                </div>
                 <div class="glass rounded-xl p-4 sm:p-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
                         <div class="min-w-0">
@@ -5386,7 +5396,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260701-foucfix"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260702-nettools"></script>
 
 </body>
 </html>

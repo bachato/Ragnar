@@ -199,7 +199,7 @@ echo -e "${BLUE}Step 6.9: Ensuring network diagnostic tools...${NC}"
 # Idempotent so existing installs pick them up on update (Debian/apt).
 if command -v apt-get >/dev/null 2>&1; then
     NET_PKGS=""
-    for pair in "traceroute:traceroute" "mtr:mtr-tiny" "whois:whois" "lldpctl:lldpd" "ethtool:ethtool" "speedtest-cli:speedtest-cli"; do
+    for pair in "traceroute:traceroute" "mtr:mtr-tiny" "whois:whois" "lldpctl:lldpd" "arp-scan:arp-scan" "ethtool:ethtool" "speedtest-cli:speedtest-cli"; do
         bin="${pair%%:*}"; pkg="${pair##*:}"
         command -v "$bin" >/dev/null 2>&1 || NET_PKGS="$NET_PKGS $pkg"
     done

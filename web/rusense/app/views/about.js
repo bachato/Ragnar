@@ -126,6 +126,7 @@ export default {
             'Set your Pushover <strong>User Key + API Token</strong> once under the main dashboard\'s <strong>Config → Pushover Notifications</strong>.',
             'Pick a <strong>Monitoring mode</strong> in Settings: <strong>Security</strong> (space should be empty — alert when someone appears), <strong>Health</strong> (space should be occupied — alert when it goes quiet, e.g. checking in on grandparents), or <strong>Both</strong>.',
             'Enable the triggers you want in the RuSense <strong>Settings</strong> tab (a master switch plus per-trigger toggles).',
+            'Optionally set <strong>Permitted alert times</strong> (Settings) to restrict surveillance alerts to chosen days + hours — e.g. an office only on weekends, or a space only at night.',
             'Use <strong>Send test notification</strong> to confirm delivery.',
           ])}
           <div class="text-sm font-medium">Triggers</div>

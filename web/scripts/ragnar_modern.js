@@ -823,7 +823,7 @@ function _setRusenseActive(name) {
 function loadRusenseLoader() {
     if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
     if (!_rusenseLoading) {
-        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260701-gfaware')
+        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260702-schedule')
             .then(m => { _rusenseLoader = m; return m; })
             .catch(err => { _rusenseLoading = null; throw err; });
     }
@@ -1113,6 +1113,7 @@ function showNetworkSubtab(name) {
     } else if (name === 'switch') {
         loadLldp();
     } else if (name === 'interfaces') {
+        loadNetworkIdentity();
         loadInterfaces();
     }
     // 'diagnostics' has no auto-load; tools run on demand.
@@ -1231,13 +1232,47 @@ async function runSpeedtest() {
     }
 }
 
+// Install a missing network tool on demand (whitelisted server-side), then
+// re-run the loader for the panel that reported it missing.
+async function installNetTool(tool, btn, reloadFn) {
+    _ndBusy(btn, true, 'Installing…');
+    try {
+        const r = await postAPI('/api/net/install-tool', { tool: tool });
+        if (r && r.success) {
+            addConsoleMessage(r.message || ('Installed ' + tool), 'success');
+            if (typeof reloadFn === 'function') reloadFn();
+        } else {
+            const msg = (r && r.error) ? r.error : 'unknown error';
+            addConsoleMessage('Install of ' + tool + ' failed: ' + msg, 'error');
+            alert('Install failed:\n\n' + msg);
+            _ndBusy(btn, false);
+        }
+    } catch (e) {
+        alert('Install failed: ' + e.message);
+        _ndBusy(btn, false);
+    }
+}
+
+// Render a "tool not installed" panel with a one-click Install button.
+// `reloadFnName` is the global function name to call after a successful install.
+function _ndMissingTool(data, reloadFnName) {
+    const tool = String(data.missing_tool || '');
+    // tool comes from a fixed server-side whitelist, so it is safe to inline.
+    return `<div class="text-sm text-amber-300 mb-2">${escapeHtml(data.error || (tool + ' is not installed.'))}</div>
+        <button onclick="installNetTool('${escapeHtml(tool)}', this, ${reloadFnName})"
+            class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-1.5 rounded text-sm whitespace-nowrap">
+            Install ${escapeHtml(tool)}</button>`;
+}
+
 async function loadLldp() {
     const out = document.getElementById('lldp-results');
     out.innerHTML = '<p class="text-gray-400">Loading neighbours…</p>';
     try {
         const data = await fetchAPI('/api/net/lldp');
         if (!data.success) {
-            out.innerHTML = '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'loadLldp')
+                : '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
         if (!data.neighbors || !data.neighbors.length) {
@@ -1276,7 +1311,9 @@ async function runArpScan() {
     try {
         const data = await fetchAPI('/api/net/arp-scan?interface=' + encodeURIComponent(iface));
         if (!data.success) {
-            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'runArpScan')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
         if (!data.hosts.length) {
@@ -1298,6 +1335,67 @@ async function runArpScan() {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     } finally {
         _ndBusy(btn, false);
+    }
+}
+
+async function loadNetworkIdentity() {
+    const out = document.getElementById('net-identity-results');
+    if (!out) return;
+    out.innerHTML = '<p class="text-gray-400">Loading…</p>';
+    try {
+        const d = await fetchAPI('/api/net/identity');
+        if (!d.success) {
+            out.innerHTML = '<p class="text-red-400">' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const rows = [];
+        const row = (label, value) => rows.push(
+            `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 text-gray-500 whitespace-nowrap align-top">${escapeHtml(label)}</td>
+                <td class="px-3 py-1.5 font-mono text-gray-200">${value}</td>
+            </tr>`);
+
+        // Domain / search suffix
+        let domainHtml;
+        if (d.domains && d.domains.length) {
+            domainHtml = d.domains.map(escapeHtml).join('<br>');
+        } else if (d.guessed_domain) {
+            domainHtml = escapeHtml(d.guessed_domain) +
+                ' <span class="text-amber-400 text-xs">(guessed from gateway/FQDN)</span>';
+        } else {
+            domainHtml = '<span class="text-gray-500">none advertised</span>';
+        }
+        row('Domain / search', domainHtml);
+
+        // Host name / FQDN
+        let hostHtml = escapeHtml(String(d.hostname || '—'));
+        if (d.fqdn) hostHtml += ' <span class="text-gray-500">(' + escapeHtml(d.fqdn) + ')</span>';
+        row('This host', hostHtml);
+
+        // Nameservers
+        let nsHtml;
+        if (d.nameservers && d.nameservers.length) {
+            nsHtml = d.nameservers.map(escapeHtml).join('<br>');
+            if (d.dns_stub) nsHtml += '<br><span class="text-gray-500 text-xs">upstream via systemd-resolved stub</span>';
+        } else {
+            nsHtml = '<span class="text-gray-500">—</span>';
+        }
+        row('Nameservers', nsHtml);
+
+        // Gateway
+        let gwHtml = '<span class="text-gray-500">—</span>';
+        if (d.gateway && d.gateway.ip) {
+            gwHtml = escapeHtml(d.gateway.ip);
+            if (d.gateway.ptr) gwHtml += ' <span class="text-gray-500">(' + escapeHtml(d.gateway.ptr) + ')</span>';
+        }
+        row('Default gateway', gwHtml);
+
+        const src = (d.sources && d.sources.length)
+            ? `<p class="text-[11px] text-gray-500 mt-2">Sources: ${d.sources.map(escapeHtml).join(', ')}</p>` : '';
+        out.innerHTML = `<table class="min-w-full text-sm">
+            <tbody>${rows.join('')}</tbody></table>${src}`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     }
 }
 

@@ -387,6 +387,49 @@ export default {
           </div>
         </div>
 
+        <div class="card card-pad space-y-3">
+          <div class="flex items-start justify-between gap-4">
+            <span class="min-w-0">
+              <h3 class="card-title">Permitted alert times (schedule)</h3>
+              <p class="text-xs text-ink-muted">Restrict presence / motion / people alerts to chosen days and a time
+                window — e.g. an office watched only on <strong>weekends</strong>, or a space only at <strong>night</strong>.
+                Outside the window nothing is pushed to your phone (sightings are still logged, and node-offline
+                warnings still fire). Off = alerts any time.</p>
+            </span>
+            <input type="checkbox" id="st-sched" data-key="rusense_alert_schedule_enabled"
+              ${c.rusense_alert_schedule_enabled ? 'checked' : ''}
+              class="mt-1 shrink-0 w-6 h-6 accent-brand-400 cursor-pointer" />
+          </div>
+          <div id="st-sched-body" class="space-y-3 ${c.rusense_alert_schedule_enabled ? '' : 'opacity-40 pointer-events-none'}">
+            <div>
+              <div class="flex items-center justify-between mb-1">
+                <span class="block text-sm font-medium">Days</span>
+                <span class="flex gap-1">
+                  <button type="button" id="st-days-wd" class="badge-mut text-xs">Weekdays</button>
+                  <button type="button" id="st-days-we" class="badge-mut text-xs">Weekends</button>
+                  <button type="button" id="st-days-all" class="badge-mut text-xs">All</button>
+                </span>
+              </div>
+              <div id="st-days" class="flex gap-1"></div>
+            </div>
+            <div class="grid gap-4 sm:grid-cols-2">
+              <label class="block">
+                <span class="block text-sm font-medium mb-1">From (hour)</span>
+                <input type="number" id="st-sched-start" min="0" max="23" step="1"
+                  value="${Number(c.rusense_alert_start ?? 0)}"
+                  class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              </label>
+              <label class="block">
+                <span class="block text-sm font-medium mb-1">Until (hour)</span>
+                <input type="number" id="st-sched-end" min="0" max="23" step="1"
+                  value="${Number(c.rusense_alert_end ?? 0)}"
+                  class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              </label>
+            </div>
+            <p id="st-sched-summary" class="text-xs text-ink-muted"></p>
+          </div>
+        </div>
+
         <div class="card card-pad space-y-1">
           <label class="flex items-start justify-between gap-4 py-1 cursor-pointer">
             <span class="min-w-0">
@@ -448,6 +491,49 @@ export default {
       }
     }));
 
+    // ── Alert schedule (permitted times) ──
+    const DAY_LABELS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];  // JS getDay(): 0=Sun
+    let schedDays = new Set(Array.isArray(c.rusense_alert_days) ? c.rusense_alert_days
+      : [0, 1, 2, 3, 4, 5, 6]);
+    const paintDays = () => {
+      const box = $('#st-days'); if (!box) return;
+      box.innerHTML = DAY_LABELS.map((d, i) => {
+        const on = schedDays.has(i);
+        return `<button type="button" data-day="${i}" class="flex-1 rounded-lg border px-0 py-2 text-xs font-medium cursor-pointer `
+          + (on ? 'border-brand-400 bg-brand-400/10 text-ink' : 'border-ink-3 text-ink-muted') + `">${d}</button>`;
+      }).join('');
+      box.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => {
+        const i = Number(b.dataset.day);
+        if (schedDays.has(i)) schedDays.delete(i); else schedDays.add(i);
+        paintDays(); paintSchedSummary();
+      }));
+    };
+    const paintSchedSummary = () => {
+      const el = $('#st-sched-summary'); if (!el) return;
+      const start = clampInt($('#st-sched-start'), 0, 23, 0);
+      const end = clampInt($('#st-sched-end'), 0, 23, 0);
+      const days = [...schedDays].sort((a, b) => a - b);
+      const dayTxt = !days.length ? 'no days (alerts never fire)'
+        : days.length === 7 ? 'every day'
+        : days.map((d) => DAY_LABELS[d]).join(' ');
+      const hh = (h) => `${String(h).padStart(2, '0')}:00`;
+      const timeTxt = start === end ? 'all day' : `${hh(start)}–${hh(end)}${end <= start ? ' (next day)' : ''}`;
+      el.textContent = `Alerts fire on ${dayTxt}, ${timeTxt}.`;
+    };
+    const syncSchedEnabled = () => {
+      const body = $('#st-sched-body'), on = $('#st-sched') && $('#st-sched').checked;
+      if (body) body.className = `space-y-3 ${on ? '' : 'opacity-40 pointer-events-none'}`;
+    };
+    paintDays(); paintSchedSummary();
+    if ($('#st-sched')) $('#st-sched').addEventListener('change', syncSchedEnabled);
+    ['#st-sched-start', '#st-sched-end'].forEach((sel) => {
+      if ($(sel)) $(sel).addEventListener('input', paintSchedSummary);
+    });
+    const setDays = (arr) => { schedDays = new Set(arr); paintDays(); paintSchedSummary(); };
+    if ($('#st-days-wd')) $('#st-days-wd').addEventListener('click', () => setDays([1, 2, 3, 4, 5]));
+    if ($('#st-days-we')) $('#st-days-we').addEventListener('click', () => setDays([0, 6]));
+    if ($('#st-days-all')) $('#st-days-all').addEventListener('click', () => setDays([0, 1, 2, 3, 4, 5, 6]));
+
     $('#st-save').addEventListener('click', async () => {
       const payload = { rusense_notify_enabled: $('#st-master').checked };
       for (const [k] of TOGGLES) {
@@ -462,6 +548,10 @@ export default {
       payload.rusense_inactivity_hours = clampInt($('#st-inact-hours'), 1, 24, 4);
       payload.rusense_quiet_start = clampInt($('#st-quiet-start'), 0, 23, 22);
       payload.rusense_quiet_end = clampInt($('#st-quiet-end'), 0, 23, 7);
+      payload.rusense_alert_schedule_enabled = $('#st-sched').checked;
+      payload.rusense_alert_days = [...schedDays].sort((a, b) => a - b);
+      payload.rusense_alert_start = clampInt($('#st-sched-start'), 0, 23, 0);
+      payload.rusense_alert_end = clampInt($('#st-sched-end'), 0, 23, 0);
       payload.rusense_geofence_enabled = $('#st-geofence').checked;
       // Reconcile the node map to the backend on every save (positions + names
       // also auto-sync as you edit them in the Observatory section below).

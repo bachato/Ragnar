@@ -766,6 +766,18 @@ class SharedData:
             # signature points outside the room (hallway walk-bys, through-wall
             # neighbours). Needs >= 3 nodes mapped with X/Y in the Settings tab;
             # with fewer mapped it is a no-op and alerts behave as before.
+            # Permitted alert schedule (surveillance): restrict presence/motion/
+            # people phone alerts to selected weekdays + a daily time window —
+            # e.g. an office watched only on weekends, or a space only at night.
+            # OFF by default (alerts fire 24/7). Sightings are still logged
+            # outside the window; only the phone push is held. Days follow JS
+            # getDay(): 0=Sun .. 6=Sat. start==end means the whole day; start>end
+            # wraps past midnight (e.g. 22->6). Node-offline + inactivity alerts
+            # are NOT gated by this (maintenance / health, not surveillance).
+            "rusense_alert_schedule_enabled": False,
+            "rusense_alert_days": [0, 1, 2, 3, 4, 5, 6],
+            "rusense_alert_start": 0,               # window start hour (local)
+            "rusense_alert_end": 0,                 # window end hour (local)
             "rusense_geofence_enabled": True,
             "rusense_node_positions": {},           # {node_id: {"x":.., "y":.., "z":..}}
             "rusense_node_names": {},               # {node_id: "friendly name"} (used in alerts)

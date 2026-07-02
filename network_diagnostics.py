@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import ipaddress
+import os
 from datetime import datetime
 
 try:
@@ -55,13 +56,14 @@ def _clamp_int(val, default, lo, hi):
     return max(lo, min(hi, n))
 
 
-def _run(cmd, timeout=30):
+def _run(cmd, timeout=30, env=None):
     """Run a command (list of args) and return {rc, out, err}.
 
     Never raises: missing binary -> rc 127, timeout -> rc 124.
     """
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=env)
         return {'rc': r.returncode, 'out': r.stdout, 'err': r.stderr}
     except FileNotFoundError:
         return {'rc': 127, 'out': '',
@@ -198,7 +200,9 @@ def do_lldp():
     neighbor advertises them."""
     if not _have('lldpctl'):
         return {'success': False,
-                'error': 'lldpd/lldpctl not installed (run the Ragnar installer/update to add it)',
+                'error': 'lldpd/lldpctl is not installed. Click Install to add it '
+                         '(configured for LLDP + CDP/EDP so Cisco switches are seen too).',
+                'missing_tool': 'lldpd',
                 'neighbors': []}
     res = _run(['lldpctl', '-f', 'json'], timeout=15)
     if res['rc'] != 0 and not res['out']:
@@ -269,9 +273,14 @@ def _parse_lldp_iface(local_if, info):
 
 
 def do_arp_scan(interface):
+    if not _have('arp-scan'):
+        return {'success': False,
+                'error': 'arp-scan is not installed. Click Install to add it.',
+                'missing_tool': 'arp-scan', 'hosts': []}
     res = _run(['arp-scan', f'--interface={interface}', '--localnet'], timeout=40)
     if res['rc'] == 127:
-        return {'success': False, 'error': res['err'], 'hosts': []}
+        return {'success': False, 'error': res['err'] or 'arp-scan not found',
+                'missing_tool': 'arp-scan', 'hosts': []}
     hosts = []
     for line in res['out'].splitlines():
         m = re.match(r'^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]{17})\s*(.*)$', line)
@@ -421,6 +430,211 @@ def do_interfaces(include_virtual=False):
 
 
 # --------------------------------------------------------------------------
+# Network identity: DNS search domain(s), nameservers, hostname/FQDN, gateway
+# --------------------------------------------------------------------------
+
+def _read_resolv_conf():
+    """Parse /etc/resolv.conf for search domains and nameservers.
+
+    Returns (domains, nameservers, stub) where `stub` is True when the only
+    nameserver is the systemd-resolved stub (127.0.0.53) -- in that case the
+    real upstream servers must come from nmcli/resolvectl instead."""
+    domains, nameservers = [], []
+    try:
+        with open('/etc/resolv.conf', 'r') as f:
+            text = f.read()
+    except OSError:
+        return domains, nameservers, False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('#') or not line:
+            continue
+        parts = line.split()
+        if parts[0] in ('search', 'domain'):
+            for d in parts[1:]:
+                if d not in domains:
+                    domains.append(d)
+        elif parts[0] == 'nameserver' and len(parts) > 1:
+            if parts[1] not in nameservers:
+                nameservers.append(parts[1])
+    stub = nameservers == ['127.0.0.53'] or nameservers == ['127.0.0.1']
+    return domains, nameservers, stub
+
+
+def _nmcli_global_values(field):
+    """Collect values for an nmcli field (e.g. IP4.DOMAINS, IP4.DNS) across all
+    devices. nmcli prints repeated keys as `FIELD[1]:value`."""
+    vals = []
+    if not _have('nmcli'):
+        return vals
+    res = _run(['nmcli', '-t', '-f', field, 'device', 'show'], timeout=6)
+    if res['rc'] != 0:
+        return vals
+    for line in res['out'].splitlines():
+        if ':' not in line:
+            continue
+        _, _, v = line.partition(':')
+        v = v.strip()
+        if v and v != '--' and v not in vals:
+            vals.append(v)
+    return vals
+
+
+def _default_gateway():
+    """Return the IPv4 default gateway IP, or None."""
+    res = _run(['ip', '-4', 'route', 'show', 'default'], timeout=5)
+    m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)', res['out'])
+    return m.group(1) if m else None
+
+
+def _reverse_dns(ip):
+    """Reverse-DNS an IP via getent (honours nsswitch, bounded by _run's
+    timeout). Returns the PTR hostname or None."""
+    if not ip:
+        return None
+    res = _run(['getent', 'hosts', ip], timeout=5)
+    if res['rc'] != 0:
+        return None
+    # Format: "192.168.1.1   gateway.lan alias1 alias2"
+    parts = res['out'].split()
+    if len(parts) >= 2 and parts[1] != ip:
+        return parts[1]
+    return None
+
+
+def do_network_identity():
+    """Best-effort identity of the network Ragnar is attached to: DNS search
+    domain(s), nameservers, this host's name/FQDN, and the default gateway
+    (with reverse-DNS). No single source is authoritative, so several are
+    merged and the provenance is reported."""
+    sources = []
+
+    rc_domains, rc_ns, stub = _read_resolv_conf()
+
+    # Search domains: union of resolv.conf and NetworkManager (DHCP option 15 /
+    # 119). NM is preferred when resolv.conf is the systemd stub.
+    domains = list(rc_domains)
+    for d in _nmcli_global_values('IP4.DOMAINS'):
+        if d not in domains:
+            domains.append(d)
+    if rc_domains:
+        sources.append('resolv.conf')
+    if _have('nmcli'):
+        sources.append('nmcli')
+
+    # Nameservers: resolv.conf, unless it only holds the local stub -- then use
+    # the upstream servers NetworkManager learned from DHCP.
+    nameservers = list(rc_ns)
+    nm_ns = _nmcli_global_values('IP4.DNS')
+    if stub or not nameservers:
+        nameservers = nm_ns or nameservers
+    else:
+        for n in nm_ns:
+            if n not in nameservers:
+                nameservers.append(n)
+
+    # Hostname / FQDN. `hostname -f` can resolve the FQDN via DNS; bounded by
+    # _run's timeout so a misconfigured resolver can't hang the request.
+    hostname = None
+    res = _run(['hostname'], timeout=5)
+    if res['rc'] == 0:
+        hostname = res['out'].strip() or None
+    fqdn = None
+    resf = _run(['hostname', '-f'], timeout=5)
+    if resf['rc'] == 0:
+        cand = resf['out'].strip()
+        if cand and cand != hostname and '.' in cand:
+            fqdn = cand
+
+    gw_ip = _default_gateway()
+    gateway = {'ip': gw_ip, 'ptr': _reverse_dns(gw_ip)} if gw_ip else None
+
+    # If no explicit search domain but the gateway/FQDN reveals one, surface it
+    # as a best-effort guess so the field isn't just empty.
+    guessed_domain = None
+    for cand in (fqdn, gateway['ptr'] if gateway else None):
+        if cand and '.' in cand:
+            guessed_domain = cand.split('.', 1)[1]
+            break
+
+    return {
+        'success': True,
+        'hostname': hostname,
+        'fqdn': fqdn,
+        'domains': domains,
+        'guessed_domain': guessed_domain if not domains else None,
+        'nameservers': nameservers,
+        'dns_stub': stub,
+        'gateway': gateway,
+        'sources': sources,
+    }
+
+
+# --------------------------------------------------------------------------
+# On-demand tool install (whitelisted apt packages, invoked from the UI)
+# --------------------------------------------------------------------------
+
+# Stable tool key -> (binary to probe, apt package name). Only these packages
+# can be installed via /api/net/install-tool, so the tool name is never
+# interpolated into a shell command.
+_NET_TOOL_PKGS = {
+    'lldpd': ('lldpctl', 'lldpd'),
+    'arp-scan': ('arp-scan', 'arp-scan'),
+    'ethtool': ('ethtool', 'ethtool'),
+    'mtr': ('mtr', 'mtr-tiny'),
+    'whois': ('whois', 'whois'),
+    'traceroute': ('traceroute', 'traceroute'),
+    'speedtest-cli': ('speedtest-cli', 'speedtest-cli'),
+}
+
+
+def _configure_lldpd():
+    """Enable CDP/EDP/FDP/SONMP decoding and (re)start lldpd -- mirrors the
+    Ragnar installer/updater so on-demand installs also see non-LLDP switches."""
+    try:
+        os.makedirs('/etc/default', exist_ok=True)
+        with open('/etc/default/lldpd', 'w') as f:
+            f.write('# Ragnar: decode CDP (Cisco), EDP (Extreme), FDP (Foundry), '
+                    'SONMP (Nortel)\n')
+            f.write('# neighbours in addition to LLDP, so switch discovery covers '
+                    'non-LLDP gear.\n')
+            f.write('DAEMON_ARGS="-c -e -f -s"\n')
+    except OSError:
+        pass
+    _run(['systemctl', 'enable', 'lldpd'], timeout=15)
+    _run(['systemctl', 'restart', 'lldpd'], timeout=15)
+
+
+def do_install_tool(tool):
+    """Install a missing network tool on demand via apt. Whitelisted packages
+    only. The Ragnar service runs as root, so apt is invoked directly."""
+    entry = _NET_TOOL_PKGS.get(tool)
+    if entry is None:
+        return {'success': False, 'error': f'Unknown or non-installable tool: {tool}'}
+    binary, pkg = entry
+    if _have(binary):
+        if tool == 'lldpd':
+            _configure_lldpd()
+        return {'success': True, 'already_installed': True, 'tool': tool,
+                'message': f'{binary} is already installed.'}
+    if not _have('apt-get'):
+        return {'success': False, 'tool': tool,
+                'error': 'apt-get is not available; install the package manually.'}
+    env = dict(os.environ)
+    env['DEBIAN_FRONTEND'] = 'noninteractive'
+    res = _run(['apt-get', 'install', '-y', pkg], timeout=300, env=env)
+    if not _have(binary):
+        tail = (res['err'] or res['out'] or '').strip()
+        tail = tail[-400:] if tail else 'no output'
+        return {'success': False, 'tool': tool,
+                'error': f'Installing {pkg} did not provide {binary}. '
+                         f'apt may need a working network / package index. Detail: {tail}'}
+    if tool == 'lldpd':
+        _configure_lldpd()
+    return {'success': True, 'tool': tool, 'message': f'Installed {pkg}.'}
+
+
+# --------------------------------------------------------------------------
 # Route registration
 # --------------------------------------------------------------------------
 
@@ -490,6 +704,18 @@ def register_network_diagnostics(app, logger=None):
             return _bad('Invalid or missing interface')
         _log(f"net/arp-scan {iface}")
         return jsonify(do_arp_scan(iface))
+
+    @app.route('/api/net/identity', methods=['GET'])
+    def net_identity():
+        _log("net/identity")
+        return jsonify(do_network_identity())
+
+    @app.route('/api/net/install-tool', methods=['POST'])
+    def net_install_tool():
+        data = request.get_json(silent=True) or {}
+        tool = (data.get('tool') or '').strip()
+        _log(f"net/install-tool {tool}")
+        return jsonify(do_install_tool(tool))
 
     @app.route('/api/net/interfaces', methods=['GET'])
     def net_interfaces():
