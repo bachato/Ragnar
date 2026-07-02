@@ -9031,21 +9031,23 @@ def _execute_git_update(repo_path: str) -> dict:
     provision_script = os.path.join(repo_path, 'scripts', 'provision_network_tools.sh')
     if os.path.isfile(provision_script):
         try:
-            logger.info("Provisioning network tools after update...")
-            prov = subprocess.run(
+            logger.info("Launching network tool provisioning in background...")
+            log_path = os.path.join(repo_path, 'data', 'logs', 'provision_network_tools.log')
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            log_fh = open(log_path, 'ab')
+            # Detach (start_new_session) and fire-and-forget so slow apt installs
+            # never delay the update response or the service restart the caller
+            # schedules right after this returns. Progress lands in the log file.
+            subprocess.Popen(
                 ['sudo', 'bash', provision_script],
-                capture_output=True, text=True, timeout=600
+                stdout=log_fh, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, start_new_session=True
             )
-            if prov.stdout.strip():
-                result['output'] = (result['output'] + '\n' + prov.stdout.strip()).strip()
-            if prov.returncode != 0:
-                warning = f"Network tool provisioning reported issues: {prov.stderr.strip() or 'see output'}"
-                logger.warning(warning)
-                result['warnings'].append(warning)
-            else:
-                logger.info("Network tool provisioning complete")
+            result['warnings'].append(
+                "Network tools are being provisioned in the background "
+                "(see data/logs/provision_network_tools.log)")
         except Exception as e:
-            warning = f"Network tool provisioning failed (continuing): {e}"
+            warning = f"Could not start network tool provisioning (continuing): {e}"
             logger.warning(warning)
             result['warnings'].append(warning)
     else:

@@ -114,6 +114,15 @@ else
     echo -e "${YELLOW}apt-get not available - skipping network tool install.${NC}"
 fi
 
+# The speedtest diagnostic (network_diagnostics.py) probes `speedtest-cli`
+# first, then a bare `speedtest`. The apt speedtest-cli package usually ships
+# both binaries, but on distros where it only provides speedtest-cli, guarantee
+# a `speedtest` alias too so neither lookup can miss.
+if command -v speedtest-cli >/dev/null 2>&1 && ! command -v speedtest >/dev/null 2>&1; then
+    ln -sf "$(command -v speedtest-cli)" /usr/local/bin/speedtest \
+        && echo -e "  ${GREEN}✓${NC} Linked speedtest -> speedtest-cli"
+fi
+
 # ---------------------------------------------------------------------------
 # 3. lldpd switch-discovery decoding
 # ---------------------------------------------------------------------------

@@ -183,12 +183,17 @@ else
     echo -e "${GREEN}No Pwnagotchi installation found or migration script missing. Skipping.${NC}"
 fi
 
-echo -e "${BLUE}Step 6.8: Provisioning radios + network tools...${NC}"
+echo -e "${BLUE}Step 6.8: Provisioning radios + network tools (background)...${NC}"
 # rfkill unblock, network diagnostic tools, and lldpd switch decoding now
 # live in one shared script so the in-app Update button provisions the same
 # things as this CLI updater (see webapp_modern.py _execute_git_update).
+# Run it in the background so slow apt installs never hold up the ragnar
+# service restart below -- the tools are not needed for ragnar to start.
 if [ -f "$ragnar_PATH/scripts/provision_network_tools.sh" ]; then
-    bash "$ragnar_PATH/scripts/provision_network_tools.sh"
+    mkdir -p "$ragnar_PATH/data/logs"
+    nohup bash "$ragnar_PATH/scripts/provision_network_tools.sh" \
+        > "$ragnar_PATH/data/logs/provision_network_tools.log" 2>&1 &
+    echo -e "  ${GREEN}✓${NC} Provisioning started in background (log: data/logs/provision_network_tools.log)"
 else
     echo -e "${YELLOW}provision_network_tools.sh missing - skipping tool provisioning.${NC}"
 fi

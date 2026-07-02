@@ -573,6 +573,15 @@ EOF
         log "WARNING" "lldpd not available - switch discovery (Switch & L2 tab) will be limited"
     fi
 
+    # The speedtest diagnostic probes `speedtest-cli` first, then a bare
+    # `speedtest`. The apt speedtest-cli package usually ships both, but on
+    # distros where it only provides speedtest-cli, guarantee a `speedtest`
+    # alias too so neither lookup can miss. Mirrors provision_network_tools.sh.
+    if command -v speedtest-cli >/dev/null 2>&1 && ! command -v speedtest >/dev/null 2>&1; then
+        ln -sf "$(command -v speedtest-cli)" /usr/local/bin/speedtest \
+            && log "SUCCESS" "Linked speedtest -> speedtest-cli"
+    fi
+
     # Create basic wpa_supplicant configuration if it doesn't exist
     if [ ! -f "/etc/wpa_supplicant/wpa_supplicant.conf" ]; then
         log "INFO" "Creating basic wpa_supplicant configuration..."
