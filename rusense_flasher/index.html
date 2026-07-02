@@ -19,6 +19,7 @@
         color: #e8eef3; font-size: .95rem;
       }
       .prov-fields input::placeholder { color: #7f8ea3; }
+      .prov-fields .prov-hint { grid-column: 1 / -1; margin: -.15rem 0 0; font-size: .8rem; line-height: 1.35; color: #9fb0c3; }
       @media (max-width: 560px) { .prov-fields { grid-template-columns: 1fr; } }
     </style>
   </head>
@@ -63,6 +64,7 @@
           <input id="prov-ip" type="text" placeholder="Server IP — e.g. 192.168.1.20" autocomplete="off" />
           <input id="prov-port" type="number" value="5005" min="1" max="65535" placeholder="Port" />
           <input id="prov-node" type="number" value="1" min="0" max="255" placeholder="Node ID (0-255, unique per node)" title="Give each node in the mesh a different ID, e.g. 1, 2, 3. Nodes with the same ID collide and only one shows up." />
+          <p class="prov-hint">⚠️ Give <strong>each node a unique Node ID</strong> (1, 2, 3…). Two nodes sharing an ID collide, so only one shows up in RuSense.</p>
         </div>
         <div class="flash-buttons">
           <button class="btn-flash" onclick="provisionDevice()">🛰️ Write WiFi config</button>
