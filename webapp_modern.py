@@ -9023,6 +9023,36 @@ def _execute_git_update(repo_path: str) -> dict:
         logger.warning(warning)
         result['warnings'].append(warning)
 
+    # Provision radios (rfkill) + network diagnostic tools + lldpd, the same way
+    # the CLI updater does. Without this, updating from the Settings tab only
+    # pulled code and a device would be left missing traceroute/mtr/lldpd/etc.
+    # The shared script is idempotent and never fails the update on a single
+    # missing tool, so provisioning problems become warnings, not hard errors.
+    provision_script = os.path.join(repo_path, 'scripts', 'provision_network_tools.sh')
+    if os.path.isfile(provision_script):
+        try:
+            logger.info("Provisioning network tools after update...")
+            prov = subprocess.run(
+                ['sudo', 'bash', provision_script],
+                capture_output=True, text=True, timeout=600
+            )
+            if prov.stdout.strip():
+                result['output'] = (result['output'] + '\n' + prov.stdout.strip()).strip()
+            if prov.returncode != 0:
+                warning = f"Network tool provisioning reported issues: {prov.stderr.strip() or 'see output'}"
+                logger.warning(warning)
+                result['warnings'].append(warning)
+            else:
+                logger.info("Network tool provisioning complete")
+        except Exception as e:
+            warning = f"Network tool provisioning failed (continuing): {e}"
+            logger.warning(warning)
+            result['warnings'].append(warning)
+    else:
+        warning = "provision_network_tools.sh not found - network tools not provisioned"
+        logger.warning(warning)
+        result['warnings'].append(warning)
+
     result['success'] = True
     return result
 
