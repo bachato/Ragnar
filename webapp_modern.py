@@ -309,6 +309,15 @@ _RUSENSE_PRES_WINDOW_S = 12.0    # rolling window (the notify loop samples ~1 Hz
 _RUSENSE_PRES_MIN_SAMPLES = 5    # need a partly-full window before confirming
 _RUSENSE_PRES_ON = 0.18          # duty ≥ this → PRESENT (clears empty, catches sitting)
 _RUSENSE_PRES_OFF = 0.08         # duty ≤ this → EMPTY (hysteresis)
+# With an ADAPTIVE model loaded the picture shifts: the model emits present_still
+# classifications, so an EMPTY room's presence-duty rises from ~2% (model-less)
+# to ~15% overall with 12s-window peaks ~23% (live: 2-class present_still/absent
+# model). The model-less 18% gate then false-fires on an empty room. Raise the
+# gates when a model is active — a real sitter reads well above these (confirmed
+# by the user), an empty room stays below. Model-less keeps the low gates so a
+# still sitter (~27-40% duty) is never missed. See [[rusense-presence-hold]].
+_RUSENSE_PRES_ON_MODEL = 0.35    # empty peaks ~23% with a model → clear margin above
+_RUSENSE_PRES_OFF_MODEL = 0.18   # empty averages ~15% → clears; holds a real sitter
 # Grace window that bridges a brief presence fall (perimeter excursion / duty dip)
 # back to a rise, so one continuous occupancy is ONE sighting instead of several
 # fragments. Backend analog of the frontend presence-hold's lingerMs. Live tests
@@ -891,8 +900,13 @@ def _rusense_check_once():
     # uncalibrated (~0.5), so a high bar would silently drop real presence —
     # relax the gate to 0 and lean on the motion-corroborated presence rule +
     # sustain debounce instead. Never miss presence for lack of a model.
-    if not _rusense_model_active():
+    has_model = _rusense_model_active()
+    if not has_model:
         min_conf = 0.0
+    # Duty gates are model-aware: a loaded model lifts the empty-room baseline
+    # (see the constants above), so use the higher gates then.
+    pres_on = _RUSENSE_PRES_ON_MODEL if has_model else _RUSENSE_PRES_ON
+    pres_off = _RUSENSE_PRES_OFF_MODEL if has_model else _RUSENSE_PRES_OFF
     try:
         sustain = float(shared_data.config.get('rusense_notify_sustain_s', 2))
     except (TypeError, ValueError):
@@ -1033,9 +1047,9 @@ def _rusense_check_once():
             duty = (sum(1 for _t, p in win if p) / len(win)) if win else 0.0
             prev_state = _rusense_notify_state.get('presence_state', False)
             new_state = prev_state
-            if not prev_state and len(win) >= _RUSENSE_PRES_MIN_SAMPLES and duty >= _RUSENSE_PRES_ON:
+            if not prev_state and len(win) >= _RUSENSE_PRES_MIN_SAMPLES and duty >= pres_on:
                 new_state = True
-            elif prev_state and duty <= _RUSENSE_PRES_OFF:
+            elif prev_state and duty <= pres_off:
                 new_state = False
             _rusense_notify_state['presence_state'] = new_state
             p_rose = new_state and not prev_state
@@ -1098,6 +1112,18 @@ def _rusense_check_once():
         # the space stays occupied (no-op when there is no open sighting).
         if present:
             _rusense_update_sighting(now, conf if confident else None, vitals)
+        # Publish the smoothed, model-aware presence decision (the SAME state that
+        # gates alerts) for the dashboard to render — one source of truth instead
+        # of the frontend re-deriving presence from a noisier 2s window.
+        bk_present = _rusense_notify_state.get('presence_state', False)
+        _rusense_notify_state['presence_pub'] = {
+            'present': bool(bk_present),
+            'people': max(1, int(people or 0)) if bk_present else 0,
+            'motion_level': (motion_level or 'present') if bk_present else 'absent',
+            'confidence': conf,
+            'model_active': bool(has_model),
+            'ts': now,
+        }
         if alerts_now and m_rose and not block_motion:
             po.notify_rusense(
                 'motion',
@@ -1200,6 +1226,26 @@ def rusense_sightings():
            or (s.get('confidence') or 0) >= min_conf]
     lst = lst[::-1]  # newest first
     return jsonify({'success': True, 'count': len(lst), 'sightings': lst})
+
+
+@app.route('/api/rusense/presence', methods=['GET'])
+def rusense_presence():
+    """The backend's authoritative presence decision — the same smoothed,
+    model-aware, duty-cycle state that gates alerts/sightings. The dashboard
+    renders THIS so it never disagrees with the alerts (and doesn't need to
+    re-tune its own gate per model). age_s lets the client fall back to its live
+    stream if the backend loop has stalled."""
+    pub = _rusense_notify_state.get('presence_pub') or {}
+    ts = pub.get('ts')
+    return jsonify({
+        'success': True,
+        'present': bool(pub.get('present', False)),
+        'people': int(pub.get('people', 0)),
+        'motion_level': pub.get('motion_level', 'absent'),
+        'confidence': pub.get('confidence'),
+        'model_active': bool(pub.get('model_active', False)),
+        'age_s': (round(time.time() - ts, 1) if ts else None),
+    })
 
 
 @app.route('/api/rusense/vitals-history', methods=['GET'])

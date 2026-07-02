@@ -681,7 +681,18 @@ export class HudController {
       else if (duty >= PRES_OFF) { this._presLastOccAt = nowMs; }
       else if (nowMs - (this._presLastOccAt || 0) >= PRES_LINGER) { this._smPresent = false; }
     }
-    const present = this._smPresent === true;
+    // Backend-authoritative presence override: poll the same smoothed, model-aware
+    // decision that gates alerts (~1.3s; presence needs no frame-rate). Keeps the
+    // 3D HUD in lock-step with the dashboard/alerts. Falls back to the local duty
+    // estimate only if the backend is unreachable/stale.
+    if (!this._bkPresAt || nowMs - this._bkPresAt >= 1300) {
+      this._bkPresAt = nowMs;
+      fetch('/api/rusense/presence').then((r) => (r.ok ? r.json() : null)).then((p) => {
+        this._bkPres = (p && p.success !== false && (p.age_s == null || p.age_s <= 12))
+          ? { present: p.present === true, people: p.people || 0 } : null;
+      }).catch(() => {});
+    }
+    const present = this._bkPres ? this._bkPres.present : (this._smPresent === true);
     const mlNow = String(cls.motion_level || '');
     if (present && (mlNow.startsWith('present') || mlNow === 'active')) this._presLastMotion = mlNow;
     // Live sensing-server sends heartbeat_confidence; demo data uses heart_rate_confidence.
@@ -743,8 +754,13 @@ export class HudController {
 
     // Mini person-count dots — gate on the smoothed presence and hold the last
     // positive count so the dots don't strobe with the raw boolean.
+    // People: prefer the backend's corroborated count (median across nodes —
+    // rejects a single node hallucinating 1 through a wall). Fall back to the raw
+    // engine estimate only when the backend is unavailable.
     if (data.estimated_persons > 0) this._presLastPeople = data.estimated_persons;
-    const personCount = present ? (this._presLastPeople || 1) : 0;
+    const personCount = this._bkPres
+      ? this._bkPres.people
+      : (present ? (this._presLastPeople || 1) : 0);
     this._updatePersonDots(personCount);
 
     const presEl = document.getElementById('presence-indicator');

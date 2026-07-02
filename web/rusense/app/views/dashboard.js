@@ -3,7 +3,6 @@ import { icons } from '../icons.js';
 import { html, $, fetchJSON, fmt, sparkPath, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
-import { makePresenceHold } from '../presence-hold.js?v=20260701-cal';
 
 function bigStat(label, id, unit = '') {
   return `<div class="stat">
@@ -93,11 +92,6 @@ export default {
     this._brHold = makeVitalHold({ holdMs: 30000, decimals: 1 });
     // Presence toggles 0↔1 at ~46 Hz (even in an empty room); smooth it with a
     // duty-cycle hysteresis biased toward PRESENT. Fed at full frame rate below.
-    this._presence = makePresenceHold();
-    this._present = false;
-    this._lastPeople = 0;
-    this._lastMotion = '';
-    this._presSig = null;
     // Custom node names live in Ragnar config (set in Settings), not in the
     // sensing-server's /api/v1/nodes roster — fetch them once to label nodes.
     this._nodeNames = {};
@@ -113,6 +107,10 @@ export default {
     this._sightings = [];
     this._nodePeople = null;  // corroborated people count (median across nodes)
     this._gf = null;          // last geofence verdict (5s poll)
+    // Authoritative presence comes from the BACKEND (/api/rusense/presence):
+    // the same smoothed, model-aware duty decision that gates alerts. The
+    // frontend no longer re-derives presence from its own noisier 2s window.
+    this._bk = { present: false, people: 0, motion: 'absent', fresh: false };
     this._trendHours = 24;
     this._trendBuckets = [];
     this._trendBucketS = 300;
@@ -258,7 +256,7 @@ export default {
       // Vitals may not ride every WS frame — poll the dedicated endpoint.
       const v = await fetchJSON('/api/v1/vital-signs');
       const vs = v?.vital_signs; if (!vs) return;
-      const present = this._present === true;
+      const present = this._bk.present === true;
       this._brHold.push(vs.breathing_rate_bpm, vs.breathing_confidence, present);
       this._hrHold.push(vs.heart_rate_bpm, vs.heartbeat_confidence, present);
       this.renderVitals();
@@ -283,7 +281,19 @@ export default {
     if (b24) b24.addEventListener('click', () => setRange(24));
     if (b7) b7.addEventListener('click', () => setRange(168));
 
-    refreshHealth(); refreshVitals(); refreshSightings(); refreshTrends();
+    // Authoritative presence from the backend (~1.3s poll — presence doesn't need
+    // frame-rate). If the backend loop has stalled (age_s large / unreachable),
+    // hold the last state rather than flapping to empty.
+    const refreshPresence = async () => {
+      const p = await fetchJSON('/api/rusense/presence');
+      if (!p || p.success === false) { this._bk.fresh = false; return; }
+      if (p.age_s != null && p.age_s > 12) { this._bk.fresh = false; return; }
+      this._bk = { present: p.present === true, people: p.people || 0,
+        motion: p.motion_level || 'absent', fresh: true };
+      this.renderPresence();
+    };
+
+    refreshHealth(); refreshVitals(); refreshSightings(); refreshTrends(); refreshPresence();
     const t1 = setInterval(refreshHealth, 5000);
     const t2 = setInterval(refreshSightings, 7000);
     const t3 = setInterval(refreshVitals, 4000);
@@ -291,8 +301,9 @@ export default {
     // hold window even if frames/polls stop arriving (stalled stream).
     const t4 = setInterval(() => { this.renderVitals(); this.renderSightings(); }, 1000);
     const t5 = setInterval(refreshTrends, 60000);
+    const t6 = setInterval(refreshPresence, 1300);
 
-    return () => { off(); offP(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); clearInterval(t5); };
+    return () => { off(); offP(); clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); clearInterval(t5); clearInterval(t6); };
   },
 
   renderVitals() {
@@ -394,48 +405,37 @@ export default {
       }).join('')}</tbody></table></div>`;
   },
 
-  // Full-rate presence: smooth the flickering boolean and only touch the DOM
-  // when the displayed state actually changes.
+  // Full-rate vitals push. Presence itself is NOT decided here anymore (the
+  // backend owns it — see refreshPresence); we only keep the sparse confident
+  // vital readings, gated on the backend's present flag.
   applyPresence(d) {
     if (!d || !d.classification) return;
-    const c = d.classification;
-    this._present = this._presence.push(c);
-    // Vitals arrive on rare, sparse frames (confident readings ~0.1% of frames),
-    // so push them here at FULL rate — the 250ms render throttle would drop them.
-    // The 30s hold then keeps the value on screen between confident readings.
+    this._lastSource = d.source;
+    const present = this._bk.present === true;
     const dvs = d.vital_signs || {};
-    this._brHold.push(dvs.breathing_rate_bpm, dvs.breathing_confidence, this._present);
-    this._hrHold.push(dvs.heart_rate_bpm, dvs.heartbeat_confidence, this._present);
-    // Remember the last "occupied" people count + motion label so the banner
-    // shows a stable value while presence is held. NEVER use persons[].length —
-    // the raw detection list flickers 1-4 with ghosts (live data) while the
-    // corroborated counts never leave 1. Node median first (majority-agreed),
-    // then the engine's own estimate.
-    const rawPeople = this._nodePeople ?? d.estimated_persons ?? null;
-    const ml = c.motion_level || '';
-    if (rawPeople != null && rawPeople > 0) this._lastPeople = rawPeople;
-    if (ml.startsWith('present') || ml === 'active') this._lastMotion = ml;
+    this._brHold.push(dvs.breathing_rate_bpm, dvs.breathing_confidence, present);
+    this._hrHold.push(dvs.heart_rate_bpm, dvs.heartbeat_confidence, present);
+  },
 
-    const present = this._present === true;
-    // Through-wall discrimination: presence duty can clear the gate for a body
-    // in the NEXT room (one node sees it through the wall). The geofence knows
-    // — real energy, zero interior corners — so show that as its own state
-    // instead of claiming "Person present". Same rule that suppresses alerts.
+  // Render the presence banner from the BACKEND decision + geofence verdict.
+  renderPresence() {
+    const bk = this._bk;
+    const present = bk.present === true;
+    // Through-wall discrimination: a body in the next room (one node sees it
+    // through the wall) is energetic but not interior. Show it as its own amber
+    // state rather than "Person present" — same rule that suppresses alerts.
     const gfOutside = present && this._gf && this._gf.energetic && !this._gf.inside_perimeter;
-    const people = present ? (this._lastPeople || 1) : 0;
-    const motion = present ? (this._lastMotion || 'present') : 'absent';
-    const sig = `${present}|${gfOutside}|${people}|${motion}|${d.source}`;
-    if (sig === this._presSig) return;
-    this._presSig = sig;
-
+    const people = present ? (bk.people || 1) : 0;
+    const motion = present ? (bk.motion || 'present') : 'absent';
+    const simulated = this._lastSource === 'simulated';
     const dot = $('#presence-dot'), txt = $('#presence-text'), sub = $('#presence-sub'), mb = $('#motion-badge');
     if (dot) dot.className = `dot w-3.5 h-3.5 ${present ? (gfOutside ? 'bg-warn pulse-live' : 'bg-ok pulse-live') : 'bg-ink-4'}`;
     if (txt) txt.textContent = !present ? 'Room empty'
       : gfOutside ? 'Activity outside perimeter'
       : (people > 1 ? `${people} people present` : 'Person present');
-    if (sub) sub.textContent = d.source === 'simulated' ? 'Simulated data (no live hardware)'
+    if (sub) sub.textContent = simulated ? 'Simulated data (no live hardware)'
       : gfOutside ? 'Disturbance not corroborated inside the room — next room or hallway (alerts suppressed)'
-      : `${motion.replace(/_/g, ' ')} · source: ${d.source}`;
+      : `${motion.replace(/_/g, ' ')} · source: ${this._lastSource || 'esp32'}`;
     if (mb) {
       const kind = motion === 'active' ? 'badge-ok' : (present ? 'badge-warn' : 'badge-mut');
       mb.className = kind; mb.textContent = motion.replace(/_/g, ' ');
