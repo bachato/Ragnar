@@ -1126,6 +1126,76 @@ function showNetworkSubtab(name) {
 // Backend: /api/net/* (see network_diagnostics.py)
 // ============================================================================
 
+// Last-fetched payloads for each net panel, so "Export CSV" has data to dump.
+let _ndLastLldp = [], _ndLastArp = null, _ndLastIfaces = [],
+    _ndLastMtr = null, _ndLastIdentity = null;
+
+// Build a CSV from a header row + rows (arrays of cells) and download it.
+function _ndDownloadCsv(nameBase, header, rows) {
+    if (!rows || !rows.length) {
+        addConsoleMessage('Nothing to export yet — run it first', 'warning');
+        return;
+    }
+    const q = (c) => `"${String(c == null ? '' : c).replace(/"/g, '""')}"`;
+    const csv = [header].concat(rows).map(r => r.map(q).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ragnar_${nameBase}_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+function exportLldpCsv() {
+    _ndDownloadCsv('switch_neighbors',
+        ['Local IF', 'Protocol', 'Switch', 'Switch descr', 'Port', 'VLAN ID', 'VLAN name', 'Mgmt IP'],
+        (_ndLastLldp || []).map(n => [n.local_interface, n.protocol, n.switch_name,
+            n.switch_descr, (n.port_descr || n.port_id), n.vlan_id, n.vlan_name, n.mgmt_ip]));
+}
+
+function exportArpCsv() {
+    const d = _ndLastArp;
+    _ndDownloadCsv('arp_scan' + (d && d.interface ? '_' + d.interface : ''),
+        ['IP', 'MAC', 'Vendor'],
+        (d && d.hosts || []).map(h => [h.ip, h.mac, h.vendor]));
+}
+
+function exportInterfacesCsv() {
+    _ndDownloadCsv('interfaces',
+        ['Name', 'Type', 'Operstate', 'Link detected', 'Speed', 'Duplex', 'Auto-neg',
+         'IP method', 'IPv4', 'IPv6', 'MAC', 'VLAN ID', 'VLAN proto'],
+        (_ndLastIfaces || []).map(i => [i.name, i.type, i.operstate, i.link_detected,
+            i.speed, i.duplex, i.autoneg, i.ip_method, (i.ipv4 || []).join(' '),
+            (i.ipv6 || []).join(' '), i.mac, i.vlan_id, i.vlan_proto]));
+}
+
+function exportMtrCsv() {
+    const d = _ndLastMtr;
+    if (!d) { addConsoleMessage('Run MTR first', 'warning'); return; }
+    const base = 'mtr_' + String(d.target || 'target').replace(/[^a-z0-9._-]/gi, '_');
+    _ndDownloadCsv(base,
+        ['Hop', 'Host', 'Loss %', 'Sent', 'Last', 'Avg', 'Best', 'Worst', 'Jitter (StDev)'],
+        (d.hops || []).map(h => [h.hop, h.host, h.loss_pct, h.sent, h.last, h.avg, h.best, h.worst, h.stdev]));
+}
+
+function exportIdentityCsv() {
+    const d = _ndLastIdentity;
+    if (!d) { addConsoleMessage('Load Network Identity first', 'warning'); return; }
+    const domain = (d.domains && d.domains.length) ? d.domains.join(' ')
+        : (d.guessed_domain ? d.guessed_domain + ' (guessed)' : '');
+    _ndDownloadCsv('network_identity', ['Field', 'Value'], [
+        ['Domain / search', domain],
+        ['Hostname', d.hostname],
+        ['FQDN', d.fqdn],
+        ['Nameservers', (d.nameservers || []).join(' ')],
+        ['DNS via stub', d.dns_stub],
+        ['Gateway IP', d.gateway ? d.gateway.ip : ''],
+        ['Gateway PTR', d.gateway ? d.gateway.ptr : ''],
+        ['Sources', (d.sources || []).join(' ')],
+    ]);
+}
+
 function _ndBusy(btn, busy, busyLabel) {
     if (!btn) return;
     if (busy) {
@@ -1211,6 +1281,7 @@ async function runMtr() {
             out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
+        _ndLastMtr = { target: target, source: source, count: count, hops: data.hops || [] };
         // Severity colour helpers (per-hop RTT in ms). Thresholds are generous
         // so only genuinely bad hops light up.
         const latColor = (ms) => (ms > 150) ? 'text-red-400' : (ms > 60) ? 'text-yellow-400' : '';
@@ -1314,6 +1385,7 @@ async function loadLldp() {
                 : '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
+        _ndLastLldp = data.neighbors || [];
         if (!data.neighbors || !data.neighbors.length) {
             out.innerHTML = '<p class="text-gray-400">No switch neighbours discovered. ' + escapeHtml(data.note || '') + '</p>';
             return;
@@ -1355,6 +1427,7 @@ async function runArpScan() {
                 : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
+        _ndLastArp = data;
         if (!data.hosts.length) {
             out.innerHTML = '<p class="text-sm text-gray-400">No hosts responded on ' + escapeHtml(iface) + '.</p>';
             return;
@@ -1387,6 +1460,7 @@ async function loadNetworkIdentity() {
             out.innerHTML = '<p class="text-red-400">' + escapeHtml(d.error || 'failed') + '</p>';
             return;
         }
+        _ndLastIdentity = d;
         const rows = [];
         const row = (label, value) => rows.push(
             `<tr class="border-t border-slate-800">
@@ -1447,6 +1521,7 @@ async function loadInterfaces() {
             out.innerHTML = '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
+        _ndLastIfaces = data.interfaces || [];
         const methodBadge = (m) => {
             const map = {
                 dhcp: 'bg-blue-900/50 text-blue-300', static: 'bg-purple-900/50 text-purple-300',

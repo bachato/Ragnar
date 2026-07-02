@@ -1159,6 +1159,7 @@
                         <div class="flex flex-col sm:flex-row gap-2">
                             <input id="mtr-target" type="text" inputmode="url" autocomplete="off" placeholder="End point — IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runMtr()">
                             <button onclick="runMtr()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run</button>
+                            <button onclick="exportMtrCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
                         </div>
                         <div class="flex flex-col sm:flex-row gap-2 mt-2">
                             <select id="mtr-source" title="Start point: source address to send probes from" class="w-full sm:flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
@@ -1203,7 +1204,7 @@
                             <h3 class="text-lg font-semibold">Switch Discovery (LLDP / CDP / EDP)</h3>
                             <p class="text-sm text-gray-400">Neighbouring switches: name, port, VLAN and management IP.</p>
                         </div>
-                        <button onclick="loadLldp()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="loadLldp()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportLldpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
                     </div>
                     <div id="lldp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
@@ -1216,6 +1217,7 @@
                         <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
                             <input id="arp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-44 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runArpScan()">
                             <button onclick="runArpScan()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan</button>
+                            <button onclick="exportArpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
                         </div>
                     </div>
                     <div id="arp-results" class="hidden mt-3 overflow-x-auto"></div>
@@ -1230,7 +1232,7 @@
                             <h3 class="text-lg font-semibold">Network Identity</h3>
                             <p class="text-sm text-gray-400">DNS domain &amp; search suffix, nameservers, this host&#39;s name/FQDN, and the default gateway.</p>
                         </div>
-                        <button onclick="loadNetworkIdentity()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="loadNetworkIdentity()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportIdentityCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
                     </div>
                     <div id="net-identity-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
@@ -1240,7 +1242,7 @@
                             <h3 class="text-lg font-semibold">Interfaces</h3>
                             <p class="text-sm text-gray-400">Link speed &amp; duplex, auto-negotiation, static/DHCP, addressing and VLAN.</p>
                         </div>
-                        <button onclick="loadInterfaces()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="loadInterfaces()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportInterfacesCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
                     </div>
                     <div id="interfaces-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
@@ -5405,7 +5407,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260702-mtr-jitter"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260702-csv"></script>
 
 </body>
 </html>
