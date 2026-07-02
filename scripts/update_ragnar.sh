@@ -74,7 +74,20 @@ else
 fi
 
 echo -e "${BLUE}Step 5: Updating Python dependencies...${NC}"
-pip3 install --break-system-packages -r requirements.txt --upgrade
+# Fast path: one batch upgrade. If pip cannot satisfy the full set (e.g.
+# one bad/unsatisfiable pin) it installs NOTHING, silently leaving every
+# dependency un-upgraded. Fall back to installing each requirement on its
+# own so a single bad package can not block all the others.
+if ! pip3 install --break-system-packages --upgrade -r requirements.txt; then
+    echo -e "${YELLOW}Batch dependency install failed - retrying package-by-package so one bad pin can not block the rest...${NC}"
+    while IFS= read -r req || [ -n "$req" ]; do
+        req="${req%%#*}"                 # strip inline comments
+        req="$(echo "$req" | xargs)"     # trim whitespace
+        [ -z "$req" ] && continue
+        pip3 install --break-system-packages --upgrade "$req" \
+            || echo -e "  ${YELLOW}!${NC} Failed to install: $req (continuing)"
+    done < requirements.txt
+fi
 
 echo -e "${BLUE}Step 5.5: Restoring local runtime data...${NC}"
 for file in "${PRESERVE_FILES[@]}"; do
