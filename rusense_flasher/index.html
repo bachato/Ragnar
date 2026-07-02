@@ -11,7 +11,8 @@
     <link rel="stylesheet" href="css/style.css?v=rusense1" />
     <style>
       .prov-fields { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; margin: .5rem 0 1rem; }
-      .prov-fields #prov-port { grid-column: 1 / -1; max-width: 8rem; }
+      .prov-fields #prov-port { max-width: 8rem; }
+      .prov-fields #prov-node { max-width: 8rem; }
       .prov-fields input {
         width: 100%; box-sizing: border-box; padding: .6rem .7rem; border-radius: 8px;
         border: 1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.25);
@@ -61,6 +62,7 @@
           <input id="prov-pass" type="password" placeholder="WiFi password" autocomplete="off" />
           <input id="prov-ip" type="text" placeholder="Server IP — e.g. 192.168.1.20" autocomplete="off" />
           <input id="prov-port" type="number" value="5005" min="1" max="65535" placeholder="Port" />
+          <input id="prov-node" type="number" value="1" min="0" max="255" placeholder="Node ID (0-255, unique per node)" title="Give each node in the mesh a different ID, e.g. 1, 2, 3. Nodes with the same ID collide and only one shows up." />
         </div>
         <div class="flash-buttons">
           <button class="btn-flash" onclick="provisionDevice()">🛰️ Write WiFi config</button>
@@ -216,7 +218,7 @@
       </div>
     </div>
 
-    <script src="js/nvs_gen.js"></script>
-    <script type="module" src="js/flasher.js"></script>
+    <script src="js/nvs_gen.js?v=20260702-nodeid"></script>
+    <script type="module" src="js/flasher.js?v=20260702-nodeid"></script>
   </body>
 </html>

@@ -210,8 +210,14 @@ window.provisionDevice = async function () {
   const password = $("prov-pass").value || "";               // don't trim — passwords may hold spaces
   const targetIp = ($("prov-ip").value || "").trim();
   const targetPort = parseInt($("prov-port").value, 10) || 5005;
+  const nodeIdRaw = ($("prov-node").value || "").trim();
+  const nodeId = nodeIdRaw === "" ? 1 : parseInt(nodeIdRaw, 10);
   if (!ssid)     { alert("Enter your 2.4 GHz WiFi SSID."); return; }
   if (!targetIp) { alert("Enter the RuSense server IP (your Ragnar box's address)."); return; }
+  if (!Number.isInteger(nodeId) || nodeId < 0 || nodeId > 255) {
+    alert("Node ID must be a whole number 0-255. Give each node in the mesh a different ID.");
+    return;
+  }
   if (typeof window.buildCsiCfgNvs !== "function") { alert("Provisioning module failed to load."); return; }
 
   showFlashOverlay();
@@ -226,9 +232,10 @@ window.provisionDevice = async function () {
     const { ESPLoader, Transport } = await getEsptool();
 
     setStatus("Building provisioning data…");
-    const nvs = window.buildCsiCfgNvs({ ssid, password, target_ip: targetIp, target_port: targetPort });
+    const nvs = window.buildCsiCfgNvs({ ssid, password, target_ip: targetIp, target_port: targetPort, node_id: nodeId });
     log("WiFi SSID : " + ssid);
     log("Server    : " + targetIp + ":" + targetPort);
+    log("Node ID   : " + nodeId);
     log("NVS       : " + nvs.length + " bytes @ 0x9000 (csi_cfg)");
 
     setStatus("Connecting…");

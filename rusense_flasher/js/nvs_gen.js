@@ -81,14 +81,22 @@ function buildNvsPartition(size, keys) {
 }
 
 // Build the csi_cfg WiFi/server provisioning partition (offset 0x9000, size 0x6000).
-function buildCsiCfgNvs({ ssid, password, target_ip, target_port = 5005 }) {
-  return buildNvsPartition(0x6000, [
+// Key set + types + order match RuView's provision.py exactly (node_id is a u8
+// written right after target_port). node_id gives each node a unique identity;
+// without it every node falls back to the firmware default (1) and they collide
+// -- the server then only ever shows one node at a time.
+function buildCsiCfgNvs({ ssid, password, target_ip, target_port = 5005, node_id }) {
+  const keys = [
     { type: 'namespace', key: 'csi_cfg', value: 1 },
     { type: 'string', key: 'ssid', value: ssid },
     { type: 'string', key: 'password', value: password },
     { type: 'string', key: 'target_ip', value: target_ip },
     { type: 'u16', key: 'target_port', value: target_port },
-  ]);
+  ];
+  if (node_id !== undefined && node_id !== null) {
+    keys.push({ type: 'u8', key: 'node_id', value: node_id & 0xFF });
+  }
+  return buildNvsPartition(0x6000, keys);
 }
 
 if (typeof module !== 'undefined') module.exports = { buildCsiCfgNvs, buildNvsPartition, zlibCrc32 };
