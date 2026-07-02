@@ -196,21 +196,44 @@ fi
 
 echo -e "${BLUE}Step 6.9: Ensuring network diagnostic tools...${NC}"
 # Tools for the Network > Diagnostics / Switch & L2 / Interfaces tabs.
-# Idempotent so existing installs pick them up on update (Debian/apt).
+# Idempotent so existing installs pick them up on update (Debian/apt). Package
+# names (and their fallbacks) mirror install_ragnar.sh so distros that name a
+# package differently -- mtr vs mtr-tiny, whois vs jwhois, the speedtest-cli
+# python variants -- still resolve instead of silently failing.
 if command -v apt-get >/dev/null 2>&1; then
-    NET_PKGS=""
-    for pair in "traceroute:traceroute" "mtr:mtr-tiny" "whois:whois" "lldpctl:lldpd" "arp-scan:arp-scan" "ethtool:ethtool" "speedtest-cli:speedtest-cli"; do
-        bin="${pair%%:*}"; pkg="${pair##*:}"
-        command -v "$bin" >/dev/null 2>&1 || NET_PKGS="$NET_PKGS $pkg"
+    # sbin tools (lldpctl, arp-scan, ethtool, traceroute) may not be on a bare
+    # PATH; make sure the presence checks can find them.
+    export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+    # "binary:pkg1 pkg2 ..." -- first candidate package that provides the
+    # binary wins; remaining candidates are only tried if it is still missing.
+    net_tools=(
+        "traceroute:traceroute"
+        "mtr:mtr-tiny mtr"
+        "whois:whois jwhois"
+        "lldpctl:lldpd"
+        "arp-scan:arp-scan arpscan"
+        "ethtool:ethtool"
+        "speedtest-cli:speedtest-cli python3-speedtest-cli python-speedtest-cli"
+    )
+    for entry in "${net_tools[@]}"; do
+        bin="${entry%%:*}"; pkgs="${entry#*:}"
+        if command -v "$bin" >/dev/null 2>&1; then
+            continue
+        fi
+        installed=false
+        for pkg in $pkgs; do
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1 || true
+            if command -v "$bin" >/dev/null 2>&1; then
+                echo -e "  ${GREEN}✓${NC} Installed $bin ($pkg)"
+                installed=true
+                break
+            fi
+        done
+        if [ "$installed" = false ]; then
+            echo -e "  ${YELLOW}!${NC} Could not install $bin (tried: $pkgs)"
+        fi
     done
-    if [ -n "$NET_PKGS" ]; then
-        echo -e "  Installing:$NET_PKGS"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y $NET_PKGS >/dev/null 2>&1 \
-            && echo -e "  ${GREEN}✓${NC} Installed network tools" \
-            || echo -e "  ${YELLOW}!${NC} Some network tools failed to install"
-    else
-        echo -e "  ${GREEN}✓${NC} Network tools already present"
-    fi
+    echo -e "  ${GREEN}✓${NC} Network tools checked"
 fi
 # Configure lldpd to also decode CDP/EDP/FDP/SONMP (non-LLDP switches)
 if command -v lldpd >/dev/null 2>&1 || command -v lldpctl >/dev/null 2>&1; then
