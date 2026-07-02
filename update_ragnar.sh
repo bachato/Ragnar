@@ -215,6 +215,17 @@ if command -v apt-get >/dev/null 2>&1; then
         "ethtool:ethtool"
         "speedtest-cli:speedtest-cli python3-speedtest-cli python-speedtest-cli"
     )
+    # Refresh the package index once, but only if something is actually missing
+    # -- an update run never did `apt-get update`, so installs against a stale
+    # index silently failed (unlike a fresh install, which updates first).
+    need_net_install=false
+    for entry in "${net_tools[@]}"; do
+        command -v "${entry%%:*}" >/dev/null 2>&1 || { need_net_install=true; break; }
+    done
+    if [ "$need_net_install" = true ]; then
+        echo -e "  Refreshing package index…"
+        DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    fi
     for entry in "${net_tools[@]}"; do
         bin="${entry%%:*}"; pkgs="${entry#*:}"
         if command -v "$bin" >/dev/null 2>&1; then

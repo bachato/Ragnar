@@ -652,6 +652,12 @@ def do_install_tool(tool):
     env['DEBIAN_FRONTEND'] = 'noninteractive'
     res = _run(['apt-get', 'install', '-y', pkg], timeout=300, env=env)
     if not _have(binary):
+        # A stale or empty package index is the usual reason apt can't find the
+        # package on an updated (vs freshly installed) box. Refresh once and
+        # retry before giving up.
+        _run(['apt-get', 'update', '-y'], timeout=180, env=env)
+        res = _run(['apt-get', 'install', '-y', pkg], timeout=300, env=env)
+    if not _have(binary):
         tail = (res['err'] or res['out'] or '').strip()
         tail = tail[-400:] if tail else 'no output'
         return {'success': False, 'tool': tool,
