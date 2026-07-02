@@ -1155,10 +1155,19 @@
                     <!-- MTR -->
                     <div class="glass rounded-xl p-4 sm:p-6">
                         <h3 class="text-lg font-semibold mb-1">MTR</h3>
-                        <p class="text-sm text-gray-400 mb-3">Per-hop loss &amp; latency statistics.</p>
+                        <p class="text-sm text-gray-400 mb-3">Per-hop loss &amp; latency to an end point, sampled over N cycles (a snapshot, not continuous). Optionally bind the start point to one of this host&#39;s addresses.</p>
                         <div class="flex flex-col sm:flex-row gap-2">
-                            <input id="mtr-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runMtr()">
+                            <input id="mtr-target" type="text" inputmode="url" autocomplete="off" placeholder="End point — IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runMtr()">
                             <button onclick="runMtr()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run</button>
+                        </div>
+                        <div class="flex flex-col sm:flex-row gap-2 mt-2">
+                            <select id="mtr-source" title="Start point: source address to send probes from" class="w-full sm:flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Start point: auto (default route)</option>
+                            </select>
+                            <label class="flex items-center gap-2 text-sm text-gray-400 whitespace-nowrap">
+                                Cycles
+                                <input id="mtr-count" type="number" min="1" max="20" value="5" class="w-20 bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm text-gray-200">
+                            </label>
                         </div>
                         <div id="mtr-results" class="hidden mt-3 overflow-x-auto"></div>
                     </div>
@@ -5396,7 +5405,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260702-nettools"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260702-mtr-jitter"></script>
 
 </body>
 </html>

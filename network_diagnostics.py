@@ -115,10 +115,38 @@ def do_traceroute(target, max_hops=20):
             'error': None if ok else res['err']}
 
 
-def do_mtr(target, count=5):
+def _local_ipv4_addrs():
+    """Set of this host's IPv4 addresses (no CIDR), across all interfaces.
+    Used to validate an mtr source ('start point') binding."""
+    addrs = set()
+    for name in _list_iface_names(include_virtual=True):
+        v4, _ = _iface_addrs(name)
+        for a in v4:
+            addrs.add(a.split('/')[0])
+    return addrs
+
+
+def do_mtr(target, count=5, source=None):
+    """Snapshot per-hop loss/latency from this host to `target` over `count`
+    probe cycles. `source`, if given, binds the trace to one of this host's
+    local IPv4 addresses (mtr -a) so a multi-homed box can choose which
+    interface/path the probes leave from."""
     count = _clamp_int(count, 5, 1, 20)
-    res = _run(['mtr', '-n', '-r', '-c', str(count), '-j', target],
-               timeout=count * 3 + 15)
+    cmd = ['mtr', '-n', '-r', '-c', str(count)]
+    if source:
+        try:
+            ipaddress.ip_address(source)
+        except ValueError:
+            return {'success': False, 'error': f'Invalid source IP: {source}'}
+        local = _local_ipv4_addrs()
+        if source not in local:
+            valid = ', '.join(sorted(local)) or 'none'
+            return {'success': False,
+                    'error': f'Source {source} is not a local address on this host '
+                             f'(mtr can only originate from a local IP). Valid: {valid}'}
+        cmd += ['-a', source]
+    cmd += ['-j', target]
+    res = _run(cmd, timeout=count * 3 + 15)
     if res['rc'] == 127:
         return {'success': False, 'error': res['err']}
     hops = []
@@ -675,8 +703,11 @@ def register_network_diagnostics(app, logger=None):
         target = (data.get('target') or '').strip()
         if not _valid_target(target):
             return _bad('Invalid target')
-        _log(f"net/mtr {target}")
-        return jsonify(do_mtr(target, data.get('count', 5)))
+        source = (data.get('source') or '').strip() or None
+        if source is not None and not _valid_target(source):
+            return _bad('Invalid source')
+        _log(f"net/mtr {target}" + (f" from {source}" if source else ""))
+        return jsonify(do_mtr(target, data.get('count', 5), source))
 
     @app.route('/api/net/whois', methods=['POST'])
     def net_whois():

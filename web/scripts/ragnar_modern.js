@@ -1115,8 +1115,10 @@ function showNetworkSubtab(name) {
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
         loadInterfaces();
+    } else if (name === 'diagnostics') {
+        populateMtrSources();
     }
-    // 'diagnostics' has no auto-load; tools run on demand.
+    // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
 
 // ============================================================================
@@ -1165,34 +1167,71 @@ function runPing() { return _ndRunText('ping-target', 'ping-results', '/api/net/
 function runTraceroute() { return _ndRunText('trace-target', 'trace-results', '/api/net/traceroute', 'Tracing'); }
 function runWhois() { return _ndRunText('whois-target', 'whois-results', '/api/net/whois', 'Looking up'); }
 
+// Fill the MTR start-point dropdown with this host's local IPv4 addresses.
+async function populateMtrSources() {
+    const sel = document.getElementById('mtr-source');
+    if (!sel || sel.dataset._loaded) return;
+    try {
+        const data = await fetchAPI('/api/net/interfaces');
+        if (!data || !data.success) return;
+        const seen = new Set();
+        (data.interfaces || []).forEach(i => {
+            (i.ipv4 || []).forEach(cidr => {
+                const ip = String(cidr).split('/')[0];
+                if (!ip || seen.has(ip)) return;
+                seen.add(ip);
+                const opt = document.createElement('option');
+                opt.value = ip;
+                opt.textContent = i.name + ' — ' + ip;
+                sel.appendChild(opt);
+            });
+        });
+        sel.dataset._loaded = '1';
+    } catch (e) { /* leave just the auto option */ }
+}
+
 async function runMtr() {
     const target = (document.getElementById('mtr-target').value || '').trim();
+    const source = (document.getElementById('mtr-source').value || '').trim();
+    let count = parseInt(document.getElementById('mtr-count').value, 10);
+    if (!Number.isFinite(count)) count = 5;
+    count = Math.max(1, Math.min(20, count));
     const out = document.getElementById('mtr-results');
     if (!target) return;
     const btn = event && event.target ? event.target : null;
     _ndBusy(btn, true, 'Running…');
     out.classList.remove('hidden');
-    out.innerHTML = '<p class="text-sm text-gray-400">Running MTR to ' + escapeHtml(target) + '…</p>';
+    out.innerHTML = '<p class="text-sm text-gray-400">Running MTR to ' + escapeHtml(target)
+        + (source ? ' from ' + escapeHtml(source) : '') + ' (' + count + ' cycles)…</p>';
     try {
-        const data = await postAPI('/api/net/mtr', { target });
+        const body = { target, count };
+        if (source) body.source = source;
+        const data = await postAPI('/api/net/mtr', body);
         if (!data.success) {
             out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
+        // Severity colour helpers (per-hop RTT in ms). Thresholds are generous
+        // so only genuinely bad hops light up.
+        const latColor = (ms) => (ms > 150) ? 'text-red-400' : (ms > 60) ? 'text-yellow-400' : '';
+        const jitColor = (ms) => (ms > 30) ? 'text-red-400' : (ms > 10) ? 'text-yellow-400' : '';
+        const lossColor = (p) => (p >= 50) ? 'text-red-400' : (p > 0) ? 'text-yellow-400' : '';
         let rows = (data.hops || []).map(h => `
             <tr class="border-t border-slate-800">
                 <td class="px-3 py-1.5 text-gray-400">${h.hop}</td>
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(h.host || '???'))}</td>
-                <td class="px-3 py-1.5 text-right ${h.loss_pct > 0 ? 'text-yellow-400' : ''}">${h.loss_pct}%</td>
-                <td class="px-3 py-1.5 text-right">${h.avg}</td>
+                <td class="px-3 py-1.5 text-right ${lossColor(h.loss_pct)}">${h.loss_pct}%</td>
+                <td class="px-3 py-1.5 text-right ${latColor(h.avg)}">${h.avg}</td>
                 <td class="px-3 py-1.5 text-right">${h.best}</td>
-                <td class="px-3 py-1.5 text-right">${h.worst}</td>
+                <td class="px-3 py-1.5 text-right ${latColor(h.worst)}">${h.worst}</td>
+                <td class="px-3 py-1.5 text-right ${jitColor(h.stdev)}">${h.stdev != null ? h.stdev : '\u2014'}</td>
             </tr>`).join('');
         out.innerHTML = `<table class="min-w-full text-sm whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Hop</th><th class="px-3 py-1.5">Host</th>
                 <th class="px-3 py-1.5 text-right">Loss</th><th class="px-3 py-1.5 text-right">Avg ms</th>
                 <th class="px-3 py-1.5 text-right">Best</th><th class="px-3 py-1.5 text-right">Worst</th>
+                <th class="px-3 py-1.5 text-right">Jitter</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
