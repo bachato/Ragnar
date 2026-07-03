@@ -674,6 +674,13 @@ def do_install_tool(tool):
         # retry before giving up.
         _run(['apt-get', 'update', '-y'], timeout=180, env=env)
         res = _run(['apt-get', 'install', '-y', pkg], timeout=300, env=env)
+    if not _have(binary) and 'dpkg was interrupted' in (res['err'] or '') + (res['out'] or ''):
+        # A previously interrupted apt/dpkg run leaves the package system
+        # half-configured; apt then refuses to do anything until it's fixed.
+        # Recover automatically ('dpkg --configure -a') and retry so the user
+        # doesn't have to drop to a shell.
+        _run(['dpkg', '--configure', '-a'], timeout=300, env=env)
+        res = _run(['apt-get', 'install', '-y', pkg], timeout=300, env=env)
     if not _have(binary):
         tail = (res['err'] or res['out'] or '').strip()
         tail = tail[-400:] if tail else 'no output'
