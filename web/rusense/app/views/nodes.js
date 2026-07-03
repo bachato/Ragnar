@@ -52,7 +52,10 @@ export default {
         <div class="card card-pad space-y-3">
           <div class="flex items-center justify-between">
             <h2 class="card-title">Sensor nodes</h2>
-            <button id="n-refresh" class="btn-ghost !py-1.5 !px-3 text-xs">Refresh</button>
+            <div class="flex items-center gap-2">
+              <button id="n-logs" class="btn-ghost !py-1.5 !px-3 text-xs" title="Capture ~30s of node + mesh + engine state to a JSON file for debugging">Download logs</button>
+              <button id="n-refresh" class="btn-ghost !py-1.5 !px-3 text-xs">Refresh</button>
+            </div>
           </div>
           <div class="overflow-x-auto -mx-1">
             <table class="w-full text-sm min-w-[480px]">
@@ -100,9 +103,55 @@ export default {
       if (el) el.textContent = m ? JSON.stringify(m, null, 2) : 'Mesh data unavailable';
     };
 
+    // Download logs: a ROLLING capture (not a single snapshot) of node roster +
+    // mesh + engine trust, so a reboot loop (mesh `sequence` resetting), clock-
+    // offset drift, or an engine demotion is visible over time. ~30s @ 3s.
+    let capturing = false;
+    const captureLogs = async (btn) => {
+      if (capturing) return;
+      capturing = true;
+      const CAP_MS = 30000, STEP = 3000, started = Date.now(), samples = [];
+      const orig = btn.textContent;
+      btn.disabled = true;
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      try {
+        while (Date.now() - started < CAP_MS && capturing) {
+          const [nodes, mesh, status, adaptive] = await Promise.all([
+            fetchJSON('/api/v1/nodes'), fetchJSON('/api/v1/mesh'),
+            fetchJSON('/api/v1/status'), fetchJSON('/api/v1/adaptive/status'),
+          ]);
+          samples.push({ t: new Date().toISOString(), nodes, mesh, status, adaptive });
+          const left = Math.max(0, Math.ceil((CAP_MS - (Date.now() - started)) / 1000));
+          btn.textContent = `Capturing… ${left}s`;
+          if (Date.now() - started < CAP_MS && capturing) await sleep(STEP);
+        }
+        if (!samples.length) return;
+        const bundle = {
+          captured_at: new Date().toISOString(),
+          capture_seconds: Math.round((Date.now() - started) / 1000),
+          sample_count: samples.length,
+          node_names: nodeNames,
+          hint: 'Watch mesh[].sequence per node: resets to low numbers = the node is rebooting. Large/growing offset_us = clock desync. status.trust.demoted/engine_error_count climbing = the engine is degrading.',
+          samples,
+        };
+        const url = URL.createObjectURL(new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `rusense-node-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      } finally {
+        capturing = false;
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    };
+
     refresh(); refreshMesh();
     $('#n-refresh').addEventListener('click', refresh);
+    const logsBtn = $('#n-logs');
+    if (logsBtn) logsBtn.addEventListener('click', (e) => captureLogs(e.currentTarget));
     const t = setInterval(refresh, 4000);
-    return () => clearInterval(t);
+    return () => { clearInterval(t); capturing = false; };
   },
 };
