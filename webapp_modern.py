@@ -1361,15 +1361,20 @@ def rusense_diagnostics():
                 'reaching the Pi — check they associated to the same AP/subnet as '
                 'this box (strong RSSI on a different AP still means no data here).')
         elif avg <= 100:
-            mode, verdict = 'edge_tier', (
+            mode, verdict = 'small_only', (
                 f'Nodes are STREAMING ({total} pkts from {len(per)} source(s), '
-                f'~{avg} B each) but these are edge-mode feature packets '
-                '(edge_tier>=1), NOT raw CSI. The server needs raw CSI (148-404 B) '
-                'for fusion, so it reports source:esp32:offline and the mesh stays '
-                'frozen even though packets flow. FIX: reprovision the nodes with '
-                'edge_tier=0 (flasher "Write WiFi config" after a hard refresh, or '
-                'provision.py --edge-tier 0). This is a node NVS setting, not the '
-                'firmware image — reflashing the app alone does not change it.')
+                f'~{avg} B each) but NO raw CSI (148-404 B) is arriving, so the '
+                'server reports source:esp32:offline and the mesh stays frozen even '
+                'though packets flow. Two causes give this identical signature — '
+                'check the node serial log to tell them apart: (1) edge_tier>=1 — '
+                'the node is emitting on-device feature packets; reprovision '
+                'edge_tier=0 (flasher "Write WiFi config", or provision.py '
+                '--edge-tier 0). (2) edge_tier=0 but CSI yield=0 — the CSI engine is '
+                'starved (serial shows "yield=0pps", state=8 DEGRADED). This hits '
+                'AMOLED display nodes on firmware without the #954 self-ping: '
+                're-Forge with firmware 0.7.0+ (adds the 50Hz self-ping OFDM '
+                'source). If serial shows "self-ping started" and yield climbing, '
+                'the node is fine and raw CSI should follow.')
         elif avg >= 130:
             mode, verdict = 'raw_csi', (
                 f'Raw CSI is flowing ({total} pkts from {len(per)} source(s), '

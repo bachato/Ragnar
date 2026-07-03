@@ -258,7 +258,7 @@ export default {
           capture_seconds: Math.round((Date.now() - started) / 1000),
           sample_count: samples.length,
           node_names: nodeNames,
-          hint: 'READ server_diagnostics.packet_analysis FIRST — it auto-classifies the tcpdump: mode=edge_tier (nodes streaming ~60B feature packets, need edge_tier=0), raw_csi (correct), or no_packets (nodes not reaching Pi). server_diagnostics = one-shot server-side deep capture (tcpdump on UDP 5005 -> packet sizes tell edge_tier: ~60B=edge mode, 148-404B=raw CSI; journal_sensing -> fusion/spread/dimension errors; binaries.*_md5 -> confirm the running binary; sockets_udp Recv-Q -> ingestion backlog; api.mesh offset_us/staleness_ms -> clock sync). samples = 30s time-series (mesh sequence resets = reboots; growing offset = desync; trust.demoted/errors climbing = engine degrading).',
+          hint: 'READ server_diagnostics.packet_analysis FIRST — it auto-classifies the tcpdump: mode=small_only (streaming ~60B, NO raw CSI — either edge_tier>=1 OR edge_tier=0 with yield=0/starved CSI; check node serial for yield=0pps + re-Forge 0.7.0+ for the #954 self-ping), raw_csi (correct), or no_packets (nodes not reaching Pi). server_diagnostics = one-shot server-side deep capture (tcpdump on UDP 5005 -> packet sizes tell edge_tier: ~60B=edge mode, 148-404B=raw CSI; journal_sensing -> fusion/spread/dimension errors; binaries.*_md5 -> confirm the running binary; sockets_udp Recv-Q -> ingestion backlog; api.mesh offset_us/staleness_ms -> clock sync). samples = 30s time-series (mesh sequence resets = reboots; growing offset = desync; trust.demoted/errors climbing = engine degrading).',
           server_diagnostics: server,
           samples,
         };
