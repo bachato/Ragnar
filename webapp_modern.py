@@ -976,22 +976,29 @@ def _rusense_check_once():
     if latest:
         cls = latest.get('classification') or {}
         present_agg = bool(cls.get('presence'))
-        # A *motionless* body (someone sitting still on a couch) makes the
-        # aggregate `presence` boolean flicker to False — and it does so even
-        # at high confidence, so those samples clear the confidence gate and
-        # confirm a premature "empty". The reliable signal in that case is the
-        # per-node motion level: the node that can see the person holds
-        # "present_still" the whole time. So treat the space as occupied if the
-        # aggregate says so OR any non-stale active node still sees a body.
-        # "Empty" can then only be declared once *no* node sees anyone.
-        node_present = False
+        # A *motionless* body makes the aggregate `presence` boolean flicker, so
+        # the per-node classification is a useful still-body signal. BUT a single
+        # node false-fires on its own (live: one weak/edge node reads
+        # present_still ~4-6% of the time in an EMPTY apartment — a through-wall
+        # neighbour or RF noise near that node), and a lone node was enough to
+        # confirm presence → phantom alerts. So require a QUORUM: at least two
+        # non-stale nodes must agree before the node path confirms presence (with
+        # only one node total, fall back to that one). A real occupant perturbs
+        # the CSI to multiple nodes and/or lights up the fused aggregate below,
+        # so this keeps real detection while killing lone-node phantoms — the
+        # same corroboration rule the people-count already uses. See
+        # [[rusense-presence-hold]].
+        node_hits = 0
+        node_total = 0
         for nf in (latest.get('node_features') or []):
             if nf.get('stale'):
                 continue
+            node_total += 1
             ncls = nf.get('classification') or {}
             if ncls.get('presence') or str(ncls.get('motion_level') or '').startswith('present'):
-                node_present = True
-                break
+                node_hits += 1
+        node_quorum = 2 if node_total >= 2 else 1
+        node_present = node_hits >= node_quorum
         # Base presence on the engine's MOTION CLASSIFIER, not the raw `presence`
         # boolean. Live data: a still couch subject reads motion_level
         # present_still/present_moving on ~40% of 1 Hz samples while the boolean
