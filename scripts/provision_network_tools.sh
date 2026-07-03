@@ -12,7 +12,7 @@
 # Does three things, each safe to re-run:
 #   1. Unblock all radios (rfkill) + install a persistent boot/hot-plug rule.
 #   2. Install network diagnostic tools (with per-distro package fallbacks).
-#   3. Configure lldpd to decode CDP/EDP/FDP/SONMP for switch discovery.
+#   3. Configure lldpd to decode CDPv1/v2, EDP, FDP and SONMP for switch discovery.
 #
 # Must run as root. Prints plain progress lines; never exits non-zero for a
 # single failed tool so a partial environment still gets everything it can.
@@ -126,11 +126,11 @@ fi
 # ---------------------------------------------------------------------------
 # 3. lldpd switch-discovery decoding
 # ---------------------------------------------------------------------------
-# Configure lldpd to also decode CDP/EDP/FDP/SONMP (non-LLDP switches)
+# Configure lldpd to also decode CDPv1/v2, EDP, FDP and SONMP (non-LLDP switches)
 if command -v lldpd >/dev/null 2>&1 || command -v lldpctl >/dev/null 2>&1; then
     mkdir -p /etc/default
     cat > /etc/default/lldpd << 'LLDPEOF'
-# Ragnar: decode CDP (Cisco), EDP (Extreme), FDP (Foundry), SONMP (Nortel)
+# Ragnar: decode CDPv1/v2 (Cisco), EDP (Extreme), FDP (Foundry), SONMP (Nortel)
 # neighbours in addition to LLDP, so switch discovery covers non-LLDP gear.
 DAEMON_ARGS="-c -e -f -s"
 LLDPEOF

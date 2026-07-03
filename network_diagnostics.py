@@ -101,18 +101,22 @@ def do_ping(target, count=4):
         summary['rtt_max'] = float(m.group(3))
     # ping returns non-zero on 100% loss; treat "ran" as success and let the
     # summary/output convey the result.
-    ok = res['rc'] != 127
-    return {'success': ok, 'output': out.strip(), 'summary': summary,
-            'error': None if ok else res['err']}
+    if res['rc'] == 127:
+        return {'success': False, 'output': '', 'summary': {},
+                'error': 'ping is not installed. Click Install to add it.',
+                'missing_tool': 'ping'}
+    return {'success': True, 'output': out.strip(), 'summary': summary, 'error': None}
 
 
 def do_traceroute(target, max_hops=20):
     max_hops = _clamp_int(max_hops, 20, 1, 30)
     res = _run(['traceroute', '-n', '-q', '1', '-w', '2', '-m', str(max_hops), target],
                timeout=max_hops * 3 + 10)
-    ok = res['rc'] != 127
-    return {'success': ok, 'output': (res['out'] or res['err']).strip(),
-            'error': None if ok else res['err']}
+    if res['rc'] == 127:
+        return {'success': False, 'output': '',
+                'error': 'traceroute is not installed. Click Install to add it.',
+                'missing_tool': 'traceroute'}
+    return {'success': True, 'output': (res['out'] or res['err']).strip(), 'error': None}
 
 
 def _local_ipv4_addrs():
@@ -148,7 +152,9 @@ def do_mtr(target, count=5, source=None):
     cmd += ['-j', target]
     res = _run(cmd, timeout=count * 3 + 15)
     if res['rc'] == 127:
-        return {'success': False, 'error': res['err']}
+        return {'success': False,
+                'error': 'mtr is not installed. Click Install to add it.',
+                'missing_tool': 'mtr'}
     hops = []
     try:
         data = json.loads(res['out'])
@@ -172,9 +178,11 @@ def do_mtr(target, count=5, source=None):
 
 def do_whois(target):
     res = _run(['whois', target], timeout=25)
-    ok = res['rc'] != 127
-    return {'success': ok, 'output': (res['out'] or res['err']).strip(),
-            'error': None if ok else res['err']}
+    if res['rc'] == 127:
+        return {'success': False, 'output': '',
+                'error': 'whois is not installed. Click Install to add it.',
+                'missing_tool': 'whois'}
+    return {'success': True, 'output': (res['out'] or res['err']).strip(), 'error': None}
 
 
 def do_speedtest():
@@ -220,7 +228,8 @@ def do_speedtest():
                 pass
         return {'success': False, 'error': res['err'] or res['out'] or 'speedtest failed'}
     return {'success': False,
-            'error': 'speedtest not installed (run the Ragnar installer/update to add it)'}
+            'error': 'speedtest is not installed. Click Install to add it.',
+            'missing_tool': 'speedtest-cli'}
 
 
 # --------------------------------------------------------------------------
@@ -229,13 +238,14 @@ def do_speedtest():
 
 def do_lldp():
     """Return discovered switch neighbors via lldpctl. lldpd (configured with
-    -c -e -f -s) also decodes CDP/EDP/FDP/SONMP, so this covers Cisco CDP and
-    Extreme EDP in addition to LLDP. VLAN id/name are included when the
+    -c -e -f -s) also decodes CDPv1/v2 (Cisco), EDP (Extreme), FDP (Foundry)
+    and SONMP (Nortel) in addition to LLDP. VLAN id/name are included when the
     neighbor advertises them."""
     if not _have('lldpctl'):
         return {'success': False,
                 'error': 'lldpd/lldpctl is not installed. Click Install to add it '
-                         '(configured for LLDP + CDP/EDP so Cisco switches are seen too).',
+                         '(configured for LLDP + CDPv1/v2, EDP, FDP and SONMP so '
+                         'Cisco, Extreme, Foundry and Nortel switches are seen too).',
                 'missing_tool': 'lldpd',
                 'neighbors': []}
     res = _run(['lldpctl', '-f', 'json'], timeout=15)
@@ -612,6 +622,7 @@ def do_network_identity():
 # can be installed via /api/net/install-tool, so the tool name is never
 # interpolated into a shell command.
 _NET_TOOL_PKGS = {
+    'ping': ('ping', 'iputils-ping'),
     'lldpd': ('lldpctl', 'lldpd'),
     'arp-scan': ('arp-scan', 'arp-scan'),
     'ethtool': ('ethtool', 'ethtool'),
@@ -623,12 +634,12 @@ _NET_TOOL_PKGS = {
 
 
 def _configure_lldpd():
-    """Enable CDP/EDP/FDP/SONMP decoding and (re)start lldpd -- mirrors the
+    """Enable CDPv1/v2/EDP/FDP/SONMP decoding and (re)start lldpd -- mirrors the
     Ragnar installer/updater so on-demand installs also see non-LLDP switches."""
     try:
         os.makedirs('/etc/default', exist_ok=True)
         with open('/etc/default/lldpd', 'w') as f:
-            f.write('# Ragnar: decode CDP (Cisco), EDP (Extreme), FDP (Foundry), '
+            f.write('# Ragnar: decode CDPv1/v2 (Cisco), EDP (Extreme), FDP (Foundry), '
                     'SONMP (Nortel)\n')
             f.write('# neighbours in addition to LLDP, so switch discovery covers '
                     'non-LLDP gear.\n')

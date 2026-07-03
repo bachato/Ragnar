@@ -1210,7 +1210,7 @@ function _ndBusy(btn, busy, busyLabel) {
     }
 }
 
-async function _ndRunText(inputId, resultId, endpoint, verb) {
+async function _ndRunText(inputId, resultId, endpoint, verb, rerunFnName) {
     const input = document.getElementById(inputId);
     const out = document.getElementById(resultId);
     const target = (input.value || '').trim();
@@ -1223,6 +1223,8 @@ async function _ndRunText(inputId, resultId, endpoint, verb) {
         const data = await postAPI(endpoint, { target });
         if (data.success) {
             out.textContent = data.output || '(no output)';
+        } else if (data.missing_tool && rerunFnName) {
+            out.innerHTML = _ndMissingTool(data, rerunFnName);
         } else {
             out.textContent = 'Error: ' + (data.error || 'failed');
         }
@@ -1233,9 +1235,9 @@ async function _ndRunText(inputId, resultId, endpoint, verb) {
     }
 }
 
-function runPing() { return _ndRunText('ping-target', 'ping-results', '/api/net/ping', 'Pinging'); }
-function runTraceroute() { return _ndRunText('trace-target', 'trace-results', '/api/net/traceroute', 'Tracing'); }
-function runWhois() { return _ndRunText('whois-target', 'whois-results', '/api/net/whois', 'Looking up'); }
+function runPing() { return _ndRunText('ping-target', 'ping-results', '/api/net/ping', 'Pinging', 'runPing'); }
+function runTraceroute() { return _ndRunText('trace-target', 'trace-results', '/api/net/traceroute', 'Tracing', 'runTraceroute'); }
+function runWhois() { return _ndRunText('whois-target', 'whois-results', '/api/net/whois', 'Looking up', 'runWhois'); }
 
 // Fill the MTR start-point dropdown with this host's local IPv4 addresses.
 async function populateMtrSources() {
@@ -1278,7 +1280,9 @@ async function runMtr() {
         if (source) body.source = source;
         const data = await postAPI('/api/net/mtr', body);
         if (!data.success) {
-            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'runMtr')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
         _ndLastMtr = { target: target, source: source, count: count, hops: data.hops || [] };
@@ -1320,7 +1324,9 @@ async function runSpeedtest() {
     try {
         const data = await postAPI('/api/net/speedtest', {});
         if (!data.success) {
-            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'runSpeedtest')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
             return;
         }
         const card = (label, val, unit) => `
