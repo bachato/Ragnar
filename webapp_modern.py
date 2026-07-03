@@ -997,18 +997,25 @@ def _rusense_check_once():
             ncls = nf.get('classification') or {}
             if ncls.get('presence') or str(ncls.get('motion_level') or '').startswith('present'):
                 node_hits += 1
-        node_quorum = 2 if node_total >= 2 else 1
-        node_present = node_hits >= node_quorum
         # Base presence on the engine's MOTION CLASSIFIER, not the raw `presence`
-        # boolean. Live data: a still couch subject reads motion_level
-        # present_still/present_moving on ~40% of 1 Hz samples while the boolean
-        # is mostly False (13%); the empty room reads present_* on only ~2%. So
-        # motion_level cleanly separates occupied from empty, and it also avoids
-        # the empty-room "presence:true + motion:absent" phantom (which never has
-        # a present_* motion level). A non-stale node seeing a body still counts.
+        # boolean (a still subject flickers the boolean; motion_level is steadier).
         motion_level = str(cls.get('motion_level') or '')
         engine_present = motion_level.startswith('present') or motion_level == 'active'
-        present = engine_present or node_present
+        # Corroborated presence: require TWO independent votes before confirming.
+        # The fused aggregate motion classifier is ONE vote; each non-stale node
+        # is one vote. This rejects the two live failure modes seen in an EMPTY
+        # apartment: (a) a single weak/edge node twitching alone (through-wall
+        # neighbour / RF noise), and (b) the aggregate motion heuristic firing on
+        # an environmental RF burst — HVAC, fridge, hallway — for 10+ s with NO
+        # node agreeing (this alone crossed the duty gate and lingered PRESENT for
+        # minutes in a 15-min soak). A real occupant perturbs the CSI to multiple
+        # nodes AND/OR the aggregate, so it clears 2 votes easily. With only one
+        # node deployed there can't be 2 votes, so fall back to "any signal".
+        votes = (1 if engine_present else 0) + node_hits
+        if node_total >= 2:
+            present = votes >= 2
+        else:
+            present = engine_present or node_hits >= 1
         motion_active = motion_level == 'active'
         conf = cls.get('confidence')
         try:
