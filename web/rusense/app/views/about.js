@@ -104,6 +104,7 @@ export default {
             'Vital signs need a <strong>still</strong> subject (someone at rest); motion otherwise dominates.',
             'For the geofence, aim for <strong>≥ 3 nodes</strong> roughly at the room\'s corners.',
           ])}
+          ${callout('Put every node on ONE access point + one fixed channel', 'The nodes sync their clocks to each other over WiFi, and that only works when they are all joined to the <strong>same access point on the same 2.4 GHz channel</strong>. If your home has several routers or a mesh/extenders sharing one SSID, each node can latch onto a different AP on a different channel — their clocks then drift by <em>seconds</em>, the engine can\'t fuse them, and the Nodes tab shows <em>“Sync failing” / offline</em>. Give the nodes a <strong>single AP</strong> (ideally a dedicated SSID served by one router), <strong>lock it to a fixed channel</strong> (disable auto-channel), and keep every node in good signal range of it. Watch the <strong>Mesh health</strong> panel on the Nodes tab — healthy is sub-millisecond offsets; seconds mean split APs.')}
         </div>
 
         <!-- 3 · Geofence -->

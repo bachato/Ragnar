@@ -65,6 +65,7 @@
           <input id="prov-port" type="number" value="5005" min="1" max="65535" placeholder="Port" />
           <input id="prov-node" type="number" value="1" min="0" max="255" placeholder="Node ID (0-255, unique per node)" title="Give each node in the mesh a different ID, e.g. 1, 2, 3. Nodes with the same ID collide and only one shows up." />
           <p class="prov-hint">⚠️ Give <strong>each node a unique Node ID</strong> (1, 2, 3…). Two nodes sharing an ID collide, so only one shows up in RuSense.</p>
+          <p class="prov-hint">📡 Point <strong>every node at the same WiFi access point on one fixed 2.4 GHz channel</strong>. If several routers or a mesh/extenders share one SSID, nodes latch onto different APs, their clocks can't sync, and sensing drops offline. Use a single AP (a dedicated 2.4 GHz SSID served by one router is ideal) and disable auto-channel.</p>
         </div>
         <div class="flash-buttons">
           <button class="btn-flash" onclick="provisionDevice()">🛰️ Write WiFi config</button>
