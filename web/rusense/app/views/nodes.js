@@ -238,7 +238,7 @@ export default {
       // port, journalctl for the sensing engine, ss/systemctl, system+wifi state,
       // binary md5s, API snapshots) — the browser can't run those. Returns in
       // ~8s, well inside the 30s sample window, so it adds no extra wait.
-      const diagPromise = fetchJSON('/api/rusense/diagnostics?secs=8').catch(() => null);
+      const diagPromise = fetchJSON('/api/rusense/diagnostics?secs=6', { timeout: 25000 }).catch(() => null);  // endpoint runs tcpdump+journal ~10s; default 6s timeout would abort it
       try {
         while (Date.now() - started < CAP_MS && capturing) {
           const [nodes, mesh, status, adaptive] = await Promise.all([
