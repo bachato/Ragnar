@@ -16,6 +16,28 @@ function nodeHealth(lastSeenMs) {
   return { label: 'offline', badge: 'badge-bad', dot: 'bg-bad', key: 'offline' };
 }
 
+// Convert a mesh clock offset (microseconds) to a human string.
+function fmtOffset(us) {
+  const a = Math.abs(us || 0);
+  if (a < 1000) return `${us || 0} \u00b5s`;
+  if (a < 1e6) return `${((us || 0) / 1000).toFixed(1)} ms`;
+  return `${((us || 0) / 1e6).toFixed(1)} s`;
+}
+
+// Classify a node's TIME-SYNC from its clock offset vs the leader + how long
+// since its last mesh sync packet. A healthy mesh syncs to sub-millisecond
+// offsets with sub-second freshness. Seconds of offset, or tens of seconds with
+// no sync, means the sync path is broken — typically because the nodes are on
+// DIFFERENT access points (the sync traffic doesn't cross between routers), even
+// while the CSI data path (unicast to the Pi) keeps working.
+function syncState(offsetUs, stalenessMs, isLeader) {
+  if (isLeader) return { label: 'leader', cls: 'badge-ok', key: 'synced' };
+  const a = Math.abs(offsetUs || 0), st = stalenessMs || 0;
+  if (a <= 5000 && st <= 10000) return { label: 'synced', cls: 'badge-ok', key: 'synced' };
+  if (a <= 500000 && st <= 30000) return { label: 'syncing', cls: 'badge-warn', key: 'syncing' };
+  return { label: 'desynced', cls: 'badge-bad', key: 'desynced' };
+}
+
 function nodeRow(n, names = {}) {
   const h = nodeHealth(n.last_seen_ms);
   const nm = names[String(n.node_id)];
@@ -69,23 +91,112 @@ export default {
           </div>
         </div>
 
-        <div class="grid gap-4 sm:grid-cols-2">
-          <div class="card card-pad space-y-2">
-            <h2 class="card-title">Mesh</h2>
-            <pre id="mesh-box" class="text-xs font-mono text-ink-soft whitespace-pre-wrap break-words">—</pre>
+        <div class="card card-pad space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="card-title">Mesh health</h2>
+            <span id="mesh-verdict-badge" class="badge-mut">—</span>
           </div>
-          <div class="card card-pad space-y-2">
-            <h2 class="card-title">Hardware reference</h2>
-            <dl class="text-sm space-y-2">
-              ${[['Node chip', 'ESP32-S3 / C6'], ['Band', '2.4 GHz WiFi CSI'], ['Subcarriers', 'up to 114'], ['Sample rate', '~100 Hz'], ['mmWave option', 'Seeed MR60BHA2 (60 GHz)']]
-                .map(([k, v]) => `<div class="flex justify-between border-b border-ink-3 pb-2 last:border-0"><dt class="text-ink-muted">${k}</dt><dd class="font-mono text-right">${v}</dd></div>`).join('')}
-            </dl>
-          </div>
+          <p id="mesh-verdict" class="text-sm text-ink-soft leading-snug">Reading mesh…</p>
+          <div id="mesh-nodes" class="space-y-2"></div>
+          <p class="text-xs text-ink-muted pt-1 border-t border-ink-3">
+            <strong>CSI</strong> = data path (node → Pi). <strong>sync</strong> = mesh time-sync between nodes;
+            it needs all nodes on the <em>same access point &amp; channel</em>. Watch <strong>offset</strong> fall
+            toward <span class="font-mono">µs</span> when the mesh is healthy.
+          </p>
+          <details class="text-xs">
+            <summary class="text-ink-muted cursor-pointer select-none">Raw mesh JSON</summary>
+            <pre id="mesh-raw" class="mt-2 font-mono text-ink-soft whitespace-pre-wrap break-words">—</pre>
+          </details>
+        </div>
+
+        <div class="card card-pad space-y-2">
+          <h2 class="card-title">Hardware reference</h2>
+          <dl class="text-sm space-y-2">
+            ${[['Node chip', 'ESP32-S3 / C6'], ['Band', '2.4 GHz WiFi CSI'], ['Subcarriers', 'up to 114'], ['Sample rate', '~100 Hz'], ['mmWave option', 'Seeed MR60BHA2 (60 GHz)']]
+              .map(([k, v]) => `<div class="flex justify-between border-b border-ink-3 pb-2 last:border-0"><dt class="text-ink-muted">${k}</dt><dd class="font-mono text-right">${v}</dd></div>`).join('')}
+          </dl>
         </div>
       </section>`);
 
+    // Cross-poll history so we can detect reboots (sequence going backwards) and
+    // offset TREND (so you can watch offsets collapse toward zero on one AP).
+    const seqPrev = {}, offPrev = {}, rebootAt = {};
+    const renderMeshHealth = (mesh, nodeList) => {
+      const raw = $('#mesh-raw'); if (raw) raw.textContent = mesh ? JSON.stringify(mesh, null, 2) : 'unavailable';
+      const wrap = $('#mesh-nodes'), vEl = $('#mesh-verdict'), vb = $('#mesh-verdict-badge');
+      const nodes = (mesh && mesh.nodes) || {};
+      const ids = Object.keys(nodes).sort((a, b) => (+a) - (+b));
+      if (!ids.length) {
+        if (wrap) wrap.innerHTML = '<div class="text-sm text-ink-muted">No mesh data — no nodes reporting.</div>';
+        if (vEl) vEl.textContent = ''; if (vb) { vb.textContent = '—'; vb.className = 'badge-mut'; }
+        return;
+      }
+      const rssi = {}, lastSeen = {};
+      for (const n of (nodeList || [])) { rssi[String(n.node_id)] = n.rssi_dbm; lastSeen[String(n.node_id)] = n.last_seen_ms; }
+      let desynced = 0, syncing = 0, dataOkAmongBad = 0;
+      const badWeak = [], rebootIds = [];
+      const rows = ids.map((id) => {
+        const m = nodes[id] || {};
+        const off = m.offset_us || 0, stale = m.staleness_ms || 0, seq = m.sequence || 0;
+        if (seqPrev[id] != null && seq < seqPrev[id] - 2) rebootAt[id] = Date.now();
+        seqPrev[id] = seq;
+        const rebooted = rebootAt[id] && (Date.now() - rebootAt[id] < 120000);
+        if (rebooted) rebootIds.push(id);
+        let trend = '';
+        if (offPrev[id] != null) {
+          const d = Math.abs(off) - Math.abs(offPrev[id]);
+          if (d < -50000) trend = ' <span class="text-ok">\u2193 converging</span>';
+          else if (d > 50000) trend = ' <span class="text-warn">\u2191 drifting</span>';
+        }
+        offPrev[id] = off;
+        const ss = syncState(off, stale, m.is_leader);
+        if (ss.key === 'desynced') { desynced++; badWeak.push({ id, rssi: rssi[id] }); }
+        else if (ss.key === 'syncing') syncing++;
+        const ls = lastSeen[id];
+        const dataFlowing = ls != null && ls < 5000;
+        if (ss.key === 'desynced' && dataFlowing) dataOkAmongBad++;
+        const nm = nodeNames[id];
+        const label = nm ? `${nm} <span class="text-ink-muted">#${id}</span>` : `#${id}`;
+        const rv = rssi[id];
+        return `<div class="rounded-lg bg-ink-1 border border-ink-3 p-2.5 space-y-1">
+          <div class="flex items-center justify-between">
+            <span class="font-mono text-sm">${label}${m.is_leader ? ' <span class="text-xs text-ink-muted">(leader)</span>' : ''}</span>
+            <span class="${ss.cls}">${ss.label}</span>
+          </div>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 text-xs text-ink-muted">
+            <span>offset <span class="font-mono text-ink-soft">${fmtOffset(off)}</span>${trend}</span>
+            <span>last sync <span class="font-mono text-ink-soft">${fmt.ago(stale / 1000)}</span></span>
+            <span>CSI <span class="font-mono ${dataFlowing ? 'text-ok' : 'text-warn'}">${dataFlowing ? `${Math.round(m.csi_fps_ema || 0)} fps` : (ls != null ? fmt.ago(ls / 1000) : '—')}</span></span>
+            <span>RSSI <span class="font-mono text-ink-soft">${rv != null ? `${Math.round(rv)} dBm` : '—'}</span></span>
+          </div>
+          ${rebooted ? '<div class="text-xs text-bad">\u26a0 sequence reset — this node rebooted</div>' : ''}
+        </div>`;
+      });
+      if (wrap) wrap.innerHTML = rows.join('');
+      // ── plain-language verdict, most-serious first ──
+      let badge, bcls, msg;
+      if (rebootIds.length) {
+        badge = 'Rebooting'; bcls = 'badge-bad';
+        msg = `Node(s) ${rebootIds.map((i) => '#' + i).join(', ')} reset their sequence — a reboot loop. Check power (ESP32-S3 browns out under WiFi TX spikes) or a weak/dropping AP.`;
+      } else if (desynced) {
+        badge = 'Sync failing'; bcls = 'badge-bad';
+        const weakest = badWeak.filter((b) => b.rssi != null).sort((a, b) => a.rssi - b.rssi)[0];
+        const weakHint = weakest ? ` Node #${weakest.id} is weakest at ${Math.round(weakest.rssi)} dBm — likely on a far router.` : '';
+        const dataHint = dataOkAmongBad ? ' CSI data is still streaming, so the data path is fine — only time-sync is broken.' : '';
+        msg = `Time-sync failing on ${desynced} node(s): clocks are seconds off the leader and sync packets are stale.${dataHint} This is the signature of nodes on <strong>different access points</strong> — one SSID across several routers makes each node roam to a different AP, which breaks the mesh sync (and CSI coherence). Put all nodes on <strong>one AP + a fixed channel</strong>.${weakHint}`;
+      } else if (syncing) {
+        badge = 'Converging'; bcls = 'badge-warn';
+        msg = 'Mesh is settling — offsets shrinking toward zero. Give it a few seconds; if they never reach sub-millisecond, the nodes are probably on different APs.';
+      } else {
+        badge = 'Healthy'; bcls = 'badge-ok';
+        msg = 'All nodes time-synced — sub-millisecond offsets, fresh sync. Same AP, coherent mesh. This is what good looks like.';
+      }
+      if (vb) { vb.textContent = badge; vb.className = bcls; }
+      if (vEl) vEl.innerHTML = msg;
+    };
+
     const refresh = async () => {
-      const data = await fetchJSON('/api/v1/nodes');
+      const [data, mesh] = await Promise.all([fetchJSON('/api/v1/nodes'), fetchJSON('/api/v1/mesh')]);
       const body = $('#n-body');
       const list = data?.nodes || [];
       const by = { live: 0, lagging: 0, offline: 0 };
@@ -96,11 +207,7 @@ export default {
       body.innerHTML = list.length
         ? list.map((n) => nodeRow(n, nodeNames)).join('')
         : '<tr><td colspan="6" class="py-6 text-center text-ink-muted">No nodes reporting. Power on an ESP32 CSI node and provision it to this server.</td></tr>';
-    };
-    const refreshMesh = async () => {
-      const m = await fetchJSON('/api/v1/mesh');
-      const el = $('#mesh-box');
-      if (el) el.textContent = m ? JSON.stringify(m, null, 2) : 'Mesh data unavailable';
+      renderMeshHealth(mesh, list);
     };
 
     // Download logs: a ROLLING capture (not a single snapshot) of node roster +
@@ -147,7 +254,7 @@ export default {
       }
     };
 
-    refresh(); refreshMesh();
+    refresh();
     $('#n-refresh').addEventListener('click', refresh);
     const logsBtn = $('#n-logs');
     if (logsBtn) logsBtn.addEventListener('click', (e) => captureLogs(e.currentTarget));

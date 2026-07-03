@@ -6,7 +6,7 @@ import { html, setQueryRoot } from './lib.js';
 import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js?v=20260702-nodestatus';
 import sensing from './views/sensing.js?v=20260701-vitfix';
-import nodes from './views/nodes.js?v=20260702-dllogs';
+import nodes from './views/nodes.js?v=20260702-meshpanel';
 import training from './views/training.js?v=20260702-dl';
 import settings from './views/settings.js?v=20260702-schedule';
 import about from './views/about.js?v=20260701-mode';
