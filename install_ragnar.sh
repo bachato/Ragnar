@@ -941,6 +941,16 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
         # Ensure spidev is installed for TFT SPI communication
         pip3 install spidev --break-system-packages >/dev/null 2>&1
         log "INFO" "SPI dependencies installed for TFT display"
+    elif [ "$EPD_VERSION" = "whisplay" ]; then
+        # TFT drivers ship with Ragnar in resources/waveshare_epd/, verify the file exists
+        if [ -f "$ragnar_PATH/resources/waveshare_epd/whisplay.py" ]; then
+            log "SUCCESS" "Whisplay TFT driver verified (resources/waveshare_epd/whisplay.py)"
+        else
+            log "ERROR" "Whisplay TFT driver not found at $ragnar_PATH/resources/waveshare_epd/whisplay.py"
+        fi
+        # Ensure spidev is installed for TFT SPI communication
+        pip3 install spidev --break-system-packages >/dev/null 2>&1
+        log "INFO" "SPI dependencies installed for TFT display"
     elif [ "$EPD_VERSION" = "ssd1306" ]; then
         if [ -f "$ragnar_PATH/resources/waveshare_epd/ssd1306.py" ]; then
             log "SUCCESS" "SSD1306 OLED driver verified (resources/waveshare_epd/ssd1306.py)"
@@ -1691,22 +1701,24 @@ main() {
 
             echo -e "\n${BLUE}Select your TFT/OLED display:${NC}"
             echo "1. GC9A01      (1.28\" Round 240x240)"
-            echo "2. SSD1306     (0.96\" OLED 128x64)"
-            echo "3. LCD1602     (16x2 I2C Character LCD)"
-            echo "4. No display  (headless install)"
+            echo "2. Whisplay    (1.69\" ST7789 240x280, PiSugar HAT)"
+            echo "3. SSD1306     (0.96\" OLED 128x64)"
+            echo "4. LCD1602     (16x2 I2C Character LCD)"
+            echo "5. No display  (headless install)"
 
             while true; do
-                read -p "Enter your choice (1-4): " tft_choice
+                read -p "Enter your choice (1-5): " tft_choice
                 case $tft_choice in
                     1) EPD_VERSION="gc9a01"; break;;
-                    2) EPD_VERSION="ssd1306"; break;;
-                    3) EPD_VERSION="lcd1602"; break;;
-                    4)
+                    2) EPD_VERSION="whisplay"; break;;
+                    3) EPD_VERSION="ssd1306"; break;;
+                    4) EPD_VERSION="lcd1602"; break;;
+                    5)
                         select_headless_variant
                         EPD_VERSION=""
                         break
                         ;;
-                    *) echo -e "${RED}Invalid choice. Please select 1-4.${NC}";;
+                    *) echo -e "${RED}Invalid choice. Please select 1-5.${NC}";;
                 esac
             done
 

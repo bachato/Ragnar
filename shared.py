@@ -133,6 +133,7 @@ SIZE_KEY_TO_DEFAULT_DRIVER = {
     "3in7":     "epd3in7",
     "4in26":    "epd4in26",
     "1in28_tft": "gc9a01",
+    "1in69_tft": "whisplay",
     "0in96_oled": "ssd1306",
     "1602_lcd": "lcd1602",
 }
@@ -174,6 +175,9 @@ DISPLAY_PROFILES = {
     "epd4in26":    {"ref_width": DESIGN_REF_WIDTH, "ref_height": DESIGN_REF_HEIGHT, "default_flip": False},
     # GC9A01 1.28" 240x240 round colour TFT LCD
     "gc9a01":      {"ref_width": DESIGN_REF_WIDTH, "ref_height": DESIGN_REF_WIDTH, "default_flip": False},
+    # Whisplay HAT 1.69" ST7789 240x280 colour TFT LCD (ref height keeps the
+    # 240:280 aspect so the layout isn't stretched: 122 * 280/240 = 142)
+    "whisplay":    {"ref_width": DESIGN_REF_WIDTH, "ref_height": 142, "default_flip": False},
     # SSD1306 0.96" 128x64 monochrome OLED
     "ssd1306":     {"ref_width": 128, "ref_height": 64,  "default_flip": False},
     # LCD1602 16x2 character LCD (I2C via PCF8574 backpack)
