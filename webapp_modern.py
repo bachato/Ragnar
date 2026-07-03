@@ -72,6 +72,15 @@ app = Flask(__name__,
             static_folder='web',
             template_folder='web')
 app.config['SECRET_KEY'] = auth_mgr.get_or_create_secret_key()
+# Cookie name must be unique per device: two Ragnar instances reached through
+# the same hostname (e.g. SSH tunnels on localhost:3000/3001) share one cookie
+# jar, and with Flask's default name 'session' each login overwrites the other
+# instance's cookie, logging it out (issue #361). The hardware fingerprint is
+# stable across reboots, so sessions survive restarts.
+try:
+    app.config['SESSION_COOKIE_NAME'] = 'ragnar_session_' + auth_mgr.get_hardware_fingerprint()[:12]
+except Exception:  # pragma: no cover - fingerprinting must never block startup
+    app.config['SESSION_COOKIE_NAME'] = 'ragnar_session'
 app.config['JSON_SORT_KEYS'] = False
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 
