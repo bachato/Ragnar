@@ -85,7 +85,7 @@ function buildNvsPartition(size, keys) {
 // written right after target_port). node_id gives each node a unique identity;
 // without it every node falls back to the firmware default (1) and they collide
 // -- the server then only ever shows one node at a time.
-function buildCsiCfgNvs({ ssid, password, target_ip, target_port = 5005, node_id }) {
+function buildCsiCfgNvs({ ssid, password, target_ip, target_port = 5005, node_id, edge_tier = 0 }) {
   const keys = [
     { type: 'namespace', key: 'csi_cfg', value: 1 },
     { type: 'string', key: 'ssid', value: ssid },
@@ -96,6 +96,13 @@ function buildCsiCfgNvs({ ssid, password, target_ip, target_port = 5005, node_id
   if (node_id !== undefined && node_id !== null) {
     keys.push({ type: 'u8', key: 'node_id', value: node_id & 0xFF });
   }
+  // edge_tier (u8) selects the node's OUTPUT MODE. The RuSense/RuView server does
+  // server-side multistatic fusion, so it needs RAW CSI frames: edge_tier=0
+  // ("raw CSI passthrough"). The firmware DEFAULT is 2 (full on-device pipeline),
+  // which makes the node emit a 60-byte rv_feature_state_t instead of CSI — the
+  // server then sees no CSI frames and the source reads "esp32:offline". So we
+  // always provision 0 here; a customer must never end up on the edge default.
+  keys.push({ type: 'u8', key: 'edge_tier', value: edge_tier & 0xFF });
   return buildNvsPartition(0x6000, keys);
 }
 

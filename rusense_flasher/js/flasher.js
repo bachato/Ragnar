@@ -236,6 +236,7 @@ window.provisionDevice = async function () {
     log("WiFi SSID : " + ssid);
     log("Server    : " + targetIp + ":" + targetPort);
     log("Node ID   : " + nodeId);
+    log("Edge tier : 0 (raw CSI — server-side fusion)");
     log("NVS       : " + nvs.length + " bytes @ 0x9000 (csi_cfg)");
 
     setStatus("Connecting…");
