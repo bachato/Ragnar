@@ -62,6 +62,7 @@ web will be down during wardrive without ap or wifi connection.
 
 - **Wi-Fi Client Isolation Testing** — AirSnitch tests whether a network properly isolates clients using GTK abuse, gateway bouncing, and port stealing attacks. See [AirSnitch Guide](docs/airsnitch.md)
 - **Wardriving with GPS recovery** — Logs WiFi networks, BLE devices, and cell towers with GPS positions while driving. Exports to WiGLE CSV / KML. Most wardrivers log observations with GPS-at-scan-time and discard the rest; Ragnar logs a GPS breadcrumb track during the session and runs a post-pass that backfills missing positions for any observation seen within 5 minutes of a real GPS point. The interpolation is speed-aware — when endpoint speeds differ (slowing for a tunnel, accelerating out the far side), it uses constant-acceleration math instead of constant-velocity, shifting positions toward whichever endpoint the device actually spent more time near. See [Wardriving Guide](docs/wardriving.md)
+- **Network Tools** — A built-in network engineer's toolbox in the web UI: ping, traceroute, MTR, WHOIS and speed test (Diagnostics); switch discovery via LLDP / CDPv1v2 / EDP / FDP / SONMP with PoE detection, and ARP host scanning (Switch & L2); per-interface link speed/duplex/auto-neg, DHCP-vs-static and VLAN detail, plus DNS/gateway network identity (Interfaces). Missing CLI tools install with one click. Co-authored by [Solarflere](https://www.instagram.com/solarflere). See [Network Tools Guide](docs/nettools.md)
 - **Network Scanning** — Identifies live hosts and open ports
 - **Vulnerability Assessment** — Scans using Nmap and other tools
 - **Multi-Source Threat Intelligence** — Real-time fusion from CISA KEV, NVD CVE, AlienVault OTX, and MITRE ATT&CK
@@ -299,6 +300,7 @@ Ragnar is built on the shoulders of great work by others:
 | [Bjorn](https://github.com/infinition/Bjorn) | infinition | Original project that Ragnar is forked from |
 | [PagerBjorn / Loki](https://github.com/pineapple-pager-projects/pineapple_pager_loki) | [brAinphreAk](https://github.com/brainphreak) | WiFi Pineapple Pager adaptation layer — display system, hardware control wrapper (`pagerctl.py`), pager menu UI, and all MIPS-compiled binaries and libraries |
 | [RuView](https://github.com/ruvnet/ruview) | ruvnet | WiFi-CSI sensing engine and ESP32 CSI-node firmware behind [RuSense](docs/rusense.md) — camera-free presence, motion, people-count, pose and vital-sign sensing. Ragnar vendors bins from the [PierreGode/RuView](https://github.com/PierreGode/RuView) fork |
+| — | [Solarflere](https://www.instagram.com/solarflere) | Co-author of the [Network Tools](docs/nettools.md) suite (Diagnostics, Switch & L2, Interfaces) |
 
 ---
 
