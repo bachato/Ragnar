@@ -159,7 +159,12 @@ UNIT
 
 as_root systemctl daemon-reload
 as_root systemctl reset-failed "$UNIT_NAME" 2>/dev/null || true
-as_root systemctl enable --now "$UNIT_NAME"
+# enable for boot, then RESTART (not `enable --now`): on an already-running
+# service `enable --now` is a no-op, so a reinstall/update would copy the new
+# binary + unit to disk but keep the OLD process running until a reboot. restart
+# guarantees the freshly-vendored binary and unit env actually take effect now.
+as_root systemctl enable "$UNIT_NAME"
+as_root systemctl restart "$UNIT_NAME"
 
 # ── 4. Verify ────────────────────────────────────────────────────────────────
 sleep 2
