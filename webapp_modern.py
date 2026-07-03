@@ -1278,6 +1278,102 @@ def rusense_recording_download():
         download_name=os.path.basename(target), mimetype='application/x-ndjson')
 
 
+@app.route('/api/rusense/diagnostics', methods=['GET'])
+def rusense_diagnostics():
+    """One-shot deep diagnostics bundle for CSI-node debugging. Runs the exact
+    server-side commands a human would (tcpdump on the CSI UDP port, journalctl
+    for the sensing engine, ss/systemctl, system + wifi state, binary md5s) AND
+    the sensing-server API snapshots, so the Nodes-tab 'Download logs' captures
+    EVERYTHING in one file. Local route; the webapp runs as root so the shell
+    commands work. ?secs=6 controls the tcpdump window (2-20)."""
+    import subprocess
+    import hashlib
+    try:
+        secs = int(request.args.get('secs', 6))
+    except (TypeError, ValueError):
+        secs = 6
+    secs = max(2, min(20, secs))
+
+    def run(cmd, timeout=12):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return {'cmd': ' '.join(cmd), 'rc': r.returncode,
+                    'stdout': (r.stdout or '')[-24000:], 'stderr': (r.stderr or '')[-4000:]}
+        except FileNotFoundError:
+            return {'cmd': ' '.join(cmd), 'error': 'command not installed'}
+        except subprocess.TimeoutExpired:
+            return {'cmd': ' '.join(cmd), 'error': f'timeout after {timeout}s'}
+        except Exception as exc:
+            return {'cmd': ' '.join(cmd), 'error': str(exc)}
+
+    def md5(path):
+        try:
+            h = hashlib.md5()
+            with open(path, 'rb') as fh:
+                for chunk in iter(lambda: fh.read(65536), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception as exc:
+            return f'err: {exc}'
+
+    # tcpdump the CSI UDP port for `secs` (bounded by packet count too). `-i any`
+    # is portable; the raw lines carry source IP + payload length per packet.
+    udp = run(['timeout', str(secs), 'tcpdump', '-i', 'any', '-n', '-c', '500',
+               'udp', 'port', '5005'], timeout=secs + 8)
+
+    repo_bin = os.path.join(shared_data.currentdir, 'bin', 'sensing-server')
+    with _rusense_notify_lock:
+        geofence = _rusense_notify_state.get('last_geofence')
+    presence_pub = _rusense_notify_state.get('presence_pub')
+
+    diag = {
+        'captured_at': time.time(),
+        'tcpdump_seconds': secs,
+        'system': {
+            'hostname': run(['hostname']),
+            'ip': run(['hostname', '-I']),
+            'uptime': run(['uptime']),
+            'free_m': run(['free', '-m']),
+            'ip_addr': run(['ip', '-br', 'addr']),
+            'wifi_dev': run(['iw', 'dev']),
+            'wifi_link': run(['iw', 'dev', 'wlan0', 'link']),
+        },
+        'sensing_service': {
+            'status': run(['systemctl', 'status', 'ragnar-sensing.service', '--no-pager', '-l']),
+            'show': run(['systemctl', 'show', 'ragnar-sensing.service',
+                         '-p', 'ActiveState', '-p', 'SubState', '-p', 'NRestarts',
+                         '-p', 'ActiveEnterTimestamp', '-p', 'ExecMainPID', '-p', 'Environment']),
+        },
+        'journal_sensing': run(['journalctl', '-u', 'ragnar-sensing.service',
+                                '-n', '400', '--no-pager']),
+        'journal_ragnar': run(['journalctl', '-u', 'ragnar.service',
+                               '-n', '80', '--no-pager']),
+        'sockets_udp': run(['ss', '-uanp']),
+        'udp_capture': udp,
+        'binaries': {
+            'installed': '/usr/local/bin/ragnar-sensing-server',
+            'installed_md5': md5('/usr/local/bin/ragnar-sensing-server'),
+            'vendored': repo_bin,
+            'vendored_md5': md5(repo_bin),
+        },
+        'api': {
+            'status': _rusense_get('/api/v1/status'),
+            'nodes': _rusense_get('/api/v1/nodes'),
+            'mesh': _rusense_get('/api/v1/mesh'),
+            'adaptive_status': _rusense_get('/api/v1/adaptive/status'),
+            'models_active': _rusense_get('/api/v1/models/active'),
+            'sensing_latest': _rusense_get('/api/v1/sensing/latest'),
+        },
+        'ragnar_state': {
+            'geofence': geofence,
+            'presence_pub': presence_pub,
+        },
+        'rusense_config': {k: v for k, v in (shared_data.config or {}).items()
+                           if isinstance(k, str) and k.startswith('rusense_')},
+    }
+    return jsonify(diag)
+
+
 @app.route('/api/rusense/vitals-history', methods=['GET'])
 def rusense_vitals_history():
     """Aggregated heart-rate / breathing / activity buckets for the dashboard

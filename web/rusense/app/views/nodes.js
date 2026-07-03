@@ -75,7 +75,7 @@ export default {
           <div class="flex items-center justify-between">
             <h2 class="card-title">Sensor nodes</h2>
             <div class="flex items-center gap-2">
-              <button id="n-logs" class="btn-ghost !py-1.5 !px-3 text-xs" title="Capture ~30s of node + mesh + engine state to a JSON file for debugging">Download logs</button>
+              <button id="n-logs" class="btn-ghost !py-1.5 !px-3 text-xs" title="Capture EVERYTHING to a JSON file: 30s node/mesh/engine time-series + server-side tcpdump, journalctl, ss, systemctl, wifi/system state, binary md5s and API snapshots">Download logs</button>
               <button id="n-refresh" class="btn-ghost !py-1.5 !px-3 text-xs">Refresh</button>
             </div>
           </div>
@@ -234,6 +234,11 @@ export default {
       const orig = btn.textContent;
       btn.disabled = true;
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      // Fire the server-side deep diagnostics in parallel (tcpdump on the CSI UDP
+      // port, journalctl for the sensing engine, ss/systemctl, system+wifi state,
+      // binary md5s, API snapshots) — the browser can't run those. Returns in
+      // ~8s, well inside the 30s sample window, so it adds no extra wait.
+      const diagPromise = fetchJSON('/api/rusense/diagnostics?secs=8').catch(() => null);
       try {
         while (Date.now() - started < CAP_MS && capturing) {
           const [nodes, mesh, status, adaptive] = await Promise.all([
@@ -245,13 +250,16 @@ export default {
           btn.textContent = `Capturing… ${left}s`;
           if (Date.now() - started < CAP_MS && capturing) await sleep(STEP);
         }
-        if (!samples.length) return;
+        btn.textContent = 'Collecting server logs…';
+        const server = await diagPromise;   // tcpdump / journal / ss / systemctl / md5 / api
+        if (!samples.length && !server) return;
         const bundle = {
           captured_at: new Date().toISOString(),
           capture_seconds: Math.round((Date.now() - started) / 1000),
           sample_count: samples.length,
           node_names: nodeNames,
-          hint: 'Watch mesh[].sequence per node: resets to low numbers = the node is rebooting. Large/growing offset_us = clock desync. status.trust.demoted/engine_error_count climbing = the engine is degrading.',
+          hint: 'server_diagnostics = one-shot server-side deep capture (tcpdump on UDP 5005 -> packet sizes tell edge_tier: ~60B=edge mode, 148-404B=raw CSI; journal_sensing -> fusion/spread/dimension errors; binaries.*_md5 -> confirm the running binary; sockets_udp Recv-Q -> ingestion backlog; api.mesh offset_us/staleness_ms -> clock sync). samples = 30s time-series (mesh sequence resets = reboots; growing offset = desync; trust.demoted/errors climbing = engine degrading).',
+          server_diagnostics: server,
           samples,
         };
         const url = URL.createObjectURL(new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' }));
