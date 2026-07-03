@@ -140,7 +140,13 @@ WorkingDirectory=$RAGNAR_DIR
 ExecStartPre=/bin/mkdir -p $RAGNAR_DIR/data/recordings $RAGNAR_DIR/data/models
 Environment=RUST_LOG=info
 Environment=SENSING_ALLOWED_HOSTS=$ALLOWED_HOSTS
-Environment=RUVIEW_PRESENCE_FLOOR=0.25
+# Presence floor: smoothed-motion (sm) threshold above which a node reports
+# present (model-free — csi.rs raw.presence = sm > floor). 0.25 was tuned
+# for the noisy AMOLED 2-node CSI (empty-room sm~0.15); clean headless
+# DevKitC nodes sit near 0 empty and ~0.12 when a person moves, so 0.25
+# gated real motion out. 0.10 sits between DevKitC empty (~0-0.085) and
+# moving (~0.12-0.15). Override per-site with RUVIEW_PRESENCE_FLOOR.
+Environment=RUVIEW_PRESENCE_FLOOR=0.10
 Environment=RUVIEW_NODE_VOTE=0.80
 Environment=RUVIEW_NONVOTING_NODES=1
 # Multi-node fusion guard: WiFi/ESP-NOW-synced ESP32 nodes drift 10-150 ms
