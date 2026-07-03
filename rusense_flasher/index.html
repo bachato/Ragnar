@@ -83,7 +83,7 @@
 
       <!-- ───────── ESP32-S3 (production) ───────── -->
       <section class="flash-panel" id="csi-s3">
-        <h2>📡 ESP32-S3 CSI Node <span class="panel-sub">(production · the workhorse)</span></h2>
+        <h2>📡 ESP32-S3 AMOLED Node <span class="panel-sub">(display board · self-ping sensing)</span></h2>
         <p>
           Dual-core LX7 @240&nbsp;MHz, 8&nbsp;MB flash. The recommended platform for live CSI
           sensing &mdash; the steadiest, best-tested ship in the fleet. Plug it into USB, provision
@@ -107,6 +107,38 @@
         <div class="flash-buttons">
           <button class="btn-flash" onclick="flashDevice('manifest-csi-s3.json')">
             🔨 Forge S3 CSI Node
+          </button>
+        </div>
+      </section>
+
+      <!-- ───────── ESP32-S3-DevKitC-1 N16R8 (headless sensor · recommended) ───────── -->
+      <section class="flash-panel" id="csi-s3-devkit">
+        <h2>📶 ESP32-S3-DevKitC-1 <span class="panel-sub">(N16R8 · headless · best sensing)</span></h2>
+        <p>
+          Plain dual-core LX7 @240&nbsp;MHz, 16&nbsp;MB flash, <strong>no display</strong>. With no
+          AMOLED panel to protect, it captures the full <strong>MGMT+DATA</strong> WiFi traffic &mdash;
+          the rich multipath a moving person actually shows up in. This is the
+          <strong>recommended sensor</strong> for presence / motion / people-count; AMOLED boards
+          sense on a single self-ping link and struggle to separate empty from occupied.
+        </p>
+
+        <div class="prereq">
+          <div class="prereq-title">Before the forge fires</div>
+          <ol>
+            <li>Close Arduino IDE, Serial Monitor, or any other app holding the port</li>
+            <li>Use a <strong>data-capable</strong> USB-C cable (charge-only cables are runes that do nothing)</li>
+            <li>Click Forge and pick <code>USB JTAG/serial debug unit</code> from the port list</li>
+            <li>If the board isn&rsquo;t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong></li>
+          </ol>
+        </div>
+
+        <div class="chip-badges">
+          <span class="chip-badge"><span class="dot"></span>ESP32-S3 &middot; 16&nbsp;MB flash &middot; no display</span>
+        </div>
+
+        <div class="flash-buttons">
+          <button class="btn-flash" onclick="flashDevice('manifest-csi-s3-devkit.json')">
+            🔨 Forge S3 DevKitC Sensor
           </button>
         </div>
       </section>
