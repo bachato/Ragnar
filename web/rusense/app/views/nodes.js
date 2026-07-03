@@ -121,7 +121,7 @@ export default {
     // Cross-poll history so we can detect reboots (sequence going backwards) and
     // offset TREND (so you can watch offsets collapse toward zero on one AP).
     const seqPrev = {}, offPrev = {}, rebootAt = {};
-    const renderMeshHealth = (mesh, nodeList) => {
+    const renderMeshHealth = (mesh, nodeList, status) => {
       const raw = $('#mesh-raw'); if (raw) raw.textContent = mesh ? JSON.stringify(mesh, null, 2) : 'unavailable';
       const wrap = $('#mesh-nodes'), vEl = $('#mesh-verdict'), vb = $('#mesh-verdict-badge');
       const nodes = (mesh && mesh.nodes) || {};
@@ -134,14 +134,18 @@ export default {
       const rssi = {}, lastSeen = {};
       for (const n of (nodeList || [])) { rssi[String(n.node_id)] = n.rssi_dbm; lastSeen[String(n.node_id)] = n.last_seen_ms; }
       let desynced = 0, syncing = 0, dataOkAmongBad = 0;
-      const badWeak = [], rebootIds = [];
+      const badWeak = [], rebootIds = [], stalledIds = [];
       const rows = ids.map((id) => {
         const m = nodes[id] || {};
         const off = m.offset_us || 0, stale = m.staleness_ms || 0, seq = m.sequence || 0;
-        if (seqPrev[id] != null && seq < seqPrev[id] - 2) rebootAt[id] = Date.now();
+        const prevSeq = seqPrev[id];
+        if (prevSeq != null && seq < prevSeq - 2) rebootAt[id] = Date.now();
+        const frozen = prevSeq != null && seq === prevSeq;   // sequence not advancing between polls
         seqPrev[id] = seq;
         const rebooted = rebootAt[id] && (Date.now() - rebootAt[id] < 120000);
         if (rebooted) rebootIds.push(id);
+        const stalled = frozen && stale > 20000;             // frozen + minutes stale = mesh dead here
+        if (stalled) stalledIds.push(id);
         let trend = '';
         if (offPrev[id] != null) {
           const d = Math.abs(off) - Math.abs(offPrev[id]);
@@ -149,7 +153,7 @@ export default {
           else if (d > 50000) trend = ' <span class="text-warn">\u2191 drifting</span>';
         }
         offPrev[id] = off;
-        const ss = syncState(off, stale, m.is_leader);
+        const ss = stalled ? { label: 'stalled', cls: 'badge-bad', key: 'stalled' } : syncState(off, stale, m.is_leader);
         if (ss.key === 'desynced') { desynced++; badWeak.push({ id, rssi: rssi[id] }); }
         else if (ss.key === 'syncing') syncing++;
         const ls = lastSeen[id];
@@ -169,13 +173,22 @@ export default {
             <span>CSI <span class="font-mono ${dataFlowing ? 'text-ok' : 'text-warn'}">${dataFlowing ? `${Math.round(m.csi_fps_ema || 0)} fps` : (ls != null ? fmt.ago(ls / 1000) : '—')}</span></span>
             <span>RSSI <span class="font-mono text-ink-soft">${rv != null ? `${Math.round(rv)} dBm` : '—'}</span></span>
           </div>
-          ${rebooted ? '<div class="text-xs text-bad">\u26a0 sequence reset — this node rebooted</div>' : ''}
+          ${stalled ? '<div class="text-xs text-bad">\u26a0 mesh frozen — no updates from this node</div>'
+            : (rebooted ? '<div class="text-xs text-bad">\u26a0 sequence reset — this node rebooted</div>' : '')}
         </div>`;
       });
       if (wrap) wrap.innerHTML = rows.join('');
       // ── plain-language verdict, most-serious first ──
+      const src = (status && status.source) ? String(status.source) : '';
+      const offline = /offline/i.test(src);
       let badge, bcls, msg;
-      if (rebootIds.length) {
+      if (offline || (stalledIds.length && stalledIds.length === ids.length)) {
+        badge = 'Not reaching server'; bcls = 'badge-bad';
+        msg = `The server isn't receiving node data${offline ? ' (source reports <span class="font-mono">offline</span>)' : ''} — the mesh is frozen: sequences aren't advancing and last-sync is minutes old. Most likely the nodes joined an access point that can't reach the Pi. A <strong>strong RSSI with no data means the wrong AP/subnet</strong>. Get all nodes onto the <strong>same AP/network as the Ragnar box</strong> — with several routers sharing one SSID, being near one doesn't force association and doesn't guarantee it routes here. Turn off the other routers' radios (or give the sensing AP a <strong>unique SSID</strong>) and confirm that AP is on the Pi's LAN (no guest / client-isolation mode).`;
+      } else if (stalledIds.length) {
+        badge = 'Node(s) stalled'; bcls = 'badge-bad';
+        msg = `Node(s) ${stalledIds.map((i) => '#' + i).join(', ')} stopped updating (mesh frozen, minutes stale) while others are live — that node likely dropped to a different AP or lost the Pi. Check its WiFi association and placement.`;
+      } else if (rebootIds.length) {
         badge = 'Rebooting'; bcls = 'badge-bad';
         msg = `Node(s) ${rebootIds.map((i) => '#' + i).join(', ')} reset their sequence — a reboot loop. Check power (ESP32-S3 browns out under WiFi TX spikes) or a weak/dropping AP.`;
       } else if (desynced) {
@@ -196,7 +209,7 @@ export default {
     };
 
     const refresh = async () => {
-      const [data, mesh] = await Promise.all([fetchJSON('/api/v1/nodes'), fetchJSON('/api/v1/mesh')]);
+      const [data, mesh, status] = await Promise.all([fetchJSON('/api/v1/nodes'), fetchJSON('/api/v1/mesh'), fetchJSON('/api/v1/status')]);
       const body = $('#n-body');
       const list = data?.nodes || [];
       const by = { live: 0, lagging: 0, offline: 0 };
@@ -207,7 +220,7 @@ export default {
       body.innerHTML = list.length
         ? list.map((n) => nodeRow(n, nodeNames)).join('')
         : '<tr><td colspan="6" class="py-6 text-center text-ink-muted">No nodes reporting. Power on an ESP32 CSI node and provision it to this server.</td></tr>';
-      renderMeshHealth(mesh, list);
+      renderMeshHealth(mesh, list, status);
     };
 
     // Download logs: a ROLLING capture (not a single snapshot) of node roster +
