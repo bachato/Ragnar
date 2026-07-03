@@ -2,13 +2,27 @@
 import { icons } from '../icons.js';
 import { html, $, fetchJSON, fmt } from '../lib.js';
 
+// Graduated node health from last_seen. The sensing-server exposes a binary
+// active/stale that flips the instant a node gaps for ~a second, which reads as
+// "dead" even though the node is still streaming and recovers immediately. Base
+// the shown status on how long ago we actually heard from it:
+//   live    (<5s)  — streaming normally
+//   lagging (5-45s)— a recent gap; still around, RF/mesh hiccup (see mesh offsets)
+//   offline (>=45s)— genuinely silent
+function nodeHealth(lastSeenMs) {
+  const s = (lastSeenMs == null) ? Infinity : lastSeenMs / 1000;
+  if (s < 5) return { label: 'live', badge: 'badge-ok', dot: 'bg-ok', key: 'live' };
+  if (s < 45) return { label: 'lagging', badge: 'badge-warn', dot: 'bg-warn', key: 'lagging' };
+  return { label: 'offline', badge: 'badge-bad', dot: 'bg-bad', key: 'offline' };
+}
+
 function nodeRow(n, names = {}) {
-  const active = n.status === 'active';
+  const h = nodeHealth(n.last_seen_ms);
   const nm = names[String(n.node_id)];
   const label = nm ? `${nm} <span class="text-ink-muted text-xs">#${n.node_id}</span>` : `#${n.node_id}`;
   return `<tr class="border-b border-ink-3 last:border-0">
     <td class="py-2.5 pr-3 font-mono">${label}</td>
-    <td class="py-2.5 pr-3"><span class="${active ? 'badge-ok' : 'badge-bad'}"><span class="dot ${active ? 'bg-ok' : 'bg-bad'}"></span>${n.status}</span></td>
+    <td class="py-2.5 pr-3"><span class="${h.badge}" title="last frame ${fmt.ago((n.last_seen_ms ?? 0) / 1000)}"><span class="dot ${h.dot}"></span>${h.label}</span></td>
     <td class="py-2.5 pr-3 font-mono text-right">${fmt.dbm(n.rssi_dbm)}</td>
     <td class="py-2.5 pr-3 text-ink-soft">${(n.motion_level || '—').replace(/_/g, ' ')}</td>
     <td class="py-2.5 pr-3 text-right font-mono">${n.person_count ?? 0}</td>
@@ -30,9 +44,9 @@ export default {
     root.appendChild(html`
       <section class="space-y-5">
         <div class="grid grid-cols-3 gap-3">
-          <div class="stat"><span class="stat-label">Total nodes</span><span class="stat-value" id="n-total">—</span></div>
-          <div class="stat"><span class="stat-label">Online</span><span class="stat-value text-ok" id="n-online">—</span></div>
-          <div class="stat"><span class="stat-label">Stale</span><span class="stat-value text-warn" id="n-stale">—</span></div>
+          <div class="stat"><span class="stat-label">Live</span><span class="stat-value text-ok" id="n-live">—</span></div>
+          <div class="stat"><span class="stat-label">Lagging</span><span class="stat-value text-warn" id="n-lagging">—</span></div>
+          <div class="stat"><span class="stat-label">Offline</span><span class="stat-value text-bad" id="n-offline">—</span></div>
         </div>
 
         <div class="card card-pad space-y-3">
@@ -71,10 +85,11 @@ export default {
       const data = await fetchJSON('/api/v1/nodes');
       const body = $('#n-body');
       const list = data?.nodes || [];
-      const online = list.filter((n) => n.status === 'active').length;
-      $('#n-total').textContent = data?.total ?? list.length;
-      $('#n-online').textContent = online;
-      $('#n-stale').textContent = list.length - online;
+      const by = { live: 0, lagging: 0, offline: 0 };
+      for (const nd of list) by[nodeHealth(nd.last_seen_ms).key]++;
+      $('#n-live').textContent = by.live;
+      $('#n-lagging').textContent = by.lagging;
+      $('#n-offline').textContent = by.offline;
       body.innerHTML = list.length
         ? list.map((n) => nodeRow(n, nodeNames)).join('')
         : '<tr><td colspan="6" class="py-6 text-center text-ink-muted">No nodes reporting. Power on an ESP32 CSI node and provision it to this server.</td></tr>';

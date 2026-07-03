@@ -4,6 +4,20 @@ import { html, $, fetchJSON, fmt, sparkPath, throttleLatest } from '../lib.js';
 import { sensingService } from '../../services/sensing.service.js';
 import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
 
+// Graduated node health from last_seen. The sensing-server exposes a binary
+// active/stale that flips the instant a node gaps for ~a second, which reads as
+// "dead" even though the node is still streaming and recovers immediately. Base
+// the shown status on how long ago we actually heard from it:
+//   live    (<5s)  — streaming normally
+//   lagging (5-45s)— a recent gap; still around, RF/mesh hiccup (see mesh offsets)
+//   offline (>=45s)— genuinely silent
+function nodeHealth(lastSeenMs) {
+  const s = (lastSeenMs == null) ? Infinity : lastSeenMs / 1000;
+  if (s < 5) return { label: 'live', badge: 'badge-ok', dot: 'bg-ok', key: 'live' };
+  if (s < 45) return { label: 'lagging', badge: 'badge-warn', dot: 'bg-warn', key: 'lagging' };
+  return { label: 'offline', badge: 'badge-bad', dot: 'bg-bad', key: 'offline' };
+}
+
 function bigStat(label, id, unit = '') {
   return `<div class="stat">
     <span class="stat-label">${label}</span>
@@ -225,23 +239,23 @@ export default {
       }
       const src = $('#rs-source'); if (src) src.textContent = st?.source || '—';
       const nodes = (n?.nodes || []).slice().sort((a, b) => (a.node_id || 0) - (b.node_id || 0));
-      const active = nodes.filter((x) => x.status === 'active').length;
+      const live = nodes.filter((x) => nodeHealth(x.last_seen_ms).key === 'live').length;
       // People: per-node person_count ghosts on single nodes, so use the LOWER
-      // MEDIAN across active nodes (same corroboration rule as the backend) —
+      // MEDIAN across live nodes (same corroboration rule as the backend) —
       // a count is only believed when a majority of nodes agree.
-      const counts = nodes.filter((x) => x.status === 'active' && typeof x.person_count === 'number')
+      const counts = nodes.filter((x) => nodeHealth(x.last_seen_ms).key === 'live' && typeof x.person_count === 'number')
         .map((x) => x.person_count).sort((a, b) => a - b);
       this._nodePeople = counts.length ? counts[Math.floor((counts.length - 1) / 2)] : null;
-      const ne = $('#rs-nodes'); if (ne) ne.textContent = `${active}/${nodes.length}`;
+      const ne = $('#rs-nodes'); if (ne) ne.textContent = `${live}/${nodes.length} live`;
       const list = $('#rs-node-list');
       if (list) {
         list.innerHTML = nodes.length ? nodes.map((x) => {
-          const on = x.status === 'active';
+          const h = nodeHealth(x.last_seen_ms);
           const rssi = x.rssi_dbm != null ? `${Number(x.rssi_dbm).toFixed(0)} dBm` : '—';
           const nm = this._nodeNames[String(x.node_id)];
           const label = nm ? `${nm} <span class="text-ink-muted">#${x.node_id}</span>` : `Node ${x.node_id}`;
           return `<div class="flex items-center justify-between">
-            <span class="flex items-center gap-2"><span class="dot w-2 h-2 ${on ? 'bg-ok' : 'bg-bad'}"></span>${label}</span>
+            <span class="flex items-center gap-2"><span class="dot w-2 h-2 ${h.dot}" title="${h.label} · last frame ${fmt.ago((x.last_seen_ms ?? 0) / 1000)}"></span>${label}</span>
             <span class="font-mono text-ink-soft">${rssi}</span>
           </div>`;
         }).join('') : '<div class="text-ink-muted">No nodes reporting</div>';
