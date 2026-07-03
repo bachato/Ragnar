@@ -1151,9 +1151,9 @@ function _ndDownloadCsv(nameBase, header, rows) {
 
 function exportLldpCsv() {
     _ndDownloadCsv('switch_neighbors',
-        ['Local IF', 'Protocol', 'Switch', 'Switch descr', 'Port', 'VLAN ID', 'VLAN name', 'Mgmt IP'],
+        ['Local IF', 'Protocol', 'Switch', 'Switch descr', 'Port', 'VLAN ID', 'VLAN name', 'PoE', 'Mgmt IP'],
         (_ndLastLldp || []).map(n => [n.local_interface, n.protocol, n.switch_name,
-            n.switch_descr, (n.port_descr || n.port_id), n.vlan_id, n.vlan_name, n.mgmt_ip]));
+            n.switch_descr, (n.port_descr || n.port_id), n.vlan_id, n.vlan_name, _poeText(n.poe), n.mgmt_ip]));
 }
 
 function exportArpCsv() {
@@ -1382,6 +1382,32 @@ function _ndMissingTool(data, reloadFnName) {
             Install ${escapeHtml(tool)}</button>`;
 }
 
+// Compact PoE summary from a neighbour's parsed power TLV. Returns plain text.
+function _poeText(poe) {
+    if (!poe) return '—';
+    const parts = [];
+    const w = poe.allocated_w != null ? poe.allocated_w : poe.requested_w;
+    if (poe.powered) {
+        parts.push('PoE');
+    } else if (poe.device_type) {
+        parts.push(poe.device_type);  // e.g. PD, or PSE with power not enabled
+    } else {
+        parts.push('PoE');
+    }
+    if (poe.class) parts.push(poe.class);
+    if (poe.standard) parts.push(poe.standard);
+    if (w != null) parts.push(w + 'W');
+    return parts.join(' · ');
+}
+
+// HTML cell for the PoE column: green when the switch is delivering power.
+function _poeCell(poe) {
+    const txt = escapeHtml(_poeText(poe));
+    if (poe && poe.powered) return '<span class="text-green-400">⚡ ' + txt + '</span>';
+    if (poe) return '<span class="text-gray-300">' + txt + '</span>';
+    return '<span class="text-gray-500">—</span>';
+}
+
 async function loadLldp() {
     const out = document.getElementById('lldp-results');
     out.innerHTML = '<p class="text-gray-400">Loading neighbours…</p>';
@@ -1405,13 +1431,14 @@ async function loadLldp() {
                 <td class="px-3 py-1.5">${escapeHtml(String(n.switch_name || '—'))}</td>
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.port_descr || n.port_id || '—'))}</td>
                 <td class="px-3 py-1.5">${escapeHtml(String(n.vlan_id || '—'))}${n.vlan_name ? ' (' + escapeHtml(n.vlan_name) + ')' : ''}</td>
+                <td class="px-3 py-1.5">${_poeCell(n.poe)}</td>
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.mgmt_ip || '—'))}</td>
             </tr>`).join('');
         out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Local IF</th><th class="px-3 py-1.5">Proto</th>
                 <th class="px-3 py-1.5">Switch</th><th class="px-3 py-1.5">Port</th>
-                <th class="px-3 py-1.5">VLAN</th><th class="px-3 py-1.5">Mgmt IP</th>
+                <th class="px-3 py-1.5">VLAN</th><th class="px-3 py-1.5">PoE</th><th class="px-3 py-1.5">Mgmt IP</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
     } catch (e) {
         out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';

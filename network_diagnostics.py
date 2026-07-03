@@ -285,6 +285,59 @@ def _scalar(v):
     return v
 
 
+def _poe_watts(mw):
+    """lldpd reports 802.3at/LLDP-MED power values in milliwatts. Convert to
+    watts, tolerating strings and junk. Returns a float or None."""
+    try:
+        w = round(int(str(mw).strip()) / 1000.0, 1)
+        return w if 0 < w <= 200 else None  # sanity bound (802.3bt tops out ~90W)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_poe(port):
+    """Extract Power-over-Ethernet state from an lldpctl port's Power-via-MDI
+    TLV (dot3 / LLDP-MED). A PoE-capable switch advertises this, so it tells us
+    whether the port supplies power and at what class/wattage. Returns None when
+    the neighbour advertised no power TLV."""
+    if not isinstance(port, dict):
+        return None
+    power = port.get('power')
+    if isinstance(power, list) and power:
+        power = power[0]
+    if not isinstance(power, dict) or not power:
+        return None
+
+    def val(k):
+        v = _scalar(power.get(k))
+        return str(v).strip() if v is not None else None
+
+    def truthy(v):
+        return str(v).strip().lower() in ('yes', 'true', '1', 'on', 'enabled')
+
+    device_type = val('device-type') or val('device_type')
+    enabled = val('enabled')
+    supported = val('supported')
+    ptype = val('power-type') or val('power_type')
+    standard = {'1': '802.3af (Type 1)', '2': '802.3at (Type 2)'}.get(ptype, ptype)
+    allocated_w = _poe_watts(power.get('allocated') if isinstance(power.get('allocated'), (str, int)) else _scalar(power.get('allocated')))
+    requested_w = _poe_watts(power.get('requested') if isinstance(power.get('requested'), (str, int)) else _scalar(power.get('requested')))
+    # The switch port is a PSE (Power Sourcing Equipment) and power is enabled
+    # => it is delivering, or ready to deliver, PoE to us.
+    powered = bool(device_type and device_type.upper() == 'PSE' and truthy(enabled))
+    return {
+        'device_type': device_type,          # PSE (switch) or PD (powered device)
+        'supported': truthy(supported) if supported is not None else None,
+        'enabled': truthy(enabled) if enabled is not None else None,
+        'powered': powered,
+        'class': val('class'),
+        'standard': standard,
+        'pairs': val('pairs'),
+        'allocated_w': allocated_w,
+        'requested_w': requested_w,
+    }
+
+
 def _parse_lldp_iface(local_if, info):
     via = info.get('via') or info.get('protocol')
     chassis = info.get('chassis', {})
@@ -313,6 +366,7 @@ def _parse_lldp_iface(local_if, info):
         'port_descr': _scalar(port.get('descr')) if isinstance(port, dict) else None,
         'vlan_id': vlan_id,
         'vlan_name': vlan_name,
+        'poe': _parse_poe(port),
     }
 
 
