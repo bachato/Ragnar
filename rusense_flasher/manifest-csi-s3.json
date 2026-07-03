@@ -1,6 +1,6 @@
 {
   "name": "RuSense CSI Node — ESP32-S3",
-  "version": "0.6.7",
+  "version": "0.7.0",
   "new_install_prompt_erase": true,
   "builds": [
     {
