@@ -1262,6 +1262,22 @@ def rusense_presence():
     })
 
 
+@app.route('/api/rusense/recording/download', methods=['GET'])
+def rusense_recording_download():
+    """Download a raw CSI recording (data/recordings/<id>.jsonl) as a file, so a
+    dataset captured on one deployment can be moved to another. Streamed via
+    send_from_directory (handles large files + range requests). Path-traversal
+    guarded to stay inside data/recordings."""
+    rid = request.args.get('id', '')
+    rec_dir = os.path.normpath(os.path.join(shared_data.currentdir, 'data', 'recordings'))
+    target = os.path.normpath(os.path.join(rec_dir, rid + '.jsonl'))
+    if not (target.startswith(rec_dir + os.sep) and os.path.isfile(target)):
+        return jsonify({'success': False, 'error': 'recording not found'}), 404
+    return send_from_directory(
+        rec_dir, os.path.basename(target), as_attachment=True,
+        download_name=os.path.basename(target), mimetype='application/x-ndjson')
+
+
 @app.route('/api/rusense/vitals-history', methods=['GET'])
 def rusense_vitals_history():
     """Aggregated heart-rate / breathing / activity buckets for the dashboard

@@ -7,7 +7,7 @@ import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js?v=20260702-bkpresence';
 import sensing from './views/sensing.js?v=20260701-vitfix';
 import nodes from './views/nodes.js?v=20260701-nodenames';
-import training from './views/training.js?v=20260630-recstate';
+import training from './views/training.js?v=20260702-dl';
 import settings from './views/settings.js?v=20260702-schedule';
 import about from './views/about.js?v=20260701-mode';
 

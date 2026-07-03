@@ -198,12 +198,17 @@ export default {
       box.innerHTML = recs.length ? recs.map((rec) => {
         const id = rec.id ?? rec.name ?? rec;
         const isLive = !!(recState && recState.active && id === recState.id);
-        const meta = rec.frames != null ? `${fmt.int(rec.frames)} frames`
-          : (rec.size_mb != null ? `${fmt.num(rec.size_mb, 1)} MB` : '');
+        const parts = [];
+        if (rec.frames != null) parts.push(`${fmt.int(rec.frames)} frames`);
+        if (rec.size_bytes != null) parts.push(`${(rec.size_bytes / 1e6).toFixed(1)} MB`);
+        else if (rec.size_mb != null) parts.push(`${fmt.num(rec.size_mb, 1)} MB`);
+        const meta = parts.join(' \u00b7 ');
         return `<div class="flex items-center gap-3 rounded-lg bg-ink-1 border border-ink-3 p-2.5 text-sm">
           <span class="flex-1 truncate font-mono">${id}${isLive ? ' <span class="badge-bad ml-1">recording</span>' : ''}</span>
           ${meta ? `<span class="text-xs text-ink-muted shrink-0">${meta}</span>` : ''}
-          <button data-rid="${id}" class="btn-danger !py-1 !px-2.5 text-xs shrink-0"${isLive ? ' disabled' : ''}>✕</button>
+          <a href="/api/rusense/recording/download?id=${encodeURIComponent(id)}" download="${id}.jsonl"
+             class="btn-ghost !py-1 !px-2.5 text-xs shrink-0" title="Download recording (.jsonl)">\u2b07</a>
+          <button data-rid="${id}" class="btn-danger !py-1 !px-2.5 text-xs shrink-0"${isLive ? ' disabled' : ''}>\u2715</button>
         </div>`;
       }).join('') : '<div class="text-sm text-ink-muted">No recordings yet.</div>';
     };
