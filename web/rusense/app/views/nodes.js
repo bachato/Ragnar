@@ -184,7 +184,7 @@ export default {
       let badge, bcls, msg;
       if (offline || (stalledIds.length && stalledIds.length === ids.length)) {
         badge = 'Not reaching server'; bcls = 'badge-bad';
-        msg = `The server isn't receiving node data${offline ? ' (source reports <span class="font-mono">offline</span>)' : ''} — the mesh is frozen: sequences aren't advancing and last-sync is minutes old. Most likely the nodes joined an access point that can't reach the Pi. A <strong>strong RSSI with no data means the wrong AP/subnet</strong>. Get all nodes onto the <strong>same AP/network as the Ragnar box</strong> — with several routers sharing one SSID, being near one doesn't force association and doesn't guarantee it routes here. Turn off the other routers' radios (or give the sensing AP a <strong>unique SSID</strong>) and confirm that AP is on the Pi's LAN (no guest / client-isolation mode).`;
+        msg = `The server reports <span class="font-mono">offline</span> and the mesh is frozen (sequences aren't advancing, last-sync is minutes old). Two causes look identical here — <strong>run “Download logs”</strong>, which now auto-classifies the packets: <br>1) <strong>Nodes are streaming but in edge mode</strong> (~60 B feature packets, <span class="font-mono">edge_tier≥1</span>): the server needs raw CSI (148–404 B) and ignores edge packets, so it shows offline even though data flows. Fix = reprovision <span class="font-mono">edge_tier=0</span> (flasher “Write WiFi config” after a hard refresh). <br>2) <strong>No packets at all</strong>: the nodes joined an AP that can't reach the Pi — a strong RSSI on the wrong AP/subnet still delivers nothing. Get all nodes onto the <strong>same AP/network as the Ragnar box</strong> (unique SSID or turn off other radios; no guest / client-isolation).`;
       } else if (stalledIds.length) {
         badge = 'Node(s) stalled'; bcls = 'badge-bad';
         msg = `Node(s) ${stalledIds.map((i) => '#' + i).join(', ')} stopped updating (mesh frozen, minutes stale) while others are live — that node likely dropped to a different AP or lost the Pi. Check its WiFi association and placement.`;
@@ -258,7 +258,7 @@ export default {
           capture_seconds: Math.round((Date.now() - started) / 1000),
           sample_count: samples.length,
           node_names: nodeNames,
-          hint: 'server_diagnostics = one-shot server-side deep capture (tcpdump on UDP 5005 -> packet sizes tell edge_tier: ~60B=edge mode, 148-404B=raw CSI; journal_sensing -> fusion/spread/dimension errors; binaries.*_md5 -> confirm the running binary; sockets_udp Recv-Q -> ingestion backlog; api.mesh offset_us/staleness_ms -> clock sync). samples = 30s time-series (mesh sequence resets = reboots; growing offset = desync; trust.demoted/errors climbing = engine degrading).',
+          hint: 'READ server_diagnostics.packet_analysis FIRST — it auto-classifies the tcpdump: mode=edge_tier (nodes streaming ~60B feature packets, need edge_tier=0), raw_csi (correct), or no_packets (nodes not reaching Pi). server_diagnostics = one-shot server-side deep capture (tcpdump on UDP 5005 -> packet sizes tell edge_tier: ~60B=edge mode, 148-404B=raw CSI; journal_sensing -> fusion/spread/dimension errors; binaries.*_md5 -> confirm the running binary; sockets_udp Recv-Q -> ingestion backlog; api.mesh offset_us/staleness_ms -> clock sync). samples = 30s time-series (mesh sequence resets = reboots; growing offset = desync; trust.demoted/errors climbing = engine degrading).',
           server_diagnostics: server,
           samples,
         };

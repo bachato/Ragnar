@@ -1321,6 +1321,72 @@ def rusense_diagnostics():
     udp = run(['timeout', str(secs), 'tcpdump', '-i', 'any', '-n', '-c', '500',
                'udp', 'port', '5005'], timeout=secs + 8)
 
+    def analyze_udp(stdout, window_s):
+        """Turn raw tcpdump lines into a verdict so a human never has to eyeball
+        packet sizes. This is THE tell that separates the three failure modes:
+          * no packets           -> nodes not reaching the Pi (AP / subnet / down)
+          * ~48-64 B packets     -> edge_tier>=1 (on-device features), server gets
+                                    NO raw CSI -> source:esp32:offline. Reprovision
+                                    edge_tier=0 (flasher 'Write WiFi config').
+          * 148-404 B packets    -> raw CSI, correct.
+        Also flags gaps (bursty streaming) vs continuous."""
+        import re as _re
+        pat = _re.compile(
+            r'(\d\d:\d\d:\d\d\.\d+)\s.*IP\s+(\d+\.\d+\.\d+\.\d+)\.\d+\s+>\s+'
+            r'\S+\.5005:\s+UDP,\s+length\s+(\d+)')
+        per = {}
+        times = []
+        for line in (stdout or '').splitlines():
+            mm = pat.search(line)
+            if not mm:
+                continue
+            ts, ip, ln = mm.group(1), mm.group(2), int(mm.group(3))
+            d = per.setdefault(ip, {'count': 0, 'bytes': 0, 'min': ln, 'max': ln})
+            d['count'] += 1
+            d['bytes'] += ln
+            d['min'] = min(d['min'], ln)
+            d['max'] = max(d['max'], ln)
+            h, m, sec = ts.split(':')
+            times.append(int(h) * 3600 + int(m) * 60 + float(sec))
+        total = sum(d['count'] for d in per.values())
+        sources = {ip: {'count': d['count'], 'avg_bytes': round(d['bytes'] / d['count'], 1),
+                        'min_bytes': d['min'], 'max_bytes': d['max']}
+                   for ip, d in per.items()}
+        times.sort()
+        max_gap = max((b - a for a, b in zip(times, times[1:])), default=0.0)
+        avg = round(sum(d['bytes'] for d in per.values()) / total, 1) if total else 0
+        if total == 0:
+            mode, verdict = 'no_packets', (
+                'No packets on UDP 5005 during the capture. The nodes are not '
+                'reaching the Pi — check they associated to the same AP/subnet as '
+                'this box (strong RSSI on a different AP still means no data here).')
+        elif avg <= 100:
+            mode, verdict = 'edge_tier', (
+                f'Nodes are STREAMING ({total} pkts from {len(per)} source(s), '
+                f'~{avg} B each) but these are edge-mode feature packets '
+                '(edge_tier>=1), NOT raw CSI. The server needs raw CSI (148-404 B) '
+                'for fusion, so it reports source:esp32:offline and the mesh stays '
+                'frozen even though packets flow. FIX: reprovision the nodes with '
+                'edge_tier=0 (flasher "Write WiFi config" after a hard refresh, or '
+                'provision.py --edge-tier 0). This is a node NVS setting, not the '
+                'firmware image — reflashing the app alone does not change it.')
+        elif avg >= 130:
+            mode, verdict = 'raw_csi', (
+                f'Raw CSI is flowing ({total} pkts from {len(per)} source(s), '
+                f'~{avg} B each) — correct packet type. If still offline, the issue '
+                'is downstream (fusion guard / clock sync), not the nodes.')
+        else:
+            mode, verdict = 'mixed', (
+                f'{total} pkts from {len(per)} source(s), avg ~{avg} B — mixed or '
+                'unusual packet sizes; inspect per-source below.')
+        if total and max_gap > 3.0:
+            verdict += (f' NOTE: streaming is bursty — largest gap {round(max_gap, 1)}s '
+                        'between packets (expected continuous at ~5-20 Hz per node).')
+        return {'mode': mode, 'verdict': verdict, 'total_packets': total,
+                'avg_bytes': avg, 'source_count': len(per),
+                'max_gap_s': round(max_gap, 2), 'window_s': window_s,
+                'per_source': sources}
+
     repo_bin = os.path.join(shared_data.currentdir, 'bin', 'sensing-server')
     with _rusense_notify_lock:
         geofence = _rusense_notify_state.get('last_geofence')
@@ -1350,6 +1416,7 @@ def rusense_diagnostics():
                                '-n', '80', '--no-pager']),
         'sockets_udp': run(['ss', '-uanp']),
         'udp_capture': udp,
+        'packet_analysis': analyze_udp(udp.get('stdout', ''), secs),
         'binaries': {
             'installed': '/usr/local/bin/ragnar-sensing-server',
             'installed_md5': md5('/usr/local/bin/ragnar-sensing-server'),
