@@ -558,22 +558,98 @@ def _is_wireless(iface):
 _VPN_IFACE_PREFIXES = ('tun', 'tap', 'wg', 'tailscale', 'ppp', 'ipsec',
                        'zt', 'nordlynx', 'proton', 'gpd', 'utun', 'vpn', 'nebula')
 
+# VPN *product* recognised anywhere in the interface name (most specific).
+_VPN_PRODUCTS = (
+    ('tailscale', 'Tailscale'), ('nordlynx', 'NordVPN'), ('mullvad', 'Mullvad'),
+    ('proton', 'ProtonVPN'), ('zerotier', 'ZeroTier'), ('nebula', 'Nebula'),
+    ('globalprotect', 'GlobalProtect'), ('expressvpn', 'ExpressVPN'),
+)
+# Generic VPN kind by interface-name prefix (fallback when the product is
+# unknown and the link kind is only a bare tun/tap).
+_VPN_PREFIX_KINDS = (
+    ('wg', 'WireGuard'), ('tun', 'OpenVPN'), ('tap', 'OpenVPN'),
+    ('ppp', 'PPP/L2TP'), ('ipsec', 'IPsec'), ('zt', 'ZeroTier'),
+    ('gpd', 'GlobalProtect'), ('utun', 'VPN tunnel'), ('vpn', 'VPN tunnel'),
+)
+# Tunnel link kinds from `ip -d link show` (authoritative, needs no extra tools).
+# ('strong' kinds are unambiguously a VPN/tunnel; bare tun/tap are weaker.)
+_VPN_LINK_KINDS = (
+    ('wireguard', 'WireGuard'), ('vti6', 'IPsec/VTI'), ('vti', 'IPsec/VTI'),
+    ('gretap', 'GRE'), ('gre', 'GRE'), ('ip6tnl', 'IPv6 tunnel'),
+    ('ipip', 'IPIP'), ('sit', 'SIT tunnel'), ('ppp', 'PPP'),
+    ('tun', 'tunnel'), ('tap', 'tunnel'),
+)
+_VPN_STRONG_KINDS = ('WireGuard', 'IPsec/VTI', 'GRE', 'IPv6 tunnel',
+                     'IPIP', 'SIT tunnel', 'PPP')
 
-def _is_vpn(iface):
-    """True if the interface is a VPN / tunnel rather than a physical link.
 
-    Matches well-known VPN/tunnel names (WireGuard, Tailscale, OpenVPN tun/tap,
-    ZeroTier, PPP/L2TP, ...) and, as a backstop, the ARPHRD_NONE (65534) link
-    type that point-to-point tunnels report in sysfs."""
-    n = iface.lower()
-    if n.startswith(_VPN_IFACE_PREFIXES):
-        return True
+def _iface_arphrd_none(iface):
+    """True if the interface's link type is ARPHRD_NONE (65534) -- typical of
+    point-to-point tunnels (tun/wireguard/tailscale)."""
     try:
         with open(f'/sys/class/net/{iface}/type') as f:
-            # 65534 = ARPHRD_NONE, typical of tun/wireguard/tailscale tunnels.
             return f.read().strip() == '65534'
     except OSError:
         return False
+
+
+def _iface_link_kind(name):
+    """Authoritative tunnel kind from `ip -d link show` (iproute2 is always
+    present), or None. Returns a friendly name like 'WireGuard' / 'GRE'."""
+    res = _run(['ip', '-d', 'link', 'show', 'dev', name], timeout=5)
+    if res['rc'] != 0:
+        return None
+    for tok, friendly in _VPN_LINK_KINDS:
+        if re.search(r'(?:^|\s)' + tok + r'(?:\s|$)', res['out'], re.M):
+            return friendly
+    return None
+
+
+def _wg_endpoint(name):
+    """WireGuard peer endpoint (the VPN server's IP:port), if `wg` is available."""
+    if not _have('wg'):
+        return None
+    res = _run(['wg', 'show', name, 'endpoints'], timeout=5)
+    if res['rc'] != 0:
+        return None
+    for line in res['out'].splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] not in ('(none)', 'none', ''):
+            return parts[-1]
+    return None
+
+
+def _iface_vpn_info(name):
+    """Rich VPN/tunnel classification of an interface.
+
+    Returns {is_vpn, kind, endpoint}: `kind` names the VPN technology/product
+    (WireGuard, Tailscale, OpenVPN, GRE, ...) and `endpoint` is the peer/server
+    address when it can be determined (WireGuard via `wg`)."""
+    n = name.lower()
+    product = next((f for sub, f in _VPN_PRODUCTS if sub in n), None)
+    link_kind = _iface_link_kind(name)
+    prefix_kind = next((f for pre, f in _VPN_PREFIX_KINDS if n.startswith(pre)), None)
+    arphrd_none = _iface_arphrd_none(name)
+    strong = link_kind in _VPN_STRONG_KINDS
+
+    is_vpn = bool(product or prefix_kind or strong
+                  or n.startswith(_VPN_IFACE_PREFIXES)
+                  or (link_kind and arphrd_none))
+    if not is_vpn:
+        return {'is_vpn': False, 'kind': None, 'endpoint': None}
+
+    kind = (product
+            or (link_kind if strong else None)
+            or prefix_kind
+            or (link_kind if link_kind and link_kind != 'tunnel' else None)
+            or 'VPN tunnel')
+    endpoint = _wg_endpoint(name) if (kind == 'WireGuard' or link_kind == 'WireGuard') else None
+    return {'is_vpn': True, 'kind': kind, 'endpoint': endpoint}
+
+
+def _is_vpn(iface):
+    """Backwards-compatible boolean wrapper around _iface_vpn_info."""
+    return _iface_vpn_info(iface)['is_vpn']
 
 
 def do_interfaces(include_virtual=False):
@@ -581,9 +657,10 @@ def do_interfaces(include_virtual=False):
     for name in _list_iface_names(include_virtual=include_virtual):
         link = _iface_link_details(name)
         v4, v6 = _iface_addrs(name)
+        vpn = _iface_vpn_info(name)
         if _is_wireless(name):
             itype = 'wifi'
-        elif _is_vpn(name):
+        elif vpn['is_vpn']:
             itype = 'vpn'
         else:
             itype = 'ethernet'
@@ -593,6 +670,8 @@ def do_interfaces(include_virtual=False):
         interfaces.append({
             'name': name,
             'type': itype,
+            'vpn_kind': vpn['kind'],
+            'vpn_endpoint': vpn['endpoint'],
             'mac': link['mac'],
             'operstate': link['operstate'],
             'ipv4': v4,
@@ -762,8 +841,11 @@ def do_network_identity():
     # route leaves via a tunnel interface (full-tunnel VPN / exit node), even
     # if the physical uplink is a normal eth0/wlan0.
     route_if = _default_route_iface()
+    route_vpn = _iface_vpn_info(route_if) if route_if else {'is_vpn': False, 'kind': None, 'endpoint': None}
     vpn_egress = {'interface': route_if,
-                  'via_vpn': bool(route_if and _is_vpn(route_if))}
+                  'via_vpn': route_vpn['is_vpn'],
+                  'kind': route_vpn['kind'],
+                  'endpoint': route_vpn['endpoint']}
 
     # If no explicit search domain but the gateway/FQDN reveals one, surface it
     # as a best-effort guess so the field isn't just empty.
@@ -808,11 +890,24 @@ def _isp_lookup_iface(iface):
     binds the socket to that device (SO_BINDTODEVICE), forcing egress out it
     regardless of the routing table."""
     # The interface itself may be a VPN tunnel (egress is definitionally VPN).
-    iface_is_vpn = _is_vpn(iface)
+    vpn = _iface_vpn_info(iface)
+    iface_is_vpn = vpn['is_vpn']
+    vpn_fields = {'iface_is_vpn': iface_is_vpn,
+                  'vpn_kind': vpn['kind'], 'vpn_endpoint': vpn['endpoint']}
+
+    def _vpn_only_result():
+        """A tunnel we can't reach a geo service through isn't a dead WAN --
+        present it as the VPN it is (kind/endpoint), not a red error row."""
+        return {'interface': iface, 'behind_vpn': True,
+                'isp': vpn['kind'] or 'VPN tunnel',
+                'note': 'VPN tunnel — no separate internet egress to geolocate',
+                **vpn_fields}
+
     if not _have('curl'):
-        return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
-                'behind_vpn': iface_is_vpn,
-                'error': 'curl is not installed', 'missing_tool': 'curl'}
+        if iface_is_vpn:
+            return _vpn_only_result()
+        return {'interface': iface, 'behind_vpn': False,
+                'error': 'curl is not installed', 'missing_tool': 'curl', **vpn_fields}
 
     # Primary: ipinfo.io over HTTPS (no API key needed for basic fields).
     res = _run(['curl', '-s', '--max-time', '8', '--interface', iface,
@@ -823,12 +918,11 @@ def _isp_lookup_iface(iface):
             if d.get('ip'):
                 asn, isp = _parse_ipinfo_org(d.get('org'))
                 vp = _vpn_provider_match(isp, d.get('org'), asn)
-                return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
-                        'public_ip': d.get('ip'),
+                return {'interface': iface, 'public_ip': d.get('ip'),
                         'isp': isp, 'asn': asn, 'org': d.get('org'),
                         'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn),
                         'city': d.get('city'), 'region': d.get('region'),
-                        'country': d.get('country'), 'source': 'ipinfo.io'}
+                        'country': d.get('country'), 'source': 'ipinfo.io', **vpn_fields}
         except ValueError:
             pass
 
@@ -842,21 +936,20 @@ def _isp_lookup_iface(iface):
             if d.get('status') == 'success':
                 asn, _ = _parse_ipinfo_org(d.get('as'))
                 vp = _vpn_provider_match(d.get('isp'), d.get('org'), d.get('as'))
-                return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
-                        'public_ip': d.get('query'),
+                return {'interface': iface, 'public_ip': d.get('query'),
                         'isp': d.get('isp'), 'asn': asn, 'org': d.get('org') or d.get('as'),
                         'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn),
                         'city': d.get('city'), 'region': d.get('regionName'),
-                        'country': d.get('country'), 'source': 'ip-api.com'}
-            return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
-                    'behind_vpn': iface_is_vpn,
-                    'error': d.get('message') or 'lookup failed (no route out this interface?)'}
+                        'country': d.get('country'), 'source': 'ip-api.com', **vpn_fields}
         except ValueError:
             pass
-    return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
-            'behind_vpn': iface_is_vpn,
+
+    if iface_is_vpn:
+        return _vpn_only_result()
+    return {'interface': iface, 'behind_vpn': False,
             'error': 'could not reach a geo-IP service through this interface '
-                     '(no internet via this WAN, or both services unreachable)'}
+                     '(no internet via this WAN, or both services unreachable)',
+            **vpn_fields}
 
 
 def do_isp(interface=None):

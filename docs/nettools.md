@@ -244,10 +244,14 @@ interface** (`curl --interface <iface>`, which forces egress out that link via
 - **Location** (city / region / country) of that egress
 - **Source** — which geo-IP service answered
 - **VPN** — is this link *behind* a VPN? Flagged when the interface is itself a
-  tunnel (`🔒 tunnel iface`), or when the public egress ASN belongs to a known
-  VPN provider/backbone (`🔒 likely (mullvad)`, `m247`, …). The provider match
-  is best-effort — many VPNs terminate on shared hosting ASNs — so it's labelled
-  "likely", not definitive.
+  tunnel (`🔒 WireGuard`, `🔒 Tailscale`, `🔒 OpenVPN`, …), or when the public
+  egress ASN belongs to a known VPN provider/backbone (`🔒 likely (mullvad)`,
+  `m247`, …). The VPN **technology** is identified from the interface's link
+  type (`ip -d link`) and name (Tailscale/NordVPN/Mullvad/ProtonVPN/ZeroTier/
+  GRE/IPsec…), and for WireGuard the **peer endpoint** (the VPN server `IP:port`)
+  is shown when the `wg` tool is available. A tunnel with no separate internet
+  egress is shown as the VPN it is rather than as a failed WAN. The ASN-based
+  provider match is best-effort ("likely"), since many VPNs share hosting ASNs.
 
 Lookups use **ipinfo.io** over HTTPS first, falling back to **ip-api.com**. An
 interface with no working internet path (e.g. a VPN tunnel with no exit, or a

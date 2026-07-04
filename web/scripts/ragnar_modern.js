@@ -1546,8 +1546,10 @@ async function loadNetworkIdentity() {
         if (ve) {
             let veHtml;
             if (ve.via_vpn) {
-                veHtml = '<span class="text-amber-300">yes</span> <span class="text-gray-500">(via '
-                    + escapeHtml(String(ve.interface || 'tunnel')) + ')</span>';
+                const via = escapeHtml(String(ve.interface || 'tunnel'))
+                    + (ve.kind ? ' · ' + escapeHtml(ve.kind) : '')
+                    + (ve.endpoint ? ' → ' + escapeHtml(ve.endpoint) : '');
+                veHtml = '<span class="text-amber-300">yes</span> <span class="text-gray-500">(via ' + via + ')</span>';
             } else {
                 veHtml = '<span class="text-gray-400">no</span>'
                     + (ve.interface ? ' <span class="text-gray-500">(default route via ' + escapeHtml(ve.interface) + ')</span>' : '');
@@ -1582,9 +1584,9 @@ async function loadInterfaces() {
             };
             return `<span class="px-2 py-0.5 rounded text-xs ${map[m] || map.unknown}">${escapeHtml(m)}</span>`;
         };
-        const typeLabel = (t) => {
-            if (t === 'vpn') return '<span class="px-2 py-0.5 rounded text-xs bg-amber-900/50 text-amber-300">VPN</span>';
-            if (t === 'wifi') return '<span class="px-2 py-0.5 rounded text-xs bg-sky-900/50 text-sky-300">wifi</span>';
+        const typeLabel = (i) => {
+            if (i.type === 'vpn') return '<span class="px-2 py-0.5 rounded text-xs bg-amber-900/50 text-amber-300">🔒 ' + escapeHtml(i.vpn_kind || 'VPN') + '</span>';
+            if (i.type === 'wifi') return '<span class="px-2 py-0.5 rounded text-xs bg-sky-900/50 text-sky-300">wifi</span>';
             return '<span class="px-2 py-0.5 rounded text-xs bg-slate-700 text-slate-300">ethernet</span>';
         };
         const rows = data.interfaces.map(i => {
@@ -1596,7 +1598,7 @@ async function loadInterfaces() {
             const vlan = i.vlan_id ? escapeHtml(String(i.vlan_id)) + (i.vlan_proto ? ' (' + escapeHtml(i.vlan_proto) + ')' : '') : '—';
             return `<tr class="border-t border-slate-800">
                 <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(i.name)}</td>
-                <td class="px-3 py-1.5">${typeLabel(i.type)}</td>
+                <td class="px-3 py-1.5">${typeLabel(i)}</td>
                 <td class="px-3 py-1.5">${link}</td>
                 <td class="px-3 py-1.5">${speed}</td>
                 <td class="px-3 py-1.5 text-center">${autoneg}</td>
@@ -1670,9 +1672,14 @@ async function detectIsp() {
             return;
         }
         const vpnCell = (r) => {
-            if (r.iface_is_vpn) return '<span class="text-amber-300">🔒 tunnel iface</span>';
+            if (r.iface_is_vpn) return '<span class="text-amber-300">🔒 ' + escapeHtml(r.vpn_kind || 'tunnel') + '</span>';
             if (r.vpn_provider) return '<span class="text-amber-300">🔒 likely (' + escapeHtml(r.vpn_provider) + ')</span>';
             return '<span class="text-gray-500">no</span>';
+        };
+        const ispCell = (r) => {
+            let s = r.isp || r.vpn_kind || r.org || '—';
+            if (r.vpn_endpoint) s += ' (peer ' + r.vpn_endpoint + ')';
+            return escapeHtml(String(s));
         };
         const rows = _ndLastIsp.map(r => {
             if (r.error) {
@@ -1685,7 +1692,7 @@ async function detectIsp() {
             const loc = [r.city, r.region, r.country].filter(Boolean).map(escapeHtml).join(', ') || '—';
             return `<tr class="border-t border-slate-800">
                 <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
-                <td class="px-3 py-1.5">${escapeHtml(String(r.isp || r.org || '—'))}</td>
+                <td class="px-3 py-1.5">${ispCell(r)}</td>
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.asn || '—'))}</td>
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.public_ip || '—'))}</td>
                 <td class="px-3 py-1.5">${loc}</td>
@@ -1710,10 +1717,11 @@ async function detectIsp() {
 function exportIspCsv() {
     _ndDownloadCsv('interface_isp',
         ['Interface', 'ISP', 'ASN', 'Public IP', 'City', 'Region', 'Country', 'Source',
-         'Behind VPN', 'VPN provider', 'Tunnel iface', 'Error'],
+         'Behind VPN', 'VPN kind', 'VPN endpoint', 'VPN provider', 'Tunnel iface', 'Error'],
         (_ndLastIsp || []).map(r => [r.interface, r.isp || r.org, r.asn, r.public_ip,
             r.city, r.region, r.country, r.source,
-            r.behind_vpn ? 'yes' : 'no', r.vpn_provider, r.iface_is_vpn ? 'yes' : 'no', r.error]));
+            r.behind_vpn ? 'yes' : 'no', r.vpn_kind, r.vpn_endpoint, r.vpn_provider,
+            r.iface_is_vpn ? 'yes' : 'no', r.error]));
 }
 
 function showDiscoveredSubtab(name) {
