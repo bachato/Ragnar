@@ -1301,6 +1301,20 @@
                     </div>
                     <div id="locate-results" class="hidden mt-3 text-sm"></div>
                 </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">L2 Link Health</h3>
+                            <p class="text-sm text-gray-400">Listens passively for a few seconds and reports Layer-2 problems: STP root bridge &amp; loop churn, CDP/LLDP/DTP/VTP control frames, broadcast-storm rate, rogue DHCP servers, rogue IPv6 RA, and duplicate IPs. One "what's wrong at L2" snapshot.</p>
+                        </div>
+                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                            <input id="l2-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runL2Health()">
+                            <input id="l2-secs" type="number" min="3" max="30" value="12" title="seconds" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runL2Health()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan L2</button>
+                        </div>
+                    </div>
+                    <div id="l2-results" class="hidden mt-3 text-sm"></div>
+                </div>
             </div><!-- /#net-sub-switch -->
 
             <!-- ===================== Interfaces ===================== -->
@@ -5496,7 +5510,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260704-iperf3"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260704-l2health"></script>
 
 </body>
 </html>

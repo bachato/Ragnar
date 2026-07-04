@@ -1324,6 +1324,119 @@ def do_locate_port(interface, count=6, on_ms=800, off_ms=800, force=False):
 
 
 # --------------------------------------------------------------------------
+# L2 Link Health: a short passive capture that flags Layer-2 problems
+# --------------------------------------------------------------------------
+
+def do_l2_health(interface, seconds=12):
+    """Listen passively for a few seconds and report Layer-2 health: STP root
+    bridge(s) and topology churn (loop smell), CDP/LLDP/DTP/VTP control frames,
+    broadcast/multicast storm rate, rogue DHCP servers, rogue IPv6 RA sources,
+    and duplicate IPs (conflicting ARP). One 'what's wrong at L2' snapshot."""
+    interface = (interface or '').strip()
+    if not interface:
+        return {'success': False, 'error': 'interface required'}
+    if not _have('tcpdump'):
+        return {'success': False, 'missing_tool': 'tcpdump',
+                'error': 'tcpdump is not installed. Click Install to add it.'}
+    if interface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {interface}'}
+    seconds = _clamp_int(seconds, 12, 3, 30)
+
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-e', '-t', '-s', '256', '-c', '20000'], timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()):
+        return {'success': False, 'error': res['err'].strip()[:200]}
+
+    total = bcast = mcast = tcn = 0
+    protos = {}
+    stp_roots, dhcp_servers, ra_sources = set(), set(), set()
+    arp_ip_macs = {}
+
+    def bump(p):
+        protos[p] = protos.get(p, 0) + 1
+
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        total += 1
+        m = re.match(r'^(\S+)\s+>\s+([0-9a-fA-F:]{17})', line)
+        src = m.group(1).lower() if m else None
+        dst = m.group(2).lower() if m else None
+        if dst == 'ff:ff:ff:ff:ff:ff':
+            bcast += 1
+        elif dst:
+            try:
+                if int(dst[0:2], 16) & 1:
+                    mcast += 1
+            except ValueError:
+                pass
+        if 'STP' in line or '802.1d' in line or '802.1w' in line:
+            bump('STP')
+            rr = re.search(r'root-id\s+([0-9a-fA-F.:]+)', line) or re.search(r'\broot\s+([0-9a-fA-F.:]+)', line)
+            if rr:
+                stp_roots.add(rr.group(1))
+            if 'TCN' in line or 'topology' in line.lower():
+                tcn += 1
+        if 'CDP' in line:
+            bump('CDP')
+        if 'LLDP' in line:
+            bump('LLDP')
+        if 'DTP' in line:
+            bump('DTP')
+        if 'VTP' in line:
+            bump('VTP')
+        if 'router advertisement' in line.lower():
+            bump('IPv6-RA')
+            sm = re.search(r'ethertype IPv6.*?:\s*([0-9a-fA-F:]+)\s*>', line)
+            ra_sources.add(sm.group(1) if sm else (src or '?'))
+        if 'BOOTP/DHCP' in line or 'DHCP' in line:
+            bump('DHCP')
+            if any(k in line for k in ('Reply', 'Offer', 'ACK')):
+                sm = (re.search(r'(\d+\.\d+\.\d+\.\d+)\.67\s*>', line)
+                      or re.search(r'server-id\s+(\d+\.\d+\.\d+\.\d+)', line))
+                if sm:
+                    dhcp_servers.add(sm.group(1))
+        if 'ARP' in line:
+            bump('ARP')
+            am = re.search(r'(\d+\.\d+\.\d+\.\d+) is-at ([0-9a-fA-F:]{17})', line)
+            if am:
+                arp_ip_macs.setdefault(am.group(1), set()).add(am.group(2).lower())
+
+    dup_ips = {ip: sorted(macs) for ip, macs in arp_ip_macs.items() if len(macs) > 1}
+    rate = round((bcast + mcast) / seconds, 1)
+
+    findings = []
+    if len(stp_roots) > 1:
+        findings.append(('warn', f'Multiple STP root bridges seen ({len(stp_roots)}) — possible L2 loop or merged/segmented domains'))
+    if tcn > 5:
+        findings.append(('warn', f'{tcn} STP topology-change notifications — flapping or a loop somewhere'))
+    if 'STP' not in protos:
+        findings.append(('info', 'No STP/BPDUs seen — the switch may have STP disabled or filtered on this port'))
+    if len(dhcp_servers) > 1:
+        findings.append(('warn', 'Multiple DHCP servers answering: ' + ', '.join(sorted(dhcp_servers)) + ' — possible rogue DHCP'))
+    if len(ra_sources) > 1:
+        findings.append(('warn', f'Multiple IPv6 RA sources ({len(ra_sources)}) — possible rogue Router Advertisement'))
+    if dup_ips:
+        findings.append(('warn', 'Duplicate IP(s) via conflicting ARP: ' + ', '.join(dup_ips.keys())))
+    if rate > 100:
+        findings.append(('warn', f'High broadcast/multicast rate ({rate}/s) — possible broadcast storm'))
+    if 'DTP' in protos:
+        findings.append(('info', 'DTP (Dynamic Trunking) frames seen — this port may auto-negotiate a trunk; consider hard-setting the mode'))
+    if not findings:
+        findings.append(('ok', 'No obvious Layer-2 problems in the capture window.'))
+
+    return {'success': True, 'interface': interface, 'seconds': seconds,
+            'packets': total, 'broadcast': bcast, 'multicast': mcast,
+            'bcast_mcast_per_s': rate, 'protocols': protos,
+            'stp_roots': sorted(stp_roots), 'tcn': tcn,
+            'dhcp_servers': sorted(dhcp_servers), 'ra_sources': sorted(ra_sources),
+            'duplicate_ips': dup_ips,
+            'findings': [{'level': l, 'text': t} for l, t in findings]}
+
+
+# --------------------------------------------------------------------------
 # On-demand tool install (whitelisted apt packages, invoked from the UI)
 # --------------------------------------------------------------------------
 
@@ -1342,6 +1455,7 @@ _NET_TOOL_PKGS = {
     'curl': ('curl', 'curl'),
     'dig': ('dig', 'dnsutils'),
     'iperf3': ('iperf3', 'iperf3'),
+    'tcpdump': ('tcpdump', 'tcpdump'),
 }
 
 
@@ -1533,6 +1647,13 @@ def register_network_diagnostics(app, logger=None):
         action = (data.get('action') or 'status').strip()
         _log(f"net/iperf3-server {action}")
         return jsonify(do_iperf3_server(action))
+
+    @app.route('/api/net/l2-health', methods=['POST'])
+    def net_l2_health():
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip()
+        _log(f"net/l2-health {iface}")
+        return jsonify(do_l2_health(iface, data.get('seconds', 12)))
 
     @app.route('/api/net/locate-port', methods=['POST'])
     def net_locate_port():

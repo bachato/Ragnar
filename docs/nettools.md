@@ -218,6 +218,24 @@ The fastest way to inventory a subnet you're attached to. Results export to CSV.
 
 - Endpoint: `GET /api/net/arp-scan?interface=<iface>` · binary: `arp-scan`
 
+### L2 Link Health
+Listens **passively** on an interface for a few seconds (`tcpdump`) and reports
+what's wrong at Layer 2 — no configuration, just plug in and scan:
+
+- **STP** — root bridge(s) seen and topology-change churn. Multiple roots or a
+  flood of TCNs is the fingerprint of a **loop** or merged/segmented domains.
+- **CDP / LLDP / DTP / VTP** control frames present (DTP = the port may
+  auto-negotiate a trunk).
+- **Broadcast / multicast rate** — a high rate flags a **broadcast storm**.
+- **Rogue DHCP** — more than one DHCP server answering on the segment.
+- **Rogue IPv6 RA** — more than one Router Advertisement source.
+- **Duplicate IP** — the same IP claimed by different MACs (conflicting ARP).
+
+Findings are ranked (warn / info / ok). This is the one-tap "why is this
+segment misbehaving" check that normally needs a laptop and Wireshark.
+
+- Endpoint: `POST /api/net/l2-health` `{interface, seconds}` · binary: `tcpdump`
+
 ### Locate Port
 Physically find **which switch port** the device is plugged into — the software
 equivalent of a cable tester / toner probe. It **flaps the link** on the chosen

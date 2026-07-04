@@ -1658,6 +1658,48 @@ async function runArpScan() {
     }
 }
 
+async function runL2Health() {
+    const ifaceEl = document.getElementById('l2-iface');
+    const out = document.getElementById('l2-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    let secs = parseInt(document.getElementById('l2-secs').value, 10);
+    if (!Number.isFinite(secs)) secs = 12;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Capturing on ' + escapeHtml(iface) + ' for ' + secs + 's…</p>';
+    try {
+        const d = await postAPI('/api/net/l2-health', { interface: iface, seconds: secs });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runL2Health')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const lvl = { warn: 'text-amber-300', info: 'text-gray-400', ok: 'text-green-400' };
+        const icon = { warn: '⚠', info: 'ℹ', ok: '✓' };
+        const findings = (d.findings || []).map(f =>
+            `<li class="${lvl[f.level] || ''}">${icon[f.level] || ''} ${escapeHtml(f.text)}</li>`).join('');
+        const protos = Object.keys(d.protocols || {}).length
+            ? Object.entries(d.protocols).map(([k, v]) =>
+                `<span class="px-2 py-0.5 rounded bg-slate-800 text-xs mr-1">${escapeHtml(k)} ${v}</span>`).join('')
+            : '<span class="text-gray-500">none</span>';
+        const detail = [];
+        if (d.stp_roots && d.stp_roots.length) detail.push('STP root(s): ' + d.stp_roots.map(escapeHtml).join(', ') + (d.tcn ? ' · ' + d.tcn + ' TCN' : ''));
+        if (d.dhcp_servers && d.dhcp_servers.length) detail.push('DHCP server(s): ' + d.dhcp_servers.map(escapeHtml).join(', '));
+        if (d.ra_sources && d.ra_sources.length) detail.push('IPv6 RA source(s): ' + d.ra_sources.map(escapeHtml).join(', '));
+        if (d.duplicate_ips && Object.keys(d.duplicate_ips).length) detail.push('Duplicate IPs: ' + Object.keys(d.duplicate_ips).map(escapeHtml).join(', '));
+        out.innerHTML = `<ul class="space-y-1 mb-2">${findings}</ul>
+            <p class="text-xs text-gray-500 mb-1">${d.packets} pkts in ${d.seconds}s · ${d.broadcast} bcast / ${d.multicast} mcast (${d.bcast_mcast_per_s}/s)</p>
+            <div class="mb-1">${protos}</div>
+            ${detail.length ? '<p class="text-xs text-gray-400">' + detail.join(' &nbsp;·&nbsp; ') + '</p>' : ''}`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
 // Blink a wired link in a pattern so its switch LED reveals the port. POSTs to
 // /api/net/locate-port; on the default-route guard it asks for confirmation and
 // re-sends with force.
