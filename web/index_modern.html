@@ -1243,7 +1243,7 @@
                         <h3 class="text-lg font-semibold mb-1">LAN Throughput (iperf3)</h3>
                         <p class="text-sm text-gray-400 mb-3">Real throughput to another iperf3 node on your network — validates a cable/port/switch that the internet speed test can't. Point it at any iperf3 server, or start the built-in one below and test <em>from</em> another device to this one.</p>
                         <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2">
-                            <input id="iperf-server" type="text" inputmode="url" autocomplete="off" placeholder="iperf3 server IP" class="w-full sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runIperf()">
+                            <input id="iperf-server" type="text" inputmode="url" autocomplete="off" placeholder="iperf3 server IP (or IP:port)" class="w-full sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runIperf()">
                             <select id="iperf-dir" class="w-full sm:w-32 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                                 <option value="up">Upload</option>
                                 <option value="down">Download</option>

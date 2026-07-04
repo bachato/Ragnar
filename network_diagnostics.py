@@ -1181,6 +1181,16 @@ def do_iperf3_client(server, port=_IPERF3_PORT, duration=5, reverse=False, udp=F
     if not _have('iperf3'):
         return {'success': False, 'missing_tool': 'iperf3',
                 'error': 'iperf3 is not installed. Click Install to add it.'}
+    # iperf3 `-c` takes the host only (port is `-p`). Accept a "host:port" or
+    # "[v6addr]:port" typed into the server box: split the port out so the
+    # common mistake works, and it doubles as a way to target a non-5201 port.
+    m6 = re.match(r'^\[(.+)\]:(\d+)$', server)
+    m4 = re.match(r'^([^:]+):(\d+)$', server)
+    if m6:
+        server, port = m6.group(1), m6.group(2)
+    elif m4:
+        server, port = m4.group(1), m4.group(2)
+    server = server.strip('[]')
     port = _clamp_int(port, _IPERF3_PORT, 1, 65535)
     duration = _clamp_int(duration, 5, 1, 30)
     cmd = ['iperf3', '-c', server, '-p', str(port), '-t', str(duration), '-J']
