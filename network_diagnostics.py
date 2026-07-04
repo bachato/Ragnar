@@ -295,6 +295,32 @@ def _poe_watts(mw):
         return None
 
 
+def _poe_class_num(class_str):
+    """Pull the numeric class out of an lldpctl class string ('class 4' -> 4)."""
+    if not class_str:
+        return None
+    m = re.search(r'(\d+)', str(class_str))
+    return int(m.group(1)) if m else None
+
+
+def _poe_standard(power_type, class_num):
+    """Resolve the PoE standard to a short code (af/at/bt) and a long label.
+
+    802.3bt (Type 3/4) introduced classes 5-8, so any class >=5 is bt. Otherwise
+    the dot3 'power-type' field distinguishes Type 2 (802.3at) from Type 1
+    (802.3af); when it's absent we fall back to the class (class 4 requires at)."""
+    if class_num is not None and class_num >= 5:
+        return 'bt', '802.3bt (Type 3/4)'
+    pt = str(power_type).strip() if power_type is not None else ''
+    if pt.startswith('2'):
+        return 'at', '802.3at (Type 2)'
+    if pt.startswith('1'):
+        return 'af', '802.3af (Type 1)'
+    if class_num is not None:
+        return ('at', '802.3at (Type 2)') if class_num >= 4 else ('af', '802.3af (Type 1)')
+    return None, None
+
+
 def _parse_poe(port):
     """Extract Power-over-Ethernet state from an lldpctl port's Power-via-MDI
     TLV (dot3 / LLDP-MED). A PoE-capable switch advertises this, so it tells us
@@ -319,20 +345,48 @@ def _parse_poe(port):
     enabled = val('enabled')
     supported = val('supported')
     ptype = val('power-type') or val('power_type')
-    standard = {'1': '802.3af (Type 1)', '2': '802.3at (Type 2)'}.get(ptype, ptype)
+    class_str = val('class')
+    class_num = _poe_class_num(class_str)
+    poe_type, standard = _poe_standard(ptype, class_num)
     allocated_w = _poe_watts(power.get('allocated') if isinstance(power.get('allocated'), (str, int)) else _scalar(power.get('allocated')))
     requested_w = _poe_watts(power.get('requested') if isinstance(power.get('requested'), (str, int)) else _scalar(power.get('requested')))
     # The switch port is a PSE (Power Sourcing Equipment) and power is enabled
     # => it is delivering, or ready to deliver, PoE to us.
     powered = bool(device_type and device_type.upper() == 'PSE' and truthy(enabled))
+
+    # Active vs passive: an LLDP Power-via-MDI TLV means the PSE does 802.3
+    # detection/classification handshaking, i.e. ACTIVE (standards) PoE. Passive
+    # PoE injectors put voltage straight on the wire with no negotiation and no
+    # TLV, so they are undetectable from the PD side over LLDP -- we can only
+    # affirm 'active', never confirm 'passive' here.
+    mode = 'active'
+
+    # EndSpan vs MidSpan: not an explicit LLDP field, but the powered pairs are
+    # a strong hint. Alternative A (data pairs / 'signal') is how switch-
+    # integrated PSEs (endspan) deliver power; Alternative B (spare pairs /
+    # 'spare') is the classic mid-span injector. Best-effort; 802.3at/bt drive
+    # all four pairs so treat this as indicative, not definitive.
+    pairs = val('pairs')
+    power_via = None
+    if pairs:
+        p = pairs.lower()
+        if 'spare' in p:
+            power_via = 'midspan'
+        elif 'signal' in p or 'both' in p:
+            power_via = 'endspan'
+
     return {
         'device_type': device_type,          # PSE (switch) or PD (powered device)
         'supported': truthy(supported) if supported is not None else None,
         'enabled': truthy(enabled) if enabled is not None else None,
         'powered': powered,
-        'class': val('class'),
+        'type': poe_type,                     # af / at / bt
+        'mode': mode,                         # active (passive not LLDP-detectable)
+        'power_via': power_via,               # endspan (switch) / midspan (injector)
+        'class': class_str,
+        'class_num': class_num,
         'standard': standard,
-        'pairs': val('pairs'),
+        'pairs': pairs,
         'allocated_w': allocated_w,
         'requested_w': requested_w,
     }
@@ -500,18 +554,45 @@ def _is_wireless(iface):
     return os.path.isdir(f'/sys/class/net/{iface}/wireless')
 
 
+# Interface name prefixes that denote a VPN / tunnel link (not a physical NIC).
+_VPN_IFACE_PREFIXES = ('tun', 'tap', 'wg', 'tailscale', 'ppp', 'ipsec',
+                       'zt', 'nordlynx', 'proton', 'gpd', 'utun', 'vpn', 'nebula')
+
+
+def _is_vpn(iface):
+    """True if the interface is a VPN / tunnel rather than a physical link.
+
+    Matches well-known VPN/tunnel names (WireGuard, Tailscale, OpenVPN tun/tap,
+    ZeroTier, PPP/L2TP, ...) and, as a backstop, the ARPHRD_NONE (65534) link
+    type that point-to-point tunnels report in sysfs."""
+    n = iface.lower()
+    if n.startswith(_VPN_IFACE_PREFIXES):
+        return True
+    try:
+        with open(f'/sys/class/net/{iface}/type') as f:
+            # 65534 = ARPHRD_NONE, typical of tun/wireguard/tailscale tunnels.
+            return f.read().strip() == '65534'
+    except OSError:
+        return False
+
+
 def do_interfaces(include_virtual=False):
     interfaces = []
     for name in _list_iface_names(include_virtual=include_virtual):
         link = _iface_link_details(name)
         v4, v6 = _iface_addrs(name)
-        wireless = _is_wireless(name)
-        eth = _iface_ethtool(name) if not wireless else {
+        if _is_wireless(name):
+            itype = 'wifi'
+        elif _is_vpn(name):
+            itype = 'vpn'
+        else:
+            itype = 'ethernet'
+        eth = _iface_ethtool(name) if itype == 'ethernet' else {
             'speed': None, 'duplex': None, 'autoneg': None, 'link_detected': None}
         method = _iface_ip_method(name, v4)
         interfaces.append({
             'name': name,
-            'type': 'wifi' if wireless else 'ethernet',
+            'type': itype,
             'mac': link['mac'],
             'operstate': link['operstate'],
             'ipv4': v4,

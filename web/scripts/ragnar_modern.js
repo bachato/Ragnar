@@ -1388,15 +1388,17 @@ function _poeText(poe) {
     if (!poe) return '—';
     const parts = [];
     const w = poe.allocated_w != null ? poe.allocated_w : poe.requested_w;
+    // Lead with the standard: 802.3af / 802.3at / 802.3bt when known.
     if (poe.powered) {
-        parts.push('PoE');
+        parts.push(poe.type ? ('802.3' + poe.type) : 'PoE');
     } else if (poe.device_type) {
         parts.push(poe.device_type);  // e.g. PD, or PSE with power not enabled
     } else {
         parts.push('PoE');
     }
+    if (poe.mode) parts.push(poe.mode);              // active
+    if (poe.power_via) parts.push(poe.power_via);    // endspan / midspan
     if (poe.class) parts.push(poe.class);
-    if (poe.standard) parts.push(poe.standard);
     if (w != null) parts.push(w + 'W');
     return parts.join(' · ');
 }
@@ -1566,6 +1568,11 @@ async function loadInterfaces() {
             };
             return `<span class="px-2 py-0.5 rounded text-xs ${map[m] || map.unknown}">${escapeHtml(m)}</span>`;
         };
+        const typeLabel = (t) => {
+            if (t === 'vpn') return '<span class="px-2 py-0.5 rounded text-xs bg-amber-900/50 text-amber-300">VPN</span>';
+            if (t === 'wifi') return '<span class="px-2 py-0.5 rounded text-xs bg-sky-900/50 text-sky-300">wifi</span>';
+            return '<span class="px-2 py-0.5 rounded text-xs bg-slate-700 text-slate-300">ethernet</span>';
+        };
         const rows = data.interfaces.map(i => {
             const link = (i.link_detected === true) ? '<span class="text-green-400">up</span>'
                 : (i.link_detected === false) ? '<span class="text-gray-500">down</span>'
@@ -1575,7 +1582,7 @@ async function loadInterfaces() {
             const vlan = i.vlan_id ? escapeHtml(String(i.vlan_id)) + (i.vlan_proto ? ' (' + escapeHtml(i.vlan_proto) + ')' : '') : '—';
             return `<tr class="border-t border-slate-800">
                 <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(i.name)}</td>
-                <td class="px-3 py-1.5">${escapeHtml(i.type)}</td>
+                <td class="px-3 py-1.5">${typeLabel(i.type)}</td>
                 <td class="px-3 py-1.5">${link}</td>
                 <td class="px-3 py-1.5">${speed}</td>
                 <td class="px-3 py-1.5 text-center">${autoneg}</td>

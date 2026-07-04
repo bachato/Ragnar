@@ -977,8 +977,16 @@ class Display:
                 return
             poe = n.get('poe')
             if poe and poe.get('powered'):
+                bits = []
+                if poe.get('type'):
+                    bits.append(poe['type'])                    # af/at/bt
+                via = poe.get('power_via')
+                if via:
+                    bits.append('mid' if via == 'midspan' else 'end')
                 w = poe.get('allocated_w') or poe.get('requested_w')
-                poe_s = (poe.get('class') or 'PoE') + (f" {w}W" if w else "")
+                if w:
+                    bits.append(f"{w}W")
+                poe_s = ' '.join(bits) or 'yes'
             elif poe:
                 poe_s = poe.get('device_type') or 'no'
             else:

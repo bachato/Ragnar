@@ -150,14 +150,25 @@ column showing:
 - **Device type** — PSE (the switch is sourcing power) or PD
 - Whether power is **enabled / being delivered** (a green ⚡ marks a port that's
   actively powered)
-- **Power class** (e.g. class 3)
-- **Standard** — 802.3af (Type 1) or 802.3at (Type 2)
-- **Allocated / requested wattage**
+- **Type** — the PoE standard: **af** (802.3af, ≤15.4 W), **at** (802.3at /
+  PoE+, ≤30 W) or **bt** (802.3bt / PoE++, classes 5–8). Derived from the
+  power-type field and the advertised class.
+- **Mode** — **active**. An LLDP power TLV means the PSE does standards-based
+  802.3 detection/classification, i.e. active PoE. Passive PoE injectors put
+  voltage on the wire with no negotiation and advertise nothing, so they can't
+  be confirmed from the powered device over LLDP — the tool only ever affirms
+  *active*, it never falsely claims *passive*.
+- **Delivery** — **endspan** (power comes from the switch itself) vs **midspan**
+  (a separate power injector between switch and device). Inferred from which
+  pairs carry power — data pairs / Alternative A ⇒ endspan, spare pairs /
+  Alternative B ⇒ midspan. Best-effort: 802.3at/bt drive all four pairs, so
+  treat this as indicative rather than definitive.
+- **Power class** (e.g. class 3) and **allocated / requested wattage**
 
 > **Note:** this reflects PoE *as advertised by the switch over LLDP*. An
-> unmanaged PoE injector, or a switch with LLDP-MED power TLVs turned off, won't
-> advertise it — so a blank PoE column means "not advertised", not a guaranteed
-> "no power".
+> unmanaged/passive PoE injector, or a switch with LLDP-MED power TLVs turned
+> off, won't advertise it — so a blank PoE column means "not advertised", not a
+> guaranteed "no power".
 
 ### ARP Scan
 Sweeps the local segment with ARP to enumerate **live hosts** on a chosen
@@ -176,7 +187,11 @@ identity of the network it's attached to.
 ### Interface list
 For every interface (Ethernet and WiFi; virtual/loopback optionally included):
 
-- **Type** — ethernet or wifi
+- **Type** — **ethernet**, **wifi**, or **VPN**. VPN/tunnel links (WireGuard,
+  Tailscale, OpenVPN tun/tap, ZeroTier, PPP/L2TP, …) are detected by name and
+  by their tunnel link type, and flagged as **VPN** rather than being lumped in
+  with physical Ethernet — so a `tailscale0` or `wg0` is obvious at a glance and
+  isn't mistaken for a real wired port.
 - **MAC address** and **operational state** (up/down)
 - **IPv4 / IPv6 addresses** (link-local `fe80::` filtered out)
 - **IP method** — how the address was obtained: `dhcp`, `static`,
