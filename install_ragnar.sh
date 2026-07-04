@@ -1021,6 +1021,13 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
     # Set correct permissions and ownership
     chown -R $ragnar_USER:$ragnar_USER /home/$ragnar_USER/Ragnar
     chmod -R 755 /home/$ragnar_USER/Ragnar
+
+    # Whitelist the checkout for root's git. The ragnar service runs as root
+    # while the files belong to the ragnar user; newer git refuses that mix
+    # ("detected dubious ownership"), which made the in-app updater fail on
+    # fresh installs until the path is added to root's global git config.
+    git config --global --get-all safe.directory 2>/dev/null | grep -qxF "/home/$ragnar_USER/Ragnar" \
+        || git config --global --add safe.directory "/home/$ragnar_USER/Ragnar"
     
     # Make utility scripts executable with proper ownership
     chmod +x $ragnar_PATH/kill_port_8000.sh 2>/dev/null || true

@@ -9116,33 +9116,43 @@ def deep_scan_host():
 # SYSTEM MANAGEMENT UTILITIES & ENDPOINTS
 # ============================================================================
 
-def _execute_git_update(repo_path: str) -> dict:
-    """Run the git pull sequence Ragnar uses, returning status metadata."""
-    result = {
-        'success': False,
-        'output': '',
-        'error': '',
-        'warnings': []
-    }
+# Git config for update commands that may create commits (stash, pull-merge).
+# The service typically runs as root with no git identity configured, and
+# newer git also aborts a divergent pull unless a reconcile strategy is set
+# — either would fail the in-app update on user devices.
+_GIT_UPDATE_ID = [
+    '-c', 'user.name=Ragnar Updater',
+    '-c', 'user.email=ragnar-updater@localhost',
+    '-c', 'pull.rebase=false',
+]
 
-    # Fix permissions ahead of git pull to avoid ownership issues on devices
+
+def _prepare_git_repo(repo_path: str, warnings: list) -> None:
+    """Make the checkout usable BEFORE the first git command runs.
+
+    Fresh user devices hit three pre-conditions that fail the first git
+    command (and with it the whole update): mixed pi/ragnar/root file
+    ownership, stale lock files from interrupted runs, and git's "dubious
+    ownership" refusal because the service runs as root while the checkout
+    belongs to user 'ragnar'.
+    """
+    # Fix permissions ahead of git to avoid ownership issues on devices
     try:
-        logger.info("Correcting file permissions before git pull...")
+        logger.info("Correcting file permissions before git update...")
         subprocess.run(
-            ['sudo', 'chown', '-R', 'ragnar:ragnar', '/home/ragnar/Ragnar'],
+            ['sudo', 'chown', '-R', 'ragnar:ragnar', repo_path],
             capture_output=True,
             text=True,
             check=True
         )
-        logger.info("Permissions corrected successfully")
     except subprocess.CalledProcessError as e:
         warning = f"Permission correction failed (continuing): {e.stderr.strip() or e.stdout.strip()}"
         logger.warning(warning)
-        result['warnings'].append(warning)
+        warnings.append(warning)
     except Exception as e:
         warning = f"Permission correction error (continuing): {e}"
         logger.warning(warning)
-        result['warnings'].append(warning)
+        warnings.append(warning)
 
     # Remove stale lock files that cause "Another git process seems to be
     # running" errors — the most common reason the first update attempt
@@ -9156,25 +9166,64 @@ def _execute_git_update(repo_path: str) -> dict:
                 os.remove(lock_path)
                 warning = f"Removed stale lock file: {lock_name}"
                 logger.warning(warning)
-                result['warnings'].append(warning)
+                warnings.append(warning)
             except OSError as e:
                 logger.debug(f"Could not remove {lock_name}: {e}")
 
-    # Ensure safe-directory is configured (avoids ownership errors)
+    # Whitelist the checkout for the current user. safe.directory must live
+    # in the global config (git ignores it from plain -c), and --add only
+    # when missing so repeated updates don't pile up duplicate entries.
     try:
-        subprocess.run(
-            ['git', 'config', '--global', '--add', 'safe.directory', repo_path],
-            cwd=repo_path, capture_output=True, text=True, check=False
-        )
+        existing = subprocess.run(
+            ['git', 'config', '--global', '--get-all', 'safe.directory'],
+            capture_output=True, text=True, check=False
+        ).stdout.splitlines()
+        if repo_path not in existing:
+            subprocess.run(
+                ['git', 'config', '--global', '--add', 'safe.directory', repo_path],
+                capture_output=True, text=True, check=False
+            )
     except Exception:
         pass
+
+
+def _execute_git_update(repo_path: str, prepared: bool = False) -> dict:
+    """Run the git pull sequence Ragnar uses, returning status metadata."""
+    result = {
+        'success': False,
+        'output': '',
+        'error': '',
+        'warnings': []
+    }
+
+    if not prepared:
+        _prepare_git_repo(repo_path, result['warnings'])
+    git_dir = os.path.join(repo_path, '.git')
+
+    # Resolve which branch to update. A detached HEAD would make plain
+    # `git pull` fail, and naming the branch explicitly also covers
+    # checkouts that have no upstream tracking configured.
+    try:
+        branch = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=repo_path, capture_output=True, text=True, check=True
+        ).stdout.strip() or 'main'
+    except Exception:
+        branch = 'main'
+    if branch == 'HEAD':
+        subprocess.run(
+            ['git', 'checkout', 'main'],
+            cwd=repo_path, capture_output=True, text=True, check=False
+        )
+        branch = 'main'
+        result['warnings'].append("Checkout was detached; switched back to main")
 
     # Perform git pull with one automatic retry on failure
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
         try:
             pull_proc = subprocess.run(
-                ['git', 'pull'],
+                ['git'] + _GIT_UPDATE_ID + ['pull', 'origin', branch],
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
@@ -9188,8 +9237,26 @@ def _execute_git_update(repo_path: str) -> dict:
             logger.error(f"Git pull attempt {attempt}/{max_attempts} failed: {error_msg}")
 
             if attempt >= max_attempts:
-                result['error'] = f"Git pull failed: {error_msg}"
-                return result
+                # Last resort: make the checkout match origin/<branch>
+                # exactly. Callers stash local changes beforehand (and the
+                # retry path already resets the tree), so this only discards
+                # merge debris, never user work.
+                try:
+                    subprocess.run(
+                        ['git', 'fetch', 'origin', branch],
+                        cwd=repo_path, capture_output=True, text=True, check=True
+                    )
+                    subprocess.run(
+                        ['git', 'reset', '--hard', f'origin/{branch}'],
+                        cwd=repo_path, capture_output=True, text=True, check=True
+                    )
+                    result['output'] = f"Forced checkout to origin/{branch} after pull failures"
+                    result['warnings'].append(
+                        f"git pull kept failing ({error_msg}); forced the checkout to match origin/{branch}")
+                    break
+                except Exception:
+                    result['error'] = f"Git pull failed: {error_msg}"
+                    return result
 
             # Auto-recover before retrying
             recovered = False
@@ -9224,7 +9291,7 @@ def _execute_git_update(repo_path: str) -> dict:
             if 'diverge' in err_lower or 'need to specify' in err_lower:
                 try:
                     subprocess.run(
-                        ['git', 'pull', '--rebase'],
+                        ['git'] + _GIT_UPDATE_ID + ['pull', '--rebase'],
                         cwd=repo_path, capture_output=True, text=True, check=True
                     )
                     result['output'] = 'Pulled with rebase after divergence'
@@ -9251,13 +9318,14 @@ def _execute_git_update(repo_path: str) -> dict:
     # Ensure executable bits remain in place after pull
     try:
         logger.info("Making scripts executable after git pull...")
+        # chmod does not expand globs when invoked without a shell, so the
+        # wildcard passes go through find instead.
         chmod_commands = [
-            ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/*.sh'],
-            ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/*.py'],
             ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/Ragnar.py'],
             ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/kill_port_8000.sh'],
             ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/webapp_modern.py'],
-            ['sudo', 'find', '/home/ragnar/Ragnar', '-name', '*.sh', '-exec', 'chmod', '+x', '{}', ';']
+            ['sudo', 'find', '/home/ragnar/Ragnar', '-name', '*.sh', '-exec', 'chmod', '+x', '{}', ';'],
+            ['sudo', 'find', '/home/ragnar/Ragnar', '-maxdepth', '1', '-name', '*.py', '-exec', 'chmod', '+x', '{}', ';']
         ]
 
         for cmd in chmod_commands:
@@ -9652,12 +9720,20 @@ def stash_and_update():
     stash_message = payload.get('message') or f"Ragnar auto stash {datetime.utcnow().isoformat()}"
     include_untracked = payload.get('include_untracked', True)
 
-    stash_cmd = ['git', 'stash', 'push']
+    stash_cmd = ['git'] + _GIT_UPDATE_ID + ['stash', 'push']
     if include_untracked:
         stash_cmd.append('-u')
     stash_cmd.extend(['-m', stash_message])
 
     logger.info("Auto stash + update requested via UI")
+
+    # Prepare the repo BEFORE the stash — on a fresh install the stash is
+    # the first git command this service ever runs, and it dies on dubious
+    # ownership / stale locks / root-owned files unless those are fixed
+    # first. This was exactly the "Update failed. Fix issues and retry."
+    # dead end users hit from the Settings tab.
+    preflight_warnings = []
+    _prepare_git_repo(repo_path, preflight_warnings)
 
     try:
         stash_proc = subprocess.run(
@@ -9670,7 +9746,11 @@ def stash_and_update():
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error(f"Git stash failed: {error_msg}")
-        return jsonify({'success': False, 'error': f'Git stash failed: {error_msg}'}), 500
+        return jsonify({
+            'success': False,
+            'error': f'Git stash failed: {error_msg}',
+            'warnings': preflight_warnings
+        }), 500
 
     stash_stdout = stash_proc.stdout.strip() or stash_proc.stderr.strip() or ''
     stash_created = 'No local changes to save' not in stash_stdout
@@ -9681,7 +9761,8 @@ def stash_and_update():
     else:
         logger.info("Auto stash requested but no local changes were found")
 
-    update_result = _execute_git_update(repo_path)
+    update_result = _execute_git_update(repo_path, prepared=True)
+    update_result['warnings'] = preflight_warnings + update_result['warnings']
     if not update_result['success']:
         # Preserve the stash so the operator can recover work manually
         logger.error("Auto stash update failed after stashing; stash preserved for manual recovery")

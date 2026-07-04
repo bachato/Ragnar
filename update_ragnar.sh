@@ -40,12 +40,24 @@ fi
 echo -e "\n${BLUE}Step 1: Stopping ragnar service...${NC}"
 systemctl stop ragnar.service
 
+echo -e "${BLUE}Step 1.5: Preparing git repository...${NC}"
+# Root runs this script while the checkout belongs to user 'ragnar' — newer
+# git refuses that mix ("detected dubious ownership") unless the path is
+# whitelisted in root's global config. Interrupted runs can also leave stale
+# lock files, and previous sudo runs leave root-owned files that break git.
+git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$ragnar_PATH" \
+    || git config --global --add safe.directory "$ragnar_PATH"
+rm -f "$ragnar_PATH/.git/index.lock" "$ragnar_PATH/.git/HEAD.lock" "$ragnar_PATH/.git/shallow.lock" 2>/dev/null
+chown -R ragnar:ragnar "$ragnar_PATH" 2>/dev/null || true
+# Stash and merge commits need an author identity; root rarely has one.
+GIT_ID=(-c user.name="Ragnar Updater" -c user.email="ragnar-updater@localhost" -c pull.rebase=false)
+
 echo -e "${BLUE}Step 2: Backing up local changes...${NC}"
 if git diff --quiet && git diff --staged --quiet; then
     echo -e "${GREEN}No local changes to backup.${NC}"
 else
     echo -e "${YELLOW}Local changes detected. Creating backup...${NC}"
-    git stash push -m "Auto-backup before update $(date)"
+    git "${GIT_ID[@]}" stash push -m "Auto-backup before update $(date)"
     echo -e "${GREEN}Local changes backed up.${NC}"
 fi
 
@@ -64,13 +76,29 @@ echo -e "${BLUE}Step 3: Fetching latest updates...${NC}"
 git fetch origin
 
 echo -e "${BLUE}Step 4: Updating to latest version...${NC}"
-if git pull origin main; then
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+    # Detached checkout (e.g. a past checkout of a tag) - go back to main.
+    echo -e "${YELLOW}Detached checkout detected - switching back to main.${NC}"
+    git checkout main 2>/dev/null || git checkout -B main origin/main
+    CURRENT_BRANCH="main"
+fi
+if git "${GIT_ID[@]}" pull origin "$CURRENT_BRANCH"; then
     echo -e "${GREEN}Update completed successfully!${NC}"
 else
-    echo -e "${RED}Update failed. Attempting to restore backup...${NC}"
-    git stash pop
-    echo -e "${YELLOW}Backup restored. Please check for conflicts manually.${NC}"
-    exit 1
+    # Deterministic fallback: local changes are already in the stash and the
+    # runtime data is copied aside below, so matching origin exactly is safe
+    # and guarantees the update lands even on conflicted/diverged checkouts.
+    echo -e "${YELLOW}git pull failed - forcing checkout to match origin/$CURRENT_BRANCH (local changes stay in the stash)...${NC}"
+    if git fetch origin "$CURRENT_BRANCH" && git reset --hard "origin/$CURRENT_BRANCH"; then
+        echo -e "${GREEN}Update completed via forced sync.${NC}"
+    else
+        echo -e "${RED}Update failed. Attempting to restore backup...${NC}"
+        git "${GIT_ID[@]}" stash pop 2>/dev/null || true
+        echo -e "${YELLOW}Backup restored. Please check for conflicts manually.${NC}"
+        systemctl start ragnar.service
+        exit 1
+    fi
 fi
 
 echo -e "${BLUE}Step 5: Updating Python dependencies...${NC}"
