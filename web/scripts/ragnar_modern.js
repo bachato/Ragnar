@@ -1602,6 +1602,7 @@ async function loadInterfaces() {
                 <td class="px-3 py-1.5 text-center">${autoneg}</td>
                 <td class="px-3 py-1.5">${methodBadge(i.ip_method)}</td>
                 <td class="px-3 py-1.5 font-mono">${i.ipv4.length ? i.ipv4.map(escapeHtml).join('<br>') : '—'}</td>
+                <td class="px-3 py-1.5 font-mono">${(i.ipv6 && i.ipv6.length) ? i.ipv6.map(escapeHtml).join('<br>') : '—'}</td>
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(i.mac || '—'))}</td>
                 <td class="px-3 py-1.5">${vlan}</td>
             </tr>`;
@@ -1611,6 +1612,7 @@ async function loadInterfaces() {
                 <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">Type</th><th class="px-3 py-1.5">Link</th>
                 <th class="px-3 py-1.5">Speed/Duplex</th><th class="px-3 py-1.5 text-center">Auto-neg</th>
                 <th class="px-3 py-1.5">Addressing</th><th class="px-3 py-1.5">IPv4</th>
+                <th class="px-3 py-1.5">IPv6</th>
                 <th class="px-3 py-1.5">MAC</th><th class="px-3 py-1.5">VLAN</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
     } catch (e) {
