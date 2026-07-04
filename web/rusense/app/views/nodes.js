@@ -154,7 +154,7 @@ export default {
         }
         offPrev[id] = off;
         const ss = stalled ? { label: 'stalled', cls: 'badge-bad', key: 'stalled' } : syncState(off, stale, m.is_leader);
-        if (ss.key === 'desynced') { desynced++; badWeak.push({ id, rssi: rssi[id] }); }
+        if (ss.key === 'desynced') { desynced++; badWeak.push({ id, rssi: rssi[id], stale, off }); }
         else if (ss.key === 'syncing') syncing++;
         const ls = lastSeen[id];
         const dataFlowing = ls != null && ls < 5000;
@@ -192,11 +192,22 @@ export default {
         badge = 'Rebooting'; bcls = 'badge-bad';
         msg = `Node(s) ${rebootIds.map((i) => '#' + i).join(', ')} reset their sequence — a reboot loop. Check power (ESP32-S3 browns out under WiFi TX spikes) or a weak/dropping AP.`;
       } else if (desynced) {
-        badge = 'Sync failing'; bcls = 'badge-bad';
-        const weakest = badWeak.filter((b) => b.rssi != null).sort((a, b) => a.rssi - b.rssi)[0];
-        const weakHint = weakest ? ` Node #${weakest.id} is weakest at ${Math.round(weakest.rssi)} dBm — likely on a far router.` : '';
-        const dataHint = dataOkAmongBad ? ' CSI data is still streaming, so the data path is fine — only time-sync is broken.' : '';
-        msg = `Time-sync failing on ${desynced} node(s): clocks are seconds off the leader and sync packets are stale.${dataHint} This is the signature of nodes on <strong>different access points</strong> — one SSID across several routers makes each node roam to a different AP, which breaks the mesh sync (and CSI coherence). Put all nodes on <strong>one AP + a fixed channel</strong>.${weakHint}`;
+        // Read the evidence before blaming APs: a big offset with FRESH sync and
+        // STRONG signal is the ESP-NOW clock not converging, NOT a far/other AP.
+        const offList = badWeak.map((b) => `#${b.id} ${fmtOffset(b.off)}`).join(', ');
+        const allFresh = badWeak.every((b) => (b.stale ?? 0) < 10000);
+        const allStrong = badWeak.every((b) => b.rssi == null || b.rssi >= -70);
+        if (allFresh && allStrong) {
+          badge = 'Clock not converging'; bcls = 'badge-warn';
+          msg = `Sync packets are arriving <strong>fresh</strong> and the signal is <strong>strong</strong>, so this is <strong>not</strong> an access-point / range problem — the ESP-NOW clock offset just isn't converging to the leader (${offList}). CSI is streaming, so per-node <strong>presence &amp; motion work fine</strong>; only multi-node <strong>fusion</strong> (position / people-count) needs the clocks within ~200&nbsp;ms. Power-cycle the desynced node(s) to re-run leader election; if the offset stays multi-second it's the mesh time-sync not locking — safe to ignore if you only need presence.`;
+        } else {
+          badge = 'Sync failing'; bcls = 'badge-bad';
+          const weak = badWeak.filter((b) => b.rssi != null && b.rssi < -70).sort((a, b) => a.rssi - b.rssi)[0];
+          const weakHint = weak ? ` Node #${weak.id} is weak at ${Math.round(weak.rssi)} dBm — likely on a far router.` : '';
+          const staleHint = badWeak.some((b) => (b.stale ?? 0) >= 10000) ? ' Sync packets are stale (not arriving).' : '';
+          const dataHint = dataOkAmongBad ? ' CSI data is still streaming, so the data path is fine — only time-sync is broken.' : '';
+          msg = `Time-sync failing on ${desynced} node(s): clocks are off the leader (${offList}).${staleHint}${dataHint} Commonly the signature of nodes on <strong>different access points</strong> — one SSID across several routers makes each node roam to a different AP, breaking mesh sync. Put all nodes on <strong>one AP + a fixed channel</strong>.${weakHint}`;
+        }
       } else if (syncing) {
         badge = 'Converging'; bcls = 'badge-warn';
         msg = 'Mesh is settling — offsets shrinking toward zero. Give it a few seconds; if they never reach sub-millisecond, the nodes are probably on different APs.';
