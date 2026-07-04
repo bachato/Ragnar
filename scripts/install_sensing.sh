@@ -145,10 +145,10 @@ Environment=SENSING_ALLOWED_HOSTS=$ALLOWED_HOSTS
 # for the noisy AMOLED 2-node CSI (empty-room sm~0.15); clean headless
 # DevKitC nodes sit near 0 empty and ~0.12 when a person moves, so 0.25
 # gated real motion out. 0.10 sits between DevKitC empty (~0-0.085) and
-# moving (~0.12-0.15). 0.10 and 0.13 still tripped on ambient noise; 0.18 gives
-# firm margin over empty. If it starts MISSING a moving person, the room's noise
-# floor overlaps the signal — recheck empty-room sm and tune here per site.
-Environment=RUVIEW_PRESENCE_FLOOR=0.18
+# moving (~0.12-0.15). Tuning history: 0.10/0.13 too sensitive, 0.18 too high
+# (missed the person) -> 0.16 is the middle. Narrow window = empty noise sits
+# close to the motion signal. Override/retune per site via RUVIEW_PRESENCE_FLOOR.
+Environment=RUVIEW_PRESENCE_FLOOR=0.16
 Environment=RUVIEW_NODE_VOTE=0.80
 Environment=RUVIEW_NONVOTING_NODES=1
 # Multi-node fusion guard: WiFi/ESP-NOW-synced ESP32 nodes drift 10-150 ms
