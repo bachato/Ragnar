@@ -1455,6 +1455,77 @@ def rusense_diagnostics():
     return jsonify(diag)
 
 
+@app.route('/api/rusense/sensitivity', methods=['GET', 'POST'])
+def rusense_sensitivity():
+    """Get/set the model-free detection sensitivity: the presence floor and the
+    debounce depth the sensing engine uses. These are the RUVIEW_PRESENCE_FLOOR /
+    RUVIEW_DEBOUNCE_FRAMES env vars; POST writes them to a systemd drop-in
+    (ragnar-sensing.service.d/sensitivity.conf) so they survive a RuSense
+    reinstall and cleanly override the shipped defaults, then daemon-reloads and
+    restarts the sensing service to apply live. Webapp runs as root."""
+    import subprocess
+    cfg = shared_data.config or {}
+    DEF_FLOOR, DEF_DEB = 0.16, 6
+    if request.method == 'GET':
+        return jsonify({
+            'floor': float(cfg.get('rusense_presence_floor', DEF_FLOOR)),
+            'debounce_frames': int(cfg.get('rusense_debounce_frames', DEF_DEB)),
+            'default_floor': DEF_FLOOR,
+            'default_debounce_frames': DEF_DEB,
+        })
+
+    data = request.get_json(silent=True) or {}
+    try:
+        floor = round(float(data.get('floor', DEF_FLOOR)), 3)
+        deb = int(data.get('debounce_frames', DEF_DEB))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'floor must be a number, debounce_frames an integer'}), 400
+    if not (0.03 <= floor <= 0.40):
+        return jsonify({'error': 'floor out of range (0.03-0.40)'}), 400
+    if not (1 <= deb <= 30):
+        return jsonify({'error': 'debounce_frames out of range (1-30)'}), 400
+
+    # Persist so the UI reflects the current values and a reinstall keeps them.
+    shared_data.config['rusense_presence_floor'] = floor
+    shared_data.config['rusense_debounce_frames'] = deb
+    try:
+        shared_data.save_config()
+    except Exception as exc:
+        return jsonify({'error': f'could not save config: {exc}'}), 500
+
+    # systemd drop-in override — lives beside the unit, survives reinstall, and
+    # (loaded after the main unit) wins for these Environment= keys.
+    dropin_dir = '/etc/systemd/system/ragnar-sensing.service.d'
+    dropin = os.path.join(dropin_dir, 'sensitivity.conf')
+    body = ('# Written by Ragnar RuSense Settings -> Detection sensitivity.\n'
+            '# Overrides install_sensing.sh defaults; survives RuSense reinstall.\n'
+            '[Service]\n'
+            f'Environment=RUVIEW_PRESENCE_FLOOR={floor}\n'
+            f'Environment=RUVIEW_DEBOUNCE_FRAMES={deb}\n')
+
+    def run(cmd):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return {'rc': r.returncode, 'stderr': (r.stderr or '')[-400:]}
+        except Exception as exc:
+            return {'error': str(exc)}
+
+    steps = {}
+    try:
+        os.makedirs(dropin_dir, exist_ok=True)
+        with open(dropin, 'w', encoding='utf-8') as fh:
+            fh.write(body)
+        steps['dropin'] = dropin
+    except Exception as exc:
+        return jsonify({'error': f'could not write drop-in: {exc}', 'saved': True}), 500
+
+    steps['daemon_reload'] = run(['systemctl', 'daemon-reload'])
+    steps['restart'] = run(['systemctl', 'restart', 'ragnar-sensing.service'])
+    applied = steps['restart'].get('rc') == 0
+    return jsonify({'ok': applied, 'floor': floor, 'debounce_frames': deb,
+                    'applied': applied, 'steps': steps})
+
+
 @app.route('/api/rusense/vitals-history', methods=['GET'])
 def rusense_vitals_history():
     """Aggregated heart-rate / breathing / activity buckets for the dashboard

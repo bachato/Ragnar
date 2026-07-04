@@ -446,6 +446,43 @@ export default {
           <p id="st-geofence-status" class="text-xs text-ink-muted pt-1">Checking geofence status…</p>
         </div>
 
+        <div class="card card-pad space-y-3">
+          <h3 class="card-title mb-1">Detection sensitivity</h3>
+          <p class="text-xs text-ink-muted">How readily a node reports presence from motion (model-free). Pick a preset or set the values, then Apply. Applying restarts the sensing service — a brief (~1s) gap in the CSI stream.</p>
+          <div id="st-sens-presets" class="grid gap-2 sm:grid-cols-3">
+            <button type="button" data-floor="0.12" data-deb="5" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer">
+              <span class="block text-sm font-semibold">High</span>
+              <span class="block text-xs text-ink-muted">Catch everything (more false alarms)</span>
+            </button>
+            <button type="button" data-floor="0.16" data-deb="6" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer">
+              <span class="block text-sm font-semibold">Balanced</span>
+              <span class="block text-xs text-ink-muted">Default</span>
+            </button>
+            <button type="button" data-floor="0.20" data-deb="9" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer">
+              <span class="block text-sm font-semibold">Low</span>
+              <span class="block text-xs text-ink-muted">Fewest false alarms</span>
+            </button>
+          </div>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <label class="block">
+              <span class="block text-sm font-medium mb-1">Presence floor</span>
+              <input type="number" id="st-sens-floor" min="0.03" max="0.40" step="0.01"
+                value="${Number(c.rusense_presence_floor ?? 0.16)}"
+                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              <span class="block text-xs text-ink-muted mt-1">Motion level to count as present. Lower = more sensitive.</span>
+            </label>
+            <label class="block">
+              <span class="block text-sm font-medium mb-1">Debounce frames</span>
+              <input type="number" id="st-sens-deb" min="1" max="30" step="1"
+                value="${Number(c.rusense_debounce_frames ?? 6)}"
+                class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" />
+              <span class="block text-xs text-ink-muted mt-1">Frames motion must persist before flipping. Higher = fewer brief false triggers.</span>
+            </label>
+          </div>
+          <button id="st-sens-apply" class="btn-primary">Apply sensitivity</button>
+          <p class="text-xs text-ink-muted">Empty room still triggers? Raise <strong>debounce</strong> first, then the floor. Missing you when you move? Lower the floor.</p>
+        </div>
+
         <div class="flex flex-wrap gap-3">
           <button id="st-save" class="btn-primary">Save settings</button>
           <button id="st-test" class="btn-ghost">Send test notification</button>
@@ -565,6 +602,25 @@ export default {
       toast(r.ok ? 'Settings saved' : ((r.data && r.data.error) || 'Could not save settings'),
         r.ok ? 'ok' : 'bad');
       refreshGeofenceStatus();
+    });
+
+    // ── Detection sensitivity: presence floor + debounce. Applies to the
+    //    sensing engine via a systemd drop-in + service restart (own Apply
+    //    button since it briefly interrupts the CSI stream). ──
+    root.querySelectorAll('#st-sens-presets button').forEach((b) => b.addEventListener('click', () => {
+      if ($('#st-sens-floor')) $('#st-sens-floor').value = b.dataset.floor;
+      if ($('#st-sens-deb')) $('#st-sens-deb').value = b.dataset.deb;
+    }));
+    if ($('#st-sens-apply')) $('#st-sens-apply').addEventListener('click', async () => {
+      const floor = Math.max(0.03, Math.min(0.40, parseFloat($('#st-sens-floor').value) || 0.16));
+      const deb = clampInt($('#st-sens-deb'), 1, 30, 6);
+      const btn = $('#st-sens-apply');
+      btn.disabled = true; const prev = btn.textContent; btn.textContent = 'Applying…';
+      const r = await req('POST', '/api/rusense/sensitivity', { floor, debounce_frames: deb });
+      btn.disabled = false; btn.textContent = prev;
+      toast(r.ok ? `Sensitivity applied — floor ${floor}, debounce ${deb} (sensing restarted)`
+                 : ((r.data && r.data.error) || 'Could not apply sensitivity'),
+        r.ok ? 'ok' : 'bad');
     });
 
     // Live geofence diagnostic — shows whether confinement is actually active.
