@@ -16,6 +16,30 @@ self-contained module wrapped so a failure there can never take down the rest of
 the web app. Nothing runs as a background daemon — each tool executes on demand
 when you click it.
 
+### Tool index
+
+| Tool | Sub-tab | Endpoint |
+|------|---------|----------|
+| [Ping](#ping) | Diagnostics | `POST /api/net/ping` |
+| [Traceroute](#traceroute) | Diagnostics | `POST /api/net/traceroute` |
+| [MTR](#mtr) | Diagnostics | `POST /api/net/mtr` |
+| [WHOIS](#whois) | Diagnostics | `POST /api/net/whois` |
+| [DNS Doctor](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
+| [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
+| [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
+| [LAN Throughput (iperf3)](#lan-throughput-iperf3) | Diagnostics | `POST /api/net/iperf3`, `/iperf3-server` |
+| [Speed Test](#speed-test) | Diagnostics | `POST /api/net/speedtest` |
+| [Live Flow Telemetry](#live-flow-telemetry) | Diagnostics | `GET /api/net/flows` |
+| [PTP Timing Detection](#ptp-timing-detection) | Diagnostics | `POST /api/net/ptp` |
+| [E-Paper Network Diagnostic Mode](#-e-paper-network-diagnostic-mode) | Diagnostics (toggle) | config `network_diagnostic_mode` |
+| [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2 | `GET /api/net/lldp` |
+| [ARP Scan](#arp-scan) | Switch & L2 | `GET /api/net/arp-scan` |
+| [L2 Link Health](#l2-link-health) | Switch & L2 | `POST /api/net/l2-health` |
+| [Locate Port](#locate-port) | Switch & L2 | `POST /api/net/locate-port` |
+| [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
+| [Network Identity](#network-identity) | Interfaces | `GET /api/net/identity` |
+| [ISP / WAN + VPN Detection](#isp--wan-detection) | Interfaces | `GET /api/net/isp` |
+
 ---
 
 ## One-click install for missing tools
@@ -33,8 +57,9 @@ the installer detects it, runs the recovery automatically, and retries — so th
 button works without you having to drop to a shell.
 
 Installable packages are whitelisted (`iputils-ping`, `traceroute`, `mtr-tiny`,
-`whois`, `speedtest-cli`, `lldpd`, `arp-scan`, `ethtool`), so the tool name is
-never interpolated into a shell command.
+`whois`, `speedtest-cli`, `lldpd`, `arp-scan`, `ethtool`, `curl`, `dnsutils`,
+`iperf3`, `tcpdump`), so the tool name is never interpolated into a shell
+command.
 
 ---
 
@@ -154,8 +179,6 @@ and the chosen server and ISP. If neither client is present it self-installs
 `speedtest-cli` on demand so the button always works.
 
 - Endpoint: `POST /api/net/speedtest` · binary: `speedtest-cli` or `speedtest`
-
----
 
 ### Live Flow Telemetry
 Per-connection kernel stats from `ss -ti` for every established TCP flow: **RTT**,
@@ -355,10 +378,11 @@ interface** (`curl --interface <iface>`, which forces egress out that link via
   egress is shown as the VPN it is rather than as a failed WAN. The ASN-based
   provider match is best-effort ("likely"), since many VPNs share hosting ASNs.
 
-Lookups use **ipinfo.io** over HTTPS first, falling back to **ip-api.com**. An
-interface with no working internet path (e.g. a VPN tunnel with no exit, or a
-dead WAN) reports an explicit error rather than a value — which is itself the
-diagnostic you're after.
+Lookups use **ipinfo.io** over HTTPS first, falling back to **ip-api.com**. A
+VPN tunnel with no separate internet egress is shown as the VPN it is (technology
++ endpoint); a genuinely **dead WAN** — a non-tunnel interface with no working
+internet path — reports an explicit error rather than a value, which is itself
+the diagnostic you're after.
 
 > **Privacy:** this makes an outbound request to a third-party geo-IP service,
 > revealing the device's public IP to it. It is **on-demand only** (triggered by
@@ -379,8 +403,15 @@ diagnostic you're after.
   binary as exit code 127, a timeout as 124, and any other failure as a plain
   error string — no tool can hang the web UI or raise into the request handler.
 - **On-demand only.** Nothing polls in the background; a tool runs when you ask
-  it to.
-- **CSV export** is available for the Switch Discovery and ARP Scan tables.
+  it to. Tools that touch the wire (Locate Port's link-flap, L2 Link Health and
+  PTP captures, ISP lookups) are always explicit, button-triggered actions.
+- **CSV export** is available for the Switch Discovery, ARP Scan, Interfaces,
+  Network Identity and ISP / WAN tables.
+- **Offline-capable.** Everything except the internet-facing tools (Speed Test,
+  ISP/WAN detection, DoH/DoT reachability) works with no internet at all —
+  ping/MTR to local hosts, DNS against local resolvers, LLDP/PoE, ARP scan,
+  L2 health, interfaces, PMTU, iperf3, flow telemetry, PTP and Locate Port are
+  all local to the segment, which is the whole point of a field tool.
 
 ---
 
