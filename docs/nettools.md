@@ -179,6 +179,38 @@ authoritative):
 
 - Endpoint: `GET /api/net/identity`
 
+### ISP / WAN Detection
+Detects the **public IP and ISP/ASN reached *through each interface***. On a
+**multi-WAN** box (two or more uplinks to different providers) this is the fast
+way to answer "which physical link goes to which ISP, and is each one actually
+reaching the internet?" — invaluable when one of several uplinks is flaky or
+resistant.
+
+For each interface with a usable IPv4, Ragnar runs a lookup **bound to that
+interface** (`curl --interface <iface>`, which forces egress out that link via
+`SO_BINDTODEVICE` regardless of the routing table) and reports:
+
+- **ISP** and **ASN** (e.g. `Tele2 Sverige AB` / `AS1257`)
+- **Public IP** seen from the internet through that link
+- **Location** (city / region / country) of that egress
+- **Source** — which geo-IP service answered
+
+Lookups use **ipinfo.io** over HTTPS first, falling back to **ip-api.com**. An
+interface with no working internet path (e.g. a VPN tunnel, or a dead WAN)
+reports an explicit error rather than a value — which is itself the diagnostic
+you're after.
+
+> **Privacy:** this makes an outbound request to a third-party geo-IP service,
+> revealing the device's public IP to it. It is **on-demand only** (triggered by
+> the *Detect ISPs* button), never polled in the background.
+
+- Endpoint: `GET /api/net/isp` (all interfaces) or
+  `GET /api/net/isp?interface=<iface>` · binary: `curl`
+
+> The **Speed Test** in Diagnostics also reports the ISP for the default path
+> (from the speedtest client's own geolocation) — ISP / WAN Detection is the
+> per-interface complement for multi-homed setups.
+
 ---
 
 ## Design notes

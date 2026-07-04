@@ -1246,6 +1246,16 @@
                     </div>
                     <div id="interfaces-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">ISP / WAN Detection</h3>
+                            <p class="text-sm text-gray-400">Public IP and ISP/ASN reached <em>through each interface</em> — identifies which physical link goes to which provider on multi-WAN setups. Makes an outbound lookup per interface.</p>
+                        </div>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="detectIsp()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Detect ISPs</button><button onclick="exportIspCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
+                    </div>
+                    <div id="isp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Click <span class="text-gray-300">Detect ISPs</span> to look up the ISP behind each interface.</div>
+                </div>
             </div><!-- /#net-sub-interfaces -->
         </div><!-- /#network-tab -->
 
@@ -5407,7 +5417,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260703-poe"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260703-isp"></script>
 
 </body>
 </html>

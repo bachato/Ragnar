@@ -1130,7 +1130,7 @@ function showNetworkSubtab(name) {
 
 // Last-fetched payloads for each net panel, so "Export CSV" has data to dump.
 let _ndLastLldp = [], _ndLastArp = null, _ndLastIfaces = [],
-    _ndLastMtr = null, _ndLastIdentity = null;
+    _ndLastMtr = null, _ndLastIdentity = null, _ndLastIsp = [];
 
 // Build a CSV from a header row + rows (arrays of cells) and download it.
 function _ndDownloadCsv(nameBase, header, rows) {
@@ -1594,6 +1594,63 @@ async function loadInterfaces() {
     } catch (e) {
         out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     }
+}
+
+// Detect the ISP/public IP reached through each interface (multi-WAN). Makes
+// outbound lookups server-side, so it's button-triggered, never auto-loaded.
+async function detectIsp() {
+    const out = document.getElementById('isp-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Detecting…');
+    out.innerHTML = '<p class="text-sm text-gray-400">Looking up the ISP behind each interface…</p>';
+    try {
+        const data = await fetchAPI('/api/net/isp');
+        if (!data.success) {
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'detectIsp')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        _ndLastIsp = data.results || [];
+        if (!_ndLastIsp.length) {
+            out.innerHTML = '<p class="text-sm text-gray-400">No interfaces with a usable address to query.</p>';
+            return;
+        }
+        const rows = _ndLastIsp.map(r => {
+            if (r.error) {
+                return `<tr class="border-t border-slate-800">
+                    <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
+                    <td class="px-3 py-1.5 text-red-400" colspan="5">${escapeHtml(r.error)}</td>
+                </tr>`;
+            }
+            const loc = [r.city, r.region, r.country].filter(Boolean).map(escapeHtml).join(', ') || '—';
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(r.isp || r.org || '—'))}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.asn || '—'))}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.public_ip || '—'))}</td>
+                <td class="px-3 py-1.5">${loc}</td>
+                <td class="px-3 py-1.5 text-gray-500">${escapeHtml(String(r.source || '—'))}</td>
+            </tr>`;
+        }).join('');
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">ISP</th>
+                <th class="px-3 py-1.5">ASN</th><th class="px-3 py-1.5">Public IP</th>
+                <th class="px-3 py-1.5">Location</th><th class="px-3 py-1.5">Source</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+function exportIspCsv() {
+    _ndDownloadCsv('interface_isp',
+        ['Interface', 'ISP', 'ASN', 'Public IP', 'City', 'Region', 'Country', 'Source', 'Error'],
+        (_ndLastIsp || []).map(r => [r.interface, r.isp || r.org, r.asn, r.public_ip,
+            r.city, r.region, r.country, r.source, r.error]));
 }
 
 function showDiscoveredSubtab(name) {

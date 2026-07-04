@@ -669,6 +669,101 @@ def do_network_identity():
 
 
 # --------------------------------------------------------------------------
+# Per-interface ISP / WAN detection (multi-WAN troubleshooting)
+# --------------------------------------------------------------------------
+
+def _parse_ipinfo_org(org):
+    """ipinfo.io returns org as 'AS3301 Telia Company AB'. Split the leading
+    ASN from the ISP/org name."""
+    if not org:
+        return None, None
+    m = re.match(r'^(AS\d+)\s+(.*)$', org.strip())
+    if m:
+        return m.group(1), m.group(2).strip() or None
+    return None, org.strip() or None
+
+
+def _isp_lookup_iface(iface):
+    """Query a public geo-IP/ASN service *through* one interface, so on a
+    multi-WAN box each WAN's own public IP + ISP is reported. curl --interface
+    binds the socket to that device (SO_BINDTODEVICE), forcing egress out it
+    regardless of the routing table."""
+    if not _have('curl'):
+        return {'interface': iface, 'error': 'curl is not installed', 'missing_tool': 'curl'}
+
+    # Primary: ipinfo.io over HTTPS (no API key needed for basic fields).
+    res = _run(['curl', '-s', '--max-time', '8', '--interface', iface,
+                'https://ipinfo.io/json'], timeout=12)
+    if res['rc'] == 0 and res['out'].strip():
+        try:
+            d = json.loads(res['out'])
+            if d.get('ip'):
+                asn, isp = _parse_ipinfo_org(d.get('org'))
+                return {'interface': iface, 'public_ip': d.get('ip'),
+                        'isp': isp, 'asn': asn, 'org': d.get('org'),
+                        'city': d.get('city'), 'region': d.get('region'),
+                        'country': d.get('country'), 'source': 'ipinfo.io'}
+        except ValueError:
+            pass
+
+    # Fallback: ip-api.com (HTTP only on the free tier).
+    res = _run(['curl', '-s', '--max-time', '8', '--interface', iface,
+                'http://ip-api.com/json/?fields=status,message,query,isp,org,as,country,city,regionName'],
+               timeout=12)
+    if res['rc'] == 0 and res['out'].strip():
+        try:
+            d = json.loads(res['out'])
+            if d.get('status') == 'success':
+                asn, _ = _parse_ipinfo_org(d.get('as'))
+                return {'interface': iface, 'public_ip': d.get('query'),
+                        'isp': d.get('isp'), 'asn': asn, 'org': d.get('org') or d.get('as'),
+                        'city': d.get('city'), 'region': d.get('regionName'),
+                        'country': d.get('country'), 'source': 'ip-api.com'}
+            return {'interface': iface,
+                    'error': d.get('message') or 'lookup failed (no route out this interface?)'}
+        except ValueError:
+            pass
+    return {'interface': iface,
+            'error': 'could not reach a geo-IP service through this interface '
+                     '(no internet via this WAN, or both services unreachable)'}
+
+
+def do_isp(interface=None):
+    """Detect the public IP and ISP/ASN reached through each network interface.
+    On a multi-WAN box this reveals which physical link goes to which ISP --
+    essential for troubleshooting when one of several uplinks is flaky.
+
+    Makes an outbound call to a third-party geo-IP service (ipinfo.io, then
+    ip-api.com) per interface, bound to that interface. On-demand only."""
+    if not _have('curl'):
+        return {'success': False,
+                'error': 'curl is not installed. Click Install to add it.',
+                'missing_tool': 'curl', 'results': []}
+
+    # Candidate interfaces: real (non-virtual) NICs that hold a routable-ish
+    # IPv4 (skip loopback 127.* and APIPA 169.254.*). Private addresses are
+    # kept -- they egress to a public IP via NAT, which is exactly what we
+    # want to identify per WAN.
+    ifaces = do_interfaces(include_virtual=False).get('interfaces', [])
+    candidates = []
+    for i in ifaces:
+        if interface and i['name'] != interface:
+            continue
+        v4 = [a.split('/')[0] for a in (i.get('ipv4') or [])]
+        v4 = [a for a in v4 if not a.startswith('127.') and not a.startswith('169.254.')]
+        if v4:
+            candidates.append(i['name'])
+
+    if not candidates:
+        return {'success': False,
+                'error': 'No interface has a usable IPv4 address to query through.',
+                'results': []}
+
+    results = [_isp_lookup_iface(name) for name in candidates]
+    return {'success': True, 'results': results, 'count': len(results)}
+
+
+# --------------------------------------------------------------------------
 # On-demand tool install (whitelisted apt packages, invoked from the UI)
 # --------------------------------------------------------------------------
 
@@ -684,6 +779,7 @@ _NET_TOOL_PKGS = {
     'whois': ('whois', 'whois'),
     'traceroute': ('traceroute', 'traceroute'),
     'speedtest-cli': ('speedtest-cli', 'speedtest-cli'),
+    'curl': ('curl', 'curl'),
 }
 
 
@@ -837,6 +933,12 @@ def register_network_diagnostics(app, logger=None):
         _log("net/interfaces")
         include_virtual = request.args.get('all') in ('1', 'true', 'yes')
         return jsonify(do_interfaces(include_virtual=include_virtual))
+
+    @app.route('/api/net/isp', methods=['GET'])
+    def net_isp():
+        iface = (request.args.get('interface') or '').strip() or None
+        _log(f"net/isp {iface or 'all'}")
+        return jsonify(do_isp(interface=iface))
 
     if logger is not None:
         try:
