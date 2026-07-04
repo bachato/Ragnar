@@ -709,7 +709,29 @@ class Observatory {
     } else {
       this._currentData = this._demoData.update(dt);
     }
-    const data = this._currentData;
+    let data = this._currentData;
+
+    // Authoritative presence gate: the 3D scene draws people straight from the
+    // engine's persons/estimated_persons/motion_level, which a freshly over-fit
+    // adaptive model marks "present_moving" even in an empty room. Poll the same
+    // floor-gated, model-aware decision the dashboard/HUD trust (~1.5s) and, when
+    // it says ABSENT, blank the person channels so the Observatory can't show
+    // phantom moving people while the dashboard says the room is empty. Only
+    // gates live (ws) data and only on an explicit `false` (unknown -> show).
+    if (this.settings.dataSource === 'ws' && (elapsed - (this._authPresLast || 0)) > 1.5) {
+      this._authPresLast = elapsed;
+      fetch('/api/rusense/presence').then((r) => (r.ok ? r.json() : null))
+        .then((pp) => { if (pp && typeof pp.present === 'boolean') this._authPresent = pp.present; })
+        .catch(() => {});
+    }
+    if (this.settings.dataSource === 'ws' && this._authPresent === false && data) {
+      data = Object.assign({}, data, {
+        persons: [],
+        estimated_persons: 0,
+        classification: Object.assign({}, data.classification || {},
+          { presence: false, motion_level: 'absent' }),
+      });
+    }
 
     // Connected node ids from the live feed (null on demo / no nodes array).
     // Stored on `this` so both the wave updater and the marker loop gate on it.

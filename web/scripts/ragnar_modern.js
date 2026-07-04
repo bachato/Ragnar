@@ -876,7 +876,7 @@ function showRusenseSubtab(name) {
         if (host) host.classList.add('hidden');
         if (obs) {
             obs.classList.remove('hidden');
-            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260702-bkpresence';
+            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260704-obsgate';
         }
         if (_rusenseLoader) { try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ } }
         return;
