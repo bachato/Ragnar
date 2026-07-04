@@ -77,6 +77,7 @@ web will be down during wardrive without ap or wifi connection.
 - **WiFi Pineapple Pager** — Full-color LCD display with button controls, LED indicators, and auto-dim. See [Pager section](#-wifi-pineapple-pager)
 - **Hardware-Bound Authentication** — Optional login with full database encryption at rest. See [Security & Authentication](docs/SECURITY.md)
 - **PiSugar 3 Button** — Physical button to swap between Ragnar and Pwnagotchi modes
+- **Web Terminal** — Optional interactive shell (xterm.js ↔ PTY over Socket.IO) in the dashboard, so you can manage the Pi without SSH. Runs as the non-root `ragnar` user in the Ragnar folder (`sudo` available), **off by default**, and gated by login — enable it in Config → Web Terminal only on trusted networks.
 - **Kill Switch** — Built-in endpoint (`/api/kill`) to wipe all databases, logs, and data. See [Kill Switch](docs/KILL_SWITCH.md)
 - **Comprehensive Logging** — All nmap commands and results logged to `data/logs/nmap.log`
 

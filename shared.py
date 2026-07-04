@@ -710,6 +710,10 @@ class SharedData:
             # diagnostic screen (link / IP / switch port), auto-cycling pages
             # every 5s. Web-toggled from Network > Diagnostics. e-Paper only.
             "network_diagnostic_mode": False,
+            # Browser terminal (interactive shell over the web UI). OFF by
+            # default — it exposes a shell on the Pi (as the 'ragnar' user),
+            # gated by login. Enable in Settings only if you want it.
+            "terminal_enabled": False,
 
             "network_device_retention_days": 14,
 

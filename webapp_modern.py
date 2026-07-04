@@ -14091,6 +14091,158 @@ def legacy_netkb_json():
 # WEBSOCKET EVENTS
 # ============================================================================
 
+# ============================================================================
+# WEB TERMINAL (interactive PTY over Socket.IO, /terminal namespace)
+#
+# Off by default (config 'terminal_enabled'). Runs a shell as the non-root
+# 'ragnar' user in the repo dir. Gated by login AND the config flag; the
+# service runs as root only to drop to 'ragnar' via `su`.
+# ============================================================================
+
+_TERM_USER = 'ragnar'
+_TERM_CWD = '/home/ragnar/Ragnar'
+_term_sessions = {}          # socket sid -> {'fd': int, 'pid': int}
+_term_lock = threading.Lock()
+
+
+def _terminal_enabled():
+    try:
+        return bool(shared_data.config.get('terminal_enabled', False))
+    except Exception:
+        return False
+
+
+def _term_reader(sid, fd):
+    """Background task: pump PTY output to the browser until it closes."""
+    import select
+    while True:
+        with _term_lock:
+            if sid not in _term_sessions:
+                break
+        try:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if fd in r:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                socketio.emit('terminal_output', {'data': data.decode('utf-8', 'replace')},
+                              namespace='/terminal', to=sid)
+        except OSError:
+            break
+    _term_cleanup(sid)
+    socketio.emit('terminal_exit', {}, namespace='/terminal', to=sid)
+
+
+def _term_cleanup(sid):
+    with _term_lock:
+        sess = _term_sessions.pop(sid, None)
+    if not sess:
+        return
+    try:
+        os.close(sess['fd'])
+    except OSError:
+        pass
+    try:
+        os.killpg(os.getpgid(sess['pid']), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+@socketio.on('connect', namespace='/terminal')
+def term_connect():
+    if auth_mgr.is_configured() and not session.get('authenticated'):
+        logger.warning("Rejected unauthenticated terminal connection")
+        disconnect()
+        return False
+    if not _terminal_enabled():
+        emit('terminal_output', {'data': '\r\n\x1b[33mWeb terminal is disabled. Enable it in Settings.\x1b[0m\r\n'})
+        disconnect()
+        return False
+
+    import pty
+    import fcntl
+    import termios
+    import pwd
+    sid = request.sid
+    try:
+        pw = pwd.getpwnam(_TERM_USER)
+        master_fd, slave_fd = pty.openpty()
+
+        def _preexec():
+            # New session with the slave PTY as controlling terminal, then drop
+            # from root to the target user so the shell (and job control) run
+            # unprivileged. Order matters: setsid -> TIOCSCTTY -> gid/groups -> uid.
+            os.setsid()
+            try:
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+            os.setgid(pw.pw_gid)
+            try:
+                os.initgroups(_TERM_USER, pw.pw_gid)
+            except (OSError, PermissionError):
+                pass
+            os.setuid(pw.pw_uid)
+            try:
+                os.chdir(_TERM_CWD)
+            except OSError:
+                os.chdir(pw.pw_dir)
+
+        env = {'TERM': 'xterm-256color', 'LANG': os.environ.get('LANG', 'C.UTF-8'),
+               'HOME': pw.pw_dir, 'USER': _TERM_USER, 'LOGNAME': _TERM_USER,
+               'SHELL': pw.pw_shell or '/bin/bash',
+               'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}
+        proc = subprocess.Popen(
+            [pw.pw_shell or '/bin/bash', '-l'],
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            preexec_fn=_preexec, close_fds=True, env=env)
+        os.close(slave_fd)
+    except Exception as e:
+        logger.error(f"Terminal spawn failed: {e}")
+        emit('terminal_output', {'data': f'\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n'})
+        disconnect()
+        return False
+
+    with _term_lock:
+        _term_sessions[sid] = {'fd': master_fd, 'pid': proc.pid}
+    socketio.start_background_task(_term_reader, sid, master_fd)
+    logger.info(f"Web terminal opened (sid={sid}, user={_TERM_USER})")
+
+
+@socketio.on('terminal_input', namespace='/terminal')
+def term_input(data):
+    sess = _term_sessions.get(request.sid)
+    if not sess:
+        return
+    payload = data.get('data', '') if isinstance(data, dict) else str(data)
+    try:
+        os.write(sess['fd'], payload.encode('utf-8', 'replace'))
+    except OSError:
+        _term_cleanup(request.sid)
+
+
+@socketio.on('terminal_resize', namespace='/terminal')
+def term_resize(data):
+    sess = _term_sessions.get(request.sid)
+    if not sess:
+        return
+    import struct
+    import fcntl
+    import termios
+    try:
+        rows = max(1, min(300, int(data.get('rows', 24))))
+        cols = max(1, min(500, int(data.get('cols', 80))))
+        fcntl.ioctl(sess['fd'], termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+@socketio.on('disconnect', namespace='/terminal')
+def term_disconnect():
+    _term_cleanup(request.sid)
+    logger.info(f"Web terminal closed (sid={request.sid})")
+
+
 @socketio.on('connect')
 def handle_connect():
     """Handle client connection - reject if auth is configured but not authenticated"""

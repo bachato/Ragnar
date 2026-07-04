@@ -600,9 +600,11 @@ document.addEventListener('DOMContentLoaded', function() {
     initializePwnagotchiVisibility();
     handleHeadlessMode();
     applyRusenseTabVisibility();
+    applyTerminalVisibility();
     // localStorage gave us an instant paint above; now reconcile with the
     // server (the shared source of truth) without blocking startup.
     syncRusenseTabFromServer();
+    syncTerminalFromServer();
 
 });
 
@@ -1032,6 +1034,104 @@ function onRusenseTabToggled(cb) {
     if (cb.checked) showTab('rusense');
 }
 
+// ==================== Web Terminal (xterm.js over Socket.IO) ====================
+const TERMINAL_KEY = 'terminal_enabled';
+let _term = null, _termFit = null, _termSocket = null, _termResizeHooked = false;
+
+function _terminalEnabled() { return localStorage.getItem(TERMINAL_KEY) === '1'; }
+
+function syncTerminalToggle() {
+    const cb = document.getElementById('terminal-enabled');
+    if (cb) cb.checked = _terminalEnabled();
+}
+
+function applyTerminalVisibility() {
+    const enabled = _terminalEnabled();
+    document.querySelectorAll('.terminal-nav').forEach(btn => btn.classList.toggle('hidden', !enabled));
+    if (!enabled && typeof currentTab !== 'undefined' && currentTab === 'terminal') showTab('dashboard');
+    syncTerminalToggle();
+}
+
+async function syncTerminalFromServer(config) {
+    try {
+        const cfg = config || await fetchAPI('/api/config');
+        if (cfg && Object.prototype.hasOwnProperty.call(cfg, TERMINAL_KEY)) {
+            localStorage.setItem(TERMINAL_KEY, cfg[TERMINAL_KEY] ? '1' : '0');
+            applyTerminalVisibility();
+        }
+    } catch (e) { /* offline — keep the localStorage value */ }
+}
+
+function onTerminalToggled(cb) {
+    localStorage.setItem(TERMINAL_KEY, cb.checked ? '1' : '0');
+    applyTerminalVisibility();
+    postAPI('/api/config', { [TERMINAL_KEY]: cb.checked })
+        .then(() => addConsoleMessage(cb.checked ? 'Web terminal enabled' : 'Web terminal disabled', 'info'))
+        .catch(err => {
+            addConsoleMessage('Failed to toggle terminal: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+            localStorage.setItem(TERMINAL_KEY, cb.checked ? '1' : '0');
+            applyTerminalVisibility();
+        });
+    if (cb.checked) showTab('terminal'); else _termTeardown();
+}
+
+function _sendTermResize() {
+    if (_term && _termSocket && _termSocket.connected) {
+        _termSocket.emit('terminal_resize', { rows: _term.rows, cols: _term.cols });
+    }
+}
+
+function _termTeardown() {
+    try { if (_termSocket) { _termSocket.disconnect(); _termSocket = null; } } catch (e) { /* ignore */ }
+}
+
+function initTerminal() {
+    const mount = document.getElementById('xterm-mount');
+    const status = document.getElementById('terminal-status');
+    if (!mount) return;
+    if (typeof Terminal === 'undefined') {
+        if (status) status.innerHTML = '<span class="text-red-400">Terminal library failed to load.</span>';
+        return;
+    }
+    if (!_terminalEnabled()) {
+        if (status) status.innerHTML = '<span class="text-amber-300">Web terminal is disabled.</span> Enable it in Config → Web Terminal.';
+        _termTeardown();
+        return;
+    }
+    if (status) status.textContent = '';
+
+    if (!_term) {
+        _term = new Terminal({ cursorBlink: true, fontSize: 13,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+            theme: { background: '#0f172a', foreground: '#e2e8f0' } });
+        _termFit = new FitAddon.FitAddon();
+        _term.loadAddon(_termFit);
+        _term.open(mount);
+        _term.onData(d => { if (_termSocket && _termSocket.connected) _termSocket.emit('terminal_input', { data: d }); });
+    }
+    try { _termFit.fit(); } catch (e) { /* mount not sized yet */ }
+
+    if (!_termSocket || !_termSocket.connected) {
+        _term.reset();
+        _termSocket = io('/terminal', { reconnection: false });
+        _termSocket.on('connect', () => { setTimeout(() => { try { _termFit.fit(); } catch (e) {} _sendTermResize(); _term.focus(); }, 60); });
+        _termSocket.on('terminal_output', d => _term.write(d.data || ''));
+        _termSocket.on('terminal_exit', () => _term.write('\r\n\x1b[33m[session ended — press Reconnect for a new shell]\x1b[0m\r\n'));
+        _termSocket.on('connect_error', () => _term.write('\r\n\x1b[31m[could not open terminal — is it enabled and are you logged in?]\x1b[0m\r\n'));
+    }
+
+    if (!_termResizeHooked) {
+        window.addEventListener('resize', () => {
+            if (typeof currentTab !== 'undefined' && currentTab === 'terminal' && _termFit) {
+                try { _termFit.fit(); _sendTermResize(); } catch (e) { /* ignore */ }
+            }
+        });
+        _termResizeHooked = true;
+    }
+    setTimeout(() => { try { _termFit.fit(); } catch (e) {} _sendTermResize(); }, 80);
+}
+
 function showTab(tabName) {
     // Backward-compat: these tabs are now sub-tabs of Network / Discovered
     if (tabName === 'networks') { showTab('network'); showNetworkSubtab('archive'); return; }
@@ -1078,7 +1178,7 @@ function showTab(tabName) {
     loadTabData(tabName);
 
     if (tabName === 'config') {
-        try { refreshSensingInstallCard(); syncRusenseTabToggle(); } catch (e) { /* ignore */ }
+        try { refreshSensingInstallCard(); syncRusenseTabToggle(); syncTerminalToggle(); } catch (e) { /* ignore */ }
     }
 
     const mobileMenu = document.getElementById('mobile-menu');
@@ -2483,6 +2583,9 @@ async function loadTabData(tabName) {
     const alreadyPreloaded = preloadedTabs.has(tabName);
     
     switch(tabName) {
+        case 'terminal':
+            initTerminal();
+            break;
         case 'rusense':
             initRusense();
             break;

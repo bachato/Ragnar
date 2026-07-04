@@ -14,7 +14,12 @@
 
     <!-- Socket.IO Client -->
     <script src="https://cdn.socket.io/4.8.3/socket.io.min.js"></script>
-    
+
+    <!-- xterm.js (web terminal), vendored locally for offline use -->
+    <link rel="stylesheet" href="/web/vendor/xterm.css">
+    <script src="/web/vendor/xterm.js"></script>
+    <script src="/web/vendor/xterm-addon-fit.js"></script>
+
     <style>
         @keyframes pulse-glow {
             0%, 100% { box-shadow: 0 0 5px rgba(14, 165, 233, 0.5); }
@@ -404,6 +409,9 @@
                     </button>
                     <button onclick="showTab('connect')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="connect">
                         Connect
+                    </button>
+                    <button onclick="showTab('terminal')" class="terminal-nav hidden nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="terminal">
+                        Terminal
                     </button>
                     <button onclick="showTab('config')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="config">
                         Config
@@ -4490,6 +4498,23 @@
                             </div>
                         </div>
 
+                        <!-- Web Terminal Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">Web Terminal</h4>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="terminal-enabled" class="sr-only peer" onchange="onTerminalToggled(this)">
+                                    <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                                </label>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-2">
+                                Adds a <strong>Terminal</strong> tab with an interactive shell on this Pi (as the <span class="font-mono">ragnar</span> user, in the Ragnar folder) — so you can manage the device without SSH. Off by default.
+                            </div>
+                            <div class="text-xs text-amber-300">
+                                ⚠ Security: this is a real shell reachable through the web UI (behind login). Anyone who can log in gets shell access — with <span class="font-mono">sudo</span> available. Only enable on trusted networks.
+                            </div>
+                        </div>
+
                         <!-- WiFi Sensing (RuSense) Card -->
                         <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
@@ -5386,6 +5411,21 @@
             </div>
         </div>
         
+        <!-- Terminal Tab (interactive shell on the Pi via PTY over Socket.IO) -->
+        <div id="terminal-tab" class="tab-content hidden">
+            <div class="max-w-6xl mx-auto">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3">
+                    <div class="min-w-0">
+                        <h2 class="text-xl font-bold">Terminal</h2>
+                        <p class="text-sm text-gray-400">Interactive shell on this Pi as the <span class="font-mono">ragnar</span> user, in <span class="font-mono">/home/ragnar/Ragnar</span>. Use <span class="font-mono">sudo</span> for privileged commands.</p>
+                    </div>
+                    <button onclick="initTerminal()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-sm whitespace-nowrap">Reconnect</button>
+                </div>
+                <div id="terminal-status" class="text-sm text-gray-400 mb-2"></div>
+                <div id="xterm-mount" class="rounded-lg overflow-hidden border border-slate-700 bg-[#0f172a]" style="height:70vh;"></div>
+            </div>
+        </div>
+
         <!-- RuSense Tab (native RuView WiFi-CSI console; mounted in a Shadow DOM island) -->
         <div id="rusense-tab" class="tab-content hidden">
             <div class="mb-4 flex items-center justify-between flex-wrap gap-3">
@@ -5545,7 +5585,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260704-pcapdedupe"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260704-terminal"></script>
 
 </body>
 </html>
