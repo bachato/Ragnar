@@ -1526,6 +1526,54 @@ def rusense_sensitivity():
                     'applied': applied, 'steps': steps})
 
 
+@app.route('/api/rusense/calibrate/sample', methods=['POST'])
+def rusense_calibrate_sample():
+    """Sample the engine's smoothed-motion (sm) for a few seconds and return its
+    distribution. Used by the guided sensitivity calibration: the UI runs this
+    once with the room EMPTY and once while the user WALKS, then sets the floor
+    in the gap between the two. sm is derived from the classification confidence
+    (conf = 0.4 + sm*0.6, floor-independent), so sampling doesn't perturb the
+    live setting. Blocks for `secs` (5-60)."""
+    import time as _t
+    data = request.get_json(silent=True) or {}
+    try:
+        secs = int(data.get('secs', 20))
+    except (TypeError, ValueError):
+        secs = 20
+    secs = max(5, min(60, secs))
+
+    sms = []
+    seen = 0
+    t_end = time.time() + secs
+    while time.time() < t_end:
+        latest = _rusense_get('/api/v1/sensing/latest')
+        if isinstance(latest, dict):
+            cls = latest.get('classification') or {}
+            conf = cls.get('confidence')
+            if isinstance(conf, (int, float)):
+                seen += 1
+                sms.append(max(0.0, (float(conf) - 0.4) / 0.6))
+        _t.sleep(0.3)
+
+    if not sms:
+        return jsonify({'error': 'No sensing data — is a node streaming? '
+                        'Check the Nodes tab.'}), 503
+
+    sms.sort()
+    n = len(sms)
+
+    def pct(p):
+        i = min(n - 1, max(0, int(round(p / 100.0 * (n - 1)))))
+        return round(sms[i], 4)
+
+    return jsonify({
+        'count': n, 'secs': secs,
+        'min': round(sms[0], 4), 'p05': pct(5), 'p50': pct(50),
+        'p90': pct(90), 'p95': pct(95), 'max': round(sms[-1], 4),
+        'mean': round(sum(sms) / n, 4),
+    })
+
+
 @app.route('/api/rusense/vitals-history', methods=['GET'])
 def rusense_vitals_history():
     """Aggregated heart-rate / breathing / activity buckets for the dashboard

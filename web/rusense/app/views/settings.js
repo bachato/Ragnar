@@ -481,6 +481,13 @@ export default {
           </div>
           <button id="st-sens-apply" class="btn-primary">Apply sensitivity</button>
           <p class="text-xs text-ink-muted">Empty room still triggers? Raise <strong>debounce</strong> first, then the floor. Missing you when you move? Lower the floor.</p>
+          <div class="border-t border-ink-3 pt-3 mt-1 space-y-2">
+            <div class="text-sm font-semibold">Auto-calibrate for this room</div>
+            <p class="text-xs text-ink-muted">Measures your empty room, then you walking, and picks the floor in the gap between them — no guessing. Two ~25s scans.</p>
+            <button id="st-cal-start" class="btn-ghost">Start calibration</button>
+            <div id="st-cal-status" class="text-xs text-ink-muted"></div>
+            <div id="st-cal-result" class="text-sm"></div>
+          </div>
         </div>
 
         <div class="flex flex-wrap gap-3">
@@ -622,6 +629,95 @@ export default {
                  : ((r.data && r.data.error) || 'Could not apply sensitivity'),
         r.ok ? 'ok' : 'bad');
     });
+
+    // ── Guided room calibration: measure empty-room vs walking sm and set
+    //    the floor in the gap. Sampling is floor-independent (sm from confidence),
+    //    so it doesn't perturb the live setting until you Apply. ──
+    (function wireCalibration() {
+      const startBtn = $('#st-cal-start');
+      if (!startBtn) return;
+      const statusEl = $('#st-cal-status');
+      const resultEl = $('#st-cal-result');
+      const SCAN = 25;
+      let emptyStats = null;
+
+      const scan = async (label) => {
+        let left = SCAN;
+        const paint = () => { statusEl.textContent = `Scanning “${label}”… ${Math.max(0, left)}s left`; };
+        paint();
+        const t = setInterval(() => { left -= 1; paint(); }, 1000);
+        const r = await req('POST', '/api/rusense/calibrate/sample', { secs: SCAN });
+        clearInterval(t);
+        if (!r.ok || !r.data || r.data.error) {
+          statusEl.textContent = (r.data && r.data.error) || 'Scan failed — is a node streaming? Check the Nodes tab.';
+          return null;
+        }
+        return r.data;
+      };
+
+      const resetBtn = () => { startBtn.textContent = 'Start calibration'; startBtn.disabled = false; startBtn.onclick = begin; };
+
+      const recommend = (empty, moving) => {
+        const eHi = empty.p95, mLo = moving.p05;
+        let floor, deb, note;
+        if (mLo > eHi + 0.01) {
+          floor = Math.round(((eHi + mLo) / 2) * 1000) / 1000;
+          deb = 6;
+          note = `Clean separation — empty sm tops out ≈${eHi}, walking stays ≥${mLo}.`;
+        } else {
+          floor = Math.round((eHi + 0.01) * 1000) / 1000;
+          deb = 10;
+          note = `Empty (≤${eHi}) and walking (≥${mLo}) overlap — floor set just above the empty noise with extra debounce. May miss very slow movement; consider more spacing between nodes.`;
+        }
+        floor = Math.max(0.05, Math.min(0.35, floor));
+        statusEl.textContent = '';
+        resultEl.innerHTML = `<div class="rounded-lg bg-ink-1 border border-ink-3 p-3 space-y-2">
+            <div>Recommended: <strong>floor ${floor}</strong> &middot; <strong>debounce ${deb}</strong></div>
+            <div class="text-xs text-ink-muted">${note}<br>Empty sm: max ${empty.max}, p95 ${empty.p95}. Walking sm: p05 ${moving.p05}, median ${moving.p50}, max ${moving.max}.</div>
+            <button id="st-cal-apply" class="btn-primary">Apply calibration</button>
+          </div>`;
+        resetBtn();
+        const applyBtn = $('#st-cal-apply');
+        if (applyBtn) applyBtn.onclick = async () => {
+          if ($('#st-sens-floor')) $('#st-sens-floor').value = floor;
+          if ($('#st-sens-deb')) $('#st-sens-deb').value = deb;
+          applyBtn.disabled = true; applyBtn.textContent = 'Applying…';
+          const r = await req('POST', '/api/rusense/sensitivity', { floor, debounce_frames: deb });
+          toast(r.ok ? `Calibrated — floor ${floor}, debounce ${deb} applied (sensing restarted)`
+                     : ((r.data && r.data.error) || 'Could not apply'), r.ok ? 'ok' : 'bad');
+          applyBtn.disabled = false; applyBtn.textContent = 'Apply calibration';
+        };
+      };
+
+      const step2 = () => {
+        resultEl.innerHTML = '';
+        statusEl.innerHTML = '<strong>Step 2 of 2:</strong> now WALK around the room normally — cover the whole space.';
+        startBtn.textContent = "I'm walking — scan (25s)";
+        startBtn.disabled = false;
+        startBtn.onclick = async () => {
+          startBtn.disabled = true;
+          const moving = await scan('walking');
+          if (!moving) { resetBtn(); return; }
+          recommend(emptyStats, moving);
+        };
+      };
+
+      function begin() {
+        emptyStats = null;
+        resultEl.innerHTML = '';
+        statusEl.innerHTML = '<strong>Step 1 of 2:</strong> LEAVE the room (stand a few metres away). When you are out, click below.';
+        startBtn.textContent = "I'm out — scan empty (25s)";
+        startBtn.disabled = false;
+        startBtn.onclick = async () => {
+          startBtn.disabled = true;
+          const empty = await scan('empty');
+          if (!empty) { resetBtn(); return; }
+          emptyStats = empty;
+          step2();
+        };
+      }
+      startBtn.onclick = begin;
+    })();
 
     // Live geofence diagnostic — shows whether confinement is actually active.
     const refreshGeofenceStatus = async () => {

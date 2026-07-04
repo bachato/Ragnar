@@ -827,7 +827,7 @@ function _setRusenseActive(name) {
 function loadRusenseLoader() {
     if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
     if (!_rusenseLoading) {
-        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260704-meshverdict')
+        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260704-calib')
             .then(m => { _rusenseLoader = m; return m; })
             .catch(err => { _rusenseLoading = null; throw err; });
     }
