@@ -7,8 +7,8 @@ import { sensingService } from '../services/sensing.service.js';
 import dashboard from './views/dashboard.js?v=20260704-sparkfit';
 import sensing from './views/sensing.js?v=20260704-sparkfit';
 import nodes from './views/nodes.js?v=20260704-meshverdict';
-import training from './views/training.js?v=20260704-sparkfit';
-import settings from './views/settings.js?v=20260704-calib';
+import training from './views/training.js?v=20260704-caltab';
+import settings from './views/settings.js?v=20260704-caltab';
 import about from './views/about.js?v=20260704-sparkfit';
 
 const VIEWS = { dashboard, sensing, nodes, training, settings, about };

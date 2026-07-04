@@ -70,6 +70,30 @@ export default {
   async mount(root) {
     root.appendChild(html`
       <section class="space-y-5">
+        <!-- Calibration (guided model-free floor + records the dataset) -->
+        <div class="card card-pad space-y-3">
+          <h2 class="card-title">Calibration <span class="badge-mut ml-1">start here</span></h2>
+          <p class="text-xs text-ink-muted">Teach RuSense your room. It measures the <strong>empty room</strong>, then <strong>you walking</strong>, sets the motion-detection threshold for this space, and saves both scans as <code>train_empty</code> / <code>train_walking</code> recordings — so you can Train the adaptive model below with one click. Two ~25&nbsp;s scans.</p>
+          <button id="cal-start" class="btn-primary">Start calibration</button>
+          <div id="cal-status" class="text-sm"></div>
+          <div id="cal-result" class="text-sm"></div>
+          <details>
+            <summary class="cursor-pointer text-xs text-ink-muted">Advanced — set thresholds manually</summary>
+            <div class="mt-3 space-y-3">
+              <div id="cal-presets" class="grid gap-2 sm:grid-cols-3">
+                <button type="button" data-floor="0.12" data-deb="5" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">High</span><span class="block text-xs text-ink-muted">Catch everything</span></button>
+                <button type="button" data-floor="0.16" data-deb="6" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">Balanced</span><span class="block text-xs text-ink-muted">Default</span></button>
+                <button type="button" data-floor="0.20" data-deb="9" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">Low</span><span class="block text-xs text-ink-muted">Fewest false alarms</span></button>
+              </div>
+              <div class="grid gap-4 sm:grid-cols-2">
+                <label class="block"><span class="block text-sm font-medium mb-1">Presence floor</span><input type="number" id="cal-floor" min="0.03" max="0.40" step="0.01" class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" /></label>
+                <label class="block"><span class="block text-sm font-medium mb-1">Debounce frames</span><input type="number" id="cal-deb" min="1" max="30" step="1" class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" /></label>
+              </div>
+              <button id="cal-apply" class="btn-ghost">Apply thresholds</button>
+            </div>
+          </details>
+        </div>
+
         <!-- Recording -->
         <div class="card card-pad space-y-3">
           <div class="flex items-center justify-between">
@@ -345,6 +369,110 @@ export default {
       toast(r.ok ? msgOf(r, 'Training stopped') : msgOf(r, 'Could not stop training'), r.ok ? 'warn' : 'bad');
       loadTrain();
     });
+
+    // -- Calibration: guided per-room threshold setup. Each phase records the
+    //    matching train_* clip (so adaptive training reuses it) AND samples the
+    //    engine's sm to place the model-free presence floor in the gap. --
+    (function wireCalibration() {
+      const startBtn = $('#cal-start');
+      if (!startBtn) return;
+      const statusEl = $('#cal-status');
+      const resultEl = $('#cal-result');
+      const SCAN = 25;
+      let emptyStats = null;
+
+      (async () => {
+        const cur = await fetchJSON('/api/rusense/sensitivity');
+        if (cur) {
+          if ($('#cal-floor')) $('#cal-floor').value = cur.floor ?? 0.16;
+          if ($('#cal-deb')) $('#cal-deb').value = cur.debounce_frames ?? 6;
+        }
+      })();
+
+      const scanPhase = async (label, recId) => {
+        const rs = await post('/api/v1/recording/start', { id: recId });
+        if (!rs.ok) { statusEl.textContent = msgOf(rs, `Could not start recording ${recId}`); return null; }
+        let left = SCAN;
+        const paint = () => { statusEl.textContent = `Recording “${label}” (${recId})… ${Math.max(0, left)}s left`; };
+        paint();
+        const tmr = setInterval(() => { left -= 1; paint(); }, 1000);
+        const r = await req('POST', '/api/rusense/calibrate/sample', { secs: SCAN });
+        clearInterval(tmr);
+        await post('/api/v1/recording/stop');
+        loadRecordings();
+        if (!r.ok || !r.data || r.data.error) { statusEl.textContent = (r.data && r.data.error) || 'Scan failed — is a node streaming? Check the Nodes tab.'; return null; }
+        return r.data;
+      };
+
+      const resetBtn = () => { startBtn.textContent = 'Start calibration'; startBtn.disabled = false; startBtn.onclick = begin; };
+
+      const recommend = (empty, moving) => {
+        const eHi = empty.p95, mLo = moving.p05;
+        let floor, deb, note;
+        if (mLo > eHi + 0.01) {
+          floor = Math.round(((eHi + mLo) / 2) * 1000) / 1000; deb = 6;
+          note = `Clean separation — empty sm tops out ≈${eHi}, walking stays ≥${mLo}.`;
+        } else {
+          floor = Math.round((eHi + 0.01) * 1000) / 1000; deb = 10;
+          note = `Empty (≤${eHi}) and walking (≥${mLo}) overlap — floor set just above the empty noise with extra debounce; may miss very slow movement.`;
+        }
+        floor = Math.max(0.05, Math.min(0.35, floor));
+        if ($('#cal-floor')) $('#cal-floor').value = floor;
+        if ($('#cal-deb')) $('#cal-deb').value = deb;
+        statusEl.textContent = '';
+        resultEl.innerHTML = `<div class="rounded-lg bg-ink-1 border border-ink-3 p-3 space-y-2">
+            <div>Recommended: <strong>floor ${floor}</strong> &middot; <strong>debounce ${deb}</strong></div>
+            <div class="text-xs text-ink-muted">${note}<br>Empty sm max ${empty.max} (p95 ${empty.p95}) · walking sm p05 ${moving.p05}, median ${moving.p50}. Saved <code>train_empty</code> + <code>train_walking</code> — Train the adaptive model below to add people-count.</div>
+            <button id="cal-do-apply" class="btn-primary">Apply calibration</button>
+          </div>`;
+        resetBtn();
+        const b = $('#cal-do-apply');
+        if (b) b.onclick = async () => {
+          b.disabled = true; b.textContent = 'Applying…';
+          const r = await post('/api/rusense/sensitivity', { floor, debounce_frames: deb });
+          toast(r.ok ? `Calibrated — floor ${floor}, debounce ${deb} (sensing restarted)` : msgOf(r, 'Could not apply'), r.ok ? 'ok' : 'bad');
+          b.disabled = false; b.textContent = 'Apply calibration';
+        };
+      };
+
+      const step2 = () => {
+        resultEl.innerHTML = '';
+        statusEl.innerHTML = '<strong>Step 2 of 2:</strong> now WALK around the room normally — cover the whole space.';
+        startBtn.textContent = "I'm walking — scan (25s)";
+        startBtn.disabled = false;
+        startBtn.onclick = async () => {
+          startBtn.disabled = true;
+          const moving = await scanPhase('walking', 'train_walking');
+          if (!moving) { resetBtn(); return; }
+          recommend(emptyStats, moving);
+        };
+      };
+
+      function begin() {
+        emptyStats = null; resultEl.innerHTML = '';
+        statusEl.innerHTML = '<strong>Step 1 of 2:</strong> LEAVE the room (stand a few metres away). When you are out, click below.';
+        startBtn.textContent = "I'm out — scan empty (25s)";
+        startBtn.disabled = false;
+        startBtn.onclick = async () => {
+          startBtn.disabled = true;
+          const empty = await scanPhase('empty', 'train_empty');
+          if (!empty) { resetBtn(); return; }
+          emptyStats = empty; step2();
+        };
+      }
+      startBtn.onclick = begin;
+
+      root.querySelectorAll('#cal-presets button').forEach((b) => b.addEventListener('click', () => {
+        if ($('#cal-floor')) $('#cal-floor').value = b.dataset.floor;
+        if ($('#cal-deb')) $('#cal-deb').value = b.dataset.deb;
+      }));
+      if ($('#cal-apply')) $('#cal-apply').addEventListener('click', async () => {
+        const floor = Math.max(0.03, Math.min(0.40, parseFloat($('#cal-floor').value) || 0.16));
+        let deb = parseInt($('#cal-deb').value, 10); if (isNaN(deb)) deb = 6; deb = Math.max(1, Math.min(30, deb));
+        const r = await post('/api/rusense/sensitivity', { floor, debounce_frames: deb });
+        toast(r.ok ? `Thresholds applied — floor ${floor}, debounce ${deb}` : msgOf(r, 'Could not apply'), r.ok ? 'ok' : 'bad');
+      });
+    })();
 
     if (recState && recState.active) setRecState(true, recState);
 
