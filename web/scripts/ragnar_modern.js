@@ -1541,6 +1541,20 @@ async function loadNetworkIdentity() {
         }
         row('Default gateway', gwHtml);
 
+        // Traffic via VPN — is the default route leaving through a tunnel?
+        const ve = d.vpn_egress;
+        if (ve) {
+            let veHtml;
+            if (ve.via_vpn) {
+                veHtml = '<span class="text-amber-300">yes</span> <span class="text-gray-500">(via '
+                    + escapeHtml(String(ve.interface || 'tunnel')) + ')</span>';
+            } else {
+                veHtml = '<span class="text-gray-400">no</span>'
+                    + (ve.interface ? ' <span class="text-gray-500">(default route via ' + escapeHtml(ve.interface) + ')</span>' : '');
+            }
+            row('Traffic via VPN', veHtml);
+        }
+
         const src = (d.sources && d.sources.length)
             ? `<p class="text-[11px] text-gray-500 mt-2">Sources: ${d.sources.map(escapeHtml).join(', ')}</p>` : '';
         out.innerHTML = `<table class="min-w-full text-sm">
@@ -1653,11 +1667,17 @@ async function detectIsp() {
             out.innerHTML = '<p class="text-sm text-gray-400">No interfaces with a usable address to query.</p>';
             return;
         }
+        const vpnCell = (r) => {
+            if (r.iface_is_vpn) return '<span class="text-amber-300">🔒 tunnel iface</span>';
+            if (r.vpn_provider) return '<span class="text-amber-300">🔒 likely (' + escapeHtml(r.vpn_provider) + ')</span>';
+            return '<span class="text-gray-500">no</span>';
+        };
         const rows = _ndLastIsp.map(r => {
             if (r.error) {
                 return `<tr class="border-t border-slate-800">
                     <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
                     <td class="px-3 py-1.5 text-red-400" colspan="5">${escapeHtml(r.error)}</td>
+                    <td class="px-3 py-1.5">${vpnCell(r)}</td>
                 </tr>`;
             }
             const loc = [r.city, r.region, r.country].filter(Boolean).map(escapeHtml).join(', ') || '—';
@@ -1668,6 +1688,7 @@ async function detectIsp() {
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.public_ip || '—'))}</td>
                 <td class="px-3 py-1.5">${loc}</td>
                 <td class="px-3 py-1.5 text-gray-500">${escapeHtml(String(r.source || '—'))}</td>
+                <td class="px-3 py-1.5">${vpnCell(r)}</td>
             </tr>`;
         }).join('');
         out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
@@ -1675,6 +1696,7 @@ async function detectIsp() {
                 <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">ISP</th>
                 <th class="px-3 py-1.5">ASN</th><th class="px-3 py-1.5">Public IP</th>
                 <th class="px-3 py-1.5">Location</th><th class="px-3 py-1.5">Source</th>
+                <th class="px-3 py-1.5">VPN</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
@@ -1685,9 +1707,11 @@ async function detectIsp() {
 
 function exportIspCsv() {
     _ndDownloadCsv('interface_isp',
-        ['Interface', 'ISP', 'ASN', 'Public IP', 'City', 'Region', 'Country', 'Source', 'Error'],
+        ['Interface', 'ISP', 'ASN', 'Public IP', 'City', 'Region', 'Country', 'Source',
+         'Behind VPN', 'VPN provider', 'Tunnel iface', 'Error'],
         (_ndLastIsp || []).map(r => [r.interface, r.isp || r.org, r.asn, r.public_ip,
-            r.city, r.region, r.country, r.source, r.error]));
+            r.city, r.region, r.country, r.source,
+            r.behind_vpn ? 'yes' : 'no', r.vpn_provider, r.iface_is_vpn ? 'yes' : 'no', r.error]));
 }
 
 function showDiscoveredSubtab(name) {

@@ -220,6 +220,11 @@ authoritative):
   `nmcli` / `resolvectl`
 - **Default gateway** IP, with its **reverse-DNS (PTR)** name — often reveals
   the router/firewall model or naming scheme
+- **Traffic via VPN** — whether this host's internet traffic is egressing
+  through a VPN. Reads the IPv4 **default route**: if it leaves via a tunnel
+  interface (`tun*`/`wg*`/`tailscale0`/…) the answer is **yes (via `<iface>`)**,
+  even when the physical uplink is a normal `eth0`/`wlan0`. This catches
+  full-tunnel VPNs / exit nodes that silently reroute everything.
 
 - Endpoint: `GET /api/net/identity`
 
@@ -238,11 +243,16 @@ interface** (`curl --interface <iface>`, which forces egress out that link via
 - **Public IP** seen from the internet through that link
 - **Location** (city / region / country) of that egress
 - **Source** — which geo-IP service answered
+- **VPN** — is this link *behind* a VPN? Flagged when the interface is itself a
+  tunnel (`🔒 tunnel iface`), or when the public egress ASN belongs to a known
+  VPN provider/backbone (`🔒 likely (mullvad)`, `m247`, …). The provider match
+  is best-effort — many VPNs terminate on shared hosting ASNs — so it's labelled
+  "likely", not definitive.
 
 Lookups use **ipinfo.io** over HTTPS first, falling back to **ip-api.com**. An
-interface with no working internet path (e.g. a VPN tunnel, or a dead WAN)
-reports an explicit error rather than a value — which is itself the diagnostic
-you're after.
+interface with no working internet path (e.g. a VPN tunnel with no exit, or a
+dead WAN) reports an explicit error rather than a value — which is itself the
+diagnostic you're after.
 
 > **Privacy:** this makes an outbound request to a third-party geo-IP service,
 > revealing the device's public IP to it. It is **on-demand only** (triggered by

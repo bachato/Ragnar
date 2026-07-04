@@ -666,6 +666,36 @@ def _default_gateway():
     return m.group(1) if m else None
 
 
+def _default_route_iface():
+    """Return the interface carrying the IPv4 default route, or None. Used to
+    tell whether this host's internet traffic egresses through a VPN tunnel."""
+    res = _run(['ip', '-4', 'route', 'show', 'default'], timeout=5)
+    # First (lowest-metric) default route is the active one.
+    m = re.search(r'default\b.*?\bdev\s+(\S+)', res['out'])
+    return m.group(1) if m else None
+
+
+# Substrings that mark a public egress as a commercial-VPN / VPN-hosting ASN.
+# Brand names are high-confidence; the trailing hosting backbones (M247,
+# DataCamp/DataPacket, 31173 = Mullvad's operator) are where most consumer VPNs
+# terminate, so a *public egress* on them is very likely a VPN -- reported as
+# best-effort ("likely VPN").
+_VPN_PROVIDER_HINTS = (
+    'mullvad', 'nordvpn', 'expressvpn', 'protonvpn', 'proton ag', 'surfshark',
+    'cyberghost', 'ipvanish', 'tunnelbear', 'windscribe', 'vyprvpn', 'hide.me',
+    'purevpn', 'torguard', 'azirevpn', 'perfect privacy', 'mozilla vpn',
+    'private internet access', 'privateinternetaccess',
+    'm247', 'datacamp', 'datapacket', '31173',
+)
+
+
+def _vpn_provider_match(*fields):
+    """Return the matched VPN-provider hint if any egress field looks like a VPN
+    provider/hosting ASN, else None."""
+    hay = ' '.join(str(f) for f in fields if f).lower()
+    return next((k for k in _VPN_PROVIDER_HINTS if k in hay), None)
+
+
 def _reverse_dns(ip):
     """Reverse-DNS an IP via getent (honours nsswitch, bounded by _run's
     timeout). Returns the PTR hostname or None."""
@@ -728,6 +758,13 @@ def do_network_identity():
     gw_ip = _default_gateway()
     gateway = {'ip': gw_ip, 'ptr': _reverse_dns(gw_ip)} if gw_ip else None
 
+    # Is this host's traffic egressing through a VPN? True when the default
+    # route leaves via a tunnel interface (full-tunnel VPN / exit node), even
+    # if the physical uplink is a normal eth0/wlan0.
+    route_if = _default_route_iface()
+    vpn_egress = {'interface': route_if,
+                  'via_vpn': bool(route_if and _is_vpn(route_if))}
+
     # If no explicit search domain but the gateway/FQDN reveals one, surface it
     # as a best-effort guess so the field isn't just empty.
     guessed_domain = None
@@ -745,6 +782,7 @@ def do_network_identity():
         'nameservers': nameservers,
         'dns_stub': stub,
         'gateway': gateway,
+        'vpn_egress': vpn_egress,
         'sources': sources,
     }
 
@@ -769,8 +807,12 @@ def _isp_lookup_iface(iface):
     multi-WAN box each WAN's own public IP + ISP is reported. curl --interface
     binds the socket to that device (SO_BINDTODEVICE), forcing egress out it
     regardless of the routing table."""
+    # The interface itself may be a VPN tunnel (egress is definitionally VPN).
+    iface_is_vpn = _is_vpn(iface)
     if not _have('curl'):
-        return {'interface': iface, 'error': 'curl is not installed', 'missing_tool': 'curl'}
+        return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
+                'behind_vpn': iface_is_vpn,
+                'error': 'curl is not installed', 'missing_tool': 'curl'}
 
     # Primary: ipinfo.io over HTTPS (no API key needed for basic fields).
     res = _run(['curl', '-s', '--max-time', '8', '--interface', iface,
@@ -780,8 +822,11 @@ def _isp_lookup_iface(iface):
             d = json.loads(res['out'])
             if d.get('ip'):
                 asn, isp = _parse_ipinfo_org(d.get('org'))
-                return {'interface': iface, 'public_ip': d.get('ip'),
+                vp = _vpn_provider_match(isp, d.get('org'), asn)
+                return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
+                        'public_ip': d.get('ip'),
                         'isp': isp, 'asn': asn, 'org': d.get('org'),
+                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn),
                         'city': d.get('city'), 'region': d.get('region'),
                         'country': d.get('country'), 'source': 'ipinfo.io'}
         except ValueError:
@@ -796,15 +841,20 @@ def _isp_lookup_iface(iface):
             d = json.loads(res['out'])
             if d.get('status') == 'success':
                 asn, _ = _parse_ipinfo_org(d.get('as'))
-                return {'interface': iface, 'public_ip': d.get('query'),
+                vp = _vpn_provider_match(d.get('isp'), d.get('org'), d.get('as'))
+                return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
+                        'public_ip': d.get('query'),
                         'isp': d.get('isp'), 'asn': asn, 'org': d.get('org') or d.get('as'),
+                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn),
                         'city': d.get('city'), 'region': d.get('regionName'),
                         'country': d.get('country'), 'source': 'ip-api.com'}
-            return {'interface': iface,
+            return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
+                    'behind_vpn': iface_is_vpn,
                     'error': d.get('message') or 'lookup failed (no route out this interface?)'}
         except ValueError:
             pass
-    return {'interface': iface,
+    return {'interface': iface, 'iface_is_vpn': iface_is_vpn,
+            'behind_vpn': iface_is_vpn,
             'error': 'could not reach a geo-IP service through this interface '
                      '(no internet via this WAN, or both services unreachable)'}
 
