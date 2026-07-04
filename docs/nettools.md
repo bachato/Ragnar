@@ -318,11 +318,35 @@ Health scan, a SPAN/mirror port, …) and get instant triage — the Wireshark
   **retransmissions**, **resets**, **duplicate ACKs**, zero-window, **malformed**
   packets, etc. — the fastest way to spot loss and protocol trouble.
 
+**Wi-Fi / AP captures** get a dedicated analysis (when the capture contains
+802.11 frames — i.e. a monitor-mode or AP-side capture). This is built to answer
+the question field techs live with: **why are clients dropping?** It decodes:
+
+- **Deauthentication & disassociation reason codes** (e.g. 15 = 4-way handshake
+  timeout, 7 = class-3 frame from a non-associated STA, 4 = inactivity, 14 = MIC
+  failure), counted and broken down **per client** so you see who's dropping.
+- **Auth / association failure status codes** (e.g. 17 = AP can't handle more
+  STAs / capacity).
+- **EAPOL** (4-way handshake) volume, **retry rate** (RF-health proxy), and the
+  **SSIDs** seen.
+- Plain-language **heuristic findings** (handshake timeouts → PSK/RADIUS/timing,
+  high retries → RF interference, capacity rejects, etc.) — useful even without
+  AI.
+
+**🧠 Explain with AI** — if the OpenAI integration is configured (see
+[AI Integration](AI_INTEGRATION.md)), one click hands the capture summary to the
+model (GPT-5-nano via the Responses API) with a senior-wireless-engineer prompt,
+and it returns a **Verdict / Evidence / Other factors / Fix it** root-cause
+analysis grounded in the actual reason codes and expert findings. Works for wired
+captures too. If AI isn't enabled, the tool still shows the full decoded
+breakdown — the AI just adds the interpretation.
+
 The upload is size-guarded (100 MB), magic-byte validated (real pcap/pcapng
 only), analyzed **read-only** with `tshark`, and the temp file is deleted
 immediately after. Nothing is stored.
 
-- Endpoint: `POST /api/net/pcap` (multipart `file`) · binary: `tshark` (+ `capinfos`)
+- Endpoints: `POST /api/net/pcap` (multipart `file`),
+  `POST /api/ai/pcap` (AI interpretation) · binary: `tshark` (+ `capinfos`)
 
 ---
 

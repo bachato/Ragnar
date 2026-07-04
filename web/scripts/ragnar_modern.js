@@ -1732,12 +1732,143 @@ async function runPtp() {
     }
 }
 
+function _fmtBytes(n) {
+    if (n == null) return '—';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+}
+
+async function uploadPcap() {
+    const input = document.getElementById('pcap-file');
+    const out = document.getElementById('pcap-results');
+    if (!input.files || !input.files.length) { input.focus(); return; }
+    const file = input.files[0];
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Analyzing…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Uploading &amp; analysing ' + escapeHtml(file.name) + '…</p>';
+    try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const resp = await networkAwareFetch('/api/net/pcap', { method: 'POST', body: fd });
+        if (resp.status === 401) { window.location.href = '/login'; return; }
+        const d = await resp.json();
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'uploadPcap')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const s = d.summary || {};
+        const tile = (label, val) => `<div class="bg-slate-800 rounded-lg p-3 text-center">
+            <div class="text-lg font-bold text-Ragnar-400">${escapeHtml(String(val))}</div>
+            <div class="text-[11px] uppercase text-gray-500 mt-0.5">${label}</div></div>`;
+        const tiles = `<div class="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3">
+            ${tile('Packets', s.packets != null ? s.packets.toLocaleString() : '—')}
+            ${tile('Size', _fmtBytes(s.file_size))}
+            ${tile('Duration', s.duration_s != null ? s.duration_s + ' s' : '—')}
+            ${tile('Avg pkt', s.avg_packet_size != null ? Math.round(s.avg_packet_size) + ' B' : '—')}
+            ${tile('Rate', s.data_byte_rate != null ? _fmtBytes(s.data_byte_rate) + '/s' : '—')}</div>`;
+
+        const protoRows = (d.protocols || []).map(p => `<tr class="border-t border-slate-800">
+            <td class="px-3 py-1 font-mono" style="padding-left:${12 + p.depth * 16}px">${escapeHtml(p.proto)}</td>
+            <td class="px-3 py-1 text-right">${p.frames.toLocaleString()}</td>
+            <td class="px-3 py-1 text-right text-gray-400">${_fmtBytes(p.bytes)}</td></tr>`).join('');
+
+        const talkerRows = (d.talkers || []).map(t => `<tr class="border-t border-slate-800">
+            <td class="px-3 py-1 font-mono">${escapeHtml(t.a)}</td>
+            <td class="px-3 py-1 font-mono">${escapeHtml(t.b)}</td>
+            <td class="px-3 py-1 text-right">${t.frames.toLocaleString()}</td>
+            <td class="px-3 py-1 text-right text-gray-400">${_fmtBytes(t.bytes)}</td></tr>`).join('');
+
+        const e = d.expert || { items: [] };
+        const sevColor = { errors: 'text-red-400', warnings: 'text-amber-300', notes: 'text-gray-400' };
+        const expertBadges = `<span class="text-red-400">${e.errors || 0} errors</span> ·
+            <span class="text-amber-300">${e.warnings || 0} warnings</span> ·
+            <span class="text-gray-400">${e.notes || 0} notes</span>`;
+        const expertRows = (e.items || []).map(i => `<tr class="border-t border-slate-800">
+            <td class="px-3 py-1 ${sevColor[i.severity] || ''}">${escapeHtml(i.severity)}</td>
+            <td class="px-3 py-1 text-right">${i.count}</td>
+            <td class="px-3 py-1 font-mono">${escapeHtml(i.protocol)}</td>
+            <td class="px-3 py-1">${escapeHtml(i.summary)}</td></tr>`).join('');
+
+        out.innerHTML = tiles
+            + `<p class="text-xs uppercase text-gray-500 mb-1">Protocol hierarchy</p>
+               <table class="min-w-full text-sm text-gray-300 whitespace-nowrap mb-3"><thead><tr class="text-left text-xs uppercase text-gray-500">
+               <th class="px-3 py-1">Protocol</th><th class="px-3 py-1 text-right">Frames</th><th class="px-3 py-1 text-right">Bytes</th></tr></thead><tbody>${protoRows}</tbody></table>`
+            + `<p class="text-xs uppercase text-gray-500 mb-1">Top talkers</p>
+               <table class="min-w-full text-sm text-gray-300 whitespace-nowrap mb-3"><thead><tr class="text-left text-xs uppercase text-gray-500">
+               <th class="px-3 py-1">Endpoint A</th><th class="px-3 py-1">Endpoint B</th><th class="px-3 py-1 text-right">Frames</th><th class="px-3 py-1 text-right">Bytes</th></tr></thead><tbody>${talkerRows}</tbody></table>`
+            + `<p class="text-xs uppercase text-gray-500 mb-1">Expert info — ${expertBadges}</p>`
+            + (expertRows ? `<table class="min-w-full text-sm text-gray-300"><thead><tr class="text-left text-xs uppercase text-gray-500">
+               <th class="px-3 py-1">Severity</th><th class="px-3 py-1 text-right">Count</th><th class="px-3 py-1">Proto</th><th class="px-3 py-1">Summary</th></tr></thead><tbody>${expertRows}</tbody></table>`
+               : '<p class="text-sm text-gray-500">No expert findings.</p>');
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
 function _pcapBytes(n) {
     if (n == null) return '—';
     const u = ['B', 'kB', 'MB', 'GB', 'TB'];
     let i = 0, v = n;
     while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
     return (i === 0 ? v : v.toFixed(1)) + ' ' + u[i];
+}
+
+let _lastPcap = null;
+
+function _pcapWifiHtml(w) {
+    if (!w || !w.is_wifi) return '';
+    const codeRows = (arr) => (arr || []).map(r =>
+        `<tr class="border-t border-slate-800"><td class="px-3 py-1 text-right">${r.code}</td>
+         <td class="px-3 py-1">${escapeHtml(r.label)}</td><td class="px-3 py-1 text-right">${r.count}</td></tr>`).join('');
+    const tbl = (title, total, rows) => total ? `<h5 class="text-xs uppercase text-gray-500 mt-2">${title} (${total})</h5>
+        <table class="min-w-full text-sm text-gray-300"><thead><tr class="text-left text-xs text-gray-600">
+        <th class="px-3 py-0.5 text-right">Code</th><th class="px-3 py-0.5">Meaning</th><th class="px-3 py-0.5 text-right">Count</th></tr></thead>
+        <tbody>${codeRows(rows)}</tbody></table>` : '';
+    const findings = (w.findings || []).map(f => `<li class="text-amber-300">⚠ ${escapeHtml(f)}</li>`).join('');
+    const clients = (w.deauth.top_clients || []).slice(0, 6).map(c => escapeHtml(c.mac) + ' (' + c.count + ')').join(', ');
+    return `<div class="mt-3 border-t border-slate-700 pt-3">
+        <h4 class="text-sm font-semibold mb-1">📶 Wi-Fi / AP analysis</h4>
+        <p class="text-xs text-gray-500 mb-2">${w.wlan_frames} 802.11 frames · retries ${w.retry_pct != null ? w.retry_pct + '%' : '—'} · EAPOL ${w.eapol_frames} · SSIDs: ${(w.ssids || []).map(escapeHtml).join(', ') || '—'}</p>
+        ${findings ? '<ul class="space-y-0.5 text-sm mb-1">' + findings + '</ul>' : ''}
+        <div class="overflow-x-auto">
+        ${tbl('Deauthentication reasons', w.deauth.total, w.deauth.by_reason)}
+        ${tbl('Disassociation reasons', w.disassoc.total, w.disassoc.by_reason)}
+        ${tbl('Auth / Assoc failures', w.auth_assoc_failures.total, w.auth_assoc_failures.by_status)}
+        </div>
+        ${clients ? '<p class="text-xs text-gray-400 mt-2">Most-dropped clients: ' + clients + '</p>' : ''}</div>`;
+}
+
+async function aiAnalyzePcap() {
+    if (!_lastPcap) return;
+    const out = document.getElementById('pcap-ai-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Asking AI…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Analyzing capture with AI…</p>';
+    try {
+        const d = await postAPI('/api/ai/pcap', _lastPcap);
+        if (d.enabled === false) {
+            out.innerHTML = '<p class="text-sm text-amber-300">' + escapeHtml(d.message || 'AI is not enabled.') + '</p>';
+            return;
+        }
+        if (!d.analysis) {
+            out.innerHTML = '<p class="text-sm text-red-400">AI returned no analysis — check the OpenAI token/model in Settings.</p>';
+            return;
+        }
+        const html = (typeof formatAIText === 'function')
+            ? formatAIText(d.analysis) : escapeHtml(d.analysis).replace(/\n/g, '<br>');
+        out.innerHTML = '<div class="bg-slate-900/60 border border-slate-700 rounded-lg p-3 text-sm">' + html + '</div>';
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
 }
 
 async function analyzePcap() {
@@ -1795,7 +1926,10 @@ async function analyzePcap() {
             <span class="text-xs font-normal">— <span class="text-red-400">${ex.errors || 0} err</span> · <span class="text-amber-300">${ex.warnings || 0} warn</span> · <span class="text-gray-400">${ex.notes || 0} note</span></span></h4>
             ${exItems ? '<ul class="space-y-0.5 text-sm">' + exItems + '</ul>' : '<p class="text-sm text-gray-500">No expert findings.</p>'}`;
 
-        out.innerHTML = stats + `<div class="overflow-x-auto">${protoTable}${talkTable}</div>` + expert;
+        const aiBtn = `<div class="mt-3"><button onclick="aiAnalyzePcap()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-1.5 rounded text-sm whitespace-nowrap">🧠 Explain with AI</button>
+            <div id="pcap-ai-results" class="hidden mt-2"></div></div>`;
+        out.innerHTML = stats + `<div class="overflow-x-auto">${protoTable}${talkTable}</div>` + _pcapWifiHtml(d.wifi) + expert + aiBtn;
+        _lastPcap = d;
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     } finally {

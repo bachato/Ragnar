@@ -347,6 +347,78 @@ Tone: Direct, tactical Viking strategist. Use bullet points and clear sections.
 
 
     # ===================================================================
+    #   PCAP ANALYSIS (Wi-Fi / AP client-drop diagnosis)
+    # ===================================================================
+
+    def analyze_pcap(self, data: Dict):
+        """Interpret a PCAP-analysis summary (from network_diagnostics) — built
+        for Wi-Fi/AP captures, to explain why clients are dropping. `data` is the
+        dict returned by do_pcap_analyze (summary/protocols/talkers/expert/wifi).
+        Returns a plain-language root-cause read, or None if AI is unavailable."""
+        if not self.is_enabled():
+            return None
+
+        wifi = (data or {}).get('wifi') or {}
+        summary = (data or {}).get('summary') or {}
+        key = self._cache_key("pcap_analysis", {
+            "pkts": summary.get('packets'),
+            "deauth": (wifi.get('deauth') or {}).get('total'),
+            "disassoc": (wifi.get('disassoc') or {}).get('total'),
+            "retry": wifi.get('retry_pct'),
+        })
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        # Keep the prompt compact: send the summary, expert findings, and (if
+        # present) the Wi-Fi event breakdown that actually explains drops.
+        payload = {
+            'summary': summary,
+            'expert': (data or {}).get('expert'),
+            'top_protocols': ((data or {}).get('protocols') or [])[:15],
+            'top_talkers': ((data or {}).get('talkers') or [])[:8],
+            'wifi': wifi or None,
+        }
+        data_json = json.dumps(payload, indent=2, default=str)[:6000]
+
+        is_wifi = bool(wifi.get('is_wifi'))
+        system = (
+            "You are a senior network / wireless engineer reading a packet capture. "
+            "Diagnose the ROOT CAUSE from the evidence and explain it in plain language "
+            "a field tech can act on. Be specific about 802.11 reason/status codes and "
+            "TCP expert findings. Do not invent data not present in the summary. "
+            "Use short markdown sections and bullet points."
+        )
+        focus = (
+            "This is a Wi-Fi / access-point capture and the goal is to explain WHY CLIENTS "
+            "ARE DROPPING / DISCONNECTING." if is_wifi else
+            "Explain what this capture shows and any problems in it."
+        )
+        user = f"""{focus}
+
+Packet-capture summary (JSON):
+{data_json}
+
+Provide:
+
+**Verdict** - the single most likely root cause (1-2 sentences).
+
+**Evidence** - the specific counts / reason codes / status codes / expert
+findings that point to it, quoted from the summary.
+
+**Other factors** - secondary issues worth noting (only if supported by the data).
+
+**Fix it** - concrete, prioritized remediation steps a technician can take.
+
+Keep it tight and practical. If the data is inconclusive, say so and name the
+one capture/filter that would confirm it."""
+
+        resp = self._ask(system, user)
+        if resp:
+            self._cache_set(key, resp)
+        return resp
+
+    # ===================================================================
     #   ATTACK VECTOR IDENTIFICATION
     # ===================================================================
 

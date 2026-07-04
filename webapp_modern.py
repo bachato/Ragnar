@@ -18857,15 +18857,32 @@ def get_ai_vulnerability_analysis():
         
         # Get AI analysis
         analysis = ai_service.analyze_vulnerabilities(vulnerabilities)
-        
+
         return jsonify({
             'enabled': True,
             'analysis': analysis,
             'vulnerability_count': len(vulnerabilities)
         })
-        
+
     except Exception as e:
         logger.error(f"Error getting AI vulnerability analysis: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/ai/pcap', methods=['POST'])
+def post_ai_pcap_analysis():
+    """AI root-cause analysis of a PCAP-analysis summary (Wi-Fi/AP client drops).
+    The client posts the JSON returned by /api/net/pcap; we hand it to the AI."""
+    try:
+        ai_service = getattr(shared_data, 'ai_service', None)
+        if not ai_service or not ai_service.is_enabled():
+            return jsonify({'enabled': False,
+                            'message': 'AI service is not enabled — add an OpenAI token in Settings.'})
+        data = request.get_json(silent=True) or {}
+        analysis = ai_service.analyze_pcap(data)
+        return jsonify({'enabled': True, 'analysis': analysis})
+    except Exception as e:
+        logger.error(f"Error getting AI pcap analysis: {e}")
         return jsonify({'error': str(e)}), 500
 
 

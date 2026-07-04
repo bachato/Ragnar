@@ -1455,6 +1455,126 @@ def do_l2_health(interface, seconds=12):
 _PCAP_MAGICS = (b'\xd4\xc3\xb2\xa1', b'\xa1\xb2\xc3\xd4',
                 b'\x4d\x3c\xb2\xa1', b'\xa1\xb2\x3c\x4d', b'\x0a\x0d\x0d\x0a')
 
+# IEEE 802.11 deauth/disassoc reason codes (the "why did the client drop" field).
+_WIFI_REASONS = {
+    1: 'Unspecified', 2: 'Previous auth no longer valid', 3: 'Deauth — STA leaving',
+    4: 'Disassoc — inactivity', 5: 'Disassoc — AP out of resources',
+    6: 'Class-2 frame from non-authed STA', 7: 'Class-3 frame from non-assoc STA',
+    8: 'Disassoc — STA leaving BSS', 9: 'STA not authenticated',
+    13: 'Invalid information element', 14: 'MIC failure',
+    15: '4-way handshake timeout', 16: 'Group-key handshake timeout',
+    17: '4-way handshake IE mismatch', 18: 'Invalid group cipher',
+    19: 'Invalid pairwise cipher', 20: 'Invalid AKMP', 23: '802.1X auth failed',
+    24: 'Cipher suite rejected (policy)', 34: 'Disassoc — poor RF / low ACK',
+}
+# 802.11 auth/assoc status codes (0 = success).
+_WIFI_STATUS = {
+    1: 'Unspecified failure', 10: 'Cannot support all capabilities',
+    11: 'Reassoc denied', 12: 'Assoc denied (unspecified)',
+    13: 'Auth algorithm unsupported', 15: 'Auth timeout',
+    17: 'AP unable to handle more STAs (capacity)', 18: 'Assoc denied — basic-rate mismatch',
+    40: 'Invalid IE', 43: 'Invalid pairwise cipher', 45: 'Invalid AKMP',
+}
+
+
+def _tshark_fields(path, display_filter, fields, timeout=120):
+    cmd = ['tshark', '-r', path, '-Y', display_filter, '-T', 'fields']
+    for f in fields:
+        cmd += ['-e', f]
+    return _run(cmd, timeout=timeout)['out'].splitlines()
+
+
+def _to_int(v):
+    try:
+        return int(v, 16) if v.lower().startswith('0x') else int(v)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _pcap_wifi(path, total_wlan_frames):
+    """Extract the 802.11 events that explain client drops: deauth/disassoc
+    reason codes (per client), auth/assoc failure status codes, EAPOL 4-way
+    handshake volume, retry rate, and SSIDs. tshark gives reason/status as hex."""
+    def code_table(counter, table):
+        return sorted(({'code': c, 'label': table.get(c, f'code {c}'), 'count': n}
+                       for c, n in counter.items()), key=lambda x: x['count'], reverse=True)
+
+    def collect(subtypes_filter):
+        deauth_reasons, deauth_clients = {}, {}
+        for line in _tshark_fields(path, subtypes_filter,
+                                   ['wlan.fc.type_subtype', 'wlan.fixed.reason_code',
+                                    'wlan.da', 'wlan.sa']):
+            cols = (line.split('\t') + ['', '', '', ''])[:4]
+            rc = _to_int(cols[1])
+            client = cols[2] or cols[3]
+            if rc is not None:
+                deauth_reasons[rc] = deauth_reasons.get(rc, 0) + 1
+            if client:
+                deauth_clients[client] = deauth_clients.get(client, 0) + 1
+        return deauth_reasons, deauth_clients
+
+    de_reasons, de_clients = collect('wlan.fc.type_subtype==0x0c')     # deauth
+    dis_reasons, dis_clients = collect('wlan.fc.type_subtype==0x0a')   # disassoc
+
+    # auth (0x0b) + assoc/reassoc responses (0x01/0x03): non-zero status = failure
+    status = {}
+    for line in _tshark_fields(path,
+                               'wlan.fc.type_subtype==0x0b||wlan.fc.type_subtype==0x01||wlan.fc.type_subtype==0x03',
+                               ['wlan.fixed.status_code']):
+        sc = _to_int(line.split('\t')[0])
+        if sc:  # non-zero only
+            status[sc] = status.get(sc, 0) + 1
+
+    eapol = len([l for l in _tshark_fields(path, 'eapol', ['frame.number']) if l.strip()])
+    retries = len([l for l in _tshark_fields(path, 'wlan.fc.retry==1', ['frame.number']) if l.strip()])
+    ssids = set()
+    for line in _tshark_fields(path, 'wlan.fc.type_subtype==0x08', ['wlan.ssid']):
+        v = line.strip()
+        if v:
+            try:
+                ssids.add(bytes.fromhex(v).decode('utf-8', 'replace'))
+            except ValueError:
+                ssids.add(v)
+
+    retry_pct = round(100.0 * retries / total_wlan_frames, 1) if total_wlan_frames else None
+
+    def top_clients(d):
+        return sorted(({'mac': m, 'count': n} for m, n in d.items()),
+                      key=lambda x: x['count'], reverse=True)[:8]
+
+    de = code_table(de_reasons, _WIFI_REASONS)
+    dis = code_table(dis_reasons, _WIFI_REASONS)
+    st = code_table(status, _WIFI_STATUS)
+
+    # Quick heuristics (useful even without AI, and they seed the AI prompt).
+    findings = []
+    reasons_present = {r['code'] for r in de} | {r['code'] for r in dis}
+    if 15 in reasons_present or 16 in reasons_present:
+        findings.append('4-way/group-key handshake timeouts — wrong PSK, RADIUS/EAP timing, or a flaky supplicant.')
+    if 14 in reasons_present:
+        findings.append('MIC failures — mismatched passphrase or possible attack.')
+    if 23 in reasons_present:
+        findings.append('802.1X authentication failed — RADIUS/cert/credentials issue.')
+    if 4 in reasons_present:
+        findings.append('Inactivity deauths — idle/power-save clients being aged out (often benign).')
+    if reasons_present & {6, 7}:
+        findings.append('Class-2/3 frames from unassociated STAs — clients losing association / roaming churn.')
+    if 2 in reasons_present:
+        findings.append('"Previous auth no longer valid" — roaming, or the AP reset/rebooted.')
+    if any(s['code'] == 17 for s in st):
+        findings.append('AP returning "unable to handle more STAs" — capacity/association-limit reached.')
+    if retry_pct is not None and retry_pct > 30:
+        findings.append(f'High retry rate ({retry_pct}%) — RF interference, weak signal, or distance/co-channel.')
+
+    return {
+        'is_wifi': True, 'wlan_frames': total_wlan_frames, 'retry_pct': retry_pct,
+        'eapol_frames': eapol, 'ssids': sorted(ssids),
+        'deauth': {'total': sum(de_reasons.values()), 'by_reason': de, 'top_clients': top_clients(de_clients)},
+        'disassoc': {'total': sum(dis_reasons.values()), 'by_reason': dis, 'top_clients': top_clients(dis_clients)},
+        'auth_assoc_failures': {'total': sum(status.values()), 'by_status': st},
+        'findings': findings,
+    }
+
 
 def do_pcap_analyze(path):
     """Triage a capture file: summary (packets/bytes/duration/rate), protocol
@@ -1539,8 +1659,17 @@ def do_pcap_analyze(path):
     expert['items'].sort(key=lambda i: i['count'], reverse=True)
     expert['items'] = expert['items'][:20]
 
+    # If this is an 802.11 capture, add the WiFi/AP drop analysis.
+    wifi = None
+    wlan_frames = next((p['frames'] for p in protocols if p['proto'] == 'wlan'), 0)
+    if wlan_frames:
+        try:
+            wifi = _pcap_wifi(path, wlan_frames)
+        except Exception:  # pragma: no cover - WiFi extraction is best-effort
+            wifi = None
+
     return {'success': True, 'summary': summary, 'protocols': protocols,
-            'talkers': talkers, 'expert': expert}
+            'talkers': talkers, 'expert': expert, 'wifi': wifi}
 
 
 def do_pcap_from_upload(file_storage, max_bytes=100 * 1024 * 1024):
