@@ -1488,6 +1488,41 @@ async function runArpScan() {
     }
 }
 
+// Blink a wired link in a pattern so its switch LED reveals the port. POSTs to
+// /api/net/locate-port; on the default-route guard it asks for confirmation and
+// re-sends with force.
+async function locatePort(force) {
+    const ifaceEl = document.getElementById('locate-iface');
+    const out = document.getElementById('locate-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    let count = parseInt(document.getElementById('locate-count').value, 10);
+    if (!Number.isFinite(count)) count = 6;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Flashing…');
+    out.classList.remove('hidden');
+    try {
+        const data = await postAPI('/api/net/locate-port', { interface: iface, count: count, force: !!force });
+        if (!data.success) {
+            if (data.needs_force) {
+                _ndBusy(btn, false);
+                if (confirm(data.error + '\n\nFlash it anyway?')) return locatePort(true);
+                out.innerHTML = '<p class="text-gray-400">Cancelled.</p>';
+                return;
+            }
+            out.innerHTML = '<p class="text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        out.innerHTML = '<p class="text-green-400">⚡ ' + escapeHtml(data.message) + '</p>';
+    } catch (e) {
+        // A flap on the interface serving this page can abort the request — that's expected.
+        out.innerHTML = '<p class="text-amber-300">Flash started on ' + escapeHtml(iface)
+            + '. If the UI dropped, that\'s the link flapping — watch the switch LED; it auto-restores.</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
 async function loadNetworkIdentity() {
     const out = document.getElementById('net-identity-results');
     if (!out) return;

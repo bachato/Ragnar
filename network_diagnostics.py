@@ -21,6 +21,8 @@ import shutil
 import subprocess
 import ipaddress
 import os
+import threading
+import time
 from datetime import datetime
 
 try:
@@ -988,6 +990,78 @@ def do_isp(interface=None):
 
 
 # --------------------------------------------------------------------------
+# Locate Port: flap a wired link so its switch LED blinks (find the port on an
+# unmanaged switch, the way a cable tester / toner probe does)
+# --------------------------------------------------------------------------
+
+_locate_lock = threading.Lock()
+_locate_active = {}  # interface -> True while a flap sequence is running
+
+
+def _flap_sequence(interface, count, on_ms, off_ms):
+    """Bring the link down/up `count` times so the switch's LINK LED blinks in
+    a recognisable cadence. Always leaves the interface up when finished."""
+    try:
+        for _ in range(count):
+            _run(['ip', 'link', 'set', interface, 'down'], timeout=10)
+            time.sleep(off_ms / 1000.0)
+            _run(['ip', 'link', 'set', interface, 'up'], timeout=10)
+            time.sleep(on_ms / 1000.0)
+    finally:
+        # Never leave the port down, whatever happened above.
+        _run(['ip', 'link', 'set', interface, 'up'], timeout=10)
+        with _locate_lock:
+            _locate_active.pop(interface, None)
+
+
+def do_locate_port(interface, count=6, on_ms=800, off_ms=800, force=False):
+    """Physically locate which switch port this device is plugged into by
+    flapping the link in a timed pattern (link LED blinks). Managed switches
+    already report the port via LLDP/CDP (Switch Discovery) -- this is the
+    fallback for unmanaged switches. Runs in the background and returns at once.
+
+    Refuses the interface carrying this host's default route unless force=True,
+    since flapping it briefly drops Ragnar's own connectivity."""
+    interface = (interface or '').strip()
+    if not interface:
+        return {'success': False, 'error': 'interface required'}
+
+    match = next((i for i in do_interfaces(include_virtual=True).get('interfaces', [])
+                  if i['name'] == interface), None)
+    if match is None:
+        return {'success': False, 'error': f'unknown interface: {interface}'}
+    if match.get('type') != 'ethernet' or not interface.startswith(('eth', 'en')):
+        return {'success': False,
+                'error': f'{interface} is not a physical Ethernet port; a link-flap '
+                         'only identifies a switch port on a wired link.'}
+
+    count = _clamp_int(count, 6, 1, 30)
+    on_ms = _clamp_int(on_ms, 800, 100, 3000)
+    off_ms = _clamp_int(off_ms, 800, 100, 3000)
+
+    # Guard: flapping the default-route interface drops our own uplink.
+    if not force and _default_route_iface() == interface:
+        return {'success': False, 'needs_force': True, 'interface': interface,
+                'error': f'{interface} carries this device\'s default route — flapping '
+                         'it will briefly drop Ragnar\'s connectivity (the UI freezes '
+                         'until the sequence finishes, then it auto-restores). '
+                         'Confirm to proceed anyway.'}
+
+    with _locate_lock:
+        if _locate_active.get(interface):
+            return {'success': False, 'error': f'a locate sequence is already running on {interface}.'}
+        _locate_active[interface] = True
+
+    threading.Thread(target=_flap_sequence, args=(interface, count, on_ms, off_ms),
+                     daemon=True).start()
+    total = round(count * (on_ms + off_ms) / 1000.0, 1)
+    return {'success': True, 'interface': interface, 'count': count,
+            'on_ms': on_ms, 'off_ms': off_ms, 'duration_s': total,
+            'message': f'Flapping {interface} {count}× (~{round(total)}s). Watch the '
+                       'switch — the port whose LINK LED blinks in this cadence is the one.'}
+
+
+# --------------------------------------------------------------------------
 # On-demand tool install (whitelisted apt packages, invoked from the UI)
 # --------------------------------------------------------------------------
 
@@ -1163,6 +1237,15 @@ def register_network_diagnostics(app, logger=None):
         iface = (request.args.get('interface') or '').strip() or None
         _log(f"net/isp {iface or 'all'}")
         return jsonify(do_isp(interface=iface))
+
+    @app.route('/api/net/locate-port', methods=['POST'])
+    def net_locate_port():
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip()
+        _log(f"net/locate-port {iface}")
+        return jsonify(do_locate_port(iface, data.get('count', 6),
+                                      data.get('on_ms', 800), data.get('off_ms', 800),
+                                      bool(data.get('force'))))
 
     if logger is not None:
         try:

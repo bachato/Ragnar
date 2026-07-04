@@ -177,6 +177,28 @@ The fastest way to inventory a subnet you're attached to. Results export to CSV.
 
 - Endpoint: `GET /api/net/arp-scan?interface=<iface>` · binary: `arp-scan`
 
+### Locate Port
+Physically find **which switch port** the device is plugged into — the software
+equivalent of a cable tester / toner probe. It **flaps the link** on the chosen
+wired interface in a timed pattern (down/up, a configurable number of blinks),
+so on the switch the port's **link LED** goes dark/lit in that cadence. Watch
+the switch and the port blinking in sync is the one.
+
+On a **managed** switch you don't need this — Switch Discovery already reports
+the exact port over LLDP/CDP. Locate Port is the fallback for **unmanaged**
+switches that only have link/activity LEDs.
+
+Notes and safety:
+- Physical Ethernet only (`eth*`/`en*`) — a link-flap only identifies a port on
+  a wired link.
+- It genuinely **drops the link** each cycle, so it briefly interrupts traffic
+  on that port. If Ragnar is reachable *through* that port, the UI freezes until
+  the sequence finishes — so the tool refuses the interface carrying the default
+  route unless you confirm. It always restores the link when done, and runs in
+  the background so it completes even if your session blips.
+
+- Endpoint: `POST /api/net/locate-port` `{interface, count, force}` · uses `ip link`
+
 ---
 
 ## 🔗 Interfaces

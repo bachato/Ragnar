@@ -1236,6 +1236,20 @@
                     </div>
                     <div id="arp-results" class="hidden mt-3 overflow-x-auto"></div>
                 </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Locate Port</h3>
+                            <p class="text-sm text-gray-400">Find which switch port this device is plugged into by blinking the link in a pattern — like a cable tester. Watch the switch: the port whose <strong>link LED</strong> flashes in cadence is the one. On a managed switch, Switch Discovery already names the port; this is the fallback for unmanaged switches. <span class="text-amber-400">Briefly drops the link on the chosen port.</span></p>
+                        </div>
+                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                            <input id="locate-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')locatePort()">
+                            <input id="locate-count" type="number" min="1" max="30" value="6" title="blink count" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="locatePort()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Flash Port</button>
+                        </div>
+                    </div>
+                    <div id="locate-results" class="hidden mt-3 text-sm"></div>
+                </div>
             </div><!-- /#net-sub-switch -->
 
             <!-- ===================== Interfaces ===================== -->
@@ -5431,7 +5445,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260704-vpnkind"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260704-locateport"></script>
 
 </body>
 </html>
