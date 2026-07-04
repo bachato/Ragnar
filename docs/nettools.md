@@ -36,6 +36,7 @@ when you click it.
 | [ARP Scan](#arp-scan) | Switch & L2 | `GET /api/net/arp-scan` |
 | [L2 Link Health](#l2-link-health) | Switch & L2 | `POST /api/net/l2-health` |
 | [Locate Port](#locate-port) | Switch & L2 | `POST /api/net/locate-port` |
+| [PCAP Analyzer](#pcap-analyzer) | Switch & L2 | `POST /api/net/pcap` |
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
 | [Network Identity](#network-identity) | Interfaces | `GET /api/net/identity` |
 | [ISP / WAN + VPN Detection](#isp--wan-detection) | Interfaces | `GET /api/net/isp` |
@@ -301,6 +302,27 @@ Notes and safety:
   the background so it completes even if your session blips.
 
 - Endpoint: `POST /api/net/locate-port` `{interface, count, force}` · uses `ip link`
+
+### PCAP Analyzer
+Upload a `.pcap` / `.pcapng` capture (from Wireshark, `tcpdump`, the L2 Link
+Health scan, a SPAN/mirror port, …) and get instant triage — the Wireshark
+*Statistics* menu in one click:
+
+- **Summary** — packets, size, duration, average packet size, data rate,
+  capture start/end and encapsulation (via `capinfos`).
+- **Protocol hierarchy** — the full frame/byte breakdown per protocol
+  (`tshark -z io,phs`), so you see at a glance what the capture is made of.
+- **Top talkers** — the busiest IP conversations by exact byte count
+  (aggregated from raw frame lengths, so the numbers are precise).
+- **Expert info** — tshark's analysis flags grouped by severity: TCP
+  **retransmissions**, **resets**, **duplicate ACKs**, zero-window, **malformed**
+  packets, etc. — the fastest way to spot loss and protocol trouble.
+
+The upload is size-guarded (100 MB), magic-byte validated (real pcap/pcapng
+only), analyzed **read-only** with `tshark`, and the temp file is deleted
+immediately after. Nothing is stored.
+
+- Endpoint: `POST /api/net/pcap` (multipart `file`) · binary: `tshark` (+ `capinfos`)
 
 ---
 

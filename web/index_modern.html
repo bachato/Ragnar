@@ -1280,6 +1280,16 @@
                         </div>
                         <div id="ptp-results" class="hidden mt-3 text-sm"></div>
                     </div>
+                    <!-- PCAP Analyzer -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">PCAP Analyzer</h3>
+                        <p class="text-sm text-gray-400 mb-3">Upload a <span class="font-mono">.pcap</span> / <span class="font-mono">.pcapng</span> capture for instant triage — summary, protocol breakdown, top talkers, and Wireshark-style expert findings (retransmissions, resets, dup-ACKs, malformed frames…). Read-only: the file is analysed and immediately discarded. Max 100&nbsp;MB.</p>
+                        <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2">
+                            <input id="pcap-file" type="file" accept=".pcap,.pcapng,.cap" class="w-full sm:flex-1 sm:min-w-[14rem] text-sm text-gray-300 bg-slate-800 border border-slate-700 rounded file:mr-3 file:py-2 file:px-3 file:border-0 file:bg-slate-700 file:text-gray-200 file:cursor-pointer">
+                            <button onclick="uploadPcap()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Analyze</button>
+                        </div>
+                        <div id="pcap-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
                 </div>
             </div><!-- /#net-sub-diagnostics -->
 
@@ -1336,6 +1346,19 @@
                         </div>
                     </div>
                     <div id="l2-results" class="hidden mt-3 text-sm"></div>
+                </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">PCAP Analyzer</h3>
+                            <p class="text-sm text-gray-400">Upload a <span class="font-mono">.pcap</span> / <span class="font-mono">.pcapng</span> capture (from Wireshark, tcpdump, the L2 scan, etc.) for instant triage — summary, protocol breakdown, top talkers, and tshark's expert findings (retransmissions, resets, dup-ACKs, malformed). Read-only; the file is deleted after analysis. Max 100&nbsp;MB.</p>
+                        </div>
+                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                            <input id="pcap-file" type="file" accept=".pcap,.pcapng,.cap,application/vnd.tcpdump.pcap" class="w-full sm:w-auto text-sm text-gray-300 file:mr-3 file:py-2 file:px-3 file:rounded file:border-0 file:text-sm file:bg-slate-700 file:text-gray-200 hover:file:bg-slate-600">
+                            <button onclick="analyzePcap()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Analyze</button>
+                        </div>
+                    </div>
+                    <div id="pcap-results" class="hidden mt-3 text-sm"></div>
                 </div>
             </div><!-- /#net-sub-switch -->
 
@@ -5532,7 +5555,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260704-rusense2"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260704-pcap"></script>
 
 </body>
 </html>

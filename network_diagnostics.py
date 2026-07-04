@@ -24,6 +24,7 @@ import os
 import threading
 import time
 import socket
+import tempfile
 from datetime import datetime
 
 try:
@@ -1447,6 +1448,134 @@ def do_l2_health(interface, seconds=12):
 
 
 # --------------------------------------------------------------------------
+# PCAP Analyzer: triage an uploaded capture with tshark/capinfos
+# --------------------------------------------------------------------------
+
+# pcap (LE/BE, us & ns) and pcapng magic numbers.
+_PCAP_MAGICS = (b'\xd4\xc3\xb2\xa1', b'\xa1\xb2\xc3\xd4',
+                b'\x4d\x3c\xb2\xa1', b'\xa1\xb2\x3c\x4d', b'\x0a\x0d\x0d\x0a')
+
+
+def do_pcap_analyze(path):
+    """Triage a capture file: summary (packets/bytes/duration/rate), protocol
+    hierarchy, top talkers (by bytes), and tshark's expert info (errors/warnings
+    /notes — retransmissions, resets, dup-ACKs, malformed …). Read-only analysis
+    via tshark/capinfos, the way you'd eyeball a pcap in Wireshark's Statistics."""
+    if not _have('tshark'):
+        return {'success': False, 'missing_tool': 'tshark',
+                'error': 'tshark is not installed. Click Install to add it.'}
+    if not os.path.isfile(path):
+        return {'success': False, 'error': 'capture file not found'}
+
+    # 1) File summary (capinfos ships with tshark).
+    summary = {}
+    if _have('capinfos'):
+        t = _run(['capinfos', '-M', path], timeout=30)['out']
+
+        def cap(pat, cast=float):
+            m = re.search(pat, t)
+            if not m:
+                return None
+            try:
+                return cast(m.group(1))
+            except ValueError:
+                return m.group(1)
+        summary = {
+            'packets': cap(r'Number of packets:\s*(\d+)', int),
+            'file_size': cap(r'File size:\s*(\d+)', int),
+            'data_size': cap(r'Data size:\s*(\d+)', int),
+            'duration_s': cap(r'Capture duration:\s*([\d.]+)'),
+            'avg_packet_size': cap(r'Average packet size:\s*([\d.]+)'),
+            'data_byte_rate': cap(r'Data byte rate:\s*([\d.]+)'),
+            'start_time': cap(r'(?:Earliest packet time|First packet time|Start time):\s*(.+)', str),
+            'end_time': cap(r'(?:Latest packet time|Last packet time|End time):\s*(.+)', str),
+            'encapsulation': cap(r'File encapsulation:\s*(.+)', str),
+        }
+
+    # 2) Protocol hierarchy (io,phs gives raw byte counts).
+    protocols = []
+    for line in _run(['tshark', '-r', path, '-q', '-z', 'io,phs'], timeout=90)['out'].splitlines():
+        m = re.match(r'^(\s*)([\w:.-]+)\s+frames:(\d+)\s+bytes:(\d+)', line)
+        if m:
+            protocols.append({'proto': m.group(2), 'depth': len(m.group(1)) // 2,
+                              'frames': int(m.group(3)), 'bytes': int(m.group(4))})
+
+    # 3) Top talkers by bytes. conv,ip humanises bytes ("24 kB"), so aggregate
+    #    raw frame lengths per IP pair from -T fields instead.
+    agg = {}
+    fields = _run(['tshark', '-r', path, '-T', 'fields', '-e', 'ip.src',
+                   '-e', 'ip.dst', '-e', 'frame.len'], timeout=120)
+    for line in fields['out'].splitlines():
+        parts = line.split('\t')
+        if len(parts) < 3 or not parts[0] or not parts[1]:
+            continue
+        try:
+            blen = int((parts[2] or '0').split(',')[0])
+        except ValueError:
+            blen = 0
+        key = tuple(sorted((parts[0], parts[1])))
+        e = agg.setdefault(key, [0, 0])
+        e[0] += 1
+        e[1] += blen
+    talkers = sorted(({'a': k[0], 'b': k[1], 'frames': v[0], 'bytes': v[1]}
+                      for k, v in agg.items()), key=lambda t: t['bytes'], reverse=True)[:12]
+
+    # 4) Expert info (Errors / Warns / Notes / Chats).
+    expert = {'errors': 0, 'warnings': 0, 'notes': 0, 'items': []}
+    sev = None
+    sev_key = {'Errors': 'errors', 'Warns': 'warnings', 'Notes': 'notes'}
+    for line in _run(['tshark', '-r', path, '-q', '-z', 'expert'], timeout=90)['out'].splitlines():
+        hm = re.match(r'^(Errors|Warns|Notes|Chats)\s*\((\d+)\)', line)
+        if hm:
+            sev = hm.group(1)
+            if sev in sev_key:
+                expert[sev_key[sev]] = int(hm.group(2))
+            continue
+        rm = re.match(r'^\s+(\d+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$', line)
+        if rm and sev and sev != 'Chats':
+            expert['items'].append({'severity': sev_key.get(sev, sev.lower()),
+                                    'count': int(rm.group(1)), 'protocol': rm.group(3),
+                                    'summary': rm.group(4).strip()})
+    expert['items'].sort(key=lambda i: i['count'], reverse=True)
+    expert['items'] = expert['items'][:20]
+
+    return {'success': True, 'summary': summary, 'protocols': protocols,
+            'talkers': talkers, 'expert': expert}
+
+
+def do_pcap_from_upload(file_storage, max_bytes=100 * 1024 * 1024):
+    """Save an uploaded capture to a temp file (size-guarded, magic-checked) and
+    analyze it, then delete it."""
+    if file_storage is None:
+        return {'success': False, 'error': 'no file uploaded'}
+    fd, tmp = tempfile.mkstemp(suffix='.pcap')
+    try:
+        total = 0
+        with os.fdopen(fd, 'wb') as out:
+            while True:
+                chunk = file_storage.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    return {'success': False,
+                            'error': f'file too large (max {max_bytes // (1024 * 1024)} MB)'}
+                out.write(chunk)
+        if total == 0:
+            return {'success': False, 'error': 'uploaded file is empty'}
+        with open(tmp, 'rb') as fh:
+            if fh.read(4) not in _PCAP_MAGICS:
+                return {'success': False,
+                        'error': 'not a valid pcap/pcapng capture (bad magic bytes)'}
+        return do_pcap_analyze(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
 # Flow telemetry (per-connection RTT / retransmits) + PTP timing detection
 # --------------------------------------------------------------------------
 
@@ -1543,6 +1672,7 @@ _NET_TOOL_PKGS = {
     'dig': ('dig', 'dnsutils'),
     'iperf3': ('iperf3', 'iperf3'),
     'tcpdump': ('tcpdump', 'tcpdump'),
+    'tshark': ('tshark', 'tshark'),
 }
 
 
@@ -1734,6 +1864,11 @@ def register_network_diagnostics(app, logger=None):
         action = (data.get('action') or 'status').strip()
         _log(f"net/iperf3-server {action}")
         return jsonify(do_iperf3_server(action))
+
+    @app.route('/api/net/pcap', methods=['POST'])
+    def net_pcap():
+        _log("net/pcap upload")
+        return jsonify(do_pcap_from_upload(request.files.get('file')))
 
     @app.route('/api/net/flows', methods=['GET'])
     def net_flows():
