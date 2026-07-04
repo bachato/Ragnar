@@ -1164,6 +1164,94 @@ def do_captive_portal():
 
 
 # --------------------------------------------------------------------------
+# iperf3 LAN throughput (client to a peer, + optional built-in server)
+# --------------------------------------------------------------------------
+
+_IPERF3_PORT = 5201
+_iperf3_server = {'proc': None}
+
+
+def do_iperf3_client(server, port=_IPERF3_PORT, duration=5, reverse=False, udp=False):
+    """Measure real throughput to an iperf3 peer on the LAN — the thing an
+    internet speed test can't do (switch/cable/link validation between two
+    nodes). `reverse` tests download (peer->here); `udp` reports jitter/loss."""
+    server = (server or '').strip()
+    if not server:
+        return {'success': False, 'error': 'iperf3 server address required'}
+    if not _have('iperf3'):
+        return {'success': False, 'missing_tool': 'iperf3',
+                'error': 'iperf3 is not installed. Click Install to add it.'}
+    port = _clamp_int(port, _IPERF3_PORT, 1, 65535)
+    duration = _clamp_int(duration, 5, 1, 30)
+    cmd = ['iperf3', '-c', server, '-p', str(port), '-t', str(duration), '-J']
+    if reverse:
+        cmd.append('-R')
+    if udp:
+        cmd.append('-u')
+    res = _run(cmd, timeout=duration + 15)
+    try:
+        d = json.loads(res['out'])
+    except ValueError:
+        return {'success': False,
+                'error': (res['err'] or res['out'] or 'iperf3 failed').strip()[:200]}
+    if d.get('error'):
+        return {'success': False, 'error': d['error']}
+    end = d.get('end', {})
+    out = {'success': True, 'server': server, 'port': port,
+           'direction': 'download' if reverse else 'upload',
+           'protocol': 'UDP' if udp else 'TCP', 'duration_s': duration}
+    if udp:
+        s = end.get('sum', {})
+        out['mbps'] = round(s.get('bits_per_second', 0) / 1e6, 2)
+        out['jitter_ms'] = round(s.get('jitter_ms', 0), 3)
+        out['lost_percent'] = round(s.get('lost_percent', 0), 2)
+    else:
+        sent = end.get('sum_sent', {})
+        recv = end.get('sum_received', {})
+        out['mbps'] = round(recv.get('bits_per_second', 0) / 1e6, 2)
+        out['sent_mbps'] = round(sent.get('bits_per_second', 0) / 1e6, 2)
+        out['retransmits'] = sent.get('retransmits')
+    return out
+
+
+def do_iperf3_server(action):
+    """Run/stop a built-in iperf3 server so another device can throughput-test
+    *against* this box. Returns the addresses to point the other end at."""
+    if not _have('iperf3'):
+        return {'success': False, 'missing_tool': 'iperf3',
+                'error': 'iperf3 is not installed. Click Install to add it.'}
+    proc = _iperf3_server['proc']
+    running = proc is not None and proc.poll() is None
+
+    if action == 'start':
+        if not running:
+            try:
+                _iperf3_server['proc'] = subprocess.Popen(
+                    ['iperf3', '-s', '-p', str(_IPERF3_PORT)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                running = True
+            except OSError as e:
+                return {'success': False, 'error': f'could not start iperf3 server: {e}'}
+    elif action == 'stop':
+        if running:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        _iperf3_server['proc'] = None
+        running = False
+
+    addrs = []
+    for i in do_interfaces(include_virtual=False).get('interfaces', []):
+        for cidr in (i.get('ipv4') or []):
+            ip = cidr.split('/')[0]
+            if not ip.startswith('127.'):
+                addrs.append(ip)
+    return {'success': True, 'running': running, 'port': _IPERF3_PORT, 'addresses': addrs}
+
+
+# --------------------------------------------------------------------------
 # Locate Port: flap a wired link so its switch LED blinks (find the port on an
 # unmanaged switch, the way a cable tester / toner probe does)
 # --------------------------------------------------------------------------
@@ -1253,6 +1341,7 @@ _NET_TOOL_PKGS = {
     'speedtest-cli': ('speedtest-cli', 'speedtest-cli'),
     'curl': ('curl', 'curl'),
     'dig': ('dig', 'dnsutils'),
+    'iperf3': ('iperf3', 'iperf3'),
 }
 
 
@@ -1429,6 +1518,21 @@ def register_network_diagnostics(app, logger=None):
     def net_captive_portal():
         _log("net/captive-portal")
         return jsonify(do_captive_portal())
+
+    @app.route('/api/net/iperf3', methods=['POST'])
+    def net_iperf3():
+        data = request.get_json(silent=True) or {}
+        _log(f"net/iperf3 client {data.get('server')}")
+        return jsonify(do_iperf3_client(data.get('server'), data.get('port', 5201),
+                                        data.get('duration', 5),
+                                        bool(data.get('reverse')), bool(data.get('udp'))))
+
+    @app.route('/api/net/iperf3-server', methods=['POST'])
+    def net_iperf3_server():
+        data = request.get_json(silent=True) or {}
+        action = (data.get('action') or 'status').strip()
+        _log(f"net/iperf3-server {action}")
+        return jsonify(do_iperf3_server(action))
 
     @app.route('/api/net/locate-port', methods=['POST'])
     def net_locate_port():

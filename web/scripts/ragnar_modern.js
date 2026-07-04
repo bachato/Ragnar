@@ -1456,6 +1456,71 @@ async function runCaptivePortal() {
     }
 }
 
+async function runIperf() {
+    const input = document.getElementById('iperf-server');
+    const out = document.getElementById('iperf-results');
+    const server = (input.value || '').trim();
+    if (!server) { input.focus(); return; }
+    const reverse = document.getElementById('iperf-dir').value === 'down';
+    let dur = parseInt(document.getElementById('iperf-dur').value, 10);
+    if (!Number.isFinite(dur)) dur = 5;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Testing…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running iperf3 ' + (reverse ? 'download' : 'upload') + ' for ' + dur + 's…</p>';
+    try {
+        const d = await postAPI('/api/net/iperf3', { server: server, duration: dur, reverse: reverse });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runIperf')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const card = (label, val, unit) => `<div class="bg-slate-800 rounded-lg p-4 text-center">
+            <div class="text-2xl font-bold text-Ragnar-400">${val}<span class="text-sm text-gray-400"> ${unit}</span></div>
+            <div class="text-xs uppercase text-gray-500 mt-1">${label}</div></div>`;
+        let extra = '';
+        if (d.protocol === 'TCP') extra = card('Retransmits', d.retransmits != null ? d.retransmits : '—', '');
+        else extra = card('Jitter', d.jitter_ms, 'ms') + card('Loss', d.lost_percent, '%');
+        out.innerHTML = `<div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            ${card(d.direction === 'download' ? 'Download' : 'Upload', d.mbps, 'Mbps')}${extra}</div>
+            <p class="text-xs text-gray-500 mt-2">${d.protocol} · ${escapeHtml(String(d.server))}:${d.port} · ${d.duration_s}s</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function toggleIperfServer() {
+    const btn = document.getElementById('iperf-server-btn');
+    const status = document.getElementById('iperf-server-status');
+    const starting = btn.textContent.indexOf('Start') !== -1;
+    _ndBusy(btn, true, starting ? 'Starting…' : 'Stopping…');
+    try {
+        const d = await postAPI('/api/net/iperf3-server', { action: starting ? 'start' : 'stop' });
+        _ndBusy(btn, false);
+        if (!d.success) {
+            status.classList.remove('hidden');
+            status.innerHTML = d.missing_tool
+                ? _ndMissingTool(d, 'toggleIperfServer')
+                : '<span class="text-red-400">' + escapeHtml(d.error || 'failed') + '</span>';
+            return;
+        }
+        btn.textContent = d.running ? 'Stop server' : 'Start server';
+        status.classList.toggle('hidden', !d.running);
+        if (d.running) {
+            const addrs = (d.addresses || []).map(escapeHtml).join(', ');
+            status.innerHTML = '<span class="text-green-400">● listening on port ' + d.port + '</span> — '
+                + 'run <span class="font-mono">iperf3 -c ' + escapeHtml((d.addresses || [''])[0]) + '</span> from another device'
+                + (addrs ? ' <span class="text-gray-500">(' + addrs + ')</span>' : '');
+        }
+    } catch (e) {
+        _ndBusy(btn, false);
+        status.classList.remove('hidden');
+        status.innerHTML = '<span class="text-red-400">Failed: ' + escapeHtml(e.message) + '</span>';
+    }
+}
+
 // Install a missing network tool on demand (whitelisted server-side), then
 // re-run the loader for the panel that reported it missing.
 async function installNetTool(tool, btn, reloadFn) {

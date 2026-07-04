@@ -134,6 +134,19 @@ expected body means the network is hijacking HTTP.
 
 - Endpoint: `GET /api/net/captive-portal` · binary: `curl`
 
+### LAN Throughput (iperf3)
+Measures **real throughput to another node on your network** — the test an
+internet speed test can't do, and the right way to validate that a cable, port
+or switch actually delivers its rated speed. Point it at any iperf3 server (up
+or download, TCP or UDP with jitter/loss), and it reports Mbps plus TCP
+**retransmits** (a retransmit count above zero on a LAN is a red flag for a
+duplex mismatch or a bad cable). A **built-in server** toggle lets another
+device throughput-test *against* this box — it shows the addresses to point the
+other end at.
+
+- Endpoints: `POST /api/net/iperf3` `{server,duration,reverse,udp}`,
+  `POST /api/net/iperf3-server` `{action:start|stop}` · binary: `iperf3`
+
 ### Speed Test
 Download/upload/latency bandwidth test. Supports both the Ookla `speedtest` CLI
 and the Python `speedtest-cli`, reporting download/upload in Mbps, ping in ms,

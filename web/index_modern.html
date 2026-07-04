@@ -1238,6 +1238,26 @@
                         </div>
                         <div id="captive-results" class="hidden mt-3 text-sm"></div>
                     </div>
+                    <!-- iperf3 LAN Throughput -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">LAN Throughput (iperf3)</h3>
+                        <p class="text-sm text-gray-400 mb-3">Real throughput to another iperf3 node on your network — validates a cable/port/switch that the internet speed test can't. Point it at any iperf3 server, or start the built-in one below and test <em>from</em> another device to this one.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="iperf-server" type="text" inputmode="url" autocomplete="off" placeholder="iperf3 server IP" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runIperf()">
+                            <select id="iperf-dir" class="w-full sm:w-32 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <option value="up">Upload</option>
+                                <option value="down">Download</option>
+                            </select>
+                            <input id="iperf-dur" type="number" min="1" max="30" value="5" title="seconds" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runIperf()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run</button>
+                        </div>
+                        <div id="iperf-results" class="hidden mt-3 text-sm"></div>
+                        <div class="mt-3 border-t border-slate-700 pt-3 flex items-center justify-between gap-3">
+                            <p class="text-xs text-gray-500">Built-in iperf3 server — lets another device test against this box.</p>
+                            <button id="iperf-server-btn" onclick="toggleIperfServer()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-sm whitespace-nowrap">Start server</button>
+                        </div>
+                        <div id="iperf-server-status" class="hidden mt-2 text-xs"></div>
+                    </div>
                 </div>
             </div><!-- /#net-sub-diagnostics -->
 
@@ -5476,7 +5496,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260704-dnsbundle"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260704-iperf3"></script>
 
 </body>
 </html>
