@@ -1242,13 +1242,13 @@
                     <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                         <h3 class="text-lg font-semibold mb-1">LAN Throughput (iperf3)</h3>
                         <p class="text-sm text-gray-400 mb-3">Real throughput to another iperf3 node on your network — validates a cable/port/switch that the internet speed test can't. Point it at any iperf3 server, or start the built-in one below and test <em>from</em> another device to this one.</p>
-                        <div class="flex flex-col sm:flex-row gap-2">
-                            <input id="iperf-server" type="text" inputmode="url" autocomplete="off" placeholder="iperf3 server IP" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runIperf()">
+                        <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2">
+                            <input id="iperf-server" type="text" inputmode="url" autocomplete="off" placeholder="iperf3 server IP" class="w-full sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runIperf()">
                             <select id="iperf-dir" class="w-full sm:w-32 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                                 <option value="up">Upload</option>
                                 <option value="down">Download</option>
                             </select>
-                            <input id="iperf-dur" type="number" min="1" max="30" value="5" title="seconds" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <input id="iperf-dur" type="number" min="1" max="30" value="5" title="test duration (seconds)" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                             <button onclick="runIperf()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run</button>
                         </div>
                         <div id="iperf-results" class="hidden mt-3 text-sm"></div>
@@ -1273,9 +1273,9 @@
                     <div class="glass rounded-xl p-4 sm:p-6">
                         <h3 class="text-lg font-semibold mb-1">PTP Timing Detection</h3>
                         <p class="text-sm text-gray-400 mb-3">Detects IEEE-1588 / PTPv2 grandmasters on the segment (AV-over-IP, finance, 5G fronthaul). Sniffs the PTP ports / 802.1AS ethertype — detection only; offset needs ptp4l.</p>
-                        <div class="flex flex-col sm:flex-row gap-2">
-                            <input id="ptp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPtp()">
-                            <input id="ptp-secs" type="number" min="3" max="30" value="8" title="seconds" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2">
+                            <input id="ptp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:flex-1 sm:min-w-[11rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPtp()">
+                            <input id="ptp-secs" type="number" min="3" max="30" value="8" title="capture seconds" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                             <button onclick="runPtp()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Detect</button>
                         </div>
                         <div id="ptp-results" class="hidden mt-3 text-sm"></div>
