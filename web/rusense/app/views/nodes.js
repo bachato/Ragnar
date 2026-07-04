@@ -1,6 +1,6 @@
 // Nodes — per-node CSI sensor health, mesh status, hardware spec.
 import { icons } from '../icons.js';
-import { html, $, fetchJSON, fmt } from '../lib.js';
+import { html, $, fetchJSON, fmt } from '../lib.js?v=20260704-sparkfit';
 
 // Graduated node health from last_seen. The sensing-server exposes a binary
 // active/stale that flips the instant a node gaps for ~a second, which reads as

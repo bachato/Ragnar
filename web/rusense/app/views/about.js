@@ -2,7 +2,7 @@
 // the geofence, phone alerts, and full credit to the RuView project that powers
 // it. Sourced from docs/rusense.md so the UI and docs stay in agreement.
 import { icons } from '../icons.js';
-import { html } from '../lib.js';
+import { html } from '../lib.js?v=20260704-sparkfit';
 
 const FLASHER_URL = 'https://pierregode.github.io/Ragnar/';
 const RUVIEW_URL = 'https://github.com/ruvnet/ruview';          // the source project (by ruvnet)

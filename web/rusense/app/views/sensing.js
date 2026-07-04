@@ -1,9 +1,9 @@
 // Sensing — live CSI features, classification, vital signs + signal-field heatmap.
 import { icons } from '../icons.js';
-import { html, $, fmt, throttleLatest } from '../lib.js';
+import { html, $, fmt, throttleLatest } from '../lib.js?v=20260704-sparkfit';
 import { sensingService } from '../../services/sensing.service.js';
 import { geofenceService } from '../../services/geofence.service.js?v=20260628-geofence';
-import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
+import { makeVitalHold } from '../vital-hold.js?v=20260704-sparkfit';
 import { makePresenceHold } from '../presence-hold.js?v=20260701-cal';
 
 // Teal→amber→red ramp for the field heatmap.

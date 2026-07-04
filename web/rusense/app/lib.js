@@ -96,13 +96,17 @@ export function toast(msg, kind = 'info') {
 }
 
 /** Draw a simple sparkline path into an inline SVG given values + bounds. */
-export function sparkPath(values, w, h, min, max) {
+export function sparkPath(values, w, h, min, max, pad = 2) {
   if (!values.length) return '';
   const lo = min ?? Math.min(...values);
   const hi = max ?? Math.max(...values);
   const span = hi - lo || 1;
   const step = w / Math.max(1, values.length - 1);
+  const ih = h - pad * 2; // inset so the stroke isn't clipped at the viewBox edges
   return values
-    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - ((v - lo) / span) * h).toFixed(1)}`)
+    .map((v, i) => {
+      const t = Math.max(0, Math.min(1, (v - lo) / span));
+      return `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - pad - t * ih).toFixed(1)}`;
+    })
     .join(' ');
 }

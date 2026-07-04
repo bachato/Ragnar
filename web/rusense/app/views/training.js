@@ -1,6 +1,6 @@
 // Training — models, recordings and training-run control. Wired to /api/v1/*.
 import { icons } from '../icons.js';
-import { html, $, fetchJSON, fmt, toast } from '../lib.js';
+import { html, $, fetchJSON, fmt, toast } from '../lib.js?v=20260704-sparkfit';
 
 // Action helper: unlike fetchJSON (which collapses every failure to null), this
 // reports HTTP success/failure separately and keeps any JSON body so we can

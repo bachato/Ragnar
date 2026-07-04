@@ -2,14 +2,14 @@
 // Ragnar's #rusense-tab. The shadow root fully isolates RuView's compiled
 // Tailwind build (assets/app.css) from Ragnar's own styles in both directions.
 // Navigation is driven by Ragnar's native sub-tab buttons (ragnar_modern.js).
-import { html, setQueryRoot } from './lib.js';
+import { html, setQueryRoot } from './lib.js?v=20260704-sparkfit';
 import { sensingService } from '../services/sensing.service.js';
-import dashboard from './views/dashboard.js?v=20260702-nodestatus';
-import sensing from './views/sensing.js?v=20260701-vitfix';
-import nodes from './views/nodes.js?v=20260703-pkt2';
-import training from './views/training.js?v=20260702-dl';
-import settings from './views/settings.js?v=20260702-schedule';
-import about from './views/about.js?v=20260703-oneap';
+import dashboard from './views/dashboard.js?v=20260704-sparkfit';
+import sensing from './views/sensing.js?v=20260704-sparkfit';
+import nodes from './views/nodes.js?v=20260704-sparkfit';
+import training from './views/training.js?v=20260704-sparkfit';
+import settings from './views/settings.js?v=20260704-sparkfit';
+import about from './views/about.js?v=20260704-sparkfit';
 
 const VIEWS = { dashboard, sensing, nodes, training, settings, about };
 const CSS_HREF = new URL('../assets/app.css', import.meta.url).href;

@@ -13,7 +13,7 @@
 // Callers must re-render on a timer as well as on frames — text() is
 // wall-clock based, so a stalled stream still clears to "—" after holdMs
 // instead of freezing the last value on screen forever.
-import { fmt, VITAL_MIN_CONFIDENCE } from './lib.js';
+import { fmt, VITAL_MIN_CONFIDENCE } from './lib.js?v=20260704-sparkfit';
 
 export function makeVitalHold({ holdMs = 4000, decimals = 0 } = {}) {
   let value = null;        // last confident numeric reading

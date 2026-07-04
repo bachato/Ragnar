@@ -13,7 +13,7 @@
 // saved instantly and take effect the next time the Observatory sub-tab is opened
 // (there is no live scene on this tab to preview).
 import { icons } from '../icons.js';
-import { html, $, $$, fetchJSON, toast } from '../lib.js';
+import { html, $, $$, fetchJSON, toast } from '../lib.js?v=20260704-sparkfit';
 import { DEFAULTS, PRESETS, SETTINGS_VERSION, seedObsFromServerConfig, pushObsSettingsToServer } from '../../../observatory/js/hud-controller.js?v=20260629-obsserver';
 
 // Action helper that — unlike fetchJSON — keeps HTTP ok/fail and the JSON body

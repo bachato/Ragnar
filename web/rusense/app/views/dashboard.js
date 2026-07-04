@@ -1,8 +1,8 @@
 // Dashboard — live operator overview. No marketing; leads with real data.
 import { icons } from '../icons.js';
-import { html, $, fetchJSON, fmt, sparkPath, throttleLatest } from '../lib.js';
+import { html, $, fetchJSON, fmt, sparkPath, throttleLatest } from '../lib.js?v=20260704-sparkfit';
 import { sensingService } from '../../services/sensing.service.js';
-import { makeVitalHold } from '../vital-hold.js?v=20260701-vitalhold';
+import { makeVitalHold } from '../vital-hold.js?v=20260704-sparkfit';
 
 // Graduated node health from last_seen. The sensing-server exposes a binary
 // active/stale that flips the instant a node gaps for ~a second, which reads as
