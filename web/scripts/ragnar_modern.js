@@ -1119,6 +1119,7 @@ function showNetworkSubtab(name) {
         loadInterfaces();
     } else if (name === 'diagnostics') {
         populateMtrSources();
+        syncNetDiagDisplayFromServer();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
@@ -1594,6 +1595,35 @@ async function loadInterfaces() {
     } catch (e) {
         out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     }
+}
+
+// E-Paper Network Diagnostic mode: a server-side config flag the display loop
+// reads live. Reflect the current server value into the toggle when the
+// Diagnostics sub-tab opens.
+async function syncNetDiagDisplayFromServer() {
+    const cb = document.getElementById('netdiag-display-enabled');
+    if (!cb) return;
+    try {
+        const cfg = await fetchAPI('/api/config');
+        const on = !!(cfg && cfg.network_diagnostic_mode);
+        cb.checked = on;
+        const note = document.getElementById('netdiag-display-note');
+        if (note) note.classList.toggle('hidden', !on);
+    } catch (e) { /* offline — leave the toggle as-is */ }
+}
+
+function onNetDiagDisplayToggled(cb) {
+    const note = document.getElementById('netdiag-display-note');
+    if (note) note.classList.toggle('hidden', !cb.checked);
+    postAPI('/api/config', { network_diagnostic_mode: cb.checked })
+        .then(() => addConsoleMessage(
+            cb.checked ? 'E-Paper: network diagnostic mode ON' : 'E-Paper: network diagnostic mode OFF',
+            'info'))
+        .catch(err => {
+            addConsoleMessage('Failed to toggle network diagnostic mode: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+            if (note) note.classList.toggle('hidden', !cb.checked);
+        });
 }
 
 // Detect the ISP/public IP reached through each interface (multi-WAN). Makes

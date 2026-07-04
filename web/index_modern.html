@@ -1131,6 +1131,20 @@
 
             <!-- ===================== Diagnostics ===================== -->
             <div id="net-sub-diagnostics" class="net-subview hidden">
+                <!-- E-Paper network diagnostic mode toggle -->
+                <div class="glass rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex items-center justify-between gap-4">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">E-Paper Network Diagnostic Mode</h3>
+                            <p class="text-sm text-gray-400">Turns the e-Paper display into an Ethernet-focused field tool — link speed/duplex, addressing, and the switch port you're plugged into (LLDP/CDP + PoE). Works with no internet and auto-cycles pages every 5&nbsp;seconds. Ideal for diagnosing a switch on-site.</p>
+                        </div>
+                        <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                            <input type="checkbox" id="netdiag-display-enabled" class="sr-only peer" onchange="onNetDiagDisplayToggled(this)">
+                            <div class="w-11 h-6 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                        </label>
+                    </div>
+                    <p id="netdiag-display-note" class="text-xs text-gray-500 mt-2 hidden">Active — the e-Paper is showing the network diagnostic screen. Turn off to restore the normal display.</p>
+                </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
                     <div class="glass rounded-xl p-4 sm:p-6">
@@ -5417,7 +5431,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260703-isp"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260703-netdiag"></script>
 
 </body>
 </html>

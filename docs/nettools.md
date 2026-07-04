@@ -38,6 +38,35 @@ never interpolated into a shell command.
 
 ---
 
+## 🖥️ E-Paper Network Diagnostic Mode
+
+A toggle at the top of the Diagnostics sub-tab turns the **e-Paper display**
+into a standalone, Ethernet-focused field tool — so you can plug the device
+into a switch and read the essentials off the screen with **no laptop and no
+internet**. Everything shown is gathered locally (`ip` / `ethtool` /
+`lldpctl` / `resolv.conf`), so it works on an isolated or dead network.
+
+The display auto-cycles three pages every **5 seconds**:
+
+1. **LINK** — the physical wired port: interface, link up/down, negotiated
+   speed, duplex, auto-negotiation, MAC. (Instantly spot a port that fell back
+   to 100 Mbps or half-duplex.)
+2. **IP** — addressing: DHCP vs static, IPv4/CIDR, default gateway (with its
+   reverse-DNS name), and DNS servers.
+3. **SWITCH** — the switch you're plugged into, via LLDP/CDP: switch name, the
+   **exact port** (e.g. `GigabitEthernet1/0/12`), VLAN, **PoE** class/wattage,
+   protocol, and management IP.
+
+It focuses on the **physical** wired NIC (`eth*` / `en*`), ignoring VPN,
+tunnel, bridge and container interfaces. Toggle it off to restore the normal
+Ragnar display. The setting is persisted (`network_diagnostic_mode` in the
+config) and shared across sessions.
+
+> Applies to the e-Paper display. Headless installs (no display) accept the
+> toggle but have nothing to render it on.
+
+---
+
 ## 🩺 Diagnostics
 
 Reachability, path and bandwidth testing to any target.

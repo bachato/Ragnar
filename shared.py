@@ -706,6 +706,10 @@ class SharedData:
             "ethernet_scan_enabled": True,
             "ethernet_prefer_over_wifi": True,
             "ethernet_auto_detect": True,
+            # When True, the e-Paper shows an Ethernet-focused network
+            # diagnostic screen (link / IP / switch port), auto-cycling pages
+            # every 5s. Web-toggled from Network > Diagnostics. e-Paper only.
+            "network_diagnostic_mode": False,
 
             "network_device_retention_days": 14,
 
