@@ -157,6 +157,27 @@ and the chosen server and ISP. If neither client is present it self-installs
 
 ---
 
+### Live Flow Telemetry
+Per-connection kernel stats from `ss -ti` for every established TCP flow: **RTT**,
+**min-RTT**, **retransmits** and MSS. It's the dependency-free version of the
+eBPF per-flow visibility the big shops run — an RTT far above a flow's min-RTT
+means **bufferbloat/queuing**, and any **retransmits** mean loss. Flows are
+ranked worst-first. (If `bpftrace` is installed it's reported as the engine;
+otherwise the always-present `ss` path is used.)
+
+- Endpoint: `GET /api/net/flows` · binary: `ss` (iproute2, always present)
+
+### PTP Timing Detection
+Detects **IEEE-1588 / PTPv2** on the segment — the precision-time protocol
+behind AV-over-IP, financial trading and 5G fronthaul. Sniffs the PTP event/
+general UDP ports and the 802.1AS ethertype and reports whether a grandmaster is
+announcing, the message types, and the domain(s). This is a field "is PTP here?"
+check; precise clock-offset measurement needs a running `ptp4l`. (Standardised
+TWAMP/OWAMP SLA testing is a natural next step but needs a cooperating reflector
+on the far end.)
+
+- Endpoint: `POST /api/net/ptp` `{interface, seconds}` · binary: `tcpdump`
+
 ## 🔌 Switch & L2
 
 Layer-2 discovery: what switch you're plugged into, and what else is on the

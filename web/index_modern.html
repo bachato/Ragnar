@@ -1258,6 +1258,28 @@
                         </div>
                         <div id="iperf-server-status" class="hidden mt-2 text-xs"></div>
                     </div>
+                    <!-- Live Flow Telemetry -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                            <div class="min-w-0">
+                                <h3 class="text-lg font-semibold mb-1">Live Flow Telemetry</h3>
+                                <p class="text-sm text-gray-400">Per-connection RTT and TCP retransmits from the kernel (<span class="font-mono">ss&nbsp;-ti</span>) — the light version of eBPF flow visibility. RTT far above min-RTT, or retransmits, is where loss/bufferbloat bites.</p>
+                            </div>
+                            <button onclick="runFlows()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Snapshot</button>
+                        </div>
+                        <div id="flows-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- PTP Timing Detection -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">PTP Timing Detection</h3>
+                        <p class="text-sm text-gray-400 mb-3">Detects IEEE-1588 / PTPv2 grandmasters on the segment (AV-over-IP, finance, 5G fronthaul). Sniffs the PTP ports / 802.1AS ethertype — detection only; offset needs ptp4l.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="ptp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPtp()">
+                            <input id="ptp-secs" type="number" min="3" max="30" value="8" title="seconds" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runPtp()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Detect</button>
+                        </div>
+                        <div id="ptp-results" class="hidden mt-3 text-sm"></div>
+                    </div>
                 </div>
             </div><!-- /#net-sub-diagnostics -->
 
@@ -5510,7 +5532,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260704-l2health"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260704-telemetry"></script>
 
 </body>
 </html>

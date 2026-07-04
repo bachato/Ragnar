@@ -1658,6 +1658,80 @@ async function runArpScan() {
     }
 }
 
+async function runFlows() {
+    const out = document.getElementById('flows-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Sampling…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Reading kernel flow stats…</p>';
+    try {
+        const d = await fetchAPI('/api/net/flows');
+        if (!d.success) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        if (!d.connections.length) {
+            out.innerHTML = '<p class="text-sm text-gray-400">No established external TCP connections right now.</p>';
+            return;
+        }
+        const rows = d.connections.map(c => {
+            const bloat = (c.rtt_ms != null && c.min_rtt_ms != null && c.rtt_ms > c.min_rtt_ms * 3 && c.rtt_ms > 30);
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(c.peer))}</td>
+                <td class="px-3 py-1.5 text-right ${bloat ? 'text-amber-300' : ''}">${c.rtt_ms != null ? c.rtt_ms + ' ms' : '—'}</td>
+                <td class="px-3 py-1.5 text-right text-gray-500">${c.min_rtt_ms != null ? c.min_rtt_ms + ' ms' : '—'}</td>
+                <td class="px-3 py-1.5 text-right ${c.retransmits ? 'text-red-400' : 'text-gray-500'}">${c.retransmits}</td>
+                <td class="px-3 py-1.5 text-right text-gray-500">${c.mss != null ? c.mss : '—'}</td>
+            </tr>`;
+        }).join('');
+        out.innerHTML = `<p class="text-xs text-gray-500 mb-2">${d.total} flows · ${d.with_retransmits} with retransmits · engine: ${escapeHtml(d.engine)}</p>
+            <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Peer</th><th class="px-3 py-1.5 text-right">RTT</th>
+                <th class="px-3 py-1.5 text-right">min-RTT</th><th class="px-3 py-1.5 text-right">Retrans</th>
+                <th class="px-3 py-1.5 text-right">MSS</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runPtp() {
+    const ifaceEl = document.getElementById('ptp-iface');
+    const out = document.getElementById('ptp-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    let secs = parseInt(document.getElementById('ptp-secs').value, 10);
+    if (!Number.isFinite(secs)) secs = 8;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Sniffing for PTP on ' + escapeHtml(iface) + '…</p>';
+    try {
+        const d = await postAPI('/api/net/ptp', { interface: iface, seconds: secs });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runPtp')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const verdict = d.ptp_present
+            ? '<span class="text-green-400">● PTP detected</span>'
+            : '<span class="text-gray-400">no PTP</span>';
+        const bits = [];
+        if (d.message_types && d.message_types.length) bits.push('messages: ' + d.message_types.map(escapeHtml).join(', '));
+        if (d.domains && d.domains.length) bits.push('domain(s): ' + d.domains.map(escapeHtml).join(', '));
+        out.innerHTML = `<p class="mb-1">${verdict} — ${escapeHtml(d.note)}</p>
+            ${bits.length ? '<p class="text-xs text-gray-400">' + bits.join(' · ') + '</p>' : ''}
+            <p class="text-xs text-gray-500 mt-1">${escapeHtml(d.offset_note)}</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
 async function runL2Health() {
     const ifaceEl = document.getElementById('l2-iface');
     const out = document.getElementById('l2-results');

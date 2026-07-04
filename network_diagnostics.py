@@ -1437,6 +1437,83 @@ def do_l2_health(interface, seconds=12):
 
 
 # --------------------------------------------------------------------------
+# Flow telemetry (per-connection RTT / retransmits) + PTP timing detection
+# --------------------------------------------------------------------------
+
+def do_flow_telemetry(limit=15):
+    """Per-connection kernel telemetry from `ss -ti`: RTT, min-RTT and TCP
+    retransmits for every established flow — the light, dependency-free version
+    of the eBPF per-flow visibility big shops run. A flow with retransmits or an
+    RTT far above its min-RTT is where loss/bufferbloat is biting."""
+    if not _have('ss'):
+        return {'success': False, 'error': 'ss (iproute2) is not available'}
+    res = _run(['ss', '-tino'], timeout=8)
+    conns, cur = [], None
+    for line in res['out'].splitlines():
+        if line.startswith('State') or not line.strip():
+            continue
+        if not line[0].isspace():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] == 'ESTAB' and not parts[4].startswith('127.'):
+                cur = {'local': parts[3], 'peer': parts[4]}
+            else:
+                cur = None
+        elif cur is not None:
+            def g(pat, info=line):
+                m = re.search(pat, info)
+                return m.group(1) if m else None
+            rtt, minrtt = g(r'\brtt:([\d.]+)'), g(r'\bminrtt:([\d.]+)')
+            retr = g(r'\bretrans:\d+/(\d+)')
+            mss = g(r'\bmss:(\d+)')
+            cur.update({'rtt_ms': float(rtt) if rtt else None,
+                        'min_rtt_ms': float(minrtt) if minrtt else None,
+                        'retransmits': int(retr) if retr else 0,
+                        'mss': int(mss) if mss else None})
+            conns.append(cur)
+            cur = None
+    conns.sort(key=lambda c: (c.get('retransmits') or 0, c.get('rtt_ms') or 0), reverse=True)
+    return {'success': True, 'total': len(conns),
+            'with_retransmits': sum(1 for c in conns if c.get('retransmits')),
+            'connections': conns[:_clamp_int(limit, 15, 1, 100)],
+            'engine': 'bpftrace' if _have('bpftrace') else 'ss'}
+
+
+def do_ptp_detect(interface, seconds=8):
+    """Detect PTP (IEEE-1588 / PTPv2) on a segment by sniffing the PTP event/
+    general UDP ports and the 802.1AS ethertype. Reports whether a grandmaster
+    is announcing, which message types are present, and the domain(s). Precise
+    clock-offset needs ptp4l running; this is the field 'is PTP here?' check for
+    AV-over-IP / finance / 5G-fronthaul networks."""
+    interface = (interface or '').strip()
+    if not interface:
+        return {'success': False, 'error': 'interface required'}
+    if not _have('tcpdump'):
+        return {'success': False, 'missing_tool': 'tcpdump',
+                'error': 'tcpdump is not installed. Click Install to add it.'}
+    if interface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {interface}'}
+    seconds = _clamp_int(seconds, 8, 3, 30)
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn', '-v', '-c', '200',
+                'udp port 319 or udp port 320 or ether proto 0x88f7'], timeout=seconds + 8)
+    out = res['out']
+    pkt_lines = [l for l in out.splitlines() if re.search(r'\bIP6?\b|PTP|ethertype', l)]
+    present = bool(pkt_lines) or 'PTP' in out
+    msg_types = set()
+    for kw in ('announce', 'sync', 'follow_up', 'delay_req', 'delay_resp', 'pdelay'):
+        if kw in out.lower():
+            msg_types.add(kw)
+    domains = set(re.findall(r'domain\s*(?:number)?\s*:?\s*(\d+)', out, re.I))
+    return {'success': True, 'interface': interface, 'seconds': seconds,
+            'ptp_present': present,
+            'packets': len(pkt_lines),
+            'message_types': sorted(msg_types),
+            'domains': sorted(domains),
+            'note': ('PTP traffic detected on this segment.' if present else
+                     'No PTP traffic seen — no grandmaster here, or PTP isn\'t in use.'),
+            'offset_note': 'Detection only — precise clock-offset measurement needs a running ptp4l.'}
+
+
+# --------------------------------------------------------------------------
 # On-demand tool install (whitelisted apt packages, invoked from the UI)
 # --------------------------------------------------------------------------
 
@@ -1647,6 +1724,18 @@ def register_network_diagnostics(app, logger=None):
         action = (data.get('action') or 'status').strip()
         _log(f"net/iperf3-server {action}")
         return jsonify(do_iperf3_server(action))
+
+    @app.route('/api/net/flows', methods=['GET'])
+    def net_flows():
+        _log("net/flows")
+        return jsonify(do_flow_telemetry(request.args.get('limit', 15)))
+
+    @app.route('/api/net/ptp', methods=['POST'])
+    def net_ptp():
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip()
+        _log(f"net/ptp {iface}")
+        return jsonify(do_ptp_detect(iface, data.get('seconds', 8)))
 
     @app.route('/api/net/l2-health', methods=['POST'])
     def net_l2_health():
