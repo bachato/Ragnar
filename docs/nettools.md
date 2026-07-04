@@ -106,6 +106,34 @@ Registration/ownership lookup for a domain or IP.
 
 - Endpoint: `POST /api/net/whois` · binary: `whois`
 
+### DNS Doctor
+Resolves a hostname through **every system resolver plus public 1.1.1.1 /
+8.8.8.8**, and reports per resolver: the **answers**, **query latency**, the
+**DNSSEC AD** (authenticated) flag, and status. It then tells you whether all
+resolvers **agree** — a mismatch is the fingerprint of split-DNS or DNS
+hijacking. Also reports **DoH** (443) and **DoT** (853) reachability. Far more
+than a name→IP lookup: it's a resolver-health and integrity check.
+
+- Endpoint: `POST /api/net/dns` `{name}` · binary: `dig` (`dnsutils`)
+
+### Path MTU / Black-hole
+Discovers the **path MTU** to a target and flags an **MTU black hole** — a hop
+that silently drops full-size packets, the classic "ping works but big
+transfers / HTTPS / VPN hang" fault. A PMTU below 1500 points at tunnel
+overhead (PPPoE/VPN) or a misconfigured hop. Measured with a `ping -M do`
+(don't-fragment) binary search — no extra tool, and it won't stall on
+unresponsive hops the way a full path trace can.
+
+- Endpoint: `POST /api/net/pmtu` `{target}` · binary: `ping`
+
+### Captive Portal Check
+Detects hotel / guest-WiFi **HTTP interception** by probing the same
+connectivity-check endpoints operating systems use (`generate_204`,
+`captive.apple.com`). A wrong status, a redirect, or a login page instead of the
+expected body means the network is hijacking HTTP.
+
+- Endpoint: `GET /api/net/captive-portal` · binary: `curl`
+
 ### Speed Test
 Download/upload/latency bandwidth test. Supports both the Ookla `speedtest` CLI
 and the Python `speedtest-cli`, reporting download/upload in Mbps, ping in ms,

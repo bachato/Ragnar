@@ -1207,6 +1207,37 @@
                         </div>
                         <div id="speedtest-results" class="hidden mt-4"></div>
                     </div>
+                    <!-- DNS Doctor -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">DNS Doctor</h3>
+                        <p class="text-sm text-gray-400 mb-3">Resolves a name through every system resolver plus public 1.1.1.1 / 8.8.8.8 — per-resolver answers &amp; latency, DNSSEC, and whether they agree (split-DNS / hijack smell). Also checks DoH/DoT reachability.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="dns-target" type="text" inputmode="url" autocomplete="off" placeholder="hostname (e.g. example.com)" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runDns()">
+                            <button onclick="runDns()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Diagnose DNS</button>
+                        </div>
+                        <div id="dns-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- Path MTU -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">Path MTU / Black-hole</h3>
+                        <p class="text-sm text-gray-400 mb-3">Finds the path MTU and the hop that silently drops full-size packets (the "ping works but big transfers hang" fault).</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="pmtu-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPmtu()">
+                            <button onclick="runPmtu()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Discover</button>
+                        </div>
+                        <div id="pmtu-results" class="hidden mt-3 text-sm"></div>
+                    </div>
+                    <!-- Captive Portal -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                            <div class="min-w-0">
+                                <h3 class="text-lg font-semibold mb-1">Captive Portal Check</h3>
+                                <p class="text-sm text-gray-400">Detects hotel/guest-WiFi HTTP hijacking using the OS connectivity-check endpoints.</p>
+                            </div>
+                            <button onclick="runCaptivePortal()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check</button>
+                        </div>
+                        <div id="captive-results" class="hidden mt-3 text-sm"></div>
+                    </div>
                 </div>
             </div><!-- /#net-sub-diagnostics -->
 
@@ -5445,7 +5476,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260704-locateport"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260704-dnsbundle"></script>
 
 </body>
 </html>

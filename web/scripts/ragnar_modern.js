@@ -1351,6 +1351,111 @@ async function runSpeedtest() {
     }
 }
 
+async function runDns() {
+    const input = document.getElementById('dns-target');
+    const out = document.getElementById('dns-results');
+    const name = (input.value || '').trim();
+    if (!name) { input.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Resolving…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Querying resolvers…</p>';
+    try {
+        const d = await postAPI('/api/net/dns', { name: name });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runDns')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const rows = (d.results || []).map(r => {
+            const ans = (r.answers && r.answers.length) ? r.answers.map(escapeHtml).join('<br>')
+                : '<span class="text-red-400">' + escapeHtml(r.error || (r.status || 'no answer')) + '</span>';
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(r.resolver)}</td>
+                <td class="px-3 py-1.5 text-gray-500">${escapeHtml(r.kind)}</td>
+                <td class="px-3 py-1.5 font-mono">${ans}</td>
+                <td class="px-3 py-1.5 text-right">${r.query_ms != null ? r.query_ms + ' ms' : '—'}</td>
+                <td class="px-3 py-1.5 text-center">${r.ad ? '<span class="text-green-400">✓</span>' : '<span class="text-gray-500">—</span>'}</td>
+            </tr>`;
+        }).join('');
+        const banner = d.consistent
+            ? '<span class="text-green-400">✓ resolvers agree (shared answer)</span>'
+            : '<span class="text-amber-300">⚠ resolvers returned disjoint answers — normal for CDN/anycast, but a hijack/split-DNS smell if unexpected</span>';
+        out.innerHTML = `<p class="text-xs mb-2">${banner} · DNSSEC ${d.dnssec_ok ? '<span class="text-green-400">validated</span>' : '<span class="text-gray-500">not validated</span>'}
+            · DoH ${d.doh_reachable ? '✓' : '✗'} · DoT ${d.dot_reachable ? '✓' : '✗'}</p>
+            <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Resolver</th><th class="px-3 py-1.5"></th><th class="px-3 py-1.5">Answers</th>
+                <th class="px-3 py-1.5 text-right">Latency</th><th class="px-3 py-1.5 text-center">DNSSEC</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runPmtu() {
+    const input = document.getElementById('pmtu-target');
+    const out = document.getElementById('pmtu-results');
+    const target = (input.value || '').trim();
+    if (!target) { input.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Discovering…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Tracing path MTU to ' + escapeHtml(target) + '…</p>';
+    try {
+        const d = await postAPI('/api/net/pmtu', { target: target });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runPmtu')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const pmtu = d.pmtu != null ? d.pmtu + ' bytes' : 'unknown';
+        const verdict = d.pmtu == null
+            ? '<span class="text-amber-300">⚠ could not measure</span>'
+            : d.reduced
+                ? '<span class="text-amber-300">⚠ below 1500 — MTU black-hole / tunnel overhead likely</span>'
+                : '<span class="text-green-400">✓ full 1500-byte path</span>';
+        out.innerHTML = `<p class="mb-1">Path MTU: <strong>${escapeHtml(pmtu)}</strong> — ${verdict}</p>
+            <p class="text-xs text-gray-400">${escapeHtml(d.note || '')}</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runCaptivePortal() {
+    const out = document.getElementById('captive-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Checking…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Probing connectivity endpoints…</p>';
+    try {
+        const d = await fetchAPI('/api/net/captive-portal');
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runCaptivePortal')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const verdict = d.captive_portal
+            ? '<span class="text-amber-300">⚠ captive portal / HTTP interception detected</span>'
+            : '<span class="text-green-400">✓ no captive portal — direct internet</span>';
+        const rows = (d.checks || []).map(c => `<tr class="border-t border-slate-800">
+            <td class="px-3 py-1.5 font-mono text-xs">${escapeHtml(c.url)}</td>
+            <td class="px-3 py-1.5">${escapeHtml(String(c.code || '—'))}</td>
+            <td class="px-3 py-1.5">${c.ok ? '<span class="text-green-400">ok</span>' : '<span class="text-amber-300">intercepted</span>'}${c.redirect ? ' → ' + escapeHtml(c.redirect) : ''}</td>
+        </tr>`).join('');
+        out.innerHTML = `<p class="mb-2">${verdict}</p>
+            <table class="min-w-full text-sm text-gray-300"><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
 // Install a missing network tool on demand (whitelisted server-side), then
 // re-run the loader for the panel that reported it missing.
 async function installNetTool(tool, btn, reloadFn) {

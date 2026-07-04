@@ -23,6 +23,7 @@ import ipaddress
 import os
 import threading
 import time
+import socket
 from datetime import datetime
 
 try:
@@ -990,6 +991,179 @@ def do_isp(interface=None):
 
 
 # --------------------------------------------------------------------------
+# DNS Doctor / Path-MTU / Captive-portal diagnostics
+# --------------------------------------------------------------------------
+
+def _system_resolvers():
+    """This host's real upstream DNS servers (resolv.conf, or nmcli when only
+    the systemd-resolved stub is present)."""
+    _, ns, _ = _read_resolv_conf()
+    if not ns or ns in (['127.0.0.53'], ['127.0.0.1']):
+        nm = _nmcli_global_values('IP4.DNS')
+        if nm:
+            ns = nm
+    return ns
+
+
+def _dig(name, resolver=None, rtype='A'):
+    """One dig query; returns status/AD-flag/query-time/answers, parsed."""
+    cmd = ['dig', '+tries=1', '+time=3']
+    if resolver:
+        cmd.append('@' + resolver)
+    cmd += [name, rtype, '+dnssec']
+    res = _run(cmd, timeout=8)
+    out = res['out']
+    m = re.search(r'status:\s*(\w+)', out)
+    status = m.group(1) if m else None
+    ad = bool(re.search(r'flags:[^;]*\bad\b', out))
+    m = re.search(r'Query time:\s*(\d+)\s*msec', out)
+    query_ms = int(m.group(1)) if m else None
+    answers, in_ans = [], False
+    for line in out.splitlines():
+        if line.startswith(';; ANSWER SECTION'):
+            in_ans = True
+            continue
+        if in_ans:
+            if not line.strip() or line.startswith(';'):
+                in_ans = False
+                continue
+            # Answer line: NAME TTL CLASS TYPE RDATA. Keep only the queried
+            # record type, so DNSSEC RRSIG/NSEC records don't pollute the set.
+            parts = line.split()
+            if len(parts) >= 5 and parts[3] == rtype:
+                answers.append(parts[-1])
+    return {'status': status, 'ad': ad, 'query_ms': query_ms, 'answers': answers,
+            'error': None if (status or answers) else
+                     ((res['err'] or 'no response').strip()[:120])}
+
+
+def do_dns_doctor(name):
+    """Resolve `name` through every system resolver plus public 1.1.1.1 / 8.8.8.8,
+    reporting per-resolver answers, query latency and the DNSSEC AD flag, whether
+    the resolvers agree (split-DNS / hijack smell), and DoH/DoT reachability."""
+    name = (name or '').strip()
+    if not name:
+        return {'success': False, 'error': 'hostname required'}
+    if not _have('dig'):
+        return {'success': False, 'missing_tool': 'dig',
+                'error': 'dig is not installed. Click Install to add it.'}
+
+    tested, seen = [], set()
+    for r in _system_resolvers():
+        tested.append((r, 'system'))
+        seen.add(r)
+    for pub in ('1.1.1.1', '8.8.8.8'):
+        if pub not in seen:
+            tested.append((pub, 'public'))
+
+    results, answer_sets = [], []
+    for resolver, kind in tested:
+        d = _dig(name, resolver)
+        d.update({'resolver': resolver, 'kind': kind})
+        results.append(d)
+        if d['answers']:
+            answer_sets.append(set(d['answers']))
+    # "Consistent" = the resolvers share at least one answer. Exact-match is too
+    # strict: CDN/anycast names legitimately return different IP subsets per
+    # resolver, so only a *disjoint* answer set (no address in common) is the
+    # real split-DNS / hijack smell.
+    consistent = len(answer_sets) < 2 or bool(set.intersection(*answer_sets))
+
+    return {'success': True, 'name': name, 'results': results,
+            'consistent': consistent,
+            'dnssec_ok': any(r['ad'] for r in results),
+            'doh_reachable': _tcp_reachable('1.1.1.1', 443),
+            'dot_reachable': _tcp_reachable('1.1.1.1', 853)}
+
+
+def _tcp_reachable(host, port, timeout=4):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def do_pmtu(target):
+    """Discover the path MTU to `target` and flag an MTU black hole (a hop that
+    silently drops full-size packets -- the classic 'ping works, big transfers
+    hang' fault).
+
+    Uses a `ping -M do` (don't-fragment) binary search: the largest payload that
+    gets through without fragmentation gives the path MTU. This needs no extra
+    tool and, unlike a full tracepath, doesn't stall on unresponsive hops."""
+    target = (target or '').strip()
+    if not target:
+        return {'success': False, 'error': 'target required'}
+    if not _have('ping'):
+        return {'success': False, 'missing_tool': 'ping',
+                'error': 'ping is not installed. Click Install to add it.'}
+
+    def fits(mtu):
+        # payload = MTU - 28 (20-byte IP header + 8-byte ICMP header)
+        r = _run(['ping', '-n', '-c', '1', '-W', '2', '-M', 'do', '-s', str(mtu - 28), target],
+                 timeout=6)
+        return r['rc'] == 0
+
+    if fits(1500):
+        pmtu = 1500
+    elif not fits(576):
+        # Even a 576-byte DF probe fails: the path likely filters ICMP or blocks
+        # DF. Fall back to a plain ping to say whether the host is reachable.
+        reach = _run(['ping', '-n', '-c', '1', '-W', '2', target], timeout=6)['rc'] == 0
+        return {'success': True, 'target': target, 'pmtu': None, 'reduced': False,
+                'reachable': reach,
+                'note': 'Could not measure PMTU — the path filters ICMP or blocks '
+                        'don\'t-fragment probes. ' + ('Host answers normal pings.'
+                        if reach else 'Host did not answer normal pings either.')}
+    else:
+        lo, hi = 576, 1500
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        pmtu = lo
+
+    reduced = pmtu < 1500
+    return {'success': True, 'target': target, 'pmtu': pmtu, 'reduced': reduced,
+            'reachable': True,
+            'note': (f'Largest unfragmented packet is {pmtu} bytes — below the standard '
+                     '1500, which points to tunnel overhead (PPPoE/VPN) or an MTU-mismatched '
+                     'hop.' if reduced else 'Full 1500-byte path — no MTU black hole.')}
+
+
+_CAPTIVE_CHECKS = (
+    ('http://connectivitycheck.gstatic.com/generate_204', '204', ''),
+    ('http://captive.apple.com/hotspot-detect.html', '200', 'Success'),
+)
+
+
+def do_captive_portal():
+    """Detect a captive portal (hotel/guest-WiFi HTTP hijack) by probing the
+    same connectivity-check endpoints operating systems use. A mismatch (wrong
+    status, a redirect, or a login page instead of the expected body) means the
+    network is intercepting HTTP."""
+    if not _have('curl'):
+        return {'success': False, 'missing_tool': 'curl',
+                'error': 'curl is not installed. Click Install to add it.'}
+    checks, portal = [], False
+    for url, expect_code, expect_body in _CAPTIVE_CHECKS:
+        res = _run(['curl', '-s', '-m', '6', '-o', '-',
+                    '-w', '\n__HTTP__%{http_code}__%{redirect_url}', url], timeout=10)
+        m = re.search(r'\n__HTTP__(\d+)__(.*)$', res['out'], re.S)
+        code = m.group(1) if m else None
+        redirect = ((m.group(2) or '').strip() or None) if m else None
+        body = res['out'][:m.start()] if m else res['out']
+        ok = (code == expect_code) and (expect_body in body if expect_body else True)
+        if not ok:
+            portal = True
+        checks.append({'url': url, 'code': code, 'redirect': redirect, 'ok': ok})
+    return {'success': True, 'captive_portal': portal, 'checks': checks}
+
+
+# --------------------------------------------------------------------------
 # Locate Port: flap a wired link so its switch LED blinks (find the port on an
 # unmanaged switch, the way a cable tester / toner probe does)
 # --------------------------------------------------------------------------
@@ -1078,6 +1252,7 @@ _NET_TOOL_PKGS = {
     'traceroute': ('traceroute', 'traceroute'),
     'speedtest-cli': ('speedtest-cli', 'speedtest-cli'),
     'curl': ('curl', 'curl'),
+    'dig': ('dig', 'dnsutils'),
 }
 
 
@@ -1237,6 +1412,23 @@ def register_network_diagnostics(app, logger=None):
         iface = (request.args.get('interface') or '').strip() or None
         _log(f"net/isp {iface or 'all'}")
         return jsonify(do_isp(interface=iface))
+
+    @app.route('/api/net/dns', methods=['POST'])
+    def net_dns():
+        data = request.get_json(silent=True) or {}
+        _log("net/dns")
+        return jsonify(do_dns_doctor(data.get('name') or data.get('target')))
+
+    @app.route('/api/net/pmtu', methods=['POST'])
+    def net_pmtu():
+        data = request.get_json(silent=True) or {}
+        _log("net/pmtu")
+        return jsonify(do_pmtu(data.get('target')))
+
+    @app.route('/api/net/captive-portal', methods=['GET'])
+    def net_captive_portal():
+        _log("net/captive-portal")
+        return jsonify(do_captive_portal())
 
     @app.route('/api/net/locate-port', methods=['POST'])
     def net_locate_port():
