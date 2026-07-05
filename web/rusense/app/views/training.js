@@ -81,9 +81,9 @@ export default {
             <summary class="cursor-pointer text-xs text-ink-muted">Advanced — set thresholds manually</summary>
             <div class="mt-3 space-y-3">
               <div id="cal-presets" class="grid gap-2 sm:grid-cols-3">
-                <button type="button" data-floor="0.12" data-deb="5" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">High</span><span class="block text-xs text-ink-muted">Catch everything</span></button>
-                <button type="button" data-floor="0.16" data-deb="6" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">Balanced</span><span class="block text-xs text-ink-muted">Default</span></button>
-                <button type="button" data-floor="0.20" data-deb="9" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">Low</span><span class="block text-xs text-ink-muted">Fewest false alarms</span></button>
+                <button type="button" data-floor="0.14" data-deb="4" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">High</span><span class="block text-xs text-ink-muted">Catch everything</span></button>
+                <button type="button" data-floor="0.15" data-deb="6" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">Balanced</span><span class="block text-xs text-ink-muted">Default</span></button>
+                <button type="button" data-floor="0.16" data-deb="10" class="text-left rounded-lg border border-ink-3 px-3 py-2 cursor-pointer"><span class="block text-sm font-semibold">Low</span><span class="block text-xs text-ink-muted">Fewest false alarms</span></button>
               </div>
               <div class="grid gap-4 sm:grid-cols-2">
                 <label class="block"><span class="block text-sm font-medium mb-1">Presence floor</span><input type="number" id="cal-floor" min="0.03" max="0.40" step="0.01" class="w-full bg-ink-1 border border-ink-3 rounded-lg px-3 py-2 text-sm font-mono" /></label>
@@ -384,7 +384,7 @@ export default {
       (async () => {
         const cur = await fetchJSON('/api/rusense/sensitivity');
         if (cur) {
-          if ($('#cal-floor')) $('#cal-floor').value = cur.floor ?? 0.16;
+          if ($('#cal-floor')) $('#cal-floor').value = cur.floor ?? 0.15;
           if ($('#cal-deb')) $('#cal-deb').value = cur.debounce_frames ?? 6;
         }
       })();
@@ -467,7 +467,7 @@ export default {
         if ($('#cal-deb')) $('#cal-deb').value = b.dataset.deb;
       }));
       if ($('#cal-apply')) $('#cal-apply').addEventListener('click', async () => {
-        const floor = Math.max(0.03, Math.min(0.40, parseFloat($('#cal-floor').value) || 0.16));
+        const floor = Math.max(0.03, Math.min(0.40, parseFloat($('#cal-floor').value) || 0.15));
         let deb = parseInt($('#cal-deb').value, 10); if (isNaN(deb)) deb = 6; deb = Math.max(1, Math.min(30, deb));
         const r = await post('/api/rusense/sensitivity', { floor, debounce_frames: deb });
         toast(r.ok ? `Thresholds applied — floor ${floor}, debounce ${deb}` : msgOf(r, 'Could not apply'), r.ok ? 'ok' : 'bad');
