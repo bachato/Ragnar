@@ -797,6 +797,27 @@ def _vpn_provider_match(*fields):
     return next((k for k in _VPN_PROVIDER_HINTS if k in hay), None)
 
 
+def _tor_exit_check(iface):
+    """Authoritatively detect whether egress through `iface` leaves via a Tor
+    exit node, by asking the Tor Project's own checker (which sees our exit IP).
+
+    This is the only reliable way to catch Tor/VPN running on the *router*: in
+    that case Ragnar's own interface is an ordinary LAN NIC, so the interface
+    heuristics and the commercial-VPN ISP name match both miss it. Bound to the
+    interface like the geo lookup. Returns True/False, or None if the check
+    couldn't be performed (offline / curl missing)."""
+    if not _have('curl'):
+        return None
+    res = _run(['curl', '-s', '--max-time', '8', '--interface', iface,
+                'https://check.torproject.org/api/ip'], timeout=12)
+    if res['rc'] == 0 and res['out'].strip():
+        try:
+            return bool(json.loads(res['out']).get('IsTor'))
+        except ValueError:
+            pass
+    return None
+
+
 def _reverse_dns(ip):
     """Reverse-DNS an IP via getent (honours nsswitch, bounded by _run's
     timeout). Returns the PTR hostname or None."""
@@ -931,6 +952,11 @@ def _isp_lookup_iface(iface):
         return {'interface': iface, 'behind_vpn': False,
                 'error': 'curl is not installed', 'missing_tool': 'curl', **vpn_fields}
 
+    # Is this egress a Tor exit? Catches Tor/VPN on the *router* (Ragnar's own
+    # NIC looks ordinary in that case, so the geo ISP-name match alone misses it).
+    tor_exit = _tor_exit_check(iface)
+    vpn_fields['tor_exit'] = bool(tor_exit)
+
     # Primary: ipinfo.io over HTTPS (no API key needed for basic fields).
     res = _run(['curl', '-s', '--max-time', '8', '--interface', iface,
                 'https://ipinfo.io/json'], timeout=12)
@@ -939,10 +965,10 @@ def _isp_lookup_iface(iface):
             d = json.loads(res['out'])
             if d.get('ip'):
                 asn, isp = _parse_ipinfo_org(d.get('org'))
-                vp = _vpn_provider_match(isp, d.get('org'), asn)
+                vp = _vpn_provider_match(isp, d.get('org'), asn) or ('Tor' if tor_exit else None)
                 return {'interface': iface, 'public_ip': d.get('ip'),
                         'isp': isp, 'asn': asn, 'org': d.get('org'),
-                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn),
+                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn or tor_exit),
                         'city': d.get('city'), 'region': d.get('region'),
                         'country': d.get('country'), 'source': 'ipinfo.io', **vpn_fields}
         except ValueError:
@@ -957,10 +983,10 @@ def _isp_lookup_iface(iface):
             d = json.loads(res['out'])
             if d.get('status') == 'success':
                 asn, _ = _parse_ipinfo_org(d.get('as'))
-                vp = _vpn_provider_match(d.get('isp'), d.get('org'), d.get('as'))
+                vp = _vpn_provider_match(d.get('isp'), d.get('org'), d.get('as')) or ('Tor' if tor_exit else None)
                 return {'interface': iface, 'public_ip': d.get('query'),
                         'isp': d.get('isp'), 'asn': asn, 'org': d.get('org') or d.get('as'),
-                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn),
+                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn or tor_exit),
                         'city': d.get('city'), 'region': d.get('regionName'),
                         'country': d.get('country'), 'source': 'ip-api.com', **vpn_fields}
         except ValueError:

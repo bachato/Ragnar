@@ -2220,6 +2220,7 @@ async function detectIsp() {
         }
         const vpnCell = (r) => {
             if (r.iface_is_vpn) return '<span class="text-amber-300">🔒 ' + escapeHtml(r.vpn_kind || 'tunnel') + '</span>';
+            if (r.tor_exit) return '<span class="text-amber-300">🧅 Tor exit</span>';
             if (r.vpn_provider) return '<span class="text-amber-300">🔒 likely (' + escapeHtml(r.vpn_provider) + ')</span>';
             return '<span class="text-gray-500">no</span>';
         };
