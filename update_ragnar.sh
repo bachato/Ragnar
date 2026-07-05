@@ -47,7 +47,10 @@ echo -e "${BLUE}Step 1.5: Preparing git repository...${NC}"
 # lock files, and previous sudo runs leave root-owned files that break git.
 git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$ragnar_PATH" \
     || git config --global --add safe.directory "$ragnar_PATH"
-rm -f "$ragnar_PATH/.git/index.lock" "$ragnar_PATH/.git/HEAD.lock" "$ragnar_PATH/.git/shallow.lock" 2>/dev/null
+# Clear ALL stale git locks (index/HEAD/shallow AND ref locks like
+# refs/remotes/origin/<branch>.lock, packed-refs.lock, config.lock) so an
+# interrupted run never leaves a lock that needs a manual service stop.
+find "$ragnar_PATH/.git" -name '*.lock' -type f -delete 2>/dev/null || true
 chown -R ragnar:ragnar "$ragnar_PATH" 2>/dev/null || true
 # Stash and merge commits need an author identity; root rarely has one.
 GIT_ID=(-c user.name="Ragnar Updater" -c user.email="ragnar-updater@localhost" -c pull.rebase=false)

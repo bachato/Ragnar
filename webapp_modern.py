@@ -9246,6 +9246,74 @@ _GIT_UPDATE_ID = [
 ]
 
 
+def _ensure_git_safe_dir(repo_path: str) -> None:
+    """Whitelist the checkout in the running user's global git config so root
+    operating on a 'ragnar'-owned tree doesn't hit 'detected dubious ownership'.
+    --add only when missing so repeated updates don't pile up duplicates."""
+    try:
+        existing = subprocess.run(
+            ['git', 'config', '--global', '--get-all', 'safe.directory'],
+            capture_output=True, text=True, check=False
+        ).stdout.splitlines()
+        if repo_path not in existing:
+            subprocess.run(
+                ['git', 'config', '--global', '--add', 'safe.directory', repo_path],
+                capture_output=True, text=True, check=False
+            )
+    except Exception:
+        pass
+
+
+def _clear_git_locks(repo_path: str, warnings: list) -> None:
+    """Remove EVERY stale *.lock under .git — not just the old hardcoded short
+    list (index.lock/HEAD.lock/shallow.lock/refs/heads/main.lock).
+
+    The locks that actually got stuck and forced users to stop the service and
+    delete files by hand were the ones NOT on that list: refs/remotes/origin/
+    <branch>.lock, packed-refs.lock, config.lock, and ref locks for non-'main'
+    branches. Sweeping all of them means a lock left by an interrupted run is
+    auto-cleared on the next check/update — the service (root) can delete a lock
+    regardless of which user owns it, so this never needs a manual stop."""
+    git_dir = os.path.join(repo_path, '.git')
+    if not os.path.isdir(git_dir):
+        return
+    # Primary: one find pass deletes nested ref locks too (coreutils always present).
+    try:
+        subprocess.run(
+            ['sudo', 'find', git_dir, '-name', '*.lock', '-type', 'f', '-delete'],
+            capture_output=True, text=True, check=False, timeout=20
+        )
+    except Exception as e:
+        logger.debug(f"find-based lock sweep failed (continuing): {e}")
+    # Fallback for no-sudo / no-find edge cases: top-level locks + the refs/
+    # tree only (never the huge objects/ dir).
+    removed = []
+    try:
+        for name in os.listdir(git_dir):
+            if name.endswith('.lock'):
+                try:
+                    os.remove(os.path.join(git_dir, name))
+                    removed.append(name)
+                except OSError:
+                    pass
+        refs_dir = os.path.join(git_dir, 'refs')
+        for root_dir, _dirs, files in os.walk(refs_dir):
+            for name in files:
+                if name.endswith('.lock'):
+                    lp = os.path.join(root_dir, name)
+                    try:
+                        os.remove(lp)
+                        removed.append(os.path.relpath(lp, git_dir))
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    if removed:
+        msg = f"Cleared stale git lock(s): {', '.join(removed[:8])}"
+        logger.warning(msg)
+        warnings.append(msg)
+
+
 def _prepare_git_repo(repo_path: str, warnings: list) -> None:
     """Make the checkout usable BEFORE the first git command runs.
 
@@ -9273,37 +9341,14 @@ def _prepare_git_repo(repo_path: str, warnings: list) -> None:
         logger.warning(warning)
         warnings.append(warning)
 
-    # Remove stale lock files that cause "Another git process seems to be
-    # running" errors — the most common reason the first update attempt
-    # fails but a retry succeeds.
-    git_dir = os.path.join(repo_path, '.git')
-    for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock',
-                      os.path.join('refs', 'heads', 'main.lock')):
-        lock_path = os.path.join(git_dir, lock_name)
-        if os.path.isfile(lock_path):
-            try:
-                os.remove(lock_path)
-                warning = f"Removed stale lock file: {lock_name}"
-                logger.warning(warning)
-                warnings.append(warning)
-            except OSError as e:
-                logger.debug(f"Could not remove {lock_name}: {e}")
+    # Remove ALL stale lock files (the common reason the first update attempt
+    # fails but a retry succeeds — and the ref/remote locks that used to need a
+    # manual service stop).
+    _clear_git_locks(repo_path, warnings)
 
-    # Whitelist the checkout for the current user. safe.directory must live
-    # in the global config (git ignores it from plain -c), and --add only
-    # when missing so repeated updates don't pile up duplicate entries.
-    try:
-        existing = subprocess.run(
-            ['git', 'config', '--global', '--get-all', 'safe.directory'],
-            capture_output=True, text=True, check=False
-        ).stdout.splitlines()
-        if repo_path not in existing:
-            subprocess.run(
-                ['git', 'config', '--global', '--add', 'safe.directory', repo_path],
-                capture_output=True, text=True, check=False
-            )
-    except Exception:
-        pass
+    # Whitelist the checkout for the current user (safe.directory must live in
+    # the global config; git ignores it from plain -c).
+    _ensure_git_safe_dir(repo_path)
 
 
 def _execute_git_update(repo_path: str, prepared: bool = False) -> dict:
@@ -9381,18 +9426,10 @@ def _execute_git_update(repo_path: str, prepared: bool = False) -> dict:
             recovered = False
             err_lower = error_msg.lower()
 
-            # Lock file appeared during pull
+            # Lock file appeared during pull — clear every stale lock and retry
             if 'lock' in err_lower or 'another git process' in err_lower:
-                for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock'):
-                    lp = os.path.join(git_dir, lock_name)
-                    if os.path.isfile(lp):
-                        try:
-                            os.remove(lp)
-                            recovered = True
-                        except OSError:
-                            pass
-                if recovered:
-                    result['warnings'].append("Removed lock file and retrying pull")
+                _clear_git_locks(repo_path, result['warnings'])
+                recovered = True
 
             # Merge conflict or dirty state
             if 'conflict' in err_lower or 'merge' in err_lower or 'overwritten by merge' in err_lower:
@@ -9660,7 +9697,12 @@ def check_updates():
         repo_path = os.getcwd()
         
         logger.info(f"Checking for updates in repository: {repo_path}")
-        
+
+        # Self-heal before any git command so a check never dead-ends on a stale
+        # lock or a dubious-ownership error (same guards the update path uses).
+        _ensure_git_safe_dir(repo_path)
+        _clear_git_locks(repo_path, [])
+
         # Fetch latest changes from remote
         try:
             fetch_result = subprocess.run(['git', 'fetch'], cwd=repo_path, check=True, capture_output=True, text=True)
