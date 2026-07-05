@@ -18,6 +18,7 @@ import signal
 import logging
 import threading
 import time
+import math
 import subprocess
 import re
 import io
@@ -71,6 +72,15 @@ app = Flask(__name__,
             static_folder='web',
             template_folder='web')
 app.config['SECRET_KEY'] = auth_mgr.get_or_create_secret_key()
+# Cookie name must be unique per device: two Ragnar instances reached through
+# the same hostname (e.g. SSH tunnels on localhost:3000/3001) share one cookie
+# jar, and with Flask's default name 'session' each login overwrites the other
+# instance's cookie, logging it out (issue #361). The hardware fingerprint is
+# stable across reboots, so sessions survive restarts.
+try:
+    app.config['SESSION_COOKIE_NAME'] = 'ragnar_session_' + auth_mgr.get_hardware_fingerprint()[:12]
+except Exception:  # pragma: no cover - fingerprinting must never block startup
+    app.config['SESSION_COOKIE_NAME'] = 'ragnar_session'
 app.config['JSON_SORT_KEYS'] = False
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 
@@ -80,6 +90,15 @@ if flask_cors_available:
 
 # Initialize SocketIO for real-time updates
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Register Network > Diagnostics / Switch & L2 / Interfaces API routes.
+# Kept in a separate module (network_diagnostics.py) to keep this file lean;
+# wrapped in try/except so a problem there can never take down the web app.
+try:
+    from network_diagnostics import register_network_diagnostics
+    register_network_diagnostics(app, logger)
+except Exception as _nd_err:  # pragma: no cover - defensive
+    logger.error(f"Failed to register network diagnostics routes: {_nd_err}")
 
 # ============================================================================
 # AUTHENTICATION MIDDLEWARE
@@ -127,6 +146,1555 @@ def check_authentication():
         if path.startswith('/api/'):
             return jsonify({'error': 'Unauthorized', 'auth_required': True}), 401
         return redirect('/login')
+
+# ============================================================================
+# RUSENSE PROXY
+# Relay the RuView WiFi-CSI sensing-server to the embedded RuSense tab so the
+# browser only ever talks to Ragnar's own origin. Upstream defaults to the
+# local sensing-server (HTTP + raw WebSocket on :3000); override via env.
+# Imports are guarded: a missing dep degrades the proxy, never crashes Ragnar.
+# ============================================================================
+try:
+    import requests as _rusense_requests
+except Exception:  # pragma: no cover
+    _rusense_requests = None
+try:
+    import simple_websocket as _rusense_ws
+except Exception:  # pragma: no cover
+    _rusense_ws = None
+
+RUSENSE_UPSTREAM_HTTP = os.environ.get('RUSENSE_UPSTREAM_HTTP', 'http://127.0.0.1:3000')
+RUSENSE_UPSTREAM_WS = os.environ.get('RUSENSE_UPSTREAM_WS', 'ws://127.0.0.1:3000/ws/sensing')
+
+
+@app.route('/ws/sensing', websocket=True)
+def rusense_ws_proxy():
+    """Bridge the browser's raw WebSocket to the sensing-server's /ws/sensing."""
+    if _rusense_ws is None:
+        return Response('RuSense WebSocket support unavailable', status=503)
+    if request.environ.get('HTTP_UPGRADE', '').lower() != 'websocket':
+        return Response('RuSense WebSocket endpoint', status=426)
+    try:
+        client = _rusense_ws.Server(request.environ)
+    except Exception as exc:
+        logger.warning(f"[rusense] client ws upgrade failed: {exc}")
+        return ''
+
+    try:
+        upstream = _rusense_ws.Client(RUSENSE_UPSTREAM_WS)
+    except Exception as exc:
+        logger.info(f"[rusense] upstream sensing-server unavailable: {exc}")
+        try:
+            client.send(json.dumps({'type': 'error', 'error': 'sensing-server unavailable'}))
+        except Exception:
+            pass
+        client.close()
+        return ''
+
+    stop = threading.Event()
+
+    def pump_upstream_to_client():
+        try:
+            while not stop.is_set():
+                msg = upstream.receive(timeout=1)
+                if msg is None:
+                    if not upstream.connected:
+                        break
+                    continue
+                client.send(msg)
+        except Exception:
+            pass
+        finally:
+            stop.set()
+
+    pump = threading.Thread(target=pump_upstream_to_client, daemon=True)
+    pump.start()
+
+    try:
+        while not stop.is_set():
+            data = client.receive(timeout=1)
+            if data is None:
+                if not client.connected:
+                    break
+                continue
+            upstream.send(data)
+    except Exception:
+        pass
+    finally:
+        stop.set()
+        try:
+            upstream.close()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
+    return ''
+
+
+@app.route('/api/v1/<path:subpath>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+def rusense_api_proxy(subpath):
+    """Relay RuView REST calls (/api/v1/*) to the sensing-server."""
+    if _rusense_requests is None:
+        return jsonify({'error': 'proxy unavailable'}), 503
+    url = f"{RUSENSE_UPSTREAM_HTTP}/api/v1/{subpath}"
+    try:
+        resp = _rusense_requests.request(
+            method=request.method,
+            url=url,
+            params=request.args,
+            data=request.get_data(),
+            headers={'Content-Type': request.headers.get('Content-Type', 'application/json')},
+            timeout=8,
+        )
+    except _rusense_requests.RequestException as exc:
+        return jsonify({'error': 'sensing-server unavailable', 'detail': str(exc)}), 502
+
+    # Fallback for recording deletion: the bundled sensing-server's
+    # DELETE /api/v1/recording/{id} returns 404 for recordings it scanned from
+    # disk (it only tracks ones created in the current session), so the UI's ✕
+    # never works. When that happens, remove the .jsonl from data/recordings
+    # ourselves so delete is reliable for any id (including names with spaces).
+    if (request.method == 'DELETE' and resp.status_code == 404
+            and subpath.startswith('recording/')):
+        rid = subpath[len('recording/'):]
+        rec_dir = os.path.normpath(os.path.join(shared_data.currentdir, 'data', 'recordings'))
+        target = os.path.normpath(os.path.join(rec_dir, rid + '.jsonl'))
+        # Guard against path traversal — must stay inside data/recordings.
+        if target.startswith(rec_dir + os.sep) and os.path.isfile(target):
+            try:
+                os.remove(target)
+                logger.info(f"[rusense] deleted recording via fallback: {rid}")
+                return jsonify({'success': True, 'deleted': rid})
+            except OSError as exc:
+                return jsonify({'success': False, 'error': str(exc)}), 500
+
+    excluded = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
+    headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
+    return Response(resp.content, status=resp.status_code, headers=headers)
+
+
+# ── RuSense sensing alerts (camera-free surveillance notifications) ──────────
+# A lightweight background poller that watches the sensing-server's live output
+# and fires Pushover alerts on meaningful transitions: room occupied/empty,
+# motion onset, people-count threshold crossed, and CSI node offline. Running
+# server-side means alerts fire even when nobody has the RuSense tab open.
+# Edge detection lives here; enable/per-kind/cooldown gating lives in
+# PushoverService.notify_rusense(). The user configures it in the RuSense tab's
+# Settings view (rusense_notify_* keys), which persists via /api/config.
+# False-positive guards: an event only fires when the classifier confidence is
+# at/above rusense_notify_min_confidence AND the condition has held continuously
+# for at least rusense_notify_sustain_s (debounce). A momentary blip or a
+# low-confidence flicker never alerts.
+_rusense_notify_state = {
+    # name -> {'confirmed': bool|None, 'pending': bool|None, 'since': float}
+    'signals': {},
+    'node_active': set(),        # confirmed-active node_ids
+    'node_missing_since': {},    # node_id -> first-missing timestamp (debounce offline)
+    'nodes_initialized': False,  # node baseline established
+    'rssi_windows': {},          # node_id -> recent rssi_dbm samples (for geofence)
+    'last_geofence': None,       # last geofence verdict (for the debug endpoint)
+}
+_rusense_notify_lock = threading.Lock()
+
+# ── Sightings log ──────────────────────────────────────────────────────────
+# A reviewable history of the same confirmed presence events that fire the
+# Pushover "occupied" alert, so a person who has already left is still on record
+# with the vitals seen during their stay. Persisted as a small ring buffer so it
+# survives restarts. One "sighting" spans an occupancy episode: it is opened at
+# the confirmed presence rise, its heart-rate / breathing are filled in on later
+# passes (vitals lag first detection), and it is closed at the presence fall.
+_rusense_sightings_lock = threading.Lock()
+_RUSENSE_SIGHTINGS_MAX = 50
+
+# Presence is confirmed by the DUTY CYCLE of the raw presence signal, not by
+# confidence. Live tests: an empty room reads ~2% duty (≤20% in noisy windows)
+# at ~0.83 confidence; a STILL/sitting person reads ~35% duty at the SAME ~0.83
+# confidence; only a MOVING person's confidence rises (~1.0). So confidence
+# can't tell a still occupant from an empty room — duty can. These gate presence
+# for both alerts and the sightings log.
+_RUSENSE_PRES_WINDOW_S = 12.0    # rolling window (the notify loop samples ~1 Hz)
+_RUSENSE_PRES_MIN_SAMPLES = 5    # need a partly-full window before confirming
+_RUSENSE_PRES_ON = 0.18          # duty ≥ this → PRESENT (clears empty, catches sitting)
+_RUSENSE_PRES_OFF = 0.08         # duty ≤ this → EMPTY (hysteresis)
+# With an ADAPTIVE model loaded the picture shifts: the model emits present_still
+# classifications, so an EMPTY room's presence-duty rises from ~2% (model-less)
+# to ~15% overall with 12s-window peaks ~23% (live: 2-class present_still/absent
+# model). The model-less 18% gate then false-fires on an empty room. Raise the
+# gates when a model is active — a real sitter reads well above these (confirmed
+# by the user), an empty room stays below. Model-less keeps the low gates so a
+# still sitter (~27-40% duty) is never missed. See [[rusense-presence-hold]].
+_RUSENSE_PRES_ON_MODEL = 0.35    # empty peaks ~23% with a model → clear margin above
+_RUSENSE_PRES_OFF_MODEL = 0.18   # empty averages ~15% → clears; holds a real sitter
+# Grace window that bridges a brief presence fall (perimeter excursion / duty dip)
+# back to a rise, so one continuous occupancy is ONE sighting instead of several
+# fragments. Backend analog of the frontend presence-hold's lingerMs. Live tests
+# showed real re-entry gaps of ~9-19s during in/out movement → 20s covers them.
+_RUSENSE_SIGHTING_MERGE_S = 20.0
+
+
+def _rusense_model_active():
+    """Whether a trained model is active on the sensing-server (cached ~30s).
+    Confidence is only calibrated/trustworthy with a model loaded; model-less it
+    is uninformative (~0.5), so the confidence gates relax to avoid ever missing
+    real presence for lack of a model."""
+    now = time.time()
+    cache = _rusense_notify_state.get('model_active_cache')
+    if cache and (now - cache[1]) < 30:
+        return cache[0]
+    # Two independent kinds of model calibrate confidence:
+    #   • a loaded deep .rvf model  -> /api/v1/models/active .active
+    #   • the on-device ADAPTIVE classifier -> /api/v1/adaptive/status .loaded
+    # The adaptive one is NOT reported by models/active, so both must be checked
+    # (missing the adaptive endpoint made this gate think a trained room was
+    # "model-less" and wrongly relax to 0).
+    info = _rusense_get('/api/v1/models/active')
+    active = bool(isinstance(info, dict) and info.get('active'))
+    if not active:
+        ad = _rusense_get('/api/v1/adaptive/status')
+        active = bool(isinstance(ad, dict) and (ad.get('loaded') or ad.get('trained')
+                      or ad.get('trained_frames') or ad.get('classes')))
+    _rusense_notify_state['model_active_cache'] = (active, now)
+    return active
+
+
+def _rusense_sighting_min_conf():
+    """No confidence gate on sightings anymore — confidence can't distinguish a
+    still occupant from an empty room (both ~0.83). Presence is gated upstream by
+    the duty-cycle confirmation, so a confirmed sighting is already trustworthy.
+    Kept as a hook (returns 0 = keep all) so the endpoint/close/load code that
+    calls it stays unchanged."""
+    return 0.0
+
+
+def _rusense_sightings_file():
+    return os.path.join(shared_data.datadir, 'rusense_sightings.json')
+
+
+def _rusense_sightings_unlocked():
+    """Return the in-memory sightings list, loading it from disk on first use.
+    Caller must hold _rusense_sightings_lock."""
+    lst = _rusense_notify_state.get('sightings')
+    if lst is not None:
+        return lst
+    lst = []
+    try:
+        with open(_rusense_sightings_file(), 'r') as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, list):
+            lst = loaded[-_RUSENSE_SIGHTINGS_MAX:]
+    except (OSError, ValueError):
+        lst = []
+    # Close any sighting left "open" by a previous run — we can no longer keep
+    # counting it, so lock its duration at the last time it was seen (else the
+    # UI would show it ticking "live" forever after a restart).
+    dirty = False
+    for rec in lst:
+        if isinstance(rec, dict) and rec.get('ended_ts') is None:
+            rec['ended_ts'] = rec.get('last_seen') or rec.get('ts')
+            dirty = True
+    # NB: we don't prune stored sightings by confidence on load — a sighting
+    # logged while model-less (low but valid confidence) must survive restarts.
+    # Qualification is decided once, at close time, against the gate then in
+    # effect; closed sightings are kept permanently.
+    _rusense_notify_state['sightings'] = lst
+    if dirty:
+        _rusense_persist_sightings_unlocked()
+    return lst
+
+
+def _rusense_persist_sightings_unlocked():
+    """Atomically write the sightings list. Caller must hold the lock."""
+    lst = _rusense_notify_state.get('sightings') or []
+    path = _rusense_sightings_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, 'w') as fh:
+            json.dump(lst, fh, indent=2)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.error(f"[rusense] failed to persist sightings: {exc}")
+
+
+def _rusense_merge_vitals(rec, vs):
+    """Fold a vital-signs reading into an open sighting, keeping the highest-
+    confidence heart-rate / breathing seen so far. Returns True if changed."""
+    if not isinstance(vs, dict):
+        return False
+    changed = False
+    try:
+        hr, hc = vs.get('heart_rate_bpm'), float(vs.get('heartbeat_confidence') or 0)
+        if hr is not None and hc > 0 and hc >= float(rec.get('hr_conf') or 0):
+            rec['hr'], rec['hr_conf'] = round(float(hr)), round(hc, 3)
+            changed = True
+    except (TypeError, ValueError):
+        pass
+    try:
+        br, bc = vs.get('breathing_rate_bpm'), float(vs.get('breathing_confidence') or 0)
+        if br is not None and bc > 0 and bc >= float(rec.get('br_conf') or 0):
+            rec['br'], rec['br_conf'] = round(float(br), 1), round(bc, 3)
+            changed = True
+    except (TypeError, ValueError):
+        pass
+    return changed
+
+
+def _rusense_open_sighting(now, conf, people, motion_level, vs):
+    """Record a new sighting at a confirmed presence rise and keep it 'open'."""
+    with _rusense_sightings_lock:
+        lst = _rusense_sightings_unlocked()
+        rec = {
+            'ts': round(float(now), 3),          # epoch seconds (rendered local-time client-side)
+            'last_seen': round(float(now), 3),   # advanced each pass; locks the duration on close
+            'confidence': round(float(conf or 0), 3),
+            'people': int(people or 0),
+            'motion_level': str(motion_level or ''),
+            'hr': None, 'hr_conf': 0.0,
+            'br': None, 'br_conf': 0.0,
+            'ended_ts': None,
+        }
+        _rusense_merge_vitals(rec, vs)
+        lst.append(rec)
+        if len(lst) > _RUSENSE_SIGHTINGS_MAX:
+            del lst[:-_RUSENSE_SIGHTINGS_MAX]
+        _rusense_notify_state['open_sighting'] = rec
+        _rusense_persist_sightings_unlocked()
+
+
+def _rusense_update_sighting(now, conf, vs):
+    """Fill in vitals / bump peak confidence and advance last_seen on the open
+    sighting, if any. last_seen is persisted at most every ~5s (it changes every
+    pass) so a crash/restart still recovers a near-accurate duration."""
+    with _rusense_sightings_lock:
+        rec = _rusense_notify_state.get('open_sighting')
+        if not rec:
+            return
+        changed = _rusense_merge_vitals(rec, vs)
+        try:
+            if conf is not None and float(conf) > float(rec.get('confidence') or 0):
+                rec['confidence'] = round(float(conf), 3)
+                changed = True
+        except (TypeError, ValueError):
+            pass
+        rec['last_seen'] = round(float(now), 3)
+        last_persist = _rusense_notify_state.get('last_sighting_persist', 0)
+        if changed or (now - last_persist) >= 5:
+            _rusense_notify_state['last_sighting_persist'] = now
+            _rusense_persist_sightings_unlocked()
+
+
+def _rusense_close_sighting(now):
+    """Mark the open sighting ended at a confirmed presence fall."""
+    # Resolve the gate OUTSIDE the lock (it may do a cached HTTP check).
+    min_conf = _rusense_sighting_min_conf()
+    with _rusense_sightings_lock:
+        rec = _rusense_notify_state.get('open_sighting')
+        if not rec:
+            return
+        rec['ended_ts'] = round(float(now), 3)
+        rec['last_seen'] = round(float(now), 3)
+        _rusense_notify_state['open_sighting'] = None
+        # Discard the episode only if a MODEL was calibrating confidence and it
+        # still never reached the gate (a low-confidence vital-less blip = noise).
+        # Model-less the gate is 0, so every confirmed episode is kept — we lean
+        # on the presence rule + debounce and never drop real presence.
+        if (rec.get('confidence') or 0) < min_conf:
+            lst = _rusense_notify_state.get('sightings')
+            if isinstance(lst, list) and rec in lst:
+                lst.remove(rec)
+        _rusense_persist_sightings_unlocked()
+
+
+# ── Vitals history ───────────────────────────────────────────────────────────
+# Long-horizon record of heart-rate / breathing / activity for health trending
+# (the dashboard trend card). Instant vitals are inherently sparse — the engine
+# needs ~15s+ of a STILL subject per confident reading — so the health value is
+# the TREND: a resting breathing rate drifting up over days signals illness
+# earlier than any single reading. ~1 Hz passes are aggregated into fixed
+# buckets so a full week stays a few hundred KB on disk. Recorded in EVERY mode
+# (security/health) — the data is cheap and you want it even if the mode flips.
+_rusense_vitals_lock = threading.Lock()
+_RUSENSE_VITALS_BUCKET_S = 300       # one aggregate per 5 minutes
+_RUSENSE_VITALS_MAX_BUCKETS = 2016   # 7 days of 5-min buckets
+_RUSENSE_VITALS_MIN_CONF = 0.3       # parity with the UI vital display gate
+
+
+def _rusense_vitals_file():
+    return os.path.join(shared_data.datadir, 'rusense_vitals_history.json')
+
+
+def _rusense_vitals_unlocked():
+    """Return the in-memory bucket list, loading it from disk on first use.
+    Caller must hold _rusense_vitals_lock."""
+    lst = _rusense_notify_state.get('vitals_history')
+    if lst is not None:
+        return lst
+    lst = []
+    try:
+        with open(_rusense_vitals_file(), 'r') as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, list):
+            lst = loaded[-_RUSENSE_VITALS_MAX_BUCKETS:]
+    except (OSError, ValueError):
+        lst = []
+    _rusense_notify_state['vitals_history'] = lst
+    return lst
+
+
+def _rusense_persist_vitals_unlocked():
+    """Atomically write the bucket list (same pattern as the sightings ring).
+    Caller must hold the lock."""
+    lst = _rusense_notify_state.get('vitals_history') or []
+    path = _rusense_vitals_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, 'w') as fh:
+            json.dump(lst, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.error(f"[rusense] failed to persist vitals history: {exc}")
+
+
+def _rusense_vitals_record(now, vs, present):
+    """Fold one ~1 Hz notify pass into the current 5-min bucket; when the
+    bucket rolls over, compact the finished one into the persisted history.
+    Every pass contributes to the activity duty; HR/BR contribute only at
+    display-grade confidence (>= 0.3 — below that the engine is guessing).
+    A restart loses at most the one in-progress bucket."""
+    bucket_t = int(now - (now % _RUSENSE_VITALS_BUCKET_S))
+    with _rusense_vitals_lock:
+        cur = _rusense_notify_state.get('vitals_bucket')
+        if cur is not None and cur['t'] != bucket_t:
+            # Bucket rolled — finalize the finished one (avg/min/max/counts).
+            n = cur['n']
+            rec = {'t': cur['t'], 'n': n,
+                   'duty': round(cur['pres'] / n, 3) if n else 0.0}
+            if cur['hr_n']:
+                rec['hr'] = round(cur['hr_sum'] / cur['hr_n'], 1)
+                rec['hr_min'] = round(cur['hr_min'], 1)
+                rec['hr_max'] = round(cur['hr_max'], 1)
+                rec['hr_n'] = cur['hr_n']
+            if cur['br_n']:
+                rec['br'] = round(cur['br_sum'] / cur['br_n'], 1)
+                rec['br_min'] = round(cur['br_min'], 1)
+                rec['br_max'] = round(cur['br_max'], 1)
+                rec['br_n'] = cur['br_n']
+            lst = _rusense_vitals_unlocked()
+            lst.append(rec)
+            if len(lst) > _RUSENSE_VITALS_MAX_BUCKETS:
+                del lst[:-_RUSENSE_VITALS_MAX_BUCKETS]
+            _rusense_persist_vitals_unlocked()
+            cur = None
+        if cur is None:
+            cur = {'t': bucket_t, 'n': 0, 'pres': 0,
+                   'hr_sum': 0.0, 'hr_n': 0, 'hr_min': None, 'hr_max': None,
+                   'br_sum': 0.0, 'br_n': 0, 'br_min': None, 'br_max': None}
+            _rusense_notify_state['vitals_bucket'] = cur
+        cur['n'] += 1
+        if present:
+            cur['pres'] += 1
+        if isinstance(vs, dict):
+            try:
+                hr = vs.get('heart_rate_bpm')
+                hc = float(vs.get('heartbeat_confidence') or 0)
+                if hr is not None and hc >= _RUSENSE_VITALS_MIN_CONF:
+                    hr = float(hr)
+                    cur['hr_sum'] += hr
+                    cur['hr_n'] += 1
+                    cur['hr_min'] = hr if cur['hr_min'] is None else min(cur['hr_min'], hr)
+                    cur['hr_max'] = hr if cur['hr_max'] is None else max(cur['hr_max'], hr)
+            except (TypeError, ValueError):
+                pass
+            try:
+                br = vs.get('breathing_rate_bpm')
+                bc = float(vs.get('breathing_confidence') or 0)
+                if br is not None and bc >= _RUSENSE_VITALS_MIN_CONF:
+                    br = float(br)
+                    cur['br_sum'] += br
+                    cur['br_n'] += 1
+                    cur['br_min'] = br if cur['br_min'] is None else min(cur['br_min'], br)
+                    cur['br_max'] = br if cur['br_max'] is None else max(cur['br_max'], br)
+            except (TypeError, ValueError):
+                pass
+
+
+def _rusense_inactivity_check(po, notify_on, now, present):
+    """Health-mode safety net — the INVERSE of the presence alert. Fires when a
+    home that should be occupied shows NO activity for N awake-hours (a fall,
+    not getting out of bed). The quiet/sleep window is excluded: the gap is
+    measured from the LATER of the last real activity or this morning's
+    quiet-end, so 8h of normal sleep never trips a 4h limit at wake-up. One
+    alert per inactivity episode per day; any activity re-arms it. Only the
+    ~1 Hz notify loop touches this state, so no lock is needed."""
+    if present:
+        _rusense_notify_state['last_activity_ts'] = now
+        _rusense_notify_state['inactivity_alerted'] = False
+        return
+    if not shared_data.config.get('rusense_notify_inactivity', False):
+        return
+    try:
+        limit_h = float(shared_data.config.get('rusense_inactivity_hours', 4))
+    except (TypeError, ValueError):
+        limit_h = 4.0
+    limit_h = max(0.5, limit_h)
+    try:
+        q0 = int(shared_data.config.get('rusense_quiet_start', 22)) % 24
+        q1 = int(shared_data.config.get('rusense_quiet_end', 7)) % 24
+    except (TypeError, ValueError):
+        q0, q1 = 22, 7
+    lt = time.localtime(now)
+    in_quiet = (lt.tm_hour >= q0 or lt.tm_hour < q1) if q0 > q1 else (q0 <= lt.tm_hour < q1)
+    if in_quiet:
+        return          # sleeping is not inactivity
+    last = _rusense_notify_state.get('last_activity_ts')
+    if last is None:
+        # Process start counts as activity, so a reboot never fires stale.
+        _rusense_notify_state['last_activity_ts'] = now
+        return
+    # This morning's quiet-end, as an epoch baseline (only if already past).
+    day_start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, q1, 0, 0,
+                             lt.tm_wday, lt.tm_yday, -1))
+    baseline = max(last, day_start) if day_start <= now else last
+    gap_h = (now - baseline) / 3600.0
+    if gap_h < limit_h:
+        # Each morning the baseline resets to quiet-end, dropping the gap below
+        # the limit again — re-arming here gives one fresh alert per day while
+        # the inactivity persists.
+        _rusense_notify_state['inactivity_alerted'] = False
+        return
+    if _rusense_notify_state.get('inactivity_alerted'):
+        return
+    _rusense_notify_state['inactivity_alerted'] = True
+    logger.info(f"[rusense] inactivity confirmed: {gap_h:.1f}h without activity "
+                f"(limit {limit_h:g}h, quiet {q0:02d}-{q1:02d})")
+    if notify_on:
+        po.notify_rusense(
+            'inactivity',
+            f"\u26A0\uFE0F No activity detected for {gap_h:.0f}+ hours during awake "
+            f"time — a monitored space that is normally occupied has gone quiet. "
+            f"Consider checking in.",
+            title="RuSense — Inactivity", priority=1)
+
+
+def _rusense_within_alert_schedule(now):
+    """Whether SURVEILLANCE alerts (presence/motion/people) are permitted right
+    now. Off by default → always True (fire 24/7). When enabled, alerts fire
+    only on the selected weekdays within the daily time window (e.g. weekends
+    only, or nights only for an office that should then be empty). Sightings are
+    still recorded outside the window — only the phone push is held. Days use JS
+    getDay() convention (0=Sun..6=Sat) to match the Settings UI; the weekday is
+    read at the current clock time (an overnight window spanning midnight is
+    attributed to the day it lands on)."""
+    if not shared_data.config.get('rusense_alert_schedule_enabled', False):
+        return True
+    lt = time.localtime(now)
+    js_dow = (lt.tm_wday + 1) % 7          # tm_wday Mon=0..Sun=6 -> JS Sun=0..Sat=6
+    days = shared_data.config.get('rusense_alert_days')
+    if isinstance(days, (list, tuple)) and js_dow not in days:
+        return False
+    try:
+        start = int(shared_data.config.get('rusense_alert_start', 0)) % 24
+        end = int(shared_data.config.get('rusense_alert_end', 0)) % 24
+    except (TypeError, ValueError):
+        return True
+    if start == end:
+        return True                        # whole day
+    h = lt.tm_hour
+    return (start <= h < end) if start < end else (h >= start or h < end)
+
+
+# ── Geofence (server-side port of web/rusense/services/geofence.service.js) ──
+# Confines motion/presence/people alerts to the polygon of mapped node corners,
+# rejecting disturbances whose spatial signature points outside the room
+# (hallway walk-bys, through-wall neighbours). Same math as the browser
+# prototype so the on-screen verdict and the alert gate agree. Tunables mirror
+# the JS GEOFENCE_DEFAULTS; the window size is config-driven (backend polls ~1 Hz,
+# not at frame rate, so it samples RSSI more coarsely than the browser does).
+_GF_DBM_SCALE = 2.0              # dBm of RSSI std mapping to ~0.63 disturbance
+_GF_HOT_THRESHOLD = 0.35         # a node counts as "disturbed" above this (0..1)
+_GF_MIN_HOT_NODES = 2            # corroboration floor — kills single-corner walk-bys
+_GF_INSET_FRACTION = 0.08        # shrink polygon toward centre; boundary leans "outside"
+_GF_MIN_TOTAL_DISTURBANCE = 0.5  # floor so idle jitter stays quiet
+
+
+def _gf_finite(v):
+    try:
+        return v is not None and math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _gf_std(arr):
+    n = len(arr)
+    if n < 2:
+        return 0.0
+    m = sum(arr) / n
+    return math.sqrt(sum((x - m) ** 2 for x in arr) / n)
+
+
+def _gf_convex_hull(pts):
+    """Andrew's monotone chain. pts=[{'x','y','id'}] -> ordered ring."""
+    p = sorted(pts, key=lambda q: (q['x'], q['y']))
+    if len(p) < 3:
+        return p
+    def cross(o, a, b):
+        return (a['x']-o['x'])*(b['y']-o['y']) - (a['y']-o['y'])*(b['x']-o['x'])
+    lower = []
+    for q in p:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], q) <= 0:
+            lower.pop()
+        lower.append(q)
+    upper = []
+    for q in reversed(p):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], q) <= 0:
+            upper.pop()
+        upper.append(q)
+    return lower[:-1] + upper[:-1]
+
+
+def _gf_point_in_polygon(pt, poly):
+    if not poly or len(poly) < 3:
+        return False
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]['x'], poly[i]['y']
+        xj, yj = poly[j]['x'], poly[j]['y']
+        if ((yi > pt['y']) != (yj > pt['y'])) and \
+           (pt['x'] < (xj - xi) * (pt['y'] - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _gf_inset(poly, frac):
+    if not poly or len(poly) < 3 or not frac:
+        return poly
+    n = len(poly)
+    cx = sum(p['x'] for p in poly) / n
+    cy = sum(p['y'] for p in poly) / n
+    return [{'x': p['x'] + (cx - p['x']) * frac, 'y': p['y'] + (cy - p['y']) * frac}
+            for p in poly]
+
+
+def _rusense_geofence_verdict(positions, windows):
+    """Port of evaluateGeofence(). positions={id:{x,y,z}}, windows={id:[rssi…]}.
+    Returns a dict incl. ok, energetic, corroborated, interior, inside_perimeter,
+    reason, hot_count, total. ok=False when fewer than 3 corners are mapped."""
+    nodes = []
+    for nid, pos in (positions or {}).items():
+        if not isinstance(pos, dict) or not _gf_finite(pos.get('x')) or not _gf_finite(pos.get('y')):
+            continue
+        win = windows.get(str(nid)) or []
+        disturbance = 1.0 - math.exp(-_gf_std(win) / (_GF_DBM_SCALE or 1e-9))
+        nodes.append({'id': str(nid), 'x': float(pos['x']), 'y': float(pos['y']),
+                      'disturbance': disturbance, 'hot': disturbance >= _GF_HOT_THRESHOLD})
+    if len(nodes) < 3:
+        return {'ok': False, 'reason': 'need >=3 mapped node corners', 'inside_perimeter': False,
+                'energetic': False, 'corroborated': False, 'interior': False,
+                'hot_count': 0, 'total': 0.0, 'mapped': len(nodes)}
+    hull = _gf_convex_hull(nodes)
+    inset = _gf_inset(hull, _GF_INSET_FRACTION)
+    total = sum(n['disturbance'] for n in nodes)
+    centroid = None
+    if total > 1e-6:
+        centroid = {'x': sum(n['x'] * n['disturbance'] for n in nodes) / total,
+                    'y': sum(n['y'] * n['disturbance'] for n in nodes) / total}
+    hot_count = sum(1 for n in nodes if n['hot'])
+    interior = _gf_point_in_polygon(centroid, inset) if centroid else False
+    corroborated = hot_count >= _GF_MIN_HOT_NODES
+    energetic = total >= _GF_MIN_TOTAL_DISTURBANCE
+    inside_perimeter = interior and corroborated and energetic
+    if not energetic:
+        reason = 'quiet'
+    elif not corroborated:
+        reason = f'edge/outside — only {hot_count} corner(s) disturbed'
+    elif not interior:
+        reason = 'disturbance centroid outside perimeter'
+    else:
+        reason = 'inside perimeter'
+    return {'ok': True, 'reason': reason, 'inside_perimeter': inside_perimeter,
+            'energetic': energetic, 'corroborated': corroborated, 'interior': interior,
+            'hot_count': hot_count, 'total': round(total, 3), 'mapped': len(nodes)}
+
+
+def _rusense_get(path):
+    """GET JSON from the local sensing-server; None on any failure."""
+    if _rusense_requests is None:
+        return None
+    try:
+        resp = _rusense_requests.get(f"{RUSENSE_UPSTREAM_HTTP}{path}", timeout=4)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _rusense_node_label(nid):
+    """Friendly node name from config (set in the Settings floor plan), else #id.
+    Persisted in rusense_node_names so alerts say "Living room" not "#2"."""
+    names = shared_data.config.get('rusense_node_names') or {}
+    name = names.get(str(nid))
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return f"#{nid}"
+
+
+def _rusense_pushover():
+    """Return the shared PushoverService, creating it once if needed."""
+    po = getattr(shared_data, '_pushover_service', None)
+    if po is None:
+        try:
+            from pushover_service import PushoverService
+            po = PushoverService(shared_data)
+            shared_data._pushover_service = po
+        except Exception as exc:
+            logger.debug(f"[rusense] pushover init failed: {exc}")
+            return None
+    return po
+
+
+def _rusense_debounce(name, raw, now, sustain):
+    """Debounced edge detector for one boolean signal. Returns (rose, fell):
+    True only when the *confirmed* state flips this call (never on the initial
+    baseline). A change is confirmed only after `raw` differs from the confirmed
+    value continuously for `sustain` seconds. Pass raw=None for samples that
+    shouldn't count (e.g. confidence too low) — they neither advance nor reset
+    a pending timer. Caller must hold _rusense_notify_lock."""
+    sig = _rusense_notify_state['signals'].setdefault(
+        name, {'confirmed': None, 'pending': None, 'since': 0.0})
+    if raw is None:
+        return False, False
+    if sig['confirmed'] is None:
+        sig['confirmed'] = raw          # establish baseline silently
+        sig['pending'] = None
+        return False, False
+    if raw == sig['confirmed']:
+        sig['pending'] = None           # condition reverted — back to stable
+        return False, False
+    # raw differs from the confirmed state — start/continue the debounce timer
+    if sig['pending'] != raw:
+        sig['pending'] = raw
+        sig['since'] = now
+        return False, False
+    if now - sig['since'] >= sustain:
+        sig['confirmed'] = raw
+        sig['pending'] = None
+        return raw is True, raw is False
+    return False, False
+
+
+def _rusense_check_once():
+    """One evaluation pass: read sensing + nodes, fire alerts on *confirmed*
+    transitions. Returns True when alerts are enabled (drives loop cadence)."""
+    po = _rusense_pushover()
+    # Phone alerts require Pushover configured + enabled + the master flag. The
+    # sighting history is logged regardless, so this gates only the notify sends
+    # (guarded at each call site) — the sensing read + debounce always run.
+    notify_on = bool(
+        shared_data.config.get('rusense_notify_enabled', False)   # cheap dict lookup first
+        and po is not None
+        and po.is_enabled()                                       # reads .env — only if flag on
+    )
+
+    try:
+        min_conf = float(shared_data.config.get('rusense_notify_min_confidence', 0.95))
+    except (TypeError, ValueError):
+        min_conf = 0.95
+    # Confidence only means something with a trained model. Model-less it is
+    # uncalibrated (~0.5), so a high bar would silently drop real presence —
+    # relax the gate to 0 and lean on the motion-corroborated presence rule +
+    # sustain debounce instead. Never miss presence for lack of a model.
+    has_model = _rusense_model_active()
+    if not has_model:
+        min_conf = 0.0
+    # Duty gates are model-aware: a loaded model lifts the empty-room baseline
+    # (see the constants above), so use the higher gates then.
+    pres_on = _RUSENSE_PRES_ON_MODEL if has_model else _RUSENSE_PRES_ON
+    pres_off = _RUSENSE_PRES_OFF_MODEL if has_model else _RUSENSE_PRES_OFF
+    try:
+        sustain = float(shared_data.config.get('rusense_notify_sustain_s', 2))
+    except (TypeError, ValueError):
+        sustain = 2.0
+    try:
+        gf_window = int(shared_data.config.get('rusense_geofence_window', 30))
+    except (TypeError, ValueError):
+        gf_window = 30
+    gf_window = max(4, min(600, gf_window))
+    gf_enabled = bool(shared_data.config.get('rusense_geofence_enabled', True))
+    now = time.time()
+    # Surveillance alerts also respect the permitted-times schedule (if enabled);
+    # node-offline + inactivity keep plain notify_on (maintenance / health).
+    alerts_now = notify_on and _rusense_within_alert_schedule(now)
+
+    # ── Nodes first: the roster feeds BOTH the geofence RSSI windows and the
+    #    offline detector, so fetch it once and reuse it. ──
+    nodes = _rusense_get('/api/v1/nodes')
+    node_list = nodes.get('nodes') if isinstance(nodes, dict) else None
+    if not isinstance(node_list, list):
+        node_list = None
+
+    # Extend per-node RSSI windows and evaluate the geofence verdict. A "ghost"
+    # is a disturbance with real energy that is NOT corroborated/interior — i.e.
+    # a walk-by or through-wall neighbour. When detected we suppress the
+    # occupied/motion/people RISE alerts (the "empty" alert is never a ghost).
+    block_motion = False
+    node_people = None
+    if node_list is not None:
+        # Per-node person_count is the only count the engine exposes (there is no
+        # reliable aggregate). It ghosts on individual nodes, so take the MEDIAN
+        # across active nodes — a single node spiking (e.g. node 2 → 3) can't move
+        # the median, so a count is only believed when a majority of nodes agree.
+        counts = sorted(int(n['person_count']) for n in node_list
+                        if n.get('status') == 'active'
+                        and isinstance(n.get('person_count'), (int, float)))
+        if counts:
+            node_people = counts[(len(counts) - 1) // 2]   # lower median (conservative)
+        with _rusense_notify_lock:
+            windows = _rusense_notify_state['rssi_windows']
+            seen = set()
+            for n in node_list:
+                nid, rssi = n.get('node_id'), n.get('rssi_dbm')
+                if nid is None or rssi is None:
+                    continue
+                key = str(nid)
+                seen.add(key)
+                try:
+                    val = float(rssi)
+                except (TypeError, ValueError):
+                    continue
+                w = windows.setdefault(key, [])
+                w.append(val)
+                if len(w) > gf_window:
+                    del w[:-gf_window]
+            for key in list(windows.keys()):   # drop windows for vanished nodes
+                if key not in seen:
+                    del windows[key]
+            positions = shared_data.config.get('rusense_node_positions') or {}
+            verdict = _rusense_geofence_verdict(positions, windows) if gf_enabled else None
+            _rusense_notify_state['last_geofence'] = verdict
+        if verdict and verdict.get('ok') and verdict.get('energetic') and not verdict.get('inside_perimeter'):
+            block_motion = True
+
+    # ── Presence / motion / people, from the latest sensing frame ──
+    latest = _rusense_get('/api/v1/sensing/latest')
+    if latest:
+        cls = latest.get('classification') or {}
+        present_agg = bool(cls.get('presence'))
+        # A *motionless* body makes the aggregate `presence` boolean flicker, so
+        # the per-node classification is a useful still-body signal. BUT a single
+        # node false-fires on its own (live: one weak/edge node reads
+        # present_still ~4-6% of the time in an EMPTY apartment — a through-wall
+        # neighbour or RF noise near that node), and a lone node was enough to
+        # confirm presence → phantom alerts. So require a QUORUM: at least two
+        # non-stale nodes must agree before the node path confirms presence (with
+        # only one node total, fall back to that one). A real occupant perturbs
+        # the CSI to multiple nodes and/or lights up the fused aggregate below,
+        # so this keeps real detection while killing lone-node phantoms — the
+        # same corroboration rule the people-count already uses. See
+        # [[rusense-presence-hold]].
+        node_hits = 0
+        node_total = 0
+        for nf in (latest.get('node_features') or []):
+            if nf.get('stale'):
+                continue
+            node_total += 1
+            ncls = nf.get('classification') or {}
+            if ncls.get('presence') or str(ncls.get('motion_level') or '').startswith('present'):
+                node_hits += 1
+        # Base presence on the engine's MOTION CLASSIFIER, not the raw `presence`
+        # boolean (a still subject flickers the boolean; motion_level is steadier).
+        motion_level = str(cls.get('motion_level') or '')
+        engine_present = motion_level.startswith('present') or motion_level == 'active'
+        # Corroborated presence: require TWO independent votes before confirming.
+        # The fused aggregate motion classifier is ONE vote; each non-stale node
+        # is one vote. This rejects the two live failure modes seen in an EMPTY
+        # apartment: (a) a single weak/edge node twitching alone (through-wall
+        # neighbour / RF noise), and (b) the aggregate motion heuristic firing on
+        # an environmental RF burst — HVAC, fridge, hallway — for 10+ s with NO
+        # node agreeing (this alone crossed the duty gate and lingered PRESENT for
+        # minutes in a 15-min soak). A real occupant perturbs the CSI to multiple
+        # nodes AND/OR the aggregate, so it clears 2 votes easily. With only one
+        # node deployed there can't be 2 votes, so fall back to "any signal".
+        votes = (1 if engine_present else 0) + node_hits
+        if node_total >= 2:
+            present = votes >= 2
+        else:
+            present = engine_present or node_hits >= 1
+        motion_active = motion_level == 'active'
+        conf = cls.get('confidence')
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            conf = None
+        # Confidence may arrive as 0..1 or 0..100; normalise to a fraction.
+        if conf is not None and conf > 1.0:
+            conf = conf / 100.0
+        confident = conf is not None and conf >= min_conf
+
+        # Prefer the corroborated per-node median (node_people); fall back to any
+        # top-level count field the engine might provide, then to presence.
+        if node_people is not None:
+            people = node_people
+        else:
+            people = latest.get('estimated_persons')
+            if people is None:
+                people = latest.get('total_persons')
+            if people is None:
+                persons = latest.get('persons')
+                people = len(persons) if isinstance(persons, list) else (1 if present else 0)
+            try:
+                people = int(people)
+            except (TypeError, ValueError):
+                people = 1 if present else 0
+        try:
+            threshold = int(shared_data.config.get('rusense_notify_people_threshold', 1))
+        except (TypeError, ValueError):
+            threshold = 1
+        people_over = people >= threshold if threshold > 0 else people > 0
+
+        with _rusense_notify_lock:
+            # Presence: confidence can't tell a still occupant from an empty room
+            # (both ~0.83), so confirm by the DUTY CYCLE of the raw presence signal
+            # over a rolling window, with hysteresis. Empty ~2% < ON, sitting ~35%
+            # ≥ ON. This drives both the alert and the sighting log.
+            win = _rusense_notify_state.setdefault('presence_window', [])
+            win.append((now, bool(present)))
+            cutoff = now - _RUSENSE_PRES_WINDOW_S
+            while win and win[0][0] < cutoff:
+                win.pop(0)
+            duty = (sum(1 for _t, p in win if p) / len(win)) if win else 0.0
+            prev_state = _rusense_notify_state.get('presence_state', False)
+            new_state = prev_state
+            if not prev_state and len(win) >= _RUSENSE_PRES_MIN_SAMPLES and duty >= pres_on:
+                new_state = True
+            elif prev_state and duty <= pres_off:
+                new_state = False
+            _rusense_notify_state['presence_state'] = new_state
+            p_rose = new_state and not prev_state
+            p_fell = prev_state and not new_state
+            # Motion / people keep the confidence-gated debounce — confidence is
+            # reliable for a MOVING person (~1.0), which is what these fire on.
+            m_rose, _m_fell = _rusense_debounce('motion', motion_active if confident else None, now, sustain)
+            o_rose, _o_fell = _rusense_debounce('people', people_over if confident else None, now, sustain)
+
+        if (p_rose or m_rose or o_rose) and block_motion:
+            logger.info(f"[rusense] geofence suppressed alert — {verdict.get('reason')} "
+                        f"(hot={verdict.get('hot_count')}, total={verdict.get('total')})")
+
+        vitals = latest.get('vital_signs') if isinstance(latest, dict) else None
+        # Health trending: every pass feeds the vitals/activity history
+        # (confident HR/BR + raw presence duty), independent of alerts.
+        _rusense_vitals_record(now, vitals, present)
+        # Sighting lifecycle with a grace window (deferred close): a brief
+        # presence fall does NOT close the episode immediately — it is held
+        # 'pending' so a re-entry within _RUSENSE_SIGHTING_MERGE_S resumes the
+        # SAME sighting (no fragmentation, no spurious empty→presence alert pair).
+        pending = _rusense_notify_state.get('pending_close_ts')
+        if p_rose:
+            if (pending is not None
+                    and _rusense_notify_state.get('open_sighting') is not None
+                    and (now - pending) <= _RUSENSE_SIGHTING_MERGE_S):
+                # Brief gap bridged — the space was never really empty. Resume.
+                _rusense_notify_state['pending_close_ts'] = None
+            else:
+                # A genuinely new presence. Finalize any stale pending close first.
+                if pending is not None:
+                    _rusense_close_sighting(pending)
+                    _rusense_notify_state['pending_close_ts'] = None
+                if not block_motion:
+                    if alerts_now:
+                        who = f"{people} people" if people > 1 else "Someone"
+                        po.notify_rusense(
+                            'presence',
+                            f"\U0001F441️ {who} detected — a monitored space is now occupied.",
+                            title="RuSense — Presence", priority=1)
+                    # Log the sighting whether or not the phone alert fired, so it
+                    # stays reviewable (geofence walk-by is not logged).
+                    _rusense_open_sighting(now, conf, people, cls.get('motion_level'), vitals)
+        elif p_fell:
+            # Defer the close; finalized below if no re-entry within the window.
+            _rusense_notify_state['pending_close_ts'] = (
+                now if _rusense_notify_state.get('open_sighting') is not None else None)
+
+        # Finalize a deferred close once the grace window elapses with no re-entry.
+        pending = _rusense_notify_state.get('pending_close_ts')
+        if pending is not None and (now - pending) > _RUSENSE_SIGHTING_MERGE_S:
+            if alerts_now:
+                po.notify_rusense(
+                    'presence',
+                    "\U0001F6E1️ A monitored space is now empty.",
+                    title="RuSense — Empty")
+            _rusense_close_sighting(pending)  # ends at the moment it actually fell
+            _rusense_notify_state['pending_close_ts'] = None
+        # Vitals lag first detection, so keep filling in the open sighting while
+        # the space stays occupied (no-op when there is no open sighting).
+        if present:
+            _rusense_update_sighting(now, conf if confident else None, vitals)
+        # Publish the smoothed, model-aware presence decision (the SAME state that
+        # gates alerts) for the dashboard to render — one source of truth instead
+        # of the frontend re-deriving presence from a noisier 2s window.
+        bk_present = _rusense_notify_state.get('presence_state', False)
+        _rusense_notify_state['presence_pub'] = {
+            'present': bool(bk_present),
+            'people': max(1, int(people or 0)) if bk_present else 0,
+            'motion_level': (motion_level or 'present') if bk_present else 'absent',
+            'confidence': conf,
+            'model_active': bool(has_model),
+            'ts': now,
+        }
+        if alerts_now and m_rose and not block_motion:
+            po.notify_rusense(
+                'motion',
+                "\U0001F3C3 Motion detected in a monitored space.",
+                title="RuSense — Motion")
+        if alerts_now and o_rose and not block_motion:
+            po.notify_rusense(
+                'people',
+                f"\U0001F465 {people} people detected (threshold {threshold}).",
+                title="RuSense — People", priority=1)
+        # ── Inactivity (health): inverse of the presence alert — fires when an
+        #    expected-occupied home shows no activity for N awake-hours. ──
+        _rusense_inactivity_check(po, notify_on, now, present)
+
+    # ── CSI node offline detection (debounced: must be gone for `sustain`) ──
+    if node_list is not None:
+        active_now = {str(n.get('node_id')) for n in node_list
+                      if n.get('status') == 'active' and n.get('node_id') is not None}
+        newly_offline = []
+        with _rusense_notify_lock:
+            if not _rusense_notify_state['nodes_initialized']:
+                _rusense_notify_state['node_active'] = set(active_now)
+                _rusense_notify_state['nodes_initialized'] = True
+            else:
+                confirmed = _rusense_notify_state['node_active']
+                missing_since = _rusense_notify_state['node_missing_since']
+                for nid in active_now:
+                    missing_since.pop(nid, None)           # back online — clear timer
+                for nid in list(confirmed):
+                    if nid in active_now:
+                        continue
+                    t0 = missing_since.get(nid)
+                    if t0 is None:
+                        missing_since[nid] = now           # start offline debounce
+                    elif now - t0 >= sustain:
+                        newly_offline.append(nid)
+                        missing_since.pop(nid, None)
+                # confirmed-active = (previously confirmed ∪ now active) − confirmed-offline
+                _rusense_notify_state['node_active'] = (confirmed | active_now) - set(newly_offline)
+        if notify_on and newly_offline:
+            ids = ", ".join(_rusense_node_label(x) for x in sorted(newly_offline))
+            po.notify_rusense(
+                'node_offline',
+                f"\U0001F4E1 CSI sensor node(s) offline: {ids}. Sensing coverage reduced.",
+                title="RuSense — Node Offline", priority=1)
+    # Poll ~1 Hz whenever the sensing backend is reachable so sightings capture
+    # accurately; fall back to the slow idle cadence only when it is unreachable.
+    return bool(latest) or (node_list is not None)
+
+
+def _rusense_notify_loop():
+    """Background poller for RuSense sensing. Runs for the life of the process;
+    records the sighting history whenever the sensing backend is reachable and
+    additionally sends Pushover alerts when those are enabled."""
+    import time as _time
+    # Let the sensing-server and pushover service settle before the first read.
+    _time.sleep(10)
+    while True:
+        active = False
+        try:
+            active = _rusense_check_once()
+        except Exception as exc:
+            logger.debug(f"[rusense] notify check failed: {exc}")
+        # Poll ~1 Hz while the backend is reachable so the sustain window and
+        # sighting vitals are captured accurately; idle slowly when it is not.
+        _time.sleep(1 if active else 5)
+
+
+@app.route('/api/rusense/geofence', methods=['GET'])
+def rusense_geofence_status():
+    """Diagnostic: the geofence's last verdict + how many node corners are
+    mapped. Lets you validate that alert confinement is actually working."""
+    with _rusense_notify_lock:
+        verdict = _rusense_notify_state.get('last_geofence')
+    positions = shared_data.config.get('rusense_node_positions') or {}
+    mapped = sum(1 for p in positions.values()
+                 if isinstance(p, dict) and _gf_finite(p.get('x')) and _gf_finite(p.get('y')))
+    return jsonify({
+        'enabled': bool(shared_data.config.get('rusense_geofence_enabled', True)),
+        'mapped_nodes': mapped,
+        'active': bool(verdict and verdict.get('ok')),
+        'verdict': verdict,
+        'note': ('Geofence gates alerts only with >=3 node corners mapped (X/Y) in '
+                 'the Settings tab. With fewer mapped it is a no-op.'),
+    })
+
+
+@app.route('/api/rusense/sightings', methods=['GET'])
+def rusense_sightings():
+    """Recent presence sightings, newest first — a reviewable history of the
+    confirmed occupancy events that also fire the Pushover alert, with the
+    heart-rate / breathing seen during each stay. Survives the person leaving."""
+    min_conf = _rusense_sighting_min_conf()
+    with _rusense_sightings_lock:
+        lst = list(_rusense_sightings_unlocked())
+    # Closed sightings were already vetted at close time and are shown as-is; a
+    # still-open episode is shown only once it clears the current gate (model-less
+    # the gate is 0, so it shows as soon as presence is confirmed).
+    lst = [s for s in lst if s.get('ended_ts') is not None
+           or (s.get('confidence') or 0) >= min_conf]
+    lst = lst[::-1]  # newest first
+    return jsonify({'success': True, 'count': len(lst), 'sightings': lst})
+
+
+@app.route('/api/rusense/presence', methods=['GET'])
+def rusense_presence():
+    """The backend's authoritative presence decision — the same smoothed,
+    model-aware, duty-cycle state that gates alerts/sightings. The dashboard
+    renders THIS so it never disagrees with the alerts (and doesn't need to
+    re-tune its own gate per model). age_s lets the client fall back to its live
+    stream if the backend loop has stalled."""
+    pub = _rusense_notify_state.get('presence_pub') or {}
+    ts = pub.get('ts')
+    return jsonify({
+        'success': True,
+        'present': bool(pub.get('present', False)),
+        'people': int(pub.get('people', 0)),
+        'motion_level': pub.get('motion_level', 'absent'),
+        'confidence': pub.get('confidence'),
+        'model_active': bool(pub.get('model_active', False)),
+        'age_s': (round(time.time() - ts, 1) if ts else None),
+    })
+
+
+@app.route('/api/rusense/recording/download', methods=['GET'])
+def rusense_recording_download():
+    """Download a raw CSI recording (data/recordings/<id>.jsonl) as a file, so a
+    dataset captured on one deployment can be moved to another. Streamed via
+    send_from_directory (handles large files + range requests). Path-traversal
+    guarded to stay inside data/recordings."""
+    rid = request.args.get('id', '')
+    rec_dir = os.path.normpath(os.path.join(shared_data.currentdir, 'data', 'recordings'))
+    target = os.path.normpath(os.path.join(rec_dir, rid + '.jsonl'))
+    if not (target.startswith(rec_dir + os.sep) and os.path.isfile(target)):
+        return jsonify({'success': False, 'error': 'recording not found'}), 404
+    return send_from_directory(
+        rec_dir, os.path.basename(target), as_attachment=True,
+        download_name=os.path.basename(target), mimetype='application/x-ndjson')
+
+
+@app.route('/api/rusense/diagnostics', methods=['GET'])
+def rusense_diagnostics():
+    """One-shot deep diagnostics bundle for CSI-node debugging. Runs the exact
+    server-side commands a human would (tcpdump on the CSI UDP port, journalctl
+    for the sensing engine, ss/systemctl, system + wifi state, binary md5s) AND
+    the sensing-server API snapshots, so the Nodes-tab 'Download logs' captures
+    EVERYTHING in one file. Local route; the webapp runs as root so the shell
+    commands work. ?secs=6 controls the tcpdump window (2-20)."""
+    import subprocess
+    import hashlib
+    try:
+        secs = int(request.args.get('secs', 6))
+    except (TypeError, ValueError):
+        secs = 6
+    secs = max(2, min(20, secs))
+
+    def run(cmd, timeout=12):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return {'cmd': ' '.join(cmd), 'rc': r.returncode,
+                    'stdout': (r.stdout or '')[-24000:], 'stderr': (r.stderr or '')[-4000:]}
+        except FileNotFoundError:
+            return {'cmd': ' '.join(cmd), 'error': 'command not installed'}
+        except subprocess.TimeoutExpired:
+            return {'cmd': ' '.join(cmd), 'error': f'timeout after {timeout}s'}
+        except Exception as exc:
+            return {'cmd': ' '.join(cmd), 'error': str(exc)}
+
+    def md5(path):
+        try:
+            h = hashlib.md5()
+            with open(path, 'rb') as fh:
+                for chunk in iter(lambda: fh.read(65536), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception as exc:
+            return f'err: {exc}'
+
+    # tcpdump the CSI UDP port for `secs` (bounded by packet count too). `-i any`
+    # is portable; the raw lines carry source IP + payload length per packet.
+    udp = run(['timeout', str(secs), 'tcpdump', '-i', 'any', '-n', '-c', '500',
+               'udp', 'port', '5005'], timeout=secs + 8)
+
+    def analyze_udp(stdout, window_s):
+        """Turn raw tcpdump lines into a verdict so a human never has to eyeball
+        packet sizes. This is THE tell that separates the three failure modes:
+          * no packets           -> nodes not reaching the Pi (AP / subnet / down)
+          * ~48-64 B packets     -> edge_tier>=1 (on-device features), server gets
+                                    NO raw CSI -> source:esp32:offline. Reprovision
+                                    edge_tier=0 (flasher 'Write WiFi config').
+          * 148-404 B packets    -> raw CSI, correct.
+        Also flags gaps (bursty streaming) vs continuous."""
+        import re as _re
+        pat = _re.compile(
+            r'(\d\d:\d\d:\d\d\.\d+)\s.*IP\s+(\d+\.\d+\.\d+\.\d+)\.\d+\s+>\s+'
+            r'\S+\.5005:\s+UDP,\s+length\s+(\d+)')
+        per = {}
+        times = []
+        for line in (stdout or '').splitlines():
+            mm = pat.search(line)
+            if not mm:
+                continue
+            ts, ip, ln = mm.group(1), mm.group(2), int(mm.group(3))
+            d = per.setdefault(ip, {'count': 0, 'bytes': 0, 'min': ln, 'max': ln})
+            d['count'] += 1
+            d['bytes'] += ln
+            d['min'] = min(d['min'], ln)
+            d['max'] = max(d['max'], ln)
+            h, m, sec = ts.split(':')
+            times.append(int(h) * 3600 + int(m) * 60 + float(sec))
+        total = sum(d['count'] for d in per.values())
+        sources = {ip: {'count': d['count'], 'avg_bytes': round(d['bytes'] / d['count'], 1),
+                        'min_bytes': d['min'], 'max_bytes': d['max']}
+                   for ip, d in per.items()}
+        times.sort()
+        max_gap = max((b - a for a, b in zip(times, times[1:])), default=0.0)
+        avg = round(sum(d['bytes'] for d in per.values()) / total, 1) if total else 0
+        if total == 0:
+            mode, verdict = 'no_packets', (
+                'No packets on UDP 5005 during the capture. The nodes are not '
+                'reaching the Pi — check they associated to the same AP/subnet as '
+                'this box (strong RSSI on a different AP still means no data here).')
+        elif avg <= 100:
+            mode, verdict = 'small_only', (
+                f'Nodes are STREAMING ({total} pkts from {len(per)} source(s), '
+                f'~{avg} B each) but NO raw CSI (148-404 B) is arriving, so the '
+                'server reports source:esp32:offline and the mesh stays frozen even '
+                'though packets flow. Two causes give this identical signature — '
+                'check the node serial log to tell them apart: (1) edge_tier>=1 — '
+                'the node is emitting on-device feature packets; reprovision '
+                'edge_tier=0 (flasher "Write WiFi config", or provision.py '
+                '--edge-tier 0). (2) edge_tier=0 but CSI yield=0 — the CSI engine is '
+                'starved (serial shows "yield=0pps", state=8 DEGRADED). This hits '
+                'AMOLED display nodes on firmware without the #954 self-ping: '
+                're-Forge with firmware 0.7.0+ (adds the 50Hz self-ping OFDM '
+                'source). If serial shows "self-ping started" and yield climbing, '
+                'the node is fine and raw CSI should follow.')
+        elif avg >= 130:
+            mode, verdict = 'raw_csi', (
+                f'Raw CSI is flowing ({total} pkts from {len(per)} source(s), '
+                f'~{avg} B each) — correct packet type. If still offline, the issue '
+                'is downstream (fusion guard / clock sync), not the nodes.')
+        else:
+            mode, verdict = 'mixed', (
+                f'{total} pkts from {len(per)} source(s), avg ~{avg} B — mixed or '
+                'unusual packet sizes; inspect per-source below.')
+        if total and max_gap > 3.0:
+            verdict += (f' NOTE: streaming is bursty — largest gap {round(max_gap, 1)}s '
+                        'between packets (expected continuous at ~5-20 Hz per node).')
+        return {'mode': mode, 'verdict': verdict, 'total_packets': total,
+                'avg_bytes': avg, 'source_count': len(per),
+                'max_gap_s': round(max_gap, 2), 'window_s': window_s,
+                'per_source': sources}
+
+    repo_bin = os.path.join(shared_data.currentdir, 'bin', 'sensing-server')
+    with _rusense_notify_lock:
+        geofence = _rusense_notify_state.get('last_geofence')
+    presence_pub = _rusense_notify_state.get('presence_pub')
+
+    diag = {
+        'captured_at': time.time(),
+        'tcpdump_seconds': secs,
+        'system': {
+            'hostname': run(['hostname']),
+            'ip': run(['hostname', '-I']),
+            'uptime': run(['uptime']),
+            'free_m': run(['free', '-m']),
+            'ip_addr': run(['ip', '-br', 'addr']),
+            'wifi_dev': run(['iw', 'dev']),
+            'wifi_link': run(['iw', 'dev', 'wlan0', 'link']),
+        },
+        'sensing_service': {
+            'status': run(['systemctl', 'status', 'ragnar-sensing.service', '--no-pager', '-l']),
+            'show': run(['systemctl', 'show', 'ragnar-sensing.service',
+                         '-p', 'ActiveState', '-p', 'SubState', '-p', 'NRestarts',
+                         '-p', 'ActiveEnterTimestamp', '-p', 'ExecMainPID', '-p', 'Environment']),
+        },
+        'journal_sensing': run(['journalctl', '-u', 'ragnar-sensing.service',
+                                '-n', '400', '--no-pager']),
+        'journal_ragnar': run(['journalctl', '-u', 'ragnar.service',
+                               '-n', '80', '--no-pager']),
+        'sockets_udp': run(['ss', '-uanp']),
+        'udp_capture': udp,
+        'packet_analysis': analyze_udp(udp.get('stdout', ''), secs),
+        'binaries': {
+            'installed': '/usr/local/bin/ragnar-sensing-server',
+            'installed_md5': md5('/usr/local/bin/ragnar-sensing-server'),
+            'vendored': repo_bin,
+            'vendored_md5': md5(repo_bin),
+        },
+        'api': {
+            'status': _rusense_get('/api/v1/status'),
+            'nodes': _rusense_get('/api/v1/nodes'),
+            'mesh': _rusense_get('/api/v1/mesh'),
+            'adaptive_status': _rusense_get('/api/v1/adaptive/status'),
+            'models_active': _rusense_get('/api/v1/models/active'),
+            'sensing_latest': _rusense_get('/api/v1/sensing/latest'),
+        },
+        'ragnar_state': {
+            'geofence': geofence,
+            'presence_pub': presence_pub,
+        },
+        'rusense_config': {k: v for k, v in (shared_data.config or {}).items()
+                           if isinstance(k, str) and k.startswith('rusense_')},
+    }
+    return jsonify(diag)
+
+
+@app.route('/api/rusense/sensitivity', methods=['GET', 'POST'])
+def rusense_sensitivity():
+    """Get/set the model-free detection sensitivity: the presence floor and the
+    debounce depth the sensing engine uses. These are the RUVIEW_PRESENCE_FLOOR /
+    RUVIEW_DEBOUNCE_FRAMES env vars; POST writes them to a systemd drop-in
+    (ragnar-sensing.service.d/sensitivity.conf) so they survive a RuSense
+    reinstall and cleanly override the shipped defaults, then daemon-reloads and
+    restarts the sensing service to apply live. Webapp runs as root."""
+    import subprocess
+    cfg = shared_data.config or {}
+    # Field-tested default balance: floor 0.15 with 6-frame debounce.
+    DEF_FLOOR, DEF_DEB = 0.15, 6
+    if request.method == 'GET':
+        return jsonify({
+            'floor': float(cfg.get('rusense_presence_floor', DEF_FLOOR)),
+            'debounce_frames': int(cfg.get('rusense_debounce_frames', DEF_DEB)),
+            'default_floor': DEF_FLOOR,
+            'default_debounce_frames': DEF_DEB,
+        })
+
+    data = request.get_json(silent=True) or {}
+    try:
+        floor = round(float(data.get('floor', DEF_FLOOR)), 3)
+        deb = int(data.get('debounce_frames', DEF_DEB))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'floor must be a number, debounce_frames an integer'}), 400
+    if not (0.03 <= floor <= 0.40):
+        return jsonify({'error': 'floor out of range (0.03-0.40)'}), 400
+    if not (1 <= deb <= 30):
+        return jsonify({'error': 'debounce_frames out of range (1-30)'}), 400
+
+    # Persist so the UI reflects the current values and a reinstall keeps them.
+    shared_data.config['rusense_presence_floor'] = floor
+    shared_data.config['rusense_debounce_frames'] = deb
+    try:
+        shared_data.save_config()
+    except Exception as exc:
+        return jsonify({'error': f'could not save config: {exc}'}), 500
+
+    # systemd drop-in override — lives beside the unit, survives reinstall, and
+    # (loaded after the main unit) wins for these Environment= keys.
+    dropin_dir = '/etc/systemd/system/ragnar-sensing.service.d'
+    dropin = os.path.join(dropin_dir, 'sensitivity.conf')
+    body = ('# Written by Ragnar RuSense Settings -> Detection sensitivity.\n'
+            '# Overrides install_sensing.sh defaults; survives RuSense reinstall.\n'
+            '[Service]\n'
+            f'Environment=RUVIEW_PRESENCE_FLOOR={floor}\n'
+            f'Environment=RUVIEW_DEBOUNCE_FRAMES={deb}\n')
+
+    def run(cmd):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return {'rc': r.returncode, 'stderr': (r.stderr or '')[-400:]}
+        except Exception as exc:
+            return {'error': str(exc)}
+
+    steps = {}
+    try:
+        os.makedirs(dropin_dir, exist_ok=True)
+        with open(dropin, 'w', encoding='utf-8') as fh:
+            fh.write(body)
+        steps['dropin'] = dropin
+    except Exception as exc:
+        return jsonify({'error': f'could not write drop-in: {exc}', 'saved': True}), 500
+
+    steps['daemon_reload'] = run(['systemctl', 'daemon-reload'])
+    steps['restart'] = run(['systemctl', 'restart', 'ragnar-sensing.service'])
+    applied = steps['restart'].get('rc') == 0
+    return jsonify({'ok': applied, 'floor': floor, 'debounce_frames': deb,
+                    'applied': applied, 'steps': steps})
+
+
+@app.route('/api/rusense/calibrate/sample', methods=['POST'])
+def rusense_calibrate_sample():
+    """Sample the engine's smoothed-motion (sm) for a few seconds and return its
+    distribution. Used by the guided sensitivity calibration: the UI runs this
+    once with the room EMPTY and once while the user WALKS, then sets the floor
+    in the gap between the two. sm is derived from the classification confidence
+    (conf = 0.4 + sm*0.6, floor-independent), so sampling doesn't perturb the
+    live setting. Blocks for `secs` (5-60)."""
+    import time as _t
+    data = request.get_json(silent=True) or {}
+    try:
+        secs = int(data.get('secs', 20))
+    except (TypeError, ValueError):
+        secs = 20
+    secs = max(5, min(60, secs))
+
+    sms = []
+    seen = 0
+    t_end = time.time() + secs
+    while time.time() < t_end:
+        latest = _rusense_get('/api/v1/sensing/latest')
+        if isinstance(latest, dict):
+            cls = latest.get('classification') or {}
+            conf = cls.get('confidence')
+            if isinstance(conf, (int, float)):
+                seen += 1
+                sms.append(max(0.0, (float(conf) - 0.4) / 0.6))
+        _t.sleep(0.3)
+
+    if not sms:
+        return jsonify({'error': 'No sensing data — is a node streaming? '
+                        'Check the Nodes tab.'}), 503
+
+    sms.sort()
+    n = len(sms)
+
+    def pct(p):
+        i = min(n - 1, max(0, int(round(p / 100.0 * (n - 1)))))
+        return round(sms[i], 4)
+
+    return jsonify({
+        'count': n, 'secs': secs,
+        'min': round(sms[0], 4), 'p05': pct(5), 'p50': pct(50),
+        'p90': pct(90), 'p95': pct(95), 'max': round(sms[-1], 4),
+        'mean': round(sum(sms) / n, 4),
+    })
+
+
+@app.route('/api/rusense/vitals-history', methods=['GET'])
+def rusense_vitals_history():
+    """Aggregated heart-rate / breathing / activity buckets for the dashboard
+    trend card. ?hours=24 (default), capped at 168 = the full 7-day ring.
+    Local route — NOT under /api/v1/* (which proxies to the sensing-server)."""
+    try:
+        hours = float(request.args.get('hours', 24))
+    except (TypeError, ValueError):
+        hours = 24.0
+    hours = max(1.0, min(168.0, hours))
+    cutoff = time.time() - hours * 3600
+    with _rusense_vitals_lock:
+        buckets = [b for b in _rusense_vitals_unlocked()
+                   if isinstance(b, dict) and (b.get('t') or 0) >= cutoff]
+    return jsonify({'success': True, 'bucket_s': _RUSENSE_VITALS_BUCKET_S,
+                    'hours': hours, 'count': len(buckets), 'buckets': buckets})
+
+
+# ── Sensing backend lifecycle (bundled sensing-server) ───────────────────────
+# Ragnar ships the sensing engine itself, so the config page can install/start
+# it without any external RuView checkout. These routes drive the install and
+# uninstall scripts and report service state.
+SENSING_INSTALL_SCRIPT = os.path.join(shared_data.currentdir, 'scripts', 'install_sensing.sh')
+SENSING_UNINSTALL_SCRIPT = os.path.join(shared_data.currentdir, 'scripts', 'uninstall_sensing.sh')
+SENSING_INSTALL_LOG = os.path.join(shared_data.currentdir, 'data', 'sensing_install.log')
+SENSING_UNIT = 'ragnar-sensing.service'
+_sensing_install_lock = threading.Lock()
+_sensing_installing = False
+
+
+def _sensing_unit_state():
+    """Return (installed, active) for the bundled sensing service."""
+    try:
+        installed = subprocess.run(
+            ['systemctl', 'list-unit-files', SENSING_UNIT],
+            capture_output=True, text=True, timeout=5
+        ).stdout.find(SENSING_UNIT) != -1
+        active = subprocess.run(
+            ['systemctl', 'is-active', SENSING_UNIT],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip() == 'active'
+        return installed, active
+    except Exception:
+        return False, False
+
+
+def _run_sensing_script(script_path, arg=None):
+    """Run an install/uninstall script in the background, logging to SENSING_INSTALL_LOG."""
+    global _sensing_installing
+    cmd = ['bash', script_path] if os.geteuid() == 0 else ['sudo', '-n', 'bash', script_path]
+    if arg:
+        cmd.append(arg)
+    try:
+        with open(SENSING_INSTALL_LOG, 'a') as logf:
+            logf.write(f"\n=== run {os.path.basename(script_path)} {arg or ''} ===\n")
+            logf.flush()
+            subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                           env={**os.environ, 'SENSING_INSTALL_LOG': SENSING_INSTALL_LOG},
+                           timeout=3600)
+    except Exception as exc:
+        logger.error(f"sensing script {script_path} failed: {exc}")
+    finally:
+        with _sensing_install_lock:
+            _sensing_installing = False
+
+
+@app.route('/api/sensing/status', methods=['GET'])
+def sensing_status():
+    """Report whether the bundled sensing backend is installed and running."""
+    installed, active = _sensing_unit_state()
+    arch = os.uname().machine
+    has_prebuilt = (arch == 'aarch64' and
+                    os.path.exists(os.path.join(shared_data.currentdir, 'bin', 'sensing-server')))
+    with _sensing_install_lock:
+        installing = _sensing_installing
+    return jsonify({
+        'success': True, 'installed': installed, 'active': active,
+        'installing': installing, 'arch': arch, 'has_prebuilt': has_prebuilt,
+    })
+
+
+@app.route('/api/sensing/install', methods=['POST'])
+def sensing_install():
+    """Install (or rebuild) the bundled sensing backend in the background."""
+    global _sensing_installing
+    with _sensing_install_lock:
+        if _sensing_installing:
+            return jsonify({'success': True, 'message': 'Install already in progress', 'installing': True})
+        _sensing_installing = True
+    rebuild = bool((request.get_json(silent=True) or {}).get('rebuild'))
+    open(SENSING_INSTALL_LOG, 'w').close()  # fresh log per run
+    threading.Thread(target=_run_sensing_script,
+                     args=(SENSING_INSTALL_SCRIPT, '--rebuild' if rebuild else None),
+                     daemon=True, name='sensing-install').start()
+    return jsonify({'success': True, 'message': 'Sensing backend install started', 'installing': True})
+
+
+@app.route('/api/sensing/uninstall', methods=['POST'])
+def sensing_uninstall():
+    """Stop and remove the bundled sensing backend."""
+    threading.Thread(target=_run_sensing_script, args=(SENSING_UNINSTALL_SCRIPT,),
+                     daemon=True, name='sensing-uninstall').start()
+    return jsonify({'success': True, 'message': 'Sensing backend uninstall started'})
+
+
+@app.route('/api/sensing/install-log', methods=['GET'])
+def sensing_install_log():
+    """Return the live install/uninstall log and current service state."""
+    log = ''
+    try:
+        with open(SENSING_INSTALL_LOG, 'r') as f:
+            log = f.read()[-8000:]
+    except FileNotFoundError:
+        pass
+    installed, active = _sensing_unit_state()
+    with _sensing_install_lock:
+        installing = _sensing_installing
+    return jsonify({'success': True, 'log': log, 'installing': installing,
+                    'installed': installed, 'active': active})
+
 
 # Initialize web utilities
 web_utils = WebUtils(shared_data, logger)
@@ -3367,7 +4935,10 @@ def update_config():
             try:
                 import serial  # noqa: F401
             except ImportError:
-                import subprocess
+                # NB: no local `import subprocess` here — a function-local
+                # import would shadow the module-level one for this whole
+                # function and break the _delayed_restart closure below
+                # (NameError: free variable 'subprocess').
                 logger.info("Installing pyserial for wardriving GPS support...")
                 try:
                     subprocess.check_call(
@@ -7665,7 +9236,123 @@ def deep_scan_host():
 # SYSTEM MANAGEMENT UTILITIES & ENDPOINTS
 # ============================================================================
 
-def _execute_git_update(repo_path: str) -> dict:
+# Git config for update commands that may create commits (stash, pull-merge).
+# The service typically runs as root with no git identity configured, and
+# newer git also aborts a divergent pull unless a reconcile strategy is set
+# — either would fail the in-app update on user devices.
+_GIT_UPDATE_ID = [
+    '-c', 'user.name=Ragnar Updater',
+    '-c', 'user.email=ragnar-updater@localhost',
+    '-c', 'pull.rebase=false',
+]
+
+
+def _ensure_git_safe_dir(repo_path: str) -> None:
+    """Whitelist the checkout in the running user's global git config so root
+    operating on a 'ragnar'-owned tree doesn't hit 'detected dubious ownership'.
+    --add only when missing so repeated updates don't pile up duplicates."""
+    try:
+        existing = subprocess.run(
+            ['git', 'config', '--global', '--get-all', 'safe.directory'],
+            capture_output=True, text=True, check=False
+        ).stdout.splitlines()
+        if repo_path not in existing:
+            subprocess.run(
+                ['git', 'config', '--global', '--add', 'safe.directory', repo_path],
+                capture_output=True, text=True, check=False
+            )
+    except Exception:
+        pass
+
+
+def _clear_git_locks(repo_path: str, warnings: list) -> None:
+    """Remove EVERY stale *.lock under .git — not just the old hardcoded short
+    list (index.lock/HEAD.lock/shallow.lock/refs/heads/main.lock).
+
+    The locks that actually got stuck and forced users to stop the service and
+    delete files by hand were the ones NOT on that list: refs/remotes/origin/
+    <branch>.lock, packed-refs.lock, config.lock, and ref locks for non-'main'
+    branches. Sweeping all of them means a lock left by an interrupted run is
+    auto-cleared on the next check/update — the service (root) can delete a lock
+    regardless of which user owns it, so this never needs a manual stop."""
+    git_dir = os.path.join(repo_path, '.git')
+    if not os.path.isdir(git_dir):
+        return
+    # Primary: one find pass deletes nested ref locks too (coreutils always present).
+    try:
+        subprocess.run(
+            ['sudo', 'find', git_dir, '-name', '*.lock', '-type', 'f', '-delete'],
+            capture_output=True, text=True, check=False, timeout=20
+        )
+    except Exception as e:
+        logger.debug(f"find-based lock sweep failed (continuing): {e}")
+    # Fallback for no-sudo / no-find edge cases: top-level locks + the refs/
+    # tree only (never the huge objects/ dir).
+    removed = []
+    try:
+        for name in os.listdir(git_dir):
+            if name.endswith('.lock'):
+                try:
+                    os.remove(os.path.join(git_dir, name))
+                    removed.append(name)
+                except OSError:
+                    pass
+        refs_dir = os.path.join(git_dir, 'refs')
+        for root_dir, _dirs, files in os.walk(refs_dir):
+            for name in files:
+                if name.endswith('.lock'):
+                    lp = os.path.join(root_dir, name)
+                    try:
+                        os.remove(lp)
+                        removed.append(os.path.relpath(lp, git_dir))
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    if removed:
+        msg = f"Cleared stale git lock(s): {', '.join(removed[:8])}"
+        logger.warning(msg)
+        warnings.append(msg)
+
+
+def _prepare_git_repo(repo_path: str, warnings: list) -> None:
+    """Make the checkout usable BEFORE the first git command runs.
+
+    Fresh user devices hit three pre-conditions that fail the first git
+    command (and with it the whole update): mixed pi/ragnar/root file
+    ownership, stale lock files from interrupted runs, and git's "dubious
+    ownership" refusal because the service runs as root while the checkout
+    belongs to user 'ragnar'.
+    """
+    # Fix permissions ahead of git to avoid ownership issues on devices
+    try:
+        logger.info("Correcting file permissions before git update...")
+        subprocess.run(
+            ['sudo', 'chown', '-R', 'ragnar:ragnar', repo_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        warning = f"Permission correction failed (continuing): {e.stderr.strip() or e.stdout.strip()}"
+        logger.warning(warning)
+        warnings.append(warning)
+    except Exception as e:
+        warning = f"Permission correction error (continuing): {e}"
+        logger.warning(warning)
+        warnings.append(warning)
+
+    # Remove ALL stale lock files (the common reason the first update attempt
+    # fails but a retry succeeds — and the ref/remote locks that used to need a
+    # manual service stop).
+    _clear_git_locks(repo_path, warnings)
+
+    # Whitelist the checkout for the current user (safe.directory must live in
+    # the global config; git ignores it from plain -c).
+    _ensure_git_safe_dir(repo_path)
+
+
+def _execute_git_update(repo_path: str, prepared: bool = False) -> dict:
     """Run the git pull sequence Ragnar uses, returning status metadata."""
     result = {
         'success': False,
@@ -7674,56 +9361,34 @@ def _execute_git_update(repo_path: str) -> dict:
         'warnings': []
     }
 
-    # Fix permissions ahead of git pull to avoid ownership issues on devices
-    try:
-        logger.info("Correcting file permissions before git pull...")
-        subprocess.run(
-            ['sudo', 'chown', '-R', 'ragnar:ragnar', '/home/ragnar/Ragnar'],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        logger.info("Permissions corrected successfully")
-    except subprocess.CalledProcessError as e:
-        warning = f"Permission correction failed (continuing): {e.stderr.strip() or e.stdout.strip()}"
-        logger.warning(warning)
-        result['warnings'].append(warning)
-    except Exception as e:
-        warning = f"Permission correction error (continuing): {e}"
-        logger.warning(warning)
-        result['warnings'].append(warning)
-
-    # Remove stale lock files that cause "Another git process seems to be
-    # running" errors — the most common reason the first update attempt
-    # fails but a retry succeeds.
+    if not prepared:
+        _prepare_git_repo(repo_path, result['warnings'])
     git_dir = os.path.join(repo_path, '.git')
-    for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock',
-                      os.path.join('refs', 'heads', 'main.lock')):
-        lock_path = os.path.join(git_dir, lock_name)
-        if os.path.isfile(lock_path):
-            try:
-                os.remove(lock_path)
-                warning = f"Removed stale lock file: {lock_name}"
-                logger.warning(warning)
-                result['warnings'].append(warning)
-            except OSError as e:
-                logger.debug(f"Could not remove {lock_name}: {e}")
 
-    # Ensure safe-directory is configured (avoids ownership errors)
+    # Resolve which branch to update. A detached HEAD would make plain
+    # `git pull` fail, and naming the branch explicitly also covers
+    # checkouts that have no upstream tracking configured.
     try:
+        branch = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=repo_path, capture_output=True, text=True, check=True
+        ).stdout.strip() or 'main'
+    except Exception:
+        branch = 'main'
+    if branch == 'HEAD':
         subprocess.run(
-            ['git', 'config', '--global', '--add', 'safe.directory', repo_path],
+            ['git', 'checkout', 'main'],
             cwd=repo_path, capture_output=True, text=True, check=False
         )
-    except Exception:
-        pass
+        branch = 'main'
+        result['warnings'].append("Checkout was detached; switched back to main")
 
     # Perform git pull with one automatic retry on failure
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
         try:
             pull_proc = subprocess.run(
-                ['git', 'pull'],
+                ['git'] + _GIT_UPDATE_ID + ['pull', 'origin', branch],
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
@@ -7737,25 +9402,35 @@ def _execute_git_update(repo_path: str) -> dict:
             logger.error(f"Git pull attempt {attempt}/{max_attempts} failed: {error_msg}")
 
             if attempt >= max_attempts:
-                result['error'] = f"Git pull failed: {error_msg}"
-                return result
+                # Last resort: make the checkout match origin/<branch>
+                # exactly. Callers stash local changes beforehand (and the
+                # retry path already resets the tree), so this only discards
+                # merge debris, never user work.
+                try:
+                    subprocess.run(
+                        ['git', 'fetch', 'origin', branch],
+                        cwd=repo_path, capture_output=True, text=True, check=True
+                    )
+                    subprocess.run(
+                        ['git', 'reset', '--hard', f'origin/{branch}'],
+                        cwd=repo_path, capture_output=True, text=True, check=True
+                    )
+                    result['output'] = f"Forced checkout to origin/{branch} after pull failures"
+                    result['warnings'].append(
+                        f"git pull kept failing ({error_msg}); forced the checkout to match origin/{branch}")
+                    break
+                except Exception:
+                    result['error'] = f"Git pull failed: {error_msg}"
+                    return result
 
             # Auto-recover before retrying
             recovered = False
             err_lower = error_msg.lower()
 
-            # Lock file appeared during pull
+            # Lock file appeared during pull — clear every stale lock and retry
             if 'lock' in err_lower or 'another git process' in err_lower:
-                for lock_name in ('index.lock', 'shallow.lock', 'HEAD.lock'):
-                    lp = os.path.join(git_dir, lock_name)
-                    if os.path.isfile(lp):
-                        try:
-                            os.remove(lp)
-                            recovered = True
-                        except OSError:
-                            pass
-                if recovered:
-                    result['warnings'].append("Removed lock file and retrying pull")
+                _clear_git_locks(repo_path, result['warnings'])
+                recovered = True
 
             # Merge conflict or dirty state
             if 'conflict' in err_lower or 'merge' in err_lower or 'overwritten by merge' in err_lower:
@@ -7773,7 +9448,7 @@ def _execute_git_update(repo_path: str) -> dict:
             if 'diverge' in err_lower or 'need to specify' in err_lower:
                 try:
                     subprocess.run(
-                        ['git', 'pull', '--rebase'],
+                        ['git'] + _GIT_UPDATE_ID + ['pull', '--rebase'],
                         cwd=repo_path, capture_output=True, text=True, check=True
                     )
                     result['output'] = 'Pulled with rebase after divergence'
@@ -7800,13 +9475,14 @@ def _execute_git_update(repo_path: str) -> dict:
     # Ensure executable bits remain in place after pull
     try:
         logger.info("Making scripts executable after git pull...")
+        # chmod does not expand globs when invoked without a shell, so the
+        # wildcard passes go through find instead.
         chmod_commands = [
-            ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/*.sh'],
-            ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/*.py'],
             ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/Ragnar.py'],
             ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/kill_port_8000.sh'],
             ['sudo', 'chmod', '+x', '/home/ragnar/Ragnar/webapp_modern.py'],
-            ['sudo', 'find', '/home/ragnar/Ragnar', '-name', '*.sh', '-exec', 'chmod', '+x', '{}', ';']
+            ['sudo', 'find', '/home/ragnar/Ragnar', '-name', '*.sh', '-exec', 'chmod', '+x', '{}', ';'],
+            ['sudo', 'find', '/home/ragnar/Ragnar', '-maxdepth', '1', '-name', '*.py', '-exec', 'chmod', '+x', '{}', ';']
         ]
 
         for cmd in chmod_commands:
@@ -7822,6 +9498,38 @@ def _execute_git_update(repo_path: str) -> dict:
         result['warnings'].append(warning)
     except Exception as e:
         warning = f"Chmod error (continuing): {e}"
+        logger.warning(warning)
+        result['warnings'].append(warning)
+
+    # Provision radios (rfkill) + network diagnostic tools + lldpd, the same way
+    # the CLI updater does. Without this, updating from the Settings tab only
+    # pulled code and a device would be left missing traceroute/mtr/lldpd/etc.
+    # The shared script is idempotent and never fails the update on a single
+    # missing tool, so provisioning problems become warnings, not hard errors.
+    provision_script = os.path.join(repo_path, 'scripts', 'provision_network_tools.sh')
+    if os.path.isfile(provision_script):
+        try:
+            logger.info("Launching network tool provisioning in background...")
+            log_path = os.path.join(repo_path, 'data', 'logs', 'provision_network_tools.log')
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            log_fh = open(log_path, 'ab')
+            # Detach (start_new_session) and fire-and-forget so slow apt installs
+            # never delay the update response or the service restart the caller
+            # schedules right after this returns. Progress lands in the log file.
+            subprocess.Popen(
+                ['sudo', 'bash', provision_script],
+                stdout=log_fh, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, start_new_session=True
+            )
+            result['warnings'].append(
+                "Network tools are being provisioned in the background "
+                "(see data/logs/provision_network_tools.log)")
+        except Exception as e:
+            warning = f"Could not start network tool provisioning (continuing): {e}"
+            logger.warning(warning)
+            result['warnings'].append(warning)
+    else:
+        warning = "provision_network_tools.sh not found - network tools not provisioned"
         logger.warning(warning)
         result['warnings'].append(warning)
 
@@ -7990,7 +9698,12 @@ def check_updates():
         repo_path = os.getcwd()
         
         logger.info(f"Checking for updates in repository: {repo_path}")
-        
+
+        # Self-heal before any git command so a check never dead-ends on a stale
+        # lock or a dubious-ownership error (same guards the update path uses).
+        _ensure_git_safe_dir(repo_path)
+        _clear_git_locks(repo_path, [])
+
         # Fetch latest changes from remote
         try:
             fetch_result = subprocess.run(['git', 'fetch'], cwd=repo_path, check=True, capture_output=True, text=True)
@@ -8169,12 +9882,20 @@ def stash_and_update():
     stash_message = payload.get('message') or f"Ragnar auto stash {datetime.utcnow().isoformat()}"
     include_untracked = payload.get('include_untracked', True)
 
-    stash_cmd = ['git', 'stash', 'push']
+    stash_cmd = ['git'] + _GIT_UPDATE_ID + ['stash', 'push']
     if include_untracked:
         stash_cmd.append('-u')
     stash_cmd.extend(['-m', stash_message])
 
     logger.info("Auto stash + update requested via UI")
+
+    # Prepare the repo BEFORE the stash — on a fresh install the stash is
+    # the first git command this service ever runs, and it dies on dubious
+    # ownership / stale locks / root-owned files unless those are fixed
+    # first. This was exactly the "Update failed. Fix issues and retry."
+    # dead end users hit from the Settings tab.
+    preflight_warnings = []
+    _prepare_git_repo(repo_path, preflight_warnings)
 
     try:
         stash_proc = subprocess.run(
@@ -8187,7 +9908,11 @@ def stash_and_update():
     except subprocess.CalledProcessError as e:
         error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error(f"Git stash failed: {error_msg}")
-        return jsonify({'success': False, 'error': f'Git stash failed: {error_msg}'}), 500
+        return jsonify({
+            'success': False,
+            'error': f'Git stash failed: {error_msg}',
+            'warnings': preflight_warnings
+        }), 500
 
     stash_stdout = stash_proc.stdout.strip() or stash_proc.stderr.strip() or ''
     stash_created = 'No local changes to save' not in stash_stdout
@@ -8198,7 +9923,8 @@ def stash_and_update():
     else:
         logger.info("Auto stash requested but no local changes were found")
 
-    update_result = _execute_git_update(repo_path)
+    update_result = _execute_git_update(repo_path, prepared=True)
+    update_result['warnings'] = preflight_warnings + update_result['warnings']
     if not update_result['success']:
         # Preserve the stash so the operator can recover work manually
         logger.error("Auto stash update failed after stashing; stash preserved for manual recovery")
@@ -11081,11 +12807,53 @@ def pentest_blueborne():
             return jsonify({'error': 'Target MAC address required'}), 400
         
         result = bluetooth_pentest.blueborne_scan(target)
-        
+
         return jsonify(result)
-        
+
     except Exception as e:
         logger.error(f"Error scanning for BlueBorne: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/bluetooth/pentest/whisperpair-scan', methods=['POST'])
+def pentest_whisperpair():
+    """Scan for WhisperPair (CVE-2025-36911) Fast Pair exposure"""
+    try:
+        if not BLUETOOTH_PENTEST_AVAILABLE or bluetooth_pentest is None:
+            return jsonify({'error': 'Bluetooth pentest module not available'}), 503
+
+        data = request.get_json() or {}
+        target = data.get('target')
+
+        if not target:
+            return jsonify({'error': 'Target MAC address required'}), 400
+
+        result = bluetooth_pentest.whisperpair_scan(target)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error scanning for WhisperPair: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/bluetooth/pentest/airoha-race-scan', methods=['POST'])
+def pentest_airoha_race():
+    """Scan for Airoha RACE (CVE-2025-20700) missing GATT authentication"""
+    try:
+        if not BLUETOOTH_PENTEST_AVAILABLE or bluetooth_pentest is None:
+            return jsonify({'error': 'Bluetooth pentest module not available'}), 503
+
+        data = request.get_json() or {}
+        target = data.get('target')
+
+        if not target:
+            return jsonify({'error': 'Target MAC address required'}), 400
+
+        result = bluetooth_pentest.airoha_race_scan(target)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error scanning for Airoha RACE: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/bluetooth/pentest/track-movement', methods=['POST'])
@@ -12455,6 +14223,158 @@ def legacy_netkb_json():
 # ============================================================================
 # WEBSOCKET EVENTS
 # ============================================================================
+
+# ============================================================================
+# WEB TERMINAL (interactive PTY over Socket.IO, /terminal namespace)
+#
+# Off by default (config 'terminal_enabled'). Runs a shell as the non-root
+# 'ragnar' user in the repo dir. Gated by login AND the config flag; the
+# service runs as root only to drop to 'ragnar' via `su`.
+# ============================================================================
+
+_TERM_USER = 'ragnar'
+_TERM_CWD = '/home/ragnar/Ragnar'
+_term_sessions = {}          # socket sid -> {'fd': int, 'pid': int}
+_term_lock = threading.Lock()
+
+
+def _terminal_enabled():
+    try:
+        return bool(shared_data.config.get('terminal_enabled', False))
+    except Exception:
+        return False
+
+
+def _term_reader(sid, fd):
+    """Background task: pump PTY output to the browser until it closes."""
+    import select
+    while True:
+        with _term_lock:
+            if sid not in _term_sessions:
+                break
+        try:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if fd in r:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                socketio.emit('terminal_output', {'data': data.decode('utf-8', 'replace')},
+                              namespace='/terminal', to=sid)
+        except OSError:
+            break
+    _term_cleanup(sid)
+    socketio.emit('terminal_exit', {}, namespace='/terminal', to=sid)
+
+
+def _term_cleanup(sid):
+    with _term_lock:
+        sess = _term_sessions.pop(sid, None)
+    if not sess:
+        return
+    try:
+        os.close(sess['fd'])
+    except OSError:
+        pass
+    try:
+        os.killpg(os.getpgid(sess['pid']), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+@socketio.on('connect', namespace='/terminal')
+def term_connect():
+    if auth_mgr.is_configured() and not session.get('authenticated'):
+        logger.warning("Rejected unauthenticated terminal connection")
+        disconnect()
+        return False
+    if not _terminal_enabled():
+        emit('terminal_output', {'data': '\r\n\x1b[33mWeb terminal is disabled. Enable it in Settings.\x1b[0m\r\n'})
+        disconnect()
+        return False
+
+    import pty
+    import fcntl
+    import termios
+    import pwd
+    sid = request.sid
+    try:
+        pw = pwd.getpwnam(_TERM_USER)
+        master_fd, slave_fd = pty.openpty()
+
+        def _preexec():
+            # New session with the slave PTY as controlling terminal, then drop
+            # from root to the target user so the shell (and job control) run
+            # unprivileged. Order matters: setsid -> TIOCSCTTY -> gid/groups -> uid.
+            os.setsid()
+            try:
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+            os.setgid(pw.pw_gid)
+            try:
+                os.initgroups(_TERM_USER, pw.pw_gid)
+            except (OSError, PermissionError):
+                pass
+            os.setuid(pw.pw_uid)
+            try:
+                os.chdir(_TERM_CWD)
+            except OSError:
+                os.chdir(pw.pw_dir)
+
+        env = {'TERM': 'xterm-256color', 'LANG': os.environ.get('LANG', 'C.UTF-8'),
+               'HOME': pw.pw_dir, 'USER': _TERM_USER, 'LOGNAME': _TERM_USER,
+               'SHELL': pw.pw_shell or '/bin/bash',
+               'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}
+        proc = subprocess.Popen(
+            [pw.pw_shell or '/bin/bash', '-l'],
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            preexec_fn=_preexec, close_fds=True, env=env)
+        os.close(slave_fd)
+    except Exception as e:
+        logger.error(f"Terminal spawn failed: {e}")
+        emit('terminal_output', {'data': f'\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n'})
+        disconnect()
+        return False
+
+    with _term_lock:
+        _term_sessions[sid] = {'fd': master_fd, 'pid': proc.pid}
+    socketio.start_background_task(_term_reader, sid, master_fd)
+    logger.info(f"Web terminal opened (sid={sid}, user={_TERM_USER})")
+
+
+@socketio.on('terminal_input', namespace='/terminal')
+def term_input(data):
+    sess = _term_sessions.get(request.sid)
+    if not sess:
+        return
+    payload = data.get('data', '') if isinstance(data, dict) else str(data)
+    try:
+        os.write(sess['fd'], payload.encode('utf-8', 'replace'))
+    except OSError:
+        _term_cleanup(request.sid)
+
+
+@socketio.on('terminal_resize', namespace='/terminal')
+def term_resize(data):
+    sess = _term_sessions.get(request.sid)
+    if not sess:
+        return
+    import struct
+    import fcntl
+    import termios
+    try:
+        rows = max(1, min(300, int(data.get('rows', 24))))
+        cols = max(1, min(500, int(data.get('cols', 80))))
+        fcntl.ioctl(sess['fd'], termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+@socketio.on('disconnect', namespace='/terminal')
+def term_disconnect():
+    _term_cleanup(request.sid)
+    logger.info(f"Web terminal closed (sid={request.sid})")
+
 
 @socketio.on('connect')
 def handle_connect():
@@ -17222,15 +19142,32 @@ def get_ai_vulnerability_analysis():
         
         # Get AI analysis
         analysis = ai_service.analyze_vulnerabilities(vulnerabilities)
-        
+
         return jsonify({
             'enabled': True,
             'analysis': analysis,
             'vulnerability_count': len(vulnerabilities)
         })
-        
+
     except Exception as e:
         logger.error(f"Error getting AI vulnerability analysis: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/ai/pcap', methods=['POST'])
+def post_ai_pcap_analysis():
+    """AI root-cause analysis of a PCAP-analysis summary (Wi-Fi/AP client drops).
+    The client posts the JSON returned by /api/net/pcap; we hand it to the AI."""
+    try:
+        ai_service = getattr(shared_data, 'ai_service', None)
+        if not ai_service or not ai_service.is_enabled():
+            return jsonify({'enabled': False,
+                            'message': 'AI service is not enabled — add an OpenAI token in Settings.'})
+        data = request.get_json(silent=True) or {}
+        analysis = ai_service.analyze_pcap(data)
+        return jsonify({'enabled': True, 'analysis': analysis})
+    except Exception as e:
+        logger.error(f"Error getting AI pcap analysis: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -17895,6 +19832,7 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         socketio.start_background_task(background_sync_loop)
         socketio.start_background_task(background_arp_scan_loop)
         socketio.start_background_task(background_health_monitor)
+        socketio.start_background_task(_rusense_notify_loop)
 
         logger.info("✅ All background threads started successfully")
 

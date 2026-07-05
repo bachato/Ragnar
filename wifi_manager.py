@@ -1342,6 +1342,45 @@ class WiFiManager:
             self.logger.error(f"Error checking Wi-Fi connection: {e}")
             return False
 
+    def _ensure_radios_unblocked(self):
+        """Unblock soft-blocked WiFi radios so client and AP mode can start.
+
+        A fresh OS image (no WiFi country set) or a newly plugged USB dongle
+        leaves the radio soft-blocked by rfkill. In that state hostapd cannot
+        bring the AP up, so start_ap_mode() fails silently and the endless
+        loop never presents the fallback AP. The installer/updater install a
+        persistent udev rule, but a device that has never run them (or cannot
+        update because it has no network) needs this runtime self-heal.
+        """
+        try:
+            result = subprocess.run(['rfkill', 'list', 'wifi'],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                return
+            if 'Hard blocked: yes' in result.stdout:
+                self.logger.error(
+                    "WiFi radio is HARD blocked (hardware switch) - "
+                    "cannot unblock via software")
+            if 'Soft blocked: yes' not in result.stdout:
+                return
+            self.logger.warning(
+                "WiFi radio soft-blocked by rfkill - unblocking "
+                "(required for both client and AP mode)")
+            self.ap_logger.warning(
+                "rfkill soft-block detected - running 'rfkill unblock all'")
+            unblock = subprocess.run(['sudo', 'rfkill', 'unblock', 'all'],
+                                     capture_output=True, text=True, timeout=5)
+            if unblock.returncode == 0:
+                self.logger.info("rfkill: all radios unblocked")
+            else:
+                self.logger.error(
+                    f"rfkill unblock failed: "
+                    f"{(unblock.stderr or unblock.stdout).strip()}")
+        except FileNotFoundError:
+            self.logger.debug("rfkill not installed - skipping radio unblock check")
+        except Exception as exc:
+            self.logger.debug(f"rfkill check failed: {exc}")
+
     def _ensure_wifi_interfaces_up(self):
         """Bring Wi-Fi interfaces up if they are down or unmanaged."""
         try:
@@ -1349,6 +1388,8 @@ class WiFiManager:
             if now - self.last_interface_reenable_time < self.interface_reenable_interval:
                 return
             self.last_interface_reenable_time = now
+
+            self._ensure_radios_unblocked()
 
             interfaces = gather_wifi_interfaces(self.default_wifi_interface)
             for iface in interfaces:
@@ -2291,6 +2332,9 @@ class WiFiManager:
                 self.ap_logger.warning(f"Pre-AP scan failed but continuing: {scan_error}")
                 self.available_networks = []
             
+            # Radio must not be rfkill-blocked or hostapd fails to start
+            self._ensure_radios_unblocked()
+
             # Create hostapd configuration
             self.ap_logger.info("Creating hostapd configuration...")
             if not self._create_hostapd_config():

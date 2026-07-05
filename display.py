@@ -87,6 +87,11 @@ except ImportError:
     EPDButtonListener = None
     PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC = 0, 1, 2, 3, 4, 5
 
+# Network Diagnostic mode: number of auto-cycling e-Paper sub-pages
+# (0=LINK, 1=IP, 2=SWITCH). See Display._render_netdiag_page.
+NETDIAG_PAGE_COUNT = 3
+NETDIAG_CYCLE_SECONDS = 5
+
 class Display:
     def __init__(self, shared_data):
         """Initialize the display and start the main image and shared data update threads."""
@@ -846,6 +851,154 @@ class Display:
             draw.text((value_x, y), text, font=font, fill=0)
             y += line_h
         return y
+
+    # ------------------------------------------------------------------
+    # Network Diagnostic mode (Ethernet-focused, internet-independent)
+    # ------------------------------------------------------------------
+
+    def _netdiag_sleep(self, seconds):
+        """Sleep up to `seconds`, waking early if the display is exiting or the
+        network-diagnostic toggle is switched off, so the normal display
+        resumes promptly."""
+        steps = max(1, int(seconds / 0.1))
+        for _ in range(steps):
+            if self.shared_data.display_should_exit:
+                return
+            if not self.shared_data.config.get('network_diagnostic_mode', False):
+                return
+            time.sleep(0.1)
+
+    def _fetch_netdiag_data(self):
+        """Gather Ethernet-focused diagnostics for the net-diag e-Paper mode.
+
+        Every source is local (ip / ethtool / lldpctl / resolv.conf), so this
+        works with no internet at all — the whole point when you're plugged
+        into a switch to diagnose it. Reuses network_diagnostics.py."""
+        import network_diagnostics as nd
+        ifaces = nd.do_interfaces(include_virtual=False).get('interfaces', [])
+        # Physical wired NICs only: kernel names them eth*/en* (eth0, enp*, eno*,
+        # ens*, enx*, end*). This excludes VPN/tunnel/bridge/container ifaces
+        # (tailscale0, wg0, tun0, docker0, br0, veth*) that do_interfaces still
+        # reports as 'ethernet' because they aren't wireless.
+        eth_list = [i for i in ifaces
+                    if i.get('type') == 'ethernet'
+                    and str(i.get('name', '')).startswith(('eth', 'en'))]
+        # Prefer a link-up ethernet port, then any 'up' port, then the first.
+        eth = next((i for i in eth_list if i.get('link_detected') is True), None)
+        if eth is None:
+            eth = next((i for i in eth_list
+                        if str(i.get('operstate', '')).lower() == 'up'), None)
+        if eth is None and eth_list:
+            eth = eth_list[0]
+
+        gw_ip = nd._default_gateway()
+        gateway = {'ip': gw_ip, 'ptr': nd._reverse_dns(gw_ip) if gw_ip else None}
+        _, nameservers, _ = nd._read_resolv_conf()
+
+        lldp = {'installed': True, 'neighbor': None}
+        res = nd.do_lldp()
+        if not res.get('success'):
+            if res.get('missing_tool'):
+                lldp['installed'] = False
+        else:
+            neighbors = res.get('neighbors') or []
+            if eth:
+                lldp['neighbor'] = next(
+                    (n for n in neighbors if n.get('local_interface') == eth.get('name')), None)
+            if lldp['neighbor'] is None and neighbors:
+                lldp['neighbor'] = neighbors[0]
+        return {'eth': eth, 'eth_count': len(eth_list),
+                'gateway': gateway, 'dns': nameservers, 'lldp': lldp}
+
+    def _render_netdiag_page(self, image, draw, page):
+        """Render one Ethernet network-diagnostic sub-page. Space on the panel
+        is scarce, so each page shows only the handful of facts an engineer
+        actually needs when diagnosing a switch port."""
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        data = self._get_cached_page_data('netdiag', self._fetch_netdiag_data, ttl=10)
+        names = ["LINK", "IP", "SWITCH"]
+        name = names[page % len(names)]
+        self._draw_page_frame(draw, f"NET {name}",
+                              hint=f"Ethernet diag  {page + 1}/{NETDIAG_PAGE_COUNT}  auto 5s")
+        y = int(28 * sy)
+        if not data:
+            self._draw_stat_rows(draw, y, [("Status", "gathering...")])
+            return
+        eth = data.get('eth')
+
+        if page == 0:  # LINK — physical link state
+            if not eth:
+                self._draw_stat_rows(draw, y, [("Ethernet", "not found"),
+                                               ("Ports seen", str(data.get('eth_count', 0)))])
+                return
+            link = ('UP' if eth.get('link_detected') is True
+                    else 'DOWN' if eth.get('link_detected') is False
+                    else str(eth.get('operstate', '?')).upper())
+            an = eth.get('autoneg')
+            an_s = 'on' if an is True else ('off' if an is False else '—')
+            self._draw_stat_rows(draw, y, [
+                ("Iface", eth.get('name', '?')),
+                ("Link", link),
+                ("Speed", eth.get('speed') or '—'),
+                ("Duplex", eth.get('duplex') or '—'),
+                ("Auto-neg", an_s),
+                ("MAC", eth.get('mac') or '—'),
+            ])
+
+        elif page == 1:  # IP — addressing & reachability basics
+            gw = data.get('gateway') or {}
+            dns = data.get('dns') or []
+            ipv4 = (eth.get('ipv4') if eth else []) or []
+            rows = [
+                ("Method", (eth.get('ip_method') if eth else None) or '—'),
+                ("IPv4", ipv4[0] if ipv4 else 'none'),
+            ]
+            if len(ipv4) > 1:
+                rows.append(("IPv4#2", ipv4[1]))
+            rows.append(("Gateway", gw.get('ip') or '—'))
+            if gw.get('ptr'):
+                rows.append(("GW name", gw.get('ptr')))
+            if dns:
+                rows.append(("DNS", dns[0]))
+            if len(dns) > 1:
+                rows.append(("DNS#2", dns[1]))
+            self._draw_stat_rows(draw, y, rows)
+
+        else:  # page 2: SWITCH — LLDP/CDP neighbour + PoE
+            lldp = data.get('lldp') or {}
+            if not lldp.get('installed', True):
+                self._draw_stat_rows(draw, y, [("LLDP", "not installed"),
+                                               ("Enable via", "Switch tab")])
+                return
+            n = lldp.get('neighbor')
+            if not n:
+                self._draw_stat_rows(draw, y, [("Switch", "none seen"),
+                                               ("Announce", "~30s wait")])
+                return
+            poe = n.get('poe')
+            if poe and poe.get('powered'):
+                bits = []
+                if poe.get('type'):
+                    bits.append(poe['type'])                    # af/at/bt
+                via = poe.get('power_via')
+                if via:
+                    bits.append('mid' if via == 'midspan' else 'end')
+                w = poe.get('allocated_w') or poe.get('requested_w')
+                if w:
+                    bits.append(f"{w}W")
+                poe_s = ' '.join(bits) or 'yes'
+            elif poe:
+                poe_s = poe.get('device_type') or 'no'
+            else:
+                poe_s = '—'
+            self._draw_stat_rows(draw, y, [
+                ("Switch", n.get('switch_name') or '—'),
+                ("Port", n.get('port_descr') or n.get('port_id') or '—'),
+                ("VLAN", n.get('vlan_id') or '—'),
+                ("PoE", poe_s),
+                ("Proto", n.get('protocol') or '—'),
+                ("Mgmt IP", n.get('mgmt_ip') or '—'),
+            ])
 
     def _fetch_network_data(self):
         """Fetch real host data from database."""
@@ -2690,6 +2843,33 @@ class Display:
                 current_page = PAGE_MAIN
                 if self.button_listener and self.button_listener.available:
                     current_page = self.button_listener.current_page
+
+                # Network Diagnostic display mode: an Ethernet-focused,
+                # internet-independent field screen (link / addressing / switch
+                # port via LLDP). Web-toggled; it overrides every normal page
+                # and auto-cycles its sub-pages every NETDIAG_CYCLE_SECONDS.
+                # Rendered + committed here so the standard page pipeline is
+                # bypassed entirely while active.
+                if self.shared_data.config.get('network_diagnostic_mode', False):
+                    page = getattr(self, '_netdiag_page', 0) % NETDIAG_PAGE_COUNT
+                    try:
+                        self._render_netdiag_page(image, draw, page)
+                    except Exception as e:
+                        logger.debug(f"netdiag render error: {e}")
+                    self._netdiag_page = (page + 1) % NETDIAG_PAGE_COUNT
+                    epd_img = _apply_epd_rotation(image, self.screen_reversed)
+                    self.epd_helper.display_partial(epd_img)
+                    self.epd_helper.display_partial(epd_img)
+                    web_img = _apply_web_rotation(image, self.web_screen_reversed)
+                    try:
+                        with open(os.path.join(self.shared_data.webdir, "screen.png"), 'wb') as img_file:
+                            web_img.save(img_file)
+                            img_file.flush()
+                            os.fsync(img_file.fileno())
+                    except Exception:
+                        pass
+                    self._netdiag_sleep(NETDIAG_CYCLE_SECONDS)
+                    continue
 
                 # Wardriving display override: render the wardriving page when
                 # the engine is running, OR — if wardriving-on-boot is set and

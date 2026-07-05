@@ -1,0 +1,56 @@
+name: Deploy RuSense CSI Node Flasher (ESP32-S3 / C6)
+
+# The CSI-node firmware binaries are vendored under rusense_flasher/firmware/
+# (copied bit-identically from the upstream RuView repo at the commit pinned in
+# rusense_flasher/rusense-csi-node.version). There is no build step — this
+# workflow just publishes the static web flasher to GitHub Pages.
+
+on:
+  push:
+    branches: [View, main]
+    paths:
+      - 'rusense_flasher/**'
+      - '.github/workflows/build-rusense-flasher.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage site and stamp build version
+        run: |
+          mkdir -p site
+          cp -r rusense_flasher/. site/
+
+          FW_VERSION="$(grep -E '^version=' rusense_flasher/rusense-csi-node.version | cut -d= -f2)"
+          BUILD="${FW_VERSION}.${GITHUB_SHA::7}"
+          echo "Build: $BUILD"
+          echo "{\"build\":\"$BUILD\",\"fw\":\"$FW_VERSION\",\"sha\":\"${GITHUB_SHA::7}\",\"date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+            > site/version.json
+
+          echo "=== Firmware binaries ==="
+          ls -lhR site/firmware
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

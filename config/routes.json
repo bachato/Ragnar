@@ -1,5 +1,61 @@
 [
   {
+    "route": "/api/net/ping",
+    "methods": [
+      "POST"
+    ],
+    "handler": "net_ping"
+  },
+  {
+    "route": "/api/net/traceroute",
+    "methods": [
+      "POST"
+    ],
+    "handler": "net_traceroute"
+  },
+  {
+    "route": "/api/net/mtr",
+    "methods": [
+      "POST"
+    ],
+    "handler": "net_mtr"
+  },
+  {
+    "route": "/api/net/whois",
+    "methods": [
+      "POST"
+    ],
+    "handler": "net_whois"
+  },
+  {
+    "route": "/api/net/speedtest",
+    "methods": [
+      "POST"
+    ],
+    "handler": "net_speedtest"
+  },
+  {
+    "route": "/api/net/lldp",
+    "methods": [
+      "GET"
+    ],
+    "handler": "net_lldp"
+  },
+  {
+    "route": "/api/net/arp-scan",
+    "methods": [
+      "GET"
+    ],
+    "handler": "net_arp_scan"
+  },
+  {
+    "route": "/api/net/interfaces",
+    "methods": [
+      "GET"
+    ],
+    "handler": "net_interfaces"
+  },
+  {
     "route": "/",
     "methods": [
       "GET"

@@ -40,12 +40,24 @@ fi
 echo -e "\n${BLUE}Step 1: Stopping ragnar service...${NC}"
 systemctl stop ragnar.service
 
+echo -e "${BLUE}Step 1.5: Preparing git repository...${NC}"
+# Root runs this script while the checkout belongs to user 'ragnar' — newer
+# git refuses that mix ("detected dubious ownership") unless the path is
+# whitelisted in root's global config. Interrupted runs can also leave stale
+# lock files, and previous sudo runs leave root-owned files that break git.
+git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$ragnar_PATH" \
+    || git config --global --add safe.directory "$ragnar_PATH"
+rm -f "$ragnar_PATH/.git/index.lock" "$ragnar_PATH/.git/HEAD.lock" "$ragnar_PATH/.git/shallow.lock" 2>/dev/null
+chown -R ragnar:ragnar "$ragnar_PATH" 2>/dev/null || true
+# Stash and merge commits need an author identity; root rarely has one.
+GIT_ID=(-c user.name="Ragnar Updater" -c user.email="ragnar-updater@localhost" -c pull.rebase=false)
+
 echo -e "${BLUE}Step 2: Backing up local changes...${NC}"
 if git diff --quiet && git diff --staged --quiet; then
     echo -e "${GREEN}No local changes to backup.${NC}"
 else
     echo -e "${YELLOW}Local changes detected. Creating backup...${NC}"
-    git stash push -m "Auto-backup before update $(date)"
+    git "${GIT_ID[@]}" stash push -m "Auto-backup before update $(date)"
     echo -e "${GREEN}Local changes backed up.${NC}"
 fi
 
@@ -64,17 +76,46 @@ echo -e "${BLUE}Step 3: Fetching latest updates...${NC}"
 git fetch origin
 
 echo -e "${BLUE}Step 4: Updating to latest version...${NC}"
-if git pull origin main; then
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+    # Detached checkout (e.g. a past checkout of a tag) - go back to main.
+    echo -e "${YELLOW}Detached checkout detected - switching back to main.${NC}"
+    git checkout main 2>/dev/null || git checkout -B main origin/main
+    CURRENT_BRANCH="main"
+fi
+if git "${GIT_ID[@]}" pull origin "$CURRENT_BRANCH"; then
     echo -e "${GREEN}Update completed successfully!${NC}"
 else
-    echo -e "${RED}Update failed. Attempting to restore backup...${NC}"
-    git stash pop
-    echo -e "${YELLOW}Backup restored. Please check for conflicts manually.${NC}"
-    exit 1
+    # Deterministic fallback: local changes are already in the stash and the
+    # runtime data is copied aside below, so matching origin exactly is safe
+    # and guarantees the update lands even on conflicted/diverged checkouts.
+    echo -e "${YELLOW}git pull failed - forcing checkout to match origin/$CURRENT_BRANCH (local changes stay in the stash)...${NC}"
+    if git fetch origin "$CURRENT_BRANCH" && git reset --hard "origin/$CURRENT_BRANCH"; then
+        echo -e "${GREEN}Update completed via forced sync.${NC}"
+    else
+        echo -e "${RED}Update failed. Attempting to restore backup...${NC}"
+        git "${GIT_ID[@]}" stash pop 2>/dev/null || true
+        echo -e "${YELLOW}Backup restored. Please check for conflicts manually.${NC}"
+        systemctl start ragnar.service
+        exit 1
+    fi
 fi
 
 echo -e "${BLUE}Step 5: Updating Python dependencies...${NC}"
-pip3 install --break-system-packages -r requirements.txt --upgrade
+# Fast path: one batch upgrade. If pip cannot satisfy the full set (e.g.
+# one bad/unsatisfiable pin) it installs NOTHING, silently leaving every
+# dependency un-upgraded. Fall back to installing each requirement on its
+# own so a single bad package can not block all the others.
+if ! pip3 install --break-system-packages --upgrade -r requirements.txt; then
+    echo -e "${YELLOW}Batch dependency install failed - retrying package-by-package so one bad pin can not block the rest...${NC}"
+    while IFS= read -r req || [ -n "$req" ]; do
+        req="${req%%#*}"                 # strip inline comments
+        req="$(echo "$req" | xargs)"     # trim whitespace
+        [ -z "$req" ] && continue
+        pip3 install --break-system-packages --upgrade "$req" \
+            || echo -e "  ${YELLOW}!${NC} Failed to install: $req (continuing)"
+    done < requirements.txt
+fi
 
 echo -e "${BLUE}Step 5.5: Restoring local runtime data...${NC}"
 for file in "${PRESERVE_FILES[@]}"; do
@@ -168,6 +209,60 @@ SVCEOF
     fi
 else
     echo -e "${GREEN}No Pwnagotchi installation found or migration script missing. Skipping.${NC}"
+fi
+
+echo -e "${BLUE}Step 6.8: Ensuring radios are unblocked (rfkill)...${NC}"
+# USB Bluetooth and monitor-mode/injection WiFi dongles come up soft-blocked
+# and stay dead until unblocked. Unblock now and install a persistent udev
+# rule so it also works at boot and on hot-plug. Idempotent.
+if command -v rfkill >/dev/null 2>&1; then
+    rfkill unblock all
+    RFKILL_BIN="$(command -v rfkill)"
+    cat > /etc/udev/rules.d/99-ragnar-rfkill.rules << RFEOF
+# Ragnar: auto-unblock every radio when it appears (boot + hot-plug).
+# USB Bluetooth and monitor-mode/injection WiFi dongles are soft-blocked by
+# default and stay dead until unblocked.
+SUBSYSTEM=="rfkill", ACTION=="add", RUN+="$RFKILL_BIN unblock all"
+RFEOF
+    chmod 644 /etc/udev/rules.d/99-ragnar-rfkill.rules
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=rfkill 2>/dev/null || true
+    fi
+    echo -e "${GREEN}All radios unblocked and persistent rfkill rule installed.${NC}"
+else
+    echo -e "${YELLOW}rfkill not available - skipping radio unblock.${NC}"
+fi
+
+echo -e "${BLUE}Step 6.9: Ensuring network diagnostic tools...${NC}"
+# Tools for the Network > Diagnostics / Switch & L2 / Interfaces tabs.
+# Idempotent so existing installs pick them up on update (Debian/apt).
+if command -v apt-get >/dev/null 2>&1; then
+    NET_PKGS=""
+    for pair in "traceroute:traceroute" "mtr:mtr-tiny" "whois:whois" "lldpctl:lldpd" "ethtool:ethtool" "speedtest-cli:speedtest-cli"; do
+        bin="${pair%%:*}"; pkg="${pair##*:}"
+        command -v "$bin" >/dev/null 2>&1 || NET_PKGS="$NET_PKGS $pkg"
+    done
+    if [ -n "$NET_PKGS" ]; then
+        echo -e "  Installing:$NET_PKGS"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y $NET_PKGS >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓${NC} Installed network tools" \
+            || echo -e "  ${YELLOW}!${NC} Some network tools failed to install"
+    else
+        echo -e "  ${GREEN}✓${NC} Network tools already present"
+    fi
+fi
+# Configure lldpd to also decode CDP/EDP/FDP/SONMP (non-LLDP switches)
+if command -v lldpd >/dev/null 2>&1 || command -v lldpctl >/dev/null 2>&1; then
+    mkdir -p /etc/default
+    cat > /etc/default/lldpd << 'LLDPEOF'
+# Ragnar: decode CDP (Cisco), EDP (Extreme), FDP (Foundry), SONMP (Nortel)
+# neighbours in addition to LLDP, so switch discovery covers non-LLDP gear.
+DAEMON_ARGS="-c -e -f -s"
+LLDPEOF
+    systemctl enable lldpd >/dev/null 2>&1 || true
+    systemctl restart lldpd >/dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓${NC} lldpd configured for switch discovery"
 fi
 
 echo -e "${BLUE}Step 7: Starting ragnar service...${NC}"

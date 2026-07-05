@@ -1,5 +1,6 @@
 ## Ragnar     <img width="105" height="150" alt="image" src="https://github.com/user-attachments/assets/463d32c7-f6ca-447c-b62b-f18f2429b2b2" />
 
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/J3J2EARPK)
 ![GitHub stars](https://img.shields.io/github/stars/PierreGode/Ragnar)
 ![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=fff)
@@ -59,8 +60,13 @@ web will be down during wardrive without ap or wifi connection.
 
 ## 🌟 Features
 
-- **Wi-Fi Client Isolation Testing** — AirSnitch tests whether a network properly isolates clients using GTK abuse, gateway bouncing, and port stealing attacks. See [AirSnitch Guide](docs/airsnitch.md)
+- **RuSense — Camera-Free Surveillance** — Turns ordinary 2.4 GHz WiFi into a no-camera sensor: ESP32 nodes read Channel State Information (CSI) to report presence, motion, people-count, and — with a trained model — coarse pose and resting vital signs (breathing / heart rate). Works in the dark and through walls, with security & health modes, a calibration wizard, browser flashing, and a multi-node offline mesh. See [RuSense](#-rusense--camera-free-surveillance)
+  
+- **Network Tools** — A built-in network engineer's toolbox in the web UI. **Diagnostics:** ping, traceroute, MTR, WHOIS, internet speed test, DNS Doctor (resolver / DNSSEC checks), Path-MTU / black-hole probe, captive-portal check, and LAN throughput via iperf3 (client + built-in server). **Switch & L2:** switch discovery via LLDP / CDPv1v2 / EDP / FDP / SONMP with PoE detection, ARP host scanning, and Locate Port (blinks a switch port so you can find the cable). **Interfaces:** per-interface link speed/duplex/auto-neg, DHCP-vs-static and VLAN detail, DNS/gateway network identity, and per-interface public IP / ISP-ASN lookup (ISP/WAN detection) for multi-WAN setups. Missing CLI tools install with one click. Co-authored by [Solarflere](https://www.instagram.com/solarflere). See [Network Tools Guide](docs/nettools.md)
+
+
 - **Wardriving with GPS recovery** — Logs WiFi networks, BLE devices, and cell towers with GPS positions while driving. Exports to WiGLE CSV / KML. Most wardrivers log observations with GPS-at-scan-time and discard the rest; Ragnar logs a GPS breadcrumb track during the session and runs a post-pass that backfills missing positions for any observation seen within 5 minutes of a real GPS point. The interpolation is speed-aware — when endpoint speeds differ (slowing for a tunnel, accelerating out the far side), it uses constant-acceleration math instead of constant-velocity, shifting positions toward whichever endpoint the device actually spent more time near. See [Wardriving Guide](docs/wardriving.md)
+    
 - **Network Scanning** — Identifies live hosts and open ports
 - **Vulnerability Assessment** — Scans using Nmap and other tools
 - **Multi-Source Threat Intelligence** — Real-time fusion from CISA KEV, NVD CVE, AlienVault OTX, and MITRE ATT&CK
@@ -75,6 +81,7 @@ web will be down during wardrive without ap or wifi connection.
 - **WiFi Pineapple Pager** — Full-color LCD display with button controls, LED indicators, and auto-dim. See [Pager section](#-wifi-pineapple-pager)
 - **Hardware-Bound Authentication** — Optional login with full database encryption at rest. See [Security & Authentication](docs/SECURITY.md)
 - **PiSugar 3 Button** — Physical button to swap between Ragnar and Pwnagotchi modes
+- **Web Terminal** — Optional interactive shell (xterm.js ↔ PTY over Socket.IO) in the dashboard, so you can manage the Pi without SSH. Runs as the non-root `ragnar` user in the Ragnar folder (`sudo` available), **off by default**, and gated by login — enable it in Config → Web Terminal only on trusted networks.
 - **Kill Switch** — Built-in endpoint (`/api/kill`) to wipe all databases, logs, and data. See [Kill Switch](docs/KILL_SWITCH.md)
 - **Comprehensive Logging** — All nmap commands and results logged to `data/logs/nmap.log`
 
@@ -167,6 +174,23 @@ When deployed on systems with 8GB+ RAM, Ragnar automatically unlocks advanced se
 - **Nmap scripts**: vulners.nse, vulscan database
 
 Ragnar auto-detects available tools and enables corresponding features in the web interface.
+
+---
+
+## 📡 RuSense — Camera-Free Surveillance
+
+RuSense turns ordinary 2.4 GHz WiFi into a **no-camera surveillance** system for home,
+office, and anywhere a lens is unwelcome. ESP32 sensor nodes read **WiFi Channel State
+Information (CSI)** — the tiny distortions a moving body imprints on radio waves — and a
+bundled sensing engine reports **presence, motion, people-count**, and (with a trained
+model) **coarse pose and resting vital signs**. No images are ever captured; it works in
+the dark and through walls.
+
+- **Flash a sensor node from your browser** — no toolchain needed: **[RuSense Flasher](https://pierregode.github.io/Ragnar/)** (ESP32-S3 / C6, Chrome/Edge).
+- **Install the backend:** `sudo ./scripts/install_sensing.sh` (runs as `ragnar-sensing.service`).
+- **View it** under the RuSense tabs in the web dashboard at `http://<ragnar-ip>:8000`.
+
+Powered by [RuView](https://github.com/ruvnet/ruview) (by ruvnet). Full details: **[RuSense Guide](docs/rusense.md)**.
 
 ---
 
@@ -280,6 +304,8 @@ Ragnar is built on the shoulders of great work by others:
 |---|---|---|
 | [Bjorn](https://github.com/infinition/Bjorn) | infinition | Original project that Ragnar is forked from |
 | [PagerBjorn / Loki](https://github.com/pineapple-pager-projects/pineapple_pager_loki) | [brAinphreAk](https://github.com/brainphreak) | WiFi Pineapple Pager adaptation layer — display system, hardware control wrapper (`pagerctl.py`), pager menu UI, and all MIPS-compiled binaries and libraries |
+| [RuView](https://github.com/ruvnet/ruview) | ruvnet | WiFi-CSI sensing engine and ESP32 CSI-node firmware behind [RuSense](docs/rusense.md) — camera-free presence, motion, people-count, pose and vital-sign sensing. Ragnar vendors bins from the [PierreGode/RuView](https://github.com/PierreGode/RuView) fork |
+| — | [Solarflere](https://www.instagram.com/solarflere) | Co-author of the [Network Tools](docs/nettools.md) suite (Diagnostics, Switch & L2, Interfaces) |
 
 ---
 

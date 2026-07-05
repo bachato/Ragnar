@@ -133,6 +133,7 @@ SIZE_KEY_TO_DEFAULT_DRIVER = {
     "3in7":     "epd3in7",
     "4in26":    "epd4in26",
     "1in28_tft": "gc9a01",
+    "1in69_tft": "whisplay",
     "0in96_oled": "ssd1306",
     "1602_lcd": "lcd1602",
 }
@@ -174,6 +175,9 @@ DISPLAY_PROFILES = {
     "epd4in26":    {"ref_width": DESIGN_REF_WIDTH, "ref_height": DESIGN_REF_HEIGHT, "default_flip": False},
     # GC9A01 1.28" 240x240 round colour TFT LCD
     "gc9a01":      {"ref_width": DESIGN_REF_WIDTH, "ref_height": DESIGN_REF_WIDTH, "default_flip": False},
+    # Whisplay HAT 1.69" ST7789 240x280 colour TFT LCD (ref height keeps the
+    # 240:280 aspect so the layout isn't stretched: 122 * 280/240 = 142)
+    "whisplay":    {"ref_width": DESIGN_REF_WIDTH, "ref_height": 142, "default_flip": False},
     # SSD1306 0.96" 128x64 monochrome OLED
     "ssd1306":     {"ref_width": 128, "ref_height": 64,  "default_flip": False},
     # LCD1602 16x2 character LCD (I2C via PCF8574 backpack)
@@ -702,6 +706,14 @@ class SharedData:
             "ethernet_scan_enabled": True,
             "ethernet_prefer_over_wifi": True,
             "ethernet_auto_detect": True,
+            # When True, the e-Paper shows an Ethernet-focused network
+            # diagnostic screen (link / IP / switch port), auto-cycling pages
+            # every 5s. Web-toggled from Network > Diagnostics. e-Paper only.
+            "network_diagnostic_mode": False,
+            # Browser terminal (interactive shell over the web UI). OFF by
+            # default — it exposes a shell on the Pi (as the 'ragnar' user),
+            # gated by login. Enable in Settings only if you want it.
+            "terminal_enabled": False,
 
             "network_device_retention_days": 14,
 
@@ -729,6 +741,67 @@ class SharedData:
             "pushover_notify_new_credential": True,
             "pushover_notify_device_lost": False,
             "pushover_notify_device_back_online": False,
+
+            "__title_rusense_pushover__": "RuSense Sensing Alerts",
+            # Master switch for camera-free (WiFi-CSI) surveillance alerts. Sent
+            # via the same Pushover account/keys as the security alerts above —
+            # these toggles only gate the RuSense events. Requires Pushover keys
+            # to be configured and pushover_enabled to be on.
+            # What the space is watched FOR. 'security' = expected-empty,
+            # alert when someone appears; 'health' = expected-occupied
+            # (wellness), alert on inactivity + lead with vitals trends;
+            # 'both' = presence and inactivity alerts together. Picking a mode
+            # in Settings presets the alert toggles below (still tunable).
+            "rusense_mode": "security",
+            "rusense_notify_enabled": False,
+            "rusense_notify_presence": True,        # room goes empty <-> occupied
+            "rusense_notify_motion": False,         # significant (active) motion
+            "rusense_notify_people": False,         # people count crosses threshold
+            "rusense_notify_people_threshold": 1,   # alert when count >= this
+            "rusense_notify_node_offline": True,    # a CSI node stops streaming
+            "rusense_notify_cooldown_s": 60,        # min seconds between same-kind alerts
+            # False-positive guards: an event only fires when the classifier
+            # confidence is at/above this fraction AND the condition has held
+            # continuously for at least this many seconds (debounce).
+            "rusense_notify_min_confidence": 0.95,  # 0..1; require >= 95% confidence
+            "rusense_notify_sustain_s": 2,          # condition must persist this long
+            # Health-mode safety net (the INVERSE of the presence alert): fire
+            # when a home that should be occupied shows NO activity for this
+            # many hours of awake time. The quiet (sleep) window is excluded —
+            # the timer only runs outside it, so a normal night never trips it.
+            "rusense_notify_inactivity": False,     # no-activity-for-N-hours alert
+            "rusense_inactivity_hours": 4,          # awake hours without activity
+            "rusense_quiet_start": 22,              # sleep window start (local hour)
+            "rusense_quiet_end": 7,                 # sleep window end (local hour)
+            # Perimeter geofence: confine motion/presence/people alerts to the
+            # polygon of mapped node corners. Rejects disturbances whose spatial
+            # signature points outside the room (hallway walk-bys, through-wall
+            # neighbours). Needs >= 3 nodes mapped with X/Y in the Settings tab;
+            # with fewer mapped it is a no-op and alerts behave as before.
+            # Permitted alert schedule (surveillance): restrict presence/motion/
+            # people phone alerts to selected weekdays + a daily time window —
+            # e.g. an office watched only on weekends, or a space only at night.
+            # OFF by default (alerts fire 24/7). Sightings are still logged
+            # outside the window; only the phone push is held. Days follow JS
+            # getDay(): 0=Sun .. 6=Sat. start==end means the whole day; start>end
+            # wraps past midnight (e.g. 22->6). Node-offline + inactivity alerts
+            # are NOT gated by this (maintenance / health, not surveillance).
+            "rusense_alert_schedule_enabled": False,
+            "rusense_alert_days": [0, 1, 2, 3, 4, 5, 6],
+            "rusense_alert_start": 0,               # window start hour (local)
+            "rusense_alert_end": 0,                 # window end hour (local)
+            "rusense_geofence_enabled": True,
+            "rusense_node_positions": {},           # {node_id: {"x":.., "y":.., "z":..}}
+            "rusense_node_names": {},               # {node_id: "friendly name"} (used in alerts)
+            "rusense_geofence_window": 30,          # RSSI samples/node (~30s @ 1Hz poll)
+            # Show the RuSense tab in the top navigation. Stored server-side so
+            # the choice is shared across every browser/device, like the rest of
+            # the settings here (the toggle lives in Config -> WiFi Sensing).
+            "rusense_tab_visible": False,
+            # Visual/scene settings for the 3D Observatory (rendering, wireframe,
+            # scene, room size, node map). Mirrored here from the browser so they
+            # persist for everyone; shape: {"version": <str>, "settings": {...}}.
+            "rusense_observatory_settings": {},
 
             "__title_pwnagotchi__": "Pwnagotchi Integration",
             "pwnagotchi_installed": False,

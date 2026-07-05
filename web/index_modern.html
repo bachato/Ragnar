@@ -8,10 +8,18 @@
     
     <!-- Tailwind CSS (local build) -->
     <link rel="stylesheet" href="/css/tailwind.css">
+    <!-- Warm the RuSense island's stylesheet during page load so opening the
+         RuSense tab renders styled instantly (no unstyled "terminal" flash). -->
+    <link rel="preload" href="/web/rusense/assets/app.css" as="style">
 
     <!-- Socket.IO Client -->
     <script src="https://cdn.socket.io/4.8.3/socket.io.min.js"></script>
-    
+
+    <!-- xterm.js (web terminal), vendored locally for offline use -->
+    <link rel="stylesheet" href="/web/vendor/xterm.css">
+    <script src="/web/vendor/xterm.js"></script>
+    <script src="/web/vendor/xterm-addon-fit.js"></script>
+
     <style>
         @keyframes pulse-glow {
             0%, 100% { box-shadow: 0 0 5px rgba(14, 165, 233, 0.5); }
@@ -291,6 +299,18 @@
             min-height: 0;
         }
         body.wd-map-fs-open { overflow: hidden; }
+        /* Observatory iframe expanded to fill the whole viewport (escapes the dashboard layout). */
+        #observatory-frame.observatory-fullscreen {
+            position: fixed !important;
+            inset: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            min-height: 100vh !important;
+            margin: 0 !important;
+            border: none !important;
+            border-radius: 0 !important;
+            z-index: 99999 !important;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
@@ -331,6 +351,14 @@
                     </button>
                     <button onclick="showTab('discovered')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="discovered">
                         Discovered
+                    </button>
+                    <button onclick="showTab('rusense')" class="rusense-nav nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="rusense">
+                        <span class="flex items-center space-x-1">
+                            <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M5.281 13.575a9.5 9.5 0 0113.438 0M2.45 10.745a13.5 13.5 0 0119.1 0M12 20h.01"></path>
+                            </svg>
+                            <span>RuSense</span>
+                        </span>
                     </button>
                     <button id="pentest-nav-btn" onclick="showTab('pentest')"
                             class="nav-btn px-3 py-1.5 rounded-lg transition-colors text-[15px] whitespace-nowrap pentest-nav-btn hidden"
@@ -382,6 +410,9 @@
                     <button onclick="showTab('connect')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="connect">
                         Connect
                     </button>
+                    <button onclick="showTab('terminal')" class="terminal-nav hidden nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="terminal">
+                        Terminal
+                    </button>
                     <button onclick="showTab('config')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="config">
                         Config
                     </button>
@@ -405,6 +436,7 @@
                 <button onclick="showTab('dashboard')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Dashboard</button>
                 <button onclick="showTab('network')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Network</button>
                 <button onclick="showTab('discovered')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Discovered</button>
+                <button onclick="showTab('rusense')" class="rusense-nav block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">RuSense</button>
                 <button onclick="showTab('pentest')"
                         id="mobile-pentest-nav"
                         class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700 pentest-nav-btn hidden"
@@ -419,6 +451,7 @@
                 <button onclick="showTab('files')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Files</button>
                 <button onclick="showTab('system')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">System</button>
                 <button onclick="showTab('connect')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Connect</button>
+                <button onclick="showTab('terminal')" class="terminal-nav hidden block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700" data-tab="terminal">Terminal</button>
                 <button onclick="showTab('config')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Config</button>
                 <button id="mobile-logout-btn" onclick="handleLogout()" class="hidden block w-full text-left px-3 py-2 rounded-lg hover:bg-red-700 bg-red-600/30 text-red-300">Logout</button>
             </div>
@@ -844,6 +877,9 @@
                 <button id="net-subtab-hosts" onclick="showNetworkSubtab('hosts')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors bg-Ragnar-600 text-white">Hosts</button>
                 <button id="net-subtab-archive" onclick="showNetworkSubtab('archive')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">AP Archive</button>
                 <button id="net-subtab-map" onclick="showNetworkSubtab('map')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Map</button>
+                <button id="net-subtab-diagnostics" onclick="showNetworkSubtab('diagnostics')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Diagnostics</button>
+                <button id="net-subtab-switch" onclick="showNetworkSubtab('switch')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Switch &amp; L2</button>
+                <button id="net-subtab-interfaces" onclick="showNetworkSubtab('interfaces')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Interfaces</button>
             </div>
 
             <div id="net-sub-hosts" class="net-subview">
@@ -1101,6 +1137,255 @@
                 <p class="text-xs text-gray-500 mt-2">Click a node to open host details. Scroll to zoom. Drag to pan.</p>
             </div>
             </div><!-- /#net-sub-map -->
+
+            <!-- ===================== Diagnostics ===================== -->
+            <div id="net-sub-diagnostics" class="net-subview hidden">
+                <!-- E-Paper network diagnostic mode toggle -->
+                <div class="glass rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex items-center justify-between gap-4">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">E-Paper Network Diagnostic Mode</h3>
+                            <p class="text-sm text-gray-400">Turns the e-Paper display into an Ethernet-focused field tool — link speed/duplex, addressing, and the switch port you're plugged into (LLDP/CDP + PoE). Works with no internet and auto-cycles pages every 5&nbsp;seconds. Ideal for diagnosing a switch on-site.</p>
+                        </div>
+                        <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                            <input type="checkbox" id="netdiag-display-enabled" class="sr-only peer" onchange="onNetDiagDisplayToggled(this)">
+                            <div class="w-11 h-6 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                        </label>
+                    </div>
+                    <p id="netdiag-display-note" class="text-xs text-gray-500 mt-2 hidden">Active — the e-Paper is showing the network diagnostic screen. Turn off to restore the normal display.</p>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
+                    <!-- Ping -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">Ping</h3>
+                        <p class="text-sm text-gray-400 mb-3">ICMP reachability &amp; round-trip time.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="ping-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPing()">
+                            <button onclick="runPing()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Ping</button>
+                        </div>
+                        <pre id="ping-results" class="hidden mt-3 text-xs font-mono bg-slate-900/70 rounded p-3 overflow-x-auto whitespace-pre-wrap"></pre>
+                    </div>
+                    <!-- Traceroute -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">Traceroute</h3>
+                        <p class="text-sm text-gray-400 mb-3">Path (hops) to a destination.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="trace-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runTraceroute()">
+                            <button onclick="runTraceroute()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Trace</button>
+                        </div>
+                        <pre id="trace-results" class="hidden mt-3 text-xs font-mono bg-slate-900/70 rounded p-3 overflow-x-auto whitespace-pre-wrap"></pre>
+                    </div>
+                    <!-- MTR -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">MTR</h3>
+                        <p class="text-sm text-gray-400 mb-3">Per-hop loss &amp; latency to an end point, sampled over N cycles (a snapshot, not continuous). Optionally bind the start point to one of this host&#39;s addresses.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="mtr-target" type="text" inputmode="url" autocomplete="off" placeholder="End point — IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runMtr()">
+                            <button onclick="runMtr()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run</button>
+                            <button onclick="exportMtrCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
+                        </div>
+                        <div class="flex flex-col sm:flex-row gap-2 mt-2">
+                            <select id="mtr-source" title="Start point: source address to send probes from" class="w-full sm:flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Start point: auto (default route)</option>
+                            </select>
+                            <label class="flex items-center gap-2 text-sm text-gray-400 whitespace-nowrap">
+                                Cycles
+                                <input id="mtr-count" type="number" min="1" max="20" value="5" class="w-20 bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm text-gray-200">
+                            </label>
+                        </div>
+                        <div id="mtr-results" class="hidden mt-3 overflow-x-auto"></div>
+                    </div>
+                    <!-- Whois -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">Whois</h3>
+                        <p class="text-sm text-gray-400 mb-3">Registration data for a domain or IP.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="whois-target" type="text" inputmode="url" autocomplete="off" placeholder="domain or IP" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runWhois()">
+                            <button onclick="runWhois()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Lookup</button>
+                        </div>
+                        <pre id="whois-results" class="hidden mt-3 text-xs font-mono bg-slate-900/70 rounded p-3 overflow-x-auto whitespace-pre-wrap max-h-96"></pre>
+                    </div>
+                    <!-- Speed Test -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                            <div class="min-w-0">
+                                <h3 class="text-lg font-semibold mb-1">Internet Speed Test</h3>
+                                <p class="text-sm text-gray-400">Measures download, upload and latency (takes ~30s).</p>
+                            </div>
+                            <button id="speedtest-btn" onclick="runSpeedtest()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Start Test</button>
+                        </div>
+                        <div id="speedtest-results" class="hidden mt-4"></div>
+                    </div>
+                    <!-- DNS Doctor -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">DNS Doctor</h3>
+                        <p class="text-sm text-gray-400 mb-3">Resolves a name through every system resolver plus public 1.1.1.1 / 8.8.8.8 — per-resolver answers &amp; latency, DNSSEC, and whether they agree (split-DNS / hijack smell). Also checks DoH/DoT reachability.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="dns-target" type="text" inputmode="url" autocomplete="off" placeholder="hostname (e.g. example.com)" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runDns()">
+                            <button onclick="runDns()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Diagnose DNS</button>
+                        </div>
+                        <div id="dns-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- Path MTU -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">Path MTU / Black-hole</h3>
+                        <p class="text-sm text-gray-400 mb-3">Finds the path MTU and the hop that silently drops full-size packets (the "ping works but big transfers hang" fault).</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="pmtu-target" type="text" inputmode="url" autocomplete="off" placeholder="IP or hostname" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPmtu()">
+                            <button onclick="runPmtu()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Discover</button>
+                        </div>
+                        <div id="pmtu-results" class="hidden mt-3 text-sm"></div>
+                    </div>
+                    <!-- Captive Portal -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                            <div class="min-w-0">
+                                <h3 class="text-lg font-semibold mb-1">Captive Portal Check</h3>
+                                <p class="text-sm text-gray-400">Detects hotel/guest-WiFi HTTP hijacking using the OS connectivity-check endpoints.</p>
+                            </div>
+                            <button onclick="runCaptivePortal()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check</button>
+                        </div>
+                        <div id="captive-results" class="hidden mt-3 text-sm"></div>
+                    </div>
+                    <!-- iperf3 LAN Throughput -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">LAN Throughput (iperf3)</h3>
+                        <p class="text-sm text-gray-400 mb-3">Real throughput to another iperf3 node on your network — validates a cable/port/switch that the internet speed test can't. Point it at any iperf3 server, or start the built-in one below and test <em>from</em> another device to this one.</p>
+                        <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2">
+                            <input id="iperf-server" type="text" inputmode="url" autocomplete="off" placeholder="iperf3 server IP (or IP:port)" class="w-full sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runIperf()">
+                            <select id="iperf-dir" class="w-full sm:w-32 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <option value="up">Upload</option>
+                                <option value="down">Download</option>
+                            </select>
+                            <input id="iperf-dur" type="number" min="1" max="30" value="5" title="test duration (seconds)" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runIperf()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run</button>
+                        </div>
+                        <div id="iperf-results" class="hidden mt-3 text-sm"></div>
+                        <div class="mt-3 border-t border-slate-700 pt-3 flex items-center justify-between gap-3">
+                            <p class="text-xs text-gray-500">Built-in iperf3 server — lets another device test against this box.</p>
+                            <button id="iperf-server-btn" onclick="toggleIperfServer()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-sm whitespace-nowrap">Start server</button>
+                        </div>
+                        <div id="iperf-server-status" class="hidden mt-2 text-xs"></div>
+                    </div>
+                    <!-- Live Flow Telemetry -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                            <div class="min-w-0">
+                                <h3 class="text-lg font-semibold mb-1">Live Flow Telemetry</h3>
+                                <p class="text-sm text-gray-400">Per-connection RTT and TCP retransmits from the kernel (<span class="font-mono">ss&nbsp;-ti</span>) — the light version of eBPF flow visibility. RTT far above min-RTT, or retransmits, is where loss/bufferbloat bites.</p>
+                            </div>
+                            <button onclick="runFlows()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Snapshot</button>
+                        </div>
+                        <div id="flows-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- PTP Timing Detection -->
+                    <div class="glass rounded-xl p-4 sm:p-6">
+                        <h3 class="text-lg font-semibold mb-1">PTP Timing Detection</h3>
+                        <p class="text-sm text-gray-400 mb-3">Detects IEEE-1588 / PTPv2 grandmasters on the segment (AV-over-IP, finance, 5G fronthaul). Sniffs the PTP ports / 802.1AS ethertype — detection only; offset needs ptp4l.</p>
+                        <div class="flex flex-col sm:flex-row sm:flex-wrap gap-2">
+                            <input id="ptp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:flex-1 sm:min-w-[11rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runPtp()">
+                            <input id="ptp-secs" type="number" min="3" max="30" value="8" title="capture seconds" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runPtp()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Detect</button>
+                        </div>
+                        <div id="ptp-results" class="hidden mt-3 text-sm"></div>
+                    </div>
+                </div>
+            </div><!-- /#net-sub-diagnostics -->
+
+            <!-- ===================== Switch & L2 ===================== -->
+            <div id="net-sub-switch" class="net-subview hidden">
+                <div class="glass rounded-xl p-4 sm:p-6 mb-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Switch Discovery (LLDP / CDPv1/v2 / EDP / FDP)</h3>
+                            <p class="text-sm text-gray-400">Neighbouring switches via LLDP, Cisco CDPv1/v2, Extreme EDP, Foundry FDP and Nortel SONMP: name, port, VLAN, PoE and management IP.</p>
+                        </div>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="loadLldp()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportLldpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
+                    </div>
+                    <div id="lldp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
+                </div>
+                <div class="glass rounded-xl p-4 sm:p-6">
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">ARP Scan</h3>
+                        <p class="text-sm text-gray-400">Discover live hosts on the local segment via ARP.</p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="arp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-auto sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runArpScan()">
+                        <button onclick="runArpScan()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan</button>
+                        <button onclick="exportArpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
+                    </div>
+                    <div id="arp-results" class="hidden mt-3 overflow-x-auto"></div>
+                </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">Locate Port</h3>
+                        <p class="text-sm text-gray-400">Find which switch port this device is plugged into by blinking the link in a pattern — like a cable tester. Watch the switch: the port whose <strong>link LED</strong> flashes in cadence is the one. On a managed switch, Switch Discovery already names the port; this is the fallback for unmanaged switches. <span class="text-amber-400">Briefly drops the link on the chosen port.</span></p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="locate-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-auto sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')locatePort()">
+                        <input id="locate-count" type="number" min="1" max="30" value="6" title="blink count" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="locatePort()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Flash Port</button>
+                    </div>
+                    <div id="locate-results" class="hidden mt-3 text-sm"></div>
+                </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">L2 Link Health</h3>
+                        <p class="text-sm text-gray-400">Listens passively for a few seconds and reports Layer-2 problems: STP root bridge &amp; loop churn, CDP/LLDP/DTP/VTP control frames, broadcast-storm rate, rogue DHCP servers, rogue IPv6 RA, and duplicate IPs. One "what's wrong at L2" snapshot.</p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="l2-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-auto sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runL2Health()">
+                        <input id="l2-secs" type="number" min="3" max="30" value="12" title="capture seconds" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runL2Health()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan L2</button>
+                    </div>
+                    <div id="l2-results" class="hidden mt-3 text-sm"></div>
+                </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">PCAP Analyzer</h3>
+                        <p class="text-sm text-gray-400">Upload a <span class="font-mono">.pcap</span> / <span class="font-mono">.pcapng</span> capture (from Wireshark, tcpdump, the L2 scan, etc.) for instant triage — summary, protocol breakdown, top talkers, and tshark's expert findings (retransmissions, resets, dup-ACKs, malformed). Read-only; the file is deleted after analysis. Max 100&nbsp;MB.</p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="pcap-file" type="file" accept=".pcap,.pcapng,.cap,application/vnd.tcpdump.pcap" class="w-full sm:w-auto sm:flex-1 sm:min-w-[14rem] max-w-full text-sm text-gray-300 file:mr-3 file:py-2 file:px-3 file:rounded file:border-0 file:text-sm file:bg-slate-700 file:text-gray-200 hover:file:bg-slate-600">
+                        <button onclick="analyzePcap()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Analyze</button>
+                    </div>
+                    <div id="pcap-results" class="hidden mt-3 text-sm"></div>
+                </div>
+            </div><!-- /#net-sub-switch -->
+
+            <!-- ===================== Interfaces ===================== -->
+            <div id="net-sub-interfaces" class="net-subview hidden">
+                <div class="glass rounded-xl p-4 sm:p-6 mb-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Network Identity</h3>
+                            <p class="text-sm text-gray-400">DNS domain &amp; search suffix, nameservers, this host&#39;s name/FQDN, and the default gateway.</p>
+                        </div>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="loadNetworkIdentity()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportIdentityCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
+                    </div>
+                    <div id="net-identity-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
+                </div>
+                <div class="glass rounded-xl p-4 sm:p-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Interfaces</h3>
+                            <p class="text-sm text-gray-400">Link speed &amp; duplex, auto-negotiation, static/DHCP, addressing and VLAN.</p>
+                        </div>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="loadInterfaces()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportInterfacesCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
+                    </div>
+                    <div id="interfaces-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
+                </div>
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">ISP / WAN Detection</h3>
+                            <p class="text-sm text-gray-400">Public IP and ISP/ASN reached <em>through each interface</em> — identifies which physical link goes to which provider on multi-WAN setups. Makes an outbound lookup per interface.</p>
+                        </div>
+                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="detectIsp()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Detect ISPs</button><button onclick="exportIspCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
+                    </div>
+                    <div id="isp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Click <span class="text-gray-300">Detect ISPs</span> to look up the ISP behind each interface.</div>
+                </div>
+            </div><!-- /#net-sub-interfaces -->
         </div><!-- /#network-tab -->
 
         <!-- Connect Tab -->
@@ -1703,6 +1988,32 @@
                             <input type="text" id="blueborne-target" placeholder="MAC Address (AA:BB:CC:DD:EE:FF)" class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-sm mb-2">
                             <button onclick="startBlueBorneScan()" id="blueborne-btn" class="w-full bg-orange-600 hover:bg-orange-700 text-white px-3 py-1 rounded text-sm transition-colors">Scan for Vulnerabilities</button>
                             <div id="blueborne-results" class="mt-2 text-xs text-gray-400 hidden"></div>
+                        </div>
+
+                        <div class="bg-slate-800 rounded p-3">
+                            <div class="flex items-center mb-2">
+                                <svg class="w-5 h-5 mr-2 text-fuchsia-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                                </svg>
+                                <h5 class="font-medium text-sm">WhisperPair Scanner</h5>
+                            </div>
+                            <p class="text-xs text-gray-400 mb-2">Detect Google Fast Pair hijack exposure (CVE-2025-36911)</p>
+                            <input type="text" id="whisperpair-target" placeholder="MAC Address (AA:BB:CC:DD:EE:FF)" class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-sm mb-2">
+                            <button onclick="startWhisperPairScan()" id="whisperpair-btn" class="w-full bg-fuchsia-600 hover:bg-fuchsia-700 text-white px-3 py-1 rounded text-sm transition-colors">Scan for WhisperPair</button>
+                            <div id="whisperpair-results" class="mt-2 text-xs text-gray-400 hidden"></div>
+                        </div>
+
+                        <div class="bg-slate-800 rounded p-3">
+                            <div class="flex items-center mb-2">
+                                <svg class="w-5 h-5 mr-2 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                                </svg>
+                                <h5 class="font-medium text-sm">Airoha RACE Scanner</h5>
+                            </div>
+                            <p class="text-xs text-gray-400 mb-2">Detect unauthenticated RACE GATT on Airoha audio SoCs (CVE-2025-20700)</p>
+                            <input type="text" id="airoha-race-target" placeholder="MAC Address (AA:BB:CC:DD:EE:FF)" class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-sm mb-2">
+                            <button onclick="startAirohaRaceScan()" id="airoha-race-btn" class="w-full bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded text-sm transition-colors">Scan for Airoha RACE</button>
+                            <div id="airoha-race-results" class="mt-2 text-xs text-gray-400 hidden"></div>
                         </div>
 
                         <div class="bg-slate-800 rounded p-3">
@@ -2467,6 +2778,14 @@
                     </button>
                 </div>
                 
+                <!-- Temperature Monitoring (if available) -->
+                <div id="temperature-section" class="glass-card p-4 mb-6 hidden">
+                    <h3 class="font-semibold mb-4">Temperature Sensors</h3>
+                    <div id="temperature-display" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        <!-- Temperature data will be populated here -->
+                    </div>
+                </div>
+
                 <!-- System Overview -->
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
                     <!-- CPU Card -->
@@ -2587,14 +2906,6 @@
                     <h3 class="font-semibold mb-4">Network Statistics</h3>
                     <div id="network-stats" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         <p class="text-gray-400 col-span-full text-center py-4">Loading network statistics...</p>
-                    </div>
-                </div>
-                
-                <!-- Temperature Monitoring (if available) -->
-                <div id="temperature-section" class="glass-card p-4 mt-6 hidden">
-                    <h3 class="font-semibold mb-4">Temperature Sensors</h3>
-                    <div id="temperature-display" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                        <!-- Temperature data will be populated here -->
                     </div>
                 </div>
             </div>
@@ -4206,6 +4517,62 @@
                             </div>
                         </div>
 
+                        <!-- Web Terminal Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">Web Terminal</h4>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="terminal-enabled" class="sr-only peer" onchange="onTerminalToggled(this)">
+                                    <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                                </label>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-2">
+                                Adds a <strong>Terminal</strong> tab with an interactive shell on this Pi (as the <span class="font-mono">ragnar</span> user, in the Ragnar folder) — so you can manage the device without SSH. Off by default.
+                            </div>
+                            <div class="text-xs text-amber-300">
+                                ⚠ Security: this is a real shell reachable through the web UI (behind login). Anyone who can log in gets shell access — with <span class="font-mono">sudo</span> available. Only enable on trusted networks.
+                            </div>
+                        </div>
+
+                        <!-- WiFi Sensing (RuSense) Card -->
+                        <div class="glass rounded-lg p-4">
+                            <div class="flex items-center justify-between mb-3">
+                                <h4 class="font-medium">WiFi Sensing (RuSense)</h4>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="rusense-tab-enabled" class="sr-only peer" onchange="onRusenseTabToggled(this)">
+                                    <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+                                </label>
+                            </div>
+                            <div class="text-sm text-gray-400 mb-3">
+                                Show the <strong>RuSense</strong> tab in the top navigation — WiFi-CSI presence, vital-sign sensing, and the 3D <strong>Observatory</strong> sub-tab. Off by default.
+                            </div>
+
+                            <!-- Bundled sensing-backend installer / management -->
+                            <div id="sensing-install-card" class="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+                                <div class="flex items-start justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <div class="flex items-center gap-2">
+                                            <span class="text-sm font-medium text-gray-200">Sensing backend</span>
+                                            <span id="sensing-status-badge" class="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300">checking…</span>
+                                        </div>
+                                        <p class="text-xs text-gray-400 mt-1">
+                                            Ragnar bundles the WiFi-CSI sensing engine — install it to run sensing on this host, no separate project required.
+                                            <span id="sensing-arch-note" class="block text-xs text-gray-500 mt-1"></span>
+                                        </p>
+                                    </div>
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                        <button id="sensing-install-btn" onclick="installSensingBackend(false)"
+                                            class="px-3 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium">Install</button>
+                                        <button id="sensing-rebuild-btn" onclick="installSensingBackend(true)"
+                                            class="px-3 py-1.5 rounded-lg bg-slate-600 hover:bg-slate-500 text-white text-xs font-medium">Build from source</button>
+                                        <button id="sensing-uninstall-btn" onclick="uninstallSensingBackend()"
+                                            class="hidden px-3 py-1.5 rounded-lg bg-red-700 hover:bg-red-600 text-white text-xs font-medium">Uninstall</button>
+                                    </div>
+                                </div>
+                                <pre id="sensing-install-log" class="hidden mt-3 max-h-48 overflow-auto rounded bg-black/50 p-2 text-xs text-gray-300 whitespace-pre-wrap"></pre>
+                            </div>
+                        </div>
+
                         <!-- On-screen Kiosk Card -->
                         <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
@@ -5063,6 +5430,57 @@
             </div>
         </div>
         
+        <!-- Terminal Tab (interactive shell on the Pi via PTY over Socket.IO) -->
+        <div id="terminal-tab" class="tab-content hidden">
+            <div class="max-w-6xl mx-auto">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3">
+                    <div class="min-w-0">
+                        <h2 class="text-xl font-bold">Terminal</h2>
+                        <p class="text-sm text-gray-400">Interactive shell on this Pi as the <span class="font-mono">ragnar</span> user, in <span class="font-mono">/home/ragnar/Ragnar</span>. Use <span class="font-mono">sudo</span> for privileged commands.</p>
+                    </div>
+                    <button onclick="initTerminal()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-sm whitespace-nowrap">Reconnect</button>
+                </div>
+                <div id="terminal-status" class="text-sm text-gray-400 mb-2"></div>
+                <div id="xterm-mount" class="rounded-lg overflow-hidden border border-slate-700 bg-[#0f172a]" style="height:70vh;"></div>
+            </div>
+        </div>
+
+        <!-- RuSense Tab (native RuView WiFi-CSI console; mounted in a Shadow DOM island) -->
+        <div id="rusense-tab" class="tab-content hidden">
+            <div class="mb-4 flex items-center justify-between flex-wrap gap-3">
+                <div>
+                    <h2 class="text-2xl font-bold text-white flex items-center gap-2">
+                        <svg class="w-6 h-6 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M5.281 13.575a9.5 9.5 0 0113.438 0M2.45 10.745a13.5 13.5 0 0119.1 0M12 20h.01"></path>
+                        </svg>
+                        RuSense
+                    </h2>
+                    <p class="text-sm text-gray-400 mt-1">WiFi CSI presence, vital-sign &amp; pose sensing</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-1 mb-3 overflow-x-auto">
+                <button id="rusense-subtab-dashboard" onclick="showRusenseSubtab('dashboard')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Dashboard</button>
+                <button id="rusense-subtab-observatory" onclick="showRusenseSubtab('observatory')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Observatory</button>
+                <button id="rusense-subtab-sensing" onclick="showRusenseSubtab('sensing')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Sensing</button>
+                <button id="rusense-subtab-nodes" onclick="showRusenseSubtab('nodes')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Nodes</button>
+                <button id="rusense-subtab-training" onclick="showRusenseSubtab('training')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Training</button>
+                <button id="rusense-subtab-settings" onclick="showRusenseSubtab('settings')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">Settings</button>
+                <button id="rusense-subtab-about" onclick="showRusenseSubtab('about')" class="px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">About</button>
+            </div>
+            <p id="rusense-offline-hint" class="hidden text-sm text-amber-300 mb-3">
+                Sensing backend not reachable. Ensure the sensing-server is running on this host (port 3000)
+                so Ragnar can proxy its CSI stream.
+            </p>
+            <!-- Shadow DOM island: RuView's compiled Tailwind is fully isolated from Ragnar here. -->
+            <div id="rusense-host" class="block w-full"></div>
+            <!-- Observatory sub-tab: full-page WebGL app (iframe). Hidden until its sub-tab is active;
+                 src is set lazily by showRusenseSubtab() so WebGL + WS only run while viewed. -->
+            <iframe id="observatory-frame" title="RuView Observatory"
+                class="hidden w-full rounded-xl border border-slate-700 bg-black"
+                style="height:calc(100vh - 220px);min-height:560px;"
+                allow="fullscreen"></iframe>
+        </div>
+
     </main>
 
     <!-- Kiosk wardriving live view (rendered only when body.kiosk-mode is set
@@ -5186,7 +5604,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260531d"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260705-hidevpn"></script>
 
 </body>
 </html>

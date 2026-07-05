@@ -523,6 +523,7 @@ function epdTypeToSizeKey(epd_type) {
     if (epd_type.startsWith('epd3in7')) return '3in7';
     if (epd_type.startsWith('epd4in26')) return '4in26';
     if (epd_type === 'gc9a01') return '1in28_tft';
+    if (epd_type === 'whisplay') return '1in69_tft';
     if (epd_type === 'ssd1306') return '0in96_oled';
     if (epd_type === 'lcd1602') return 'lcd1602';
     return epd_type; // fallback: return as-is
@@ -537,6 +538,7 @@ const displaySelectOptions = {
         { value: '3in7', label: '3.7" e-Paper (280x480)' },
         { value: '4in26', label: '4.26" e-Paper (800x480)' },
         { value: '1in28_tft', label: '1.28" GC9A01 Round TFT (240x240)' },
+        { value: '1in69_tft', label: '1.69" Whisplay ST7789 TFT (240x280)' },
         { value: '0in96_oled', label: '0.96" SSD1306 OLED (128x64)' },
         { value: 'lcd1602', label: '16×2 LCD1602 Character LCD (I2C)' },
         { value: 'max7219_8panel', label: 'MAX7219 8-panel LED Matrix (64×8)' },
@@ -597,6 +599,12 @@ document.addEventListener('DOMContentLoaded', function() {
     initializePwnUI();
     initializePwnagotchiVisibility();
     handleHeadlessMode();
+    applyRusenseTabVisibility();
+    applyTerminalVisibility();
+    // localStorage gave us an instant paint above; now reconcile with the
+    // server (the shared source of truth) without blocking startup.
+    syncRusenseTabFromServer();
+    syncTerminalFromServer();
 
 });
 
@@ -802,6 +810,328 @@ function initializeTabs() {
     showTab('dashboard');
 }
 
+// ── RuSense (native RuView WiFi-CSI console, Shadow-DOM island) ─────────────
+// The RuView SPA is served from /web/rusense/ and mounted into a shadow root
+// under #rusense-host, so its compiled Tailwind never collides with Ragnar's
+// styles. Sensing data is proxied by this Flask app (/ws/sensing, /api/v1/*).
+const RUSENSE_SUBTABS = ['dashboard', 'observatory', 'sensing', 'nodes', 'training', 'settings', 'about'];
+let _rusenseLoader = null;        // resolved loader module
+let _rusenseLoading = null;       // in-flight import() promise
+let _rusenseCurrent = 'dashboard';
+
+function _setRusenseActive(name) {
+    RUSENSE_SUBTABS.forEach(k =>
+        _setSubtabActive(document.getElementById('rusense-subtab-' + k), k === name));
+}
+
+function loadRusenseLoader() {
+    if (_rusenseLoader) return Promise.resolve(_rusenseLoader);
+    if (!_rusenseLoading) {
+        _rusenseLoading = import('/web/rusense/app/loader.js?v=20260705-calpresets')
+            .then(m => { _rusenseLoader = m; return m; })
+            .catch(err => { _rusenseLoading = null; throw err; });
+    }
+    return _rusenseLoading;
+}
+
+// Let the Observatory iframe ask the dashboard to expand it to the full
+// viewport (it cannot escape its own container from inside the iframe).
+let _observatoryFsInit = false;
+function initObservatoryFullscreenBridge() {
+    if (_observatoryFsInit) return;
+    _observatoryFsInit = true;
+    window.addEventListener('message', (e) => {
+        if (!e.data || e.data.type !== 'observatory-fullscreen') return;
+        const obs = document.getElementById('observatory-frame');
+        if (!obs) return;
+        const expanded = obs.classList.toggle('observatory-fullscreen');
+        if (expanded) {
+            const req = obs.requestFullscreen || obs.webkitRequestFullscreen;
+            if (req) Promise.resolve(req.call(obs)).catch(() => { /* CSS overlay still applies */ });
+        } else {
+            const exit = document.exitFullscreen || document.webkitExitFullscreen;
+            if (exit && (document.fullscreenElement || document.webkitFullscreenElement)) {
+                Promise.resolve(exit.call(document)).catch(() => {});
+            }
+        }
+    });
+    // Keep the CSS overlay in sync when the user leaves OS fullscreen via Esc.
+    document.addEventListener('fullscreenchange', () => {
+        const obs = document.getElementById('observatory-frame');
+        if (obs && !document.fullscreenElement) obs.classList.remove('observatory-fullscreen');
+    });
+}
+initObservatoryFullscreenBridge();
+
+function showRusenseSubtab(name) {
+    if (!RUSENSE_SUBTABS.includes(name)) name = 'dashboard';
+    _rusenseCurrent = name;
+    _setRusenseActive(name);
+
+    const host = document.getElementById('rusense-host');
+    const obs = document.getElementById('observatory-frame');
+
+    if (name === 'observatory') {
+        // Full-page WebGL app: show the iframe and hide the shadow-island views.
+        if (host) host.classList.add('hidden');
+        if (obs) {
+            obs.classList.remove('hidden');
+            if (!obs.getAttribute('src')) obs.src = '/web/observatory.html?v=20260704-obsgate';
+        }
+        if (_rusenseLoader) { try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ } }
+        return;
+    }
+
+    // Regular shadow-island view: stop/hide the Observatory iframe, show the host.
+    if (obs) { obs.classList.add('hidden'); if (obs.getAttribute('src')) obs.removeAttribute('src'); }
+    if (host) host.classList.remove('hidden');
+    loadRusenseLoader()
+        .then(m => m.init(host, name))
+        .catch(err => {
+            console.error('[rusense] loader failed', err);
+            const hint = document.getElementById('rusense-offline-hint');
+            if (hint) {
+                hint.textContent = 'RuSense UI failed to load: ' + (err && err.message);
+                hint.classList.remove('hidden');
+            }
+        });
+}
+
+function initRusense() {
+    showRusenseSubtab(_rusenseCurrent);
+    // Reachability hint: /api/v1/status is proxied to the sensing-server.
+    const hint = document.getElementById('rusense-offline-hint');
+    if (hint) {
+        fetch('/api/v1/status', { cache: 'no-store' })
+            .then(r => hint.classList.toggle('hidden', r.ok))
+            .catch(() => hint.classList.remove('hidden'));
+    }
+}
+
+// ── Bundled sensing backend: install / uninstall from the RuSense tab ────────
+let _sensingLogTimer = null;
+
+function refreshSensingInstallCard() {
+    const card = document.getElementById('sensing-install-card');
+    if (!card) return;
+    fetch('/api/sensing/status', { cache: 'no-store' })
+        .then(r => r.json())
+        .then(s => {
+            const badge = document.getElementById('sensing-status-badge');
+            const installBtn = document.getElementById('sensing-install-btn');
+            const rebuildBtn = document.getElementById('sensing-rebuild-btn');
+            const uninstallBtn = document.getElementById('sensing-uninstall-btn');
+            const archNote = document.getElementById('sensing-arch-note');
+            // Always visible in the RuSense tab: doubles as a status + management panel
+            // (Install when absent, Reinstall / Uninstall when present).
+            card.classList.remove('hidden');
+            if (archNote) {
+                archNote.textContent = s.has_prebuilt
+                    ? 'Prebuilt binary bundled for this device (' + s.arch + ') — installs instantly.'
+                    : 'No prebuilt binary for ' + s.arch + ' — install will fetch Rust and compile from source (slow).';
+            }
+            if (badge) {
+                let txt = 'not installed', cls = 'bg-gray-700 text-gray-300';
+                if (s.installing) { txt = 'installing…'; cls = 'bg-amber-700 text-amber-100'; }
+                else if (s.installed && s.active) { txt = 'running'; cls = 'bg-green-700 text-green-100'; }
+                else if (s.installed) { txt = 'stopped'; cls = 'bg-red-700 text-red-100'; }
+                badge.textContent = txt;
+                badge.className = 'text-xs px-2 py-0.5 rounded ' + cls;
+            }
+            const busy = !!s.installing;
+            if (installBtn) { installBtn.disabled = busy; installBtn.textContent = s.installed ? 'Reinstall' : 'Install'; }
+            if (rebuildBtn) rebuildBtn.disabled = busy;
+            if (uninstallBtn) { uninstallBtn.classList.toggle('hidden', !s.installed); uninstallBtn.disabled = busy; }
+            if (s.installing) startSensingLogPoll();
+        })
+        .catch(() => {});
+}
+
+function installSensingBackend(rebuild) {
+    const logEl = document.getElementById('sensing-install-log');
+    if (logEl) { logEl.classList.remove('hidden'); logEl.textContent = 'Starting…'; }
+    fetch('/api/sensing/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rebuild: !!rebuild })
+    }).then(() => startSensingLogPoll()).catch(() => {});
+}
+
+function uninstallSensingBackend() {
+    if (!confirm('Stop and remove the bundled sensing backend?')) return;
+    fetch('/api/sensing/uninstall', { method: 'POST' })
+        .then(() => startSensingLogPoll()).catch(() => {});
+}
+
+function startSensingLogPoll() {
+    if (_sensingLogTimer) return;
+    const logEl = document.getElementById('sensing-install-log');
+    if (logEl) logEl.classList.remove('hidden');
+    const tick = () => {
+        fetch('/api/sensing/install-log', { cache: 'no-store' })
+            .then(r => r.json())
+            .then(s => {
+                if (logEl && s.log) { logEl.textContent = s.log; logEl.scrollTop = logEl.scrollHeight; }
+                if (!s.installing) {
+                    clearInterval(_sensingLogTimer); _sensingLogTimer = null;
+                    refreshSensingInstallCard();
+                    if (s.installed && s.active) {
+                        const hint = document.getElementById('rusense-offline-hint');
+                        if (hint) hint.classList.add('hidden');
+                        showRusenseSubtab(_rusenseCurrent);
+                    }
+                }
+            }).catch(() => {});
+    };
+    tick();
+    _sensingLogTimer = setInterval(tick, 2000);
+}
+
+// ── RuSense tab visibility (toggle lives in Settings; hidden by default) ─────
+// Stored server-side under the same key so the choice is shared across every
+// browser/device (like Ragnar's other settings). localStorage is a local cache
+// for instant first paint; the server value is synced in on load and wins.
+const RUSENSE_TAB_KEY = 'rusense_tab_visible';
+
+function _rusenseTabVisible() {
+    return localStorage.getItem(RUSENSE_TAB_KEY) === '1';
+}
+
+function syncRusenseTabToggle() {
+    const cb = document.getElementById('rusense-tab-enabled');
+    if (cb) cb.checked = _rusenseTabVisible();
+}
+
+function applyRusenseTabVisibility() {
+    const visible = _rusenseTabVisible();
+    document.querySelectorAll('.rusense-nav').forEach(btn => btn.classList.toggle('hidden', !visible));
+    // If the tab is hidden while it's the active one, fall back to the dashboard.
+    if (!visible && typeof currentTab !== 'undefined' && currentTab === 'rusense') {
+        showTab('dashboard');
+    }
+    syncRusenseTabToggle();
+}
+
+// Seed the local cache from the server config so a save on any device shows up
+// here. Accepts an already-fetched config to avoid an extra round-trip; fetches
+// one itself otherwise. Server wins when the key is present.
+async function syncRusenseTabFromServer(config) {
+    try {
+        const cfg = config || await fetchAPI('/api/config');
+        if (cfg && Object.prototype.hasOwnProperty.call(cfg, RUSENSE_TAB_KEY)) {
+            localStorage.setItem(RUSENSE_TAB_KEY, cfg[RUSENSE_TAB_KEY] ? '1' : '0');
+            applyRusenseTabVisibility();
+        }
+    } catch (e) { /* offline — keep the localStorage value */ }
+}
+
+function onRusenseTabToggled(cb) {
+    localStorage.setItem(RUSENSE_TAB_KEY, cb.checked ? '1' : '0');
+    applyRusenseTabVisibility();
+    // Persist server-side so it's shared/persistent for everyone, not just here.
+    postAPI('/api/config', { [RUSENSE_TAB_KEY]: cb.checked })
+        .catch(err => console.warn('Failed to persist RuSense tab visibility:', err));
+    if (cb.checked) showTab('rusense');
+}
+
+// ==================== Web Terminal (xterm.js over Socket.IO) ====================
+const TERMINAL_KEY = 'terminal_enabled';
+let _term = null, _termFit = null, _termSocket = null, _termResizeHooked = false;
+
+function _terminalEnabled() { return localStorage.getItem(TERMINAL_KEY) === '1'; }
+
+function syncTerminalToggle() {
+    const cb = document.getElementById('terminal-enabled');
+    if (cb) cb.checked = _terminalEnabled();
+}
+
+function applyTerminalVisibility() {
+    const enabled = _terminalEnabled();
+    document.querySelectorAll('.terminal-nav').forEach(btn => btn.classList.toggle('hidden', !enabled));
+    if (!enabled && typeof currentTab !== 'undefined' && currentTab === 'terminal') showTab('dashboard');
+    syncTerminalToggle();
+}
+
+async function syncTerminalFromServer(config) {
+    try {
+        const cfg = config || await fetchAPI('/api/config');
+        if (cfg && Object.prototype.hasOwnProperty.call(cfg, TERMINAL_KEY)) {
+            localStorage.setItem(TERMINAL_KEY, cfg[TERMINAL_KEY] ? '1' : '0');
+            applyTerminalVisibility();
+        }
+    } catch (e) { /* offline — keep the localStorage value */ }
+}
+
+function onTerminalToggled(cb) {
+    localStorage.setItem(TERMINAL_KEY, cb.checked ? '1' : '0');
+    applyTerminalVisibility();
+    postAPI('/api/config', { [TERMINAL_KEY]: cb.checked })
+        .then(() => addConsoleMessage(cb.checked ? 'Web terminal enabled' : 'Web terminal disabled', 'info'))
+        .catch(err => {
+            addConsoleMessage('Failed to toggle terminal: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+            localStorage.setItem(TERMINAL_KEY, cb.checked ? '1' : '0');
+            applyTerminalVisibility();
+        });
+    if (cb.checked) showTab('terminal'); else _termTeardown();
+}
+
+function _sendTermResize() {
+    if (_term && _termSocket && _termSocket.connected) {
+        _termSocket.emit('terminal_resize', { rows: _term.rows, cols: _term.cols });
+    }
+}
+
+function _termTeardown() {
+    try { if (_termSocket) { _termSocket.disconnect(); _termSocket = null; } } catch (e) { /* ignore */ }
+}
+
+function initTerminal() {
+    const mount = document.getElementById('xterm-mount');
+    const status = document.getElementById('terminal-status');
+    if (!mount) return;
+    if (typeof Terminal === 'undefined') {
+        if (status) status.innerHTML = '<span class="text-red-400">Terminal library failed to load.</span>';
+        return;
+    }
+    if (!_terminalEnabled()) {
+        if (status) status.innerHTML = '<span class="text-amber-300">Web terminal is disabled.</span> Enable it in Config → Web Terminal.';
+        _termTeardown();
+        return;
+    }
+    if (status) status.textContent = '';
+
+    if (!_term) {
+        _term = new Terminal({ cursorBlink: true, fontSize: 13,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+            theme: { background: '#0f172a', foreground: '#e2e8f0' } });
+        _termFit = new FitAddon.FitAddon();
+        _term.loadAddon(_termFit);
+        _term.open(mount);
+        _term.onData(d => { if (_termSocket && _termSocket.connected) _termSocket.emit('terminal_input', { data: d }); });
+    }
+    try { _termFit.fit(); } catch (e) { /* mount not sized yet */ }
+
+    if (!_termSocket || !_termSocket.connected) {
+        _term.reset();
+        _termSocket = io('/terminal', { reconnection: false });
+        _termSocket.on('connect', () => { setTimeout(() => { try { _termFit.fit(); } catch (e) {} _sendTermResize(); _term.focus(); }, 60); });
+        _termSocket.on('terminal_output', d => _term.write(d.data || ''));
+        _termSocket.on('terminal_exit', () => _term.write('\r\n\x1b[33m[session ended — press Reconnect for a new shell]\x1b[0m\r\n'));
+        _termSocket.on('connect_error', () => _term.write('\r\n\x1b[31m[could not open terminal — is it enabled and are you logged in?]\x1b[0m\r\n'));
+    }
+
+    if (!_termResizeHooked) {
+        window.addEventListener('resize', () => {
+            if (typeof currentTab !== 'undefined' && currentTab === 'terminal' && _termFit) {
+                try { _termFit.fit(); _sendTermResize(); } catch (e) { /* ignore */ }
+            }
+        });
+        _termResizeHooked = true;
+    }
+    setTimeout(() => { try { _termFit.fit(); } catch (e) {} _sendTermResize(); }, 80);
+}
+
 function showTab(tabName) {
     // Backward-compat: these tabs are now sub-tabs of Network / Discovered
     if (tabName === 'networks') { showTab('network'); showNetworkSubtab('archive'); return; }
@@ -809,6 +1139,16 @@ function showTab(tabName) {
     if (tabName === 'credentials') { showTab('discovered'); showDiscoveredSubtab('credentials'); return; }
 
     currentTab = tabName;
+
+    if (_rusenseLoader && tabName !== 'rusense') {
+        try { _rusenseLoader.suspend(); } catch (e) { /* ignore */ }
+    }
+
+    // Leaving RuSense: stop the Observatory iframe (WebGL + WS) if it was open.
+    if (tabName !== 'rusense') {
+        const _obsFrame = document.getElementById('observatory-frame');
+        if (_obsFrame && _obsFrame.getAttribute('src')) _obsFrame.removeAttribute('src');
+    }
 
     if (systemMonitoringInterval && tabName !== 'system') {
         clearInterval(systemMonitoringInterval);
@@ -836,7 +1176,11 @@ function showTab(tabName) {
     }
     
     loadTabData(tabName);
-    
+
+    if (tabName === 'config') {
+        try { refreshSensingInstallCard(); syncRusenseTabToggle(); syncTerminalToggle(); } catch (e) { /* ignore */ }
+    }
+
     const mobileMenu = document.getElementById('mobile-menu');
     if (mobileMenu) {
         mobileMenu.classList.add('hidden');
@@ -853,7 +1197,10 @@ function _setSubtabActive(btn, active) {
 }
 
 function showNetworkSubtab(name) {
-    const views = { hosts: 'net-sub-hosts', archive: 'net-sub-archive', map: 'net-sub-map' };
+    const views = {
+        hosts: 'net-sub-hosts', archive: 'net-sub-archive', map: 'net-sub-map',
+        diagnostics: 'net-sub-diagnostics', switch: 'net-sub-switch', interfaces: 'net-sub-interfaces'
+    };
     Object.keys(views).forEach(key => {
         const el = document.getElementById(views[key]);
         if (el) el.classList.toggle('hidden', key !== name);
@@ -865,7 +1212,1052 @@ function showNetworkSubtab(name) {
         if (!_mapInitialized) { loadNetworkMap(); }
     } else if (name === 'hosts') {
         loadNetworkData();
+    } else if (name === 'switch') {
+        loadLldp();
+    } else if (name === 'interfaces') {
+        loadNetworkIdentity();
+        loadInterfaces();
+    } else if (name === 'diagnostics') {
+        populateMtrSources();
+        syncNetDiagDisplayFromServer();
     }
+    // Diagnostics tools run on demand; we only prefill the MTR start-point list.
+}
+
+// ============================================================================
+// Network diagnostics (Diagnostics / Switch & L2 / Interfaces sub-tabs)
+// Backend: /api/net/* (see network_diagnostics.py)
+// ============================================================================
+
+// Last-fetched payloads for each net panel, so "Export CSV" has data to dump.
+let _ndLastLldp = [], _ndLastArp = null, _ndLastIfaces = [],
+    _ndLastMtr = null, _ndLastIdentity = null, _ndLastIsp = [];
+
+// Build a CSV from a header row + rows (arrays of cells) and download it.
+function _ndDownloadCsv(nameBase, header, rows) {
+    if (!rows || !rows.length) {
+        addConsoleMessage('Nothing to export yet — run it first', 'warning');
+        return;
+    }
+    const q = (c) => `"${String(c == null ? '' : c).replace(/"/g, '""')}"`;
+    const csv = [header].concat(rows).map(r => r.map(q).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ragnar_${nameBase}_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+function exportLldpCsv() {
+    _ndDownloadCsv('switch_neighbors',
+        ['Local IF', 'Protocol', 'Switch', 'Switch descr', 'Port', 'VLAN ID', 'VLAN name', 'PoE', 'Mgmt IP'],
+        (_ndLastLldp || []).map(n => [n.local_interface, n.protocol, n.switch_name,
+            n.switch_descr, (n.port_descr || n.port_id), n.vlan_id, n.vlan_name, _poeText(n.poe), n.mgmt_ip]));
+}
+
+function exportArpCsv() {
+    const d = _ndLastArp;
+    _ndDownloadCsv('arp_scan' + (d && d.interface ? '_' + d.interface : ''),
+        ['IP', 'MAC', 'Vendor'],
+        (d && d.hosts || []).map(h => [h.ip, h.mac, h.vendor]));
+}
+
+function exportInterfacesCsv() {
+    _ndDownloadCsv('interfaces',
+        ['Name', 'Type', 'Operstate', 'Link detected', 'Speed', 'Duplex', 'Auto-neg',
+         'IP method', 'IPv4', 'IPv6', 'MAC', 'VLAN ID', 'VLAN proto'],
+        (_ndLastIfaces || []).map(i => [i.name, i.type, i.operstate, i.link_detected,
+            i.speed, i.duplex, i.autoneg, i.ip_method, (i.ipv4 || []).join(' '),
+            (i.ipv6 || []).join(' '), i.mac, i.vlan_id, i.vlan_proto]));
+}
+
+function exportMtrCsv() {
+    const d = _ndLastMtr;
+    if (!d) { addConsoleMessage('Run MTR first', 'warning'); return; }
+    const base = 'mtr_' + String(d.target || 'target').replace(/[^a-z0-9._-]/gi, '_');
+    _ndDownloadCsv(base,
+        ['Hop', 'Host', 'Loss %', 'Sent', 'Last', 'Avg', 'Best', 'Worst', 'Jitter (StDev)'],
+        (d.hops || []).map(h => [h.hop, h.host, h.loss_pct, h.sent, h.last, h.avg, h.best, h.worst, h.stdev]));
+}
+
+function exportIdentityCsv() {
+    const d = _ndLastIdentity;
+    if (!d) { addConsoleMessage('Load Network Identity first', 'warning'); return; }
+    const domain = (d.domains && d.domains.length) ? d.domains.join(' ')
+        : (d.guessed_domain ? d.guessed_domain + ' (guessed)' : '');
+    _ndDownloadCsv('network_identity', ['Field', 'Value'], [
+        ['Domain / search', domain],
+        ['Hostname', d.hostname],
+        ['FQDN', d.fqdn],
+        ['Nameservers', (d.nameservers || []).join(' ')],
+        ['DNS via stub', d.dns_stub],
+        ['Gateway IP', d.gateway ? d.gateway.ip : ''],
+        ['Gateway PTR', d.gateway ? d.gateway.ptr : ''],
+        ['Sources', (d.sources || []).join(' ')],
+    ]);
+}
+
+function _ndBusy(btn, busy, busyLabel) {
+    if (!btn) return;
+    if (busy) {
+        btn.dataset._orig = btn.innerHTML;
+        btn.disabled = true;
+        btn.classList.add('opacity-60');
+        btn.innerHTML = '<span class="inline-block animate-spin">⟳</span> ' + (busyLabel || 'Running…');
+    } else {
+        btn.disabled = false;
+        btn.classList.remove('opacity-60');
+        if (btn.dataset._orig) btn.innerHTML = btn.dataset._orig;
+    }
+}
+
+async function _ndRunText(inputId, resultId, endpoint, verb, rerunFnName) {
+    const input = document.getElementById(inputId);
+    const out = document.getElementById(resultId);
+    const target = (input.value || '').trim();
+    if (!target) { input.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, verb);
+    out.classList.remove('hidden');
+    out.textContent = verb + ' ' + target + '…';
+    try {
+        const data = await postAPI(endpoint, { target });
+        if (data.success) {
+            out.textContent = data.output || '(no output)';
+        } else if (data.missing_tool && rerunFnName) {
+            out.innerHTML = _ndMissingTool(data, rerunFnName);
+        } else {
+            out.textContent = 'Error: ' + (data.error || 'failed');
+        }
+    } catch (e) {
+        out.textContent = 'Failed: ' + e.message;
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+function runPing() { return _ndRunText('ping-target', 'ping-results', '/api/net/ping', 'Pinging', 'runPing'); }
+function runTraceroute() { return _ndRunText('trace-target', 'trace-results', '/api/net/traceroute', 'Tracing', 'runTraceroute'); }
+function runWhois() { return _ndRunText('whois-target', 'whois-results', '/api/net/whois', 'Looking up', 'runWhois'); }
+
+// Fill the MTR start-point dropdown with this host's local IPv4 addresses.
+async function populateMtrSources() {
+    const sel = document.getElementById('mtr-source');
+    if (!sel || sel.dataset._loaded) return;
+    try {
+        const data = await fetchAPI('/api/net/interfaces');
+        if (!data || !data.success) return;
+        const seen = new Set();
+        (data.interfaces || []).forEach(i => {
+            (i.ipv4 || []).forEach(cidr => {
+                const ip = String(cidr).split('/')[0];
+                if (!ip || seen.has(ip)) return;
+                seen.add(ip);
+                const opt = document.createElement('option');
+                opt.value = ip;
+                opt.textContent = i.name + ' — ' + ip;
+                sel.appendChild(opt);
+            });
+        });
+        sel.dataset._loaded = '1';
+    } catch (e) { /* leave just the auto option */ }
+}
+
+async function runMtr() {
+    const target = (document.getElementById('mtr-target').value || '').trim();
+    const source = (document.getElementById('mtr-source').value || '').trim();
+    let count = parseInt(document.getElementById('mtr-count').value, 10);
+    if (!Number.isFinite(count)) count = 5;
+    count = Math.max(1, Math.min(20, count));
+    const out = document.getElementById('mtr-results');
+    if (!target) return;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Running…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running MTR to ' + escapeHtml(target)
+        + (source ? ' from ' + escapeHtml(source) : '') + ' (' + count + ' cycles)…</p>';
+    try {
+        const body = { target, count };
+        if (source) body.source = source;
+        const data = await postAPI('/api/net/mtr', body);
+        if (!data.success) {
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'runMtr')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        _ndLastMtr = { target: target, source: source, count: count, hops: data.hops || [] };
+        // Severity colour helpers (per-hop RTT in ms). Thresholds are generous
+        // so only genuinely bad hops light up.
+        const latColor = (ms) => (ms > 150) ? 'text-red-400' : (ms > 60) ? 'text-yellow-400' : '';
+        const jitColor = (ms) => (ms > 30) ? 'text-red-400' : (ms > 10) ? 'text-yellow-400' : '';
+        const lossColor = (p) => (p >= 50) ? 'text-red-400' : (p > 0) ? 'text-yellow-400' : '';
+        let rows = (data.hops || []).map(h => `
+            <tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 text-gray-400">${h.hop}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(h.host || '???'))}</td>
+                <td class="px-3 py-1.5 text-right ${lossColor(h.loss_pct)}">${h.loss_pct}%</td>
+                <td class="px-3 py-1.5 text-right ${latColor(h.avg)}">${h.avg}</td>
+                <td class="px-3 py-1.5 text-right">${h.best}</td>
+                <td class="px-3 py-1.5 text-right ${latColor(h.worst)}">${h.worst}</td>
+                <td class="px-3 py-1.5 text-right ${jitColor(h.stdev)}">${h.stdev != null ? h.stdev : '\u2014'}</td>
+            </tr>`).join('');
+        out.innerHTML = `<table class="min-w-full text-sm whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Hop</th><th class="px-3 py-1.5">Host</th>
+                <th class="px-3 py-1.5 text-right">Loss</th><th class="px-3 py-1.5 text-right">Avg ms</th>
+                <th class="px-3 py-1.5 text-right">Best</th><th class="px-3 py-1.5 text-right">Worst</th>
+                <th class="px-3 py-1.5 text-right">Jitter</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runSpeedtest() {
+    const btn = document.getElementById('speedtest-btn');
+    const out = document.getElementById('speedtest-results');
+    _ndBusy(btn, true, 'Testing…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running speed test (this can take ~30s)…</p>';
+    try {
+        const data = await postAPI('/api/net/speedtest', {});
+        if (!data.success) {
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'runSpeedtest')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        const card = (label, val, unit) => `
+            <div class="bg-slate-800 rounded-lg p-4 text-center">
+                <div class="text-2xl font-bold text-Ragnar-400">${val}<span class="text-sm text-gray-400"> ${unit}</span></div>
+                <div class="text-xs uppercase text-gray-500 mt-1">${label}</div>
+            </div>`;
+        out.innerHTML = `
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-3">
+                ${card('Download', data.download_mbps, 'Mbps')}
+                ${card('Upload', data.upload_mbps, 'Mbps')}
+                ${card('Ping', data.ping_ms, 'ms')}
+            </div>
+            <p class="text-xs text-gray-500">Server: ${escapeHtml(String(data.server || '—'))}${data.server_location ? ' (' + escapeHtml(data.server_location) + ')' : ''} · ISP: ${escapeHtml(String(data.isp || '—'))}</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runDns() {
+    const input = document.getElementById('dns-target');
+    const out = document.getElementById('dns-results');
+    const name = (input.value || '').trim();
+    if (!name) { input.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Resolving…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Querying resolvers…</p>';
+    try {
+        const d = await postAPI('/api/net/dns', { name: name });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runDns')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const rows = (d.results || []).map(r => {
+            const ans = (r.answers && r.answers.length) ? r.answers.map(escapeHtml).join('<br>')
+                : '<span class="text-red-400">' + escapeHtml(r.error || (r.status || 'no answer')) + '</span>';
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(r.resolver)}</td>
+                <td class="px-3 py-1.5 text-gray-500">${escapeHtml(r.kind)}</td>
+                <td class="px-3 py-1.5 font-mono">${ans}</td>
+                <td class="px-3 py-1.5 text-right">${r.query_ms != null ? r.query_ms + ' ms' : '—'}</td>
+                <td class="px-3 py-1.5 text-center">${r.ad ? '<span class="text-green-400">✓</span>' : '<span class="text-gray-500">—</span>'}</td>
+            </tr>`;
+        }).join('');
+        const banner = d.consistent
+            ? '<span class="text-green-400">✓ resolvers agree (shared answer)</span>'
+            : '<span class="text-amber-300">⚠ resolvers returned disjoint answers — normal for CDN/anycast, but a hijack/split-DNS smell if unexpected</span>';
+        out.innerHTML = `<p class="text-xs mb-2">${banner} · DNSSEC ${d.dnssec_ok ? '<span class="text-green-400">validated</span>' : '<span class="text-gray-500">not validated</span>'}
+            · DoH ${d.doh_reachable ? '✓' : '✗'} · DoT ${d.dot_reachable ? '✓' : '✗'}</p>
+            <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Resolver</th><th class="px-3 py-1.5"></th><th class="px-3 py-1.5">Answers</th>
+                <th class="px-3 py-1.5 text-right">Latency</th><th class="px-3 py-1.5 text-center">DNSSEC</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runPmtu() {
+    const input = document.getElementById('pmtu-target');
+    const out = document.getElementById('pmtu-results');
+    const target = (input.value || '').trim();
+    if (!target) { input.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Discovering…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Tracing path MTU to ' + escapeHtml(target) + '…</p>';
+    try {
+        const d = await postAPI('/api/net/pmtu', { target: target });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runPmtu')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const pmtu = d.pmtu != null ? d.pmtu + ' bytes' : 'unknown';
+        const verdict = d.pmtu == null
+            ? '<span class="text-amber-300">⚠ could not measure</span>'
+            : d.reduced
+                ? '<span class="text-amber-300">⚠ below 1500 — MTU black-hole / tunnel overhead likely</span>'
+                : '<span class="text-green-400">✓ full 1500-byte path</span>';
+        out.innerHTML = `<p class="mb-1">Path MTU: <strong>${escapeHtml(pmtu)}</strong> — ${verdict}</p>
+            <p class="text-xs text-gray-400">${escapeHtml(d.note || '')}</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runCaptivePortal() {
+    const out = document.getElementById('captive-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Checking…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Probing connectivity endpoints…</p>';
+    try {
+        const d = await fetchAPI('/api/net/captive-portal');
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runCaptivePortal')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const verdict = d.captive_portal
+            ? '<span class="text-amber-300">⚠ captive portal / HTTP interception detected</span>'
+            : '<span class="text-green-400">✓ no captive portal — direct internet</span>';
+        const rows = (d.checks || []).map(c => `<tr class="border-t border-slate-800">
+            <td class="px-3 py-1.5 font-mono text-xs">${escapeHtml(c.url)}</td>
+            <td class="px-3 py-1.5">${escapeHtml(String(c.code || '—'))}</td>
+            <td class="px-3 py-1.5">${c.ok ? '<span class="text-green-400">ok</span>' : '<span class="text-amber-300">intercepted</span>'}${c.redirect ? ' → ' + escapeHtml(c.redirect) : ''}</td>
+        </tr>`).join('');
+        out.innerHTML = `<p class="mb-2">${verdict}</p>
+            <table class="min-w-full text-sm text-gray-300"><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runIperf() {
+    const input = document.getElementById('iperf-server');
+    const out = document.getElementById('iperf-results');
+    const server = (input.value || '').trim();
+    if (!server) { input.focus(); return; }
+    const reverse = document.getElementById('iperf-dir').value === 'down';
+    let dur = parseInt(document.getElementById('iperf-dur').value, 10);
+    if (!Number.isFinite(dur)) dur = 5;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Testing…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running iperf3 ' + (reverse ? 'download' : 'upload') + ' for ' + dur + 's…</p>';
+    try {
+        const d = await postAPI('/api/net/iperf3', { server: server, duration: dur, reverse: reverse });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runIperf')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const card = (label, val, unit) => `<div class="bg-slate-800 rounded-lg p-4 text-center">
+            <div class="text-2xl font-bold text-Ragnar-400">${val}<span class="text-sm text-gray-400"> ${unit}</span></div>
+            <div class="text-xs uppercase text-gray-500 mt-1">${label}</div></div>`;
+        let extra = '';
+        if (d.protocol === 'TCP') extra = card('Retransmits', d.retransmits != null ? d.retransmits : '—', '');
+        else extra = card('Jitter', d.jitter_ms, 'ms') + card('Loss', d.lost_percent, '%');
+        out.innerHTML = `<div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            ${card(d.direction === 'download' ? 'Download' : 'Upload', d.mbps, 'Mbps')}${extra}</div>
+            <p class="text-xs text-gray-500 mt-2">${d.protocol} · ${escapeHtml(String(d.server))}:${d.port} · ${d.duration_s}s</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function toggleIperfServer() {
+    const btn = document.getElementById('iperf-server-btn');
+    const status = document.getElementById('iperf-server-status');
+    const starting = btn.textContent.indexOf('Start') !== -1;
+    _ndBusy(btn, true, starting ? 'Starting…' : 'Stopping…');
+    try {
+        const d = await postAPI('/api/net/iperf3-server', { action: starting ? 'start' : 'stop' });
+        _ndBusy(btn, false);
+        if (!d.success) {
+            status.classList.remove('hidden');
+            status.innerHTML = d.missing_tool
+                ? _ndMissingTool(d, 'toggleIperfServer')
+                : '<span class="text-red-400">' + escapeHtml(d.error || 'failed') + '</span>';
+            return;
+        }
+        btn.textContent = d.running ? 'Stop server' : 'Start server';
+        status.classList.toggle('hidden', !d.running);
+        if (d.running) {
+            const addrs = (d.addresses || []).map(escapeHtml).join(', ');
+            status.innerHTML = '<span class="text-green-400">● listening on port ' + d.port + '</span> — '
+                + 'run <span class="font-mono">iperf3 -c ' + escapeHtml((d.addresses || [''])[0]) + '</span> from another device'
+                + (addrs ? ' <span class="text-gray-500">(' + addrs + ')</span>' : '');
+        }
+    } catch (e) {
+        _ndBusy(btn, false);
+        status.classList.remove('hidden');
+        status.innerHTML = '<span class="text-red-400">Failed: ' + escapeHtml(e.message) + '</span>';
+    }
+}
+
+// Install a missing network tool on demand (whitelisted server-side), then
+// re-run the loader for the panel that reported it missing.
+async function installNetTool(tool, btn, reloadFn) {
+    _ndBusy(btn, true, 'Installing…');
+    try {
+        const r = await postAPI('/api/net/install-tool', { tool: tool });
+        if (r && r.success) {
+            addConsoleMessage(r.message || ('Installed ' + tool), 'success');
+            if (typeof reloadFn === 'function') reloadFn();
+        } else {
+            const msg = (r && r.error) ? r.error : 'unknown error';
+            addConsoleMessage('Install of ' + tool + ' failed: ' + msg, 'error');
+            alert('Install failed:\n\n' + msg);
+            _ndBusy(btn, false);
+        }
+    } catch (e) {
+        alert('Install failed: ' + e.message);
+        _ndBusy(btn, false);
+    }
+}
+
+// Render a "tool not installed" panel with a one-click Install button.
+// `reloadFnName` is the global function name to call after a successful install.
+function _ndMissingTool(data, reloadFnName) {
+    const tool = String(data.missing_tool || '');
+    // tool comes from a fixed server-side whitelist, so it is safe to inline.
+    return `<div class="text-sm text-amber-300 mb-2">${escapeHtml(data.error || (tool + ' is not installed.'))}</div>
+        <button onclick="installNetTool('${escapeHtml(tool)}', this, ${reloadFnName})"
+            class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-1.5 rounded text-sm whitespace-nowrap">
+            Install ${escapeHtml(tool)}</button>`;
+}
+
+// Compact PoE summary from a neighbour's parsed power TLV. Returns plain text.
+function _poeText(poe) {
+    if (!poe) return '—';
+    const parts = [];
+    const w = poe.allocated_w != null ? poe.allocated_w : poe.requested_w;
+    // Lead with the standard: 802.3af / 802.3at / 802.3bt when known.
+    if (poe.powered) {
+        parts.push(poe.type ? ('802.3' + poe.type) : 'PoE');
+    } else if (poe.device_type) {
+        parts.push(poe.device_type);  // e.g. PD, or PSE with power not enabled
+    } else {
+        parts.push('PoE');
+    }
+    if (poe.mode) parts.push(poe.mode);              // active
+    if (poe.power_via) parts.push(poe.power_via);    // endspan / midspan
+    if (poe.class) parts.push(poe.class);
+    if (w != null) parts.push(w + 'W');
+    return parts.join(' · ');
+}
+
+// HTML cell for the PoE column: green when the switch is delivering power.
+function _poeCell(poe) {
+    const txt = escapeHtml(_poeText(poe));
+    if (poe && poe.powered) return '<span class="text-green-400">⚡ ' + txt + '</span>';
+    if (poe) return '<span class="text-gray-300">' + txt + '</span>';
+    return '<span class="text-gray-500">—</span>';
+}
+
+async function loadLldp() {
+    const out = document.getElementById('lldp-results');
+    out.innerHTML = '<p class="text-gray-400">Loading neighbours…</p>';
+    try {
+        const data = await fetchAPI('/api/net/lldp');
+        if (!data.success) {
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'loadLldp')
+                : '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        _ndLastLldp = data.neighbors || [];
+        if (!data.neighbors || !data.neighbors.length) {
+            out.innerHTML = '<p class="text-gray-400">No switch neighbours discovered. ' + escapeHtml(data.note || '') + '</p>';
+            return;
+        }
+        const rows = data.neighbors.map(n => `
+            <tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.local_interface || '—'))}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(n.protocol || '—'))}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(n.switch_name || '—'))}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.port_descr || n.port_id || '—'))}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(n.vlan_id || '—'))}${n.vlan_name ? ' (' + escapeHtml(n.vlan_name) + ')' : ''}</td>
+                <td class="px-3 py-1.5">${_poeCell(n.poe)}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(n.mgmt_ip || '—'))}</td>
+            </tr>`).join('');
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Local IF</th><th class="px-3 py-1.5">Proto</th>
+                <th class="px-3 py-1.5">Switch</th><th class="px-3 py-1.5">Port</th>
+                <th class="px-3 py-1.5">VLAN</th><th class="px-3 py-1.5">PoE</th><th class="px-3 py-1.5">Mgmt IP</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+async function runArpScan() {
+    const ifaceEl = document.getElementById('arp-iface');
+    const out = document.getElementById('arp-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Scanning…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Scanning ' + escapeHtml(iface) + '…</p>';
+    try {
+        const data = await fetchAPI('/api/net/arp-scan?interface=' + encodeURIComponent(iface));
+        if (!data.success) {
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'runArpScan')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        _ndLastArp = data;
+        if (!data.hosts.length) {
+            out.innerHTML = '<p class="text-sm text-gray-400">No hosts responded on ' + escapeHtml(iface) + '.</p>';
+            return;
+        }
+        const rows = data.hosts.map(h => `
+            <tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(h.ip)}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(h.mac)}</td>
+                <td class="px-3 py-1.5">${escapeHtml(String(h.vendor || '—'))}</td>
+            </tr>`).join('');
+        out.innerHTML = `<p class="text-xs text-gray-500 mb-2">${data.count} host(s) on ${escapeHtml(iface)}</p>
+            <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">IP</th><th class="px-3 py-1.5">MAC</th><th class="px-3 py-1.5">Vendor</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runFlows() {
+    const out = document.getElementById('flows-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Sampling…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Reading kernel flow stats…</p>';
+    try {
+        const d = await fetchAPI('/api/net/flows');
+        if (!d.success) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        if (!d.connections.length) {
+            out.innerHTML = '<p class="text-sm text-gray-400">No established external TCP connections right now.</p>';
+            return;
+        }
+        const rows = d.connections.map(c => {
+            const bloat = (c.rtt_ms != null && c.min_rtt_ms != null && c.rtt_ms > c.min_rtt_ms * 3 && c.rtt_ms > 30);
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(c.peer))}</td>
+                <td class="px-3 py-1.5 text-right ${bloat ? 'text-amber-300' : ''}">${c.rtt_ms != null ? c.rtt_ms + ' ms' : '—'}</td>
+                <td class="px-3 py-1.5 text-right text-gray-500">${c.min_rtt_ms != null ? c.min_rtt_ms + ' ms' : '—'}</td>
+                <td class="px-3 py-1.5 text-right ${c.retransmits ? 'text-red-400' : 'text-gray-500'}">${c.retransmits}</td>
+                <td class="px-3 py-1.5 text-right text-gray-500">${c.mss != null ? c.mss : '—'}</td>
+            </tr>`;
+        }).join('');
+        out.innerHTML = `<p class="text-xs text-gray-500 mb-2">${d.total} flows · ${d.with_retransmits} with retransmits · engine: ${escapeHtml(d.engine)}</p>
+            <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Peer</th><th class="px-3 py-1.5 text-right">RTT</th>
+                <th class="px-3 py-1.5 text-right">min-RTT</th><th class="px-3 py-1.5 text-right">Retrans</th>
+                <th class="px-3 py-1.5 text-right">MSS</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runPtp() {
+    const ifaceEl = document.getElementById('ptp-iface');
+    const out = document.getElementById('ptp-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    let secs = parseInt(document.getElementById('ptp-secs').value, 10);
+    if (!Number.isFinite(secs)) secs = 8;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Sniffing for PTP on ' + escapeHtml(iface) + '…</p>';
+    try {
+        const d = await postAPI('/api/net/ptp', { interface: iface, seconds: secs });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runPtp')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const verdict = d.ptp_present
+            ? '<span class="text-green-400">● PTP detected</span>'
+            : '<span class="text-gray-400">no PTP</span>';
+        const bits = [];
+        if (d.message_types && d.message_types.length) bits.push('messages: ' + d.message_types.map(escapeHtml).join(', '));
+        if (d.domains && d.domains.length) bits.push('domain(s): ' + d.domains.map(escapeHtml).join(', '));
+        out.innerHTML = `<p class="mb-1">${verdict} — ${escapeHtml(d.note)}</p>
+            ${bits.length ? '<p class="text-xs text-gray-400">' + bits.join(' · ') + '</p>' : ''}
+            <p class="text-xs text-gray-500 mt-1">${escapeHtml(d.offset_note)}</p>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+function _pcapBytes(n) {
+    if (n == null) return '—';
+    const u = ['B', 'kB', 'MB', 'GB', 'TB'];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + ' ' + u[i];
+}
+
+let _lastPcap = null;
+
+function _pcapWifiHtml(w) {
+    if (!w || !w.is_wifi) return '';
+    const codeRows = (arr) => (arr || []).map(r =>
+        `<tr class="border-t border-slate-800"><td class="px-3 py-1 text-right">${r.code}</td>
+         <td class="px-3 py-1">${escapeHtml(r.label)}</td><td class="px-3 py-1 text-right">${r.count}</td></tr>`).join('');
+    const tbl = (title, total, rows) => total ? `<h5 class="text-xs uppercase text-gray-500 mt-2">${title} (${total})</h5>
+        <table class="min-w-full text-sm text-gray-300"><thead><tr class="text-left text-xs text-gray-600">
+        <th class="px-3 py-0.5 text-right">Code</th><th class="px-3 py-0.5">Meaning</th><th class="px-3 py-0.5 text-right">Count</th></tr></thead>
+        <tbody>${codeRows(rows)}</tbody></table>` : '';
+    const findings = (w.findings || []).map(f => `<li class="text-amber-300">⚠ ${escapeHtml(f)}</li>`).join('');
+    const clients = (w.deauth.top_clients || []).slice(0, 6).map(c => escapeHtml(c.mac) + ' (' + c.count + ')').join(', ');
+    return `<div class="mt-3 border-t border-slate-700 pt-3">
+        <h4 class="text-sm font-semibold mb-1">📶 Wi-Fi / AP analysis</h4>
+        <p class="text-xs text-gray-500 mb-2">${w.wlan_frames} 802.11 frames · retries ${w.retry_pct != null ? w.retry_pct + '%' : '—'} · EAPOL ${w.eapol_frames} · SSIDs: ${(w.ssids || []).map(escapeHtml).join(', ') || '—'}</p>
+        ${findings ? '<ul class="space-y-0.5 text-sm mb-1">' + findings + '</ul>' : ''}
+        <div class="overflow-x-auto">
+        ${tbl('Deauthentication reasons', w.deauth.total, w.deauth.by_reason)}
+        ${tbl('Disassociation reasons', w.disassoc.total, w.disassoc.by_reason)}
+        ${tbl('Auth / Assoc failures', w.auth_assoc_failures.total, w.auth_assoc_failures.by_status)}
+        </div>
+        ${clients ? '<p class="text-xs text-gray-400 mt-2">Most-dropped clients: ' + clients + '</p>' : ''}</div>`;
+}
+
+async function aiAnalyzePcap() {
+    if (!_lastPcap) return;
+    const out = document.getElementById('pcap-ai-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Asking AI…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Analyzing capture with AI…</p>';
+    try {
+        const d = await postAPI('/api/ai/pcap', _lastPcap);
+        if (d.enabled === false) {
+            out.innerHTML = '<p class="text-sm text-amber-300">' + escapeHtml(d.message || 'AI is not enabled.') + '</p>';
+            return;
+        }
+        if (!d.analysis) {
+            out.innerHTML = '<p class="text-sm text-red-400">AI returned no analysis — check the OpenAI token/model in Settings.</p>';
+            return;
+        }
+        const html = (typeof formatAIText === 'function')
+            ? formatAIText(d.analysis) : escapeHtml(d.analysis).replace(/\n/g, '<br>');
+        out.innerHTML = '<div class="bg-slate-900/60 border border-slate-700 rounded-lg p-3 text-sm">' + html + '</div>';
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function analyzePcap() {
+    const fileEl = document.getElementById('pcap-file');
+    const out = document.getElementById('pcap-results');
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) { fileEl.focus(); return; }
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Analyzing…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Uploading &amp; analyzing ' + escapeHtml(f.name) + '…</p>';
+    try {
+        const fd = new FormData();
+        fd.append('file', f);
+        const resp = await fetch('/api/net/pcap', { method: 'POST', body: fd, credentials: 'same-origin' });
+        const d = await resp.json();
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'analyzePcap')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const s = d.summary || {};
+        const stat = (label, val) => `<div class="bg-slate-800 rounded-lg p-3 text-center">
+            <div class="text-lg font-bold text-Ragnar-400">${val}</div>
+            <div class="text-xs uppercase text-gray-500 mt-1">${label}</div></div>`;
+        const stats = `<div class="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3">
+            ${stat('Packets', s.packets != null ? s.packets : '—')}
+            ${stat('Size', _pcapBytes(s.file_size))}
+            ${stat('Duration', s.duration_s != null ? s.duration_s + ' s' : '—')}
+            ${stat('Avg pkt', s.avg_packet_size != null ? Math.round(s.avg_packet_size) + ' B' : '—')}
+            ${stat('Rate', s.data_byte_rate != null ? _pcapBytes(s.data_byte_rate) + '/s' : '—')}
+        </div>${s.start_time ? '<p class="text-xs text-gray-500 mb-3">' + escapeHtml(String(s.start_time)) + ' → ' + escapeHtml(String(s.end_time || '')) + ' · ' + escapeHtml(String(s.encapsulation || '')) + '</p>' : ''}`;
+
+        const protoRows = (d.protocols || []).map(p =>
+            `<tr class="border-t border-slate-800"><td class="px-3 py-1 font-mono">${'&nbsp;'.repeat(p.depth * 3)}${escapeHtml(p.proto)}</td>
+             <td class="px-3 py-1 text-right">${p.frames}</td><td class="px-3 py-1 text-right text-gray-400">${_pcapBytes(p.bytes)}</td></tr>`).join('');
+        const protoTable = `<h4 class="text-sm font-semibold mt-1 mb-1">Protocol hierarchy</h4>
+            <table class="min-w-full text-sm text-gray-300"><thead><tr class="text-left text-xs uppercase text-gray-500">
+            <th class="px-3 py-1">Protocol</th><th class="px-3 py-1 text-right">Frames</th><th class="px-3 py-1 text-right">Bytes</th></tr></thead>
+            <tbody>${protoRows}</tbody></table>`;
+
+        const talkRows = (d.talkers || []).map(t =>
+            `<tr class="border-t border-slate-800"><td class="px-3 py-1 font-mono">${escapeHtml(t.a)} <span class="text-gray-500">↔</span> ${escapeHtml(t.b)}</td>
+             <td class="px-3 py-1 text-right">${t.frames}</td><td class="px-3 py-1 text-right text-gray-400">${_pcapBytes(t.bytes)}</td></tr>`).join('');
+        const talkTable = (d.talkers && d.talkers.length) ? `<h4 class="text-sm font-semibold mt-3 mb-1">Top talkers</h4>
+            <table class="min-w-full text-sm text-gray-300 whitespace-nowrap"><thead><tr class="text-left text-xs uppercase text-gray-500">
+            <th class="px-3 py-1">Conversation</th><th class="px-3 py-1 text-right">Frames</th><th class="px-3 py-1 text-right">Bytes</th></tr></thead>
+            <tbody>${talkRows}</tbody></table>` : '';
+
+        const ex = d.expert || {};
+        const sevColor = { errors: 'text-red-400', warnings: 'text-amber-300', notes: 'text-gray-400' };
+        const exItems = (ex.items || []).map(i =>
+            `<li class="${sevColor[i.severity] || ''}">×${i.count} <span class="text-gray-500">${escapeHtml(i.protocol)}</span> — ${escapeHtml(i.summary)}</li>`).join('');
+        const expert = `<h4 class="text-sm font-semibold mt-3 mb-1">Expert info
+            <span class="text-xs font-normal">— <span class="text-red-400">${ex.errors || 0} err</span> · <span class="text-amber-300">${ex.warnings || 0} warn</span> · <span class="text-gray-400">${ex.notes || 0} note</span></span></h4>
+            ${exItems ? '<ul class="space-y-0.5 text-sm">' + exItems + '</ul>' : '<p class="text-sm text-gray-500">No expert findings.</p>'}`;
+
+        const aiBtn = `<div class="mt-3"><button onclick="aiAnalyzePcap()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-1.5 rounded text-sm whitespace-nowrap">🧠 Explain with AI</button>
+            <div id="pcap-ai-results" class="hidden mt-2"></div></div>`;
+        out.innerHTML = stats + `<div class="overflow-x-auto">${protoTable}${talkTable}</div>` + _pcapWifiHtml(d.wifi) + expert + aiBtn;
+        _lastPcap = d;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function runL2Health() {
+    const ifaceEl = document.getElementById('l2-iface');
+    const out = document.getElementById('l2-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    let secs = parseInt(document.getElementById('l2-secs').value, 10);
+    if (!Number.isFinite(secs)) secs = 12;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Capturing on ' + escapeHtml(iface) + ' for ' + secs + 's…</p>';
+    try {
+        const d = await postAPI('/api/net/l2-health', { interface: iface, seconds: secs });
+        if (!d.success) {
+            out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runL2Health')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        const lvl = { warn: 'text-amber-300', info: 'text-gray-400', ok: 'text-green-400' };
+        const icon = { warn: '⚠', info: 'ℹ', ok: '✓' };
+        const findings = (d.findings || []).map(f =>
+            `<li class="${lvl[f.level] || ''}">${icon[f.level] || ''} ${escapeHtml(f.text)}</li>`).join('');
+        const protos = Object.keys(d.protocols || {}).length
+            ? Object.entries(d.protocols).map(([k, v]) =>
+                `<span class="px-2 py-0.5 rounded bg-slate-800 text-xs mr-1">${escapeHtml(k)} ${v}</span>`).join('')
+            : '<span class="text-gray-500">none</span>';
+        const detail = [];
+        if (d.stp_roots && d.stp_roots.length) detail.push('STP root(s): ' + d.stp_roots.map(escapeHtml).join(', ') + (d.tcn ? ' · ' + d.tcn + ' TCN' : ''));
+        if (d.dhcp_servers && d.dhcp_servers.length) detail.push('DHCP server(s): ' + d.dhcp_servers.map(escapeHtml).join(', '));
+        if (d.ra_sources && d.ra_sources.length) detail.push('IPv6 RA source(s): ' + d.ra_sources.map(escapeHtml).join(', '));
+        if (d.duplicate_ips && Object.keys(d.duplicate_ips).length) detail.push('Duplicate IPs: ' + Object.keys(d.duplicate_ips).map(escapeHtml).join(', '));
+        out.innerHTML = `<ul class="space-y-1 mb-2">${findings}</ul>
+            <p class="text-xs text-gray-500 mb-1">${d.packets} pkts in ${d.seconds}s · ${d.broadcast} bcast / ${d.multicast} mcast (${d.bcast_mcast_per_s}/s)</p>
+            <div class="mb-1">${protos}</div>
+            ${detail.length ? '<p class="text-xs text-gray-400">' + detail.join(' &nbsp;·&nbsp; ') + '</p>' : ''}`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+// Blink a wired link in a pattern so its switch LED reveals the port. POSTs to
+// /api/net/locate-port; on the default-route guard it asks for confirmation and
+// re-sends with force.
+async function locatePort(force) {
+    const ifaceEl = document.getElementById('locate-iface');
+    const out = document.getElementById('locate-results');
+    const iface = (ifaceEl.value || '').trim();
+    if (!iface) { ifaceEl.focus(); return; }
+    let count = parseInt(document.getElementById('locate-count').value, 10);
+    if (!Number.isFinite(count)) count = 6;
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Flashing…');
+    out.classList.remove('hidden');
+    try {
+        const data = await postAPI('/api/net/locate-port', { interface: iface, count: count, force: !!force });
+        if (!data.success) {
+            if (data.needs_force) {
+                _ndBusy(btn, false);
+                if (confirm(data.error + '\n\nFlash it anyway?')) return locatePort(true);
+                out.innerHTML = '<p class="text-gray-400">Cancelled.</p>';
+                return;
+            }
+            out.innerHTML = '<p class="text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        out.innerHTML = '<p class="text-green-400">⚡ ' + escapeHtml(data.message) + '</p>';
+    } catch (e) {
+        // A flap on the interface serving this page can abort the request — that's expected.
+        out.innerHTML = '<p class="text-amber-300">Flash started on ' + escapeHtml(iface)
+            + '. If the UI dropped, that\'s the link flapping — watch the switch LED; it auto-restores.</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+async function loadNetworkIdentity() {
+    const out = document.getElementById('net-identity-results');
+    if (!out) return;
+    out.innerHTML = '<p class="text-gray-400">Loading…</p>';
+    try {
+        const d = await fetchAPI('/api/net/identity');
+        if (!d.success) {
+            out.innerHTML = '<p class="text-red-400">' + escapeHtml(d.error || 'failed') + '</p>';
+            return;
+        }
+        _ndLastIdentity = d;
+        const rows = [];
+        const row = (label, value) => rows.push(
+            `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 text-gray-500 whitespace-nowrap align-top">${escapeHtml(label)}</td>
+                <td class="px-3 py-1.5 font-mono text-gray-200">${value}</td>
+            </tr>`);
+
+        // Domain / search suffix
+        let domainHtml;
+        if (d.domains && d.domains.length) {
+            domainHtml = d.domains.map(escapeHtml).join('<br>');
+        } else if (d.guessed_domain) {
+            domainHtml = escapeHtml(d.guessed_domain) +
+                ' <span class="text-amber-400 text-xs">(guessed from gateway/FQDN)</span>';
+        } else {
+            domainHtml = '<span class="text-gray-500">none advertised</span>';
+        }
+        row('Domain / search', domainHtml);
+
+        // Host name / FQDN
+        let hostHtml = escapeHtml(String(d.hostname || '—'));
+        if (d.fqdn) hostHtml += ' <span class="text-gray-500">(' + escapeHtml(d.fqdn) + ')</span>';
+        row('This host', hostHtml);
+
+        // Nameservers
+        let nsHtml;
+        if (d.nameservers && d.nameservers.length) {
+            nsHtml = d.nameservers.map(escapeHtml).join('<br>');
+            if (d.dns_stub) nsHtml += '<br><span class="text-gray-500 text-xs">upstream via systemd-resolved stub</span>';
+        } else {
+            nsHtml = '<span class="text-gray-500">—</span>';
+        }
+        row('Nameservers', nsHtml);
+
+        // Gateway
+        let gwHtml = '<span class="text-gray-500">—</span>';
+        if (d.gateway && d.gateway.ip) {
+            gwHtml = escapeHtml(d.gateway.ip);
+            if (d.gateway.ptr) gwHtml += ' <span class="text-gray-500">(' + escapeHtml(d.gateway.ptr) + ')</span>';
+        }
+        row('Default gateway', gwHtml);
+
+        // 'Traffic via VPN' hidden pending rework: it only sees tunnels on the
+        // default route (local VPN), so it reports 'no' for VPN/Tor running on
+        // the router — misleading. Re-enable once router-level detection is
+        // reliable. (Backend still returns d.vpn_egress.)
+
+        const src = (d.sources && d.sources.length)
+            ? `<p class="text-[11px] text-gray-500 mt-2">Sources: ${d.sources.map(escapeHtml).join(', ')}</p>` : '';
+        out.innerHTML = `<table class="min-w-full text-sm">
+            <tbody>${rows.join('')}</tbody></table>${src}`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+async function loadInterfaces() {
+    const out = document.getElementById('interfaces-results');
+    out.innerHTML = '<p class="text-gray-400">Loading…</p>';
+    try {
+        const data = await fetchAPI('/api/net/interfaces');
+        if (!data.success) {
+            out.innerHTML = '<p class="text-red-400">' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        _ndLastIfaces = data.interfaces || [];
+        const methodBadge = (m) => {
+            const map = {
+                dhcp: 'bg-blue-900/50 text-blue-300', static: 'bg-purple-900/50 text-purple-300',
+                'dhcp-failed': 'bg-red-900/50 text-red-300', 'link-down': 'bg-slate-700 text-slate-400',
+                unknown: 'bg-slate-700 text-slate-400'
+            };
+            return `<span class="px-2 py-0.5 rounded text-xs ${map[m] || map.unknown}">${escapeHtml(m)}</span>`;
+        };
+        const typeLabel = (i) => {
+            if (i.type === 'vpn') return '<span class="px-2 py-0.5 rounded text-xs bg-amber-900/50 text-amber-300">🔒 ' + escapeHtml(i.vpn_kind || 'VPN') + '</span>';
+            if (i.type === 'wifi') return '<span class="px-2 py-0.5 rounded text-xs bg-sky-900/50 text-sky-300">wifi</span>';
+            return '<span class="px-2 py-0.5 rounded text-xs bg-slate-700 text-slate-300">ethernet</span>';
+        };
+        const rows = data.interfaces.map(i => {
+            const link = (i.link_detected === true) ? '<span class="text-green-400">up</span>'
+                : (i.link_detected === false) ? '<span class="text-gray-500">down</span>'
+                : escapeHtml(String(i.operstate || '—'));
+            const speed = i.speed ? escapeHtml(i.speed) + (i.duplex ? ' ' + escapeHtml(i.duplex) : '') : '—';
+            const autoneg = (i.autoneg === true) ? '✓' : (i.autoneg === false) ? '✗' : '—';
+            const vlan = i.vlan_id ? escapeHtml(String(i.vlan_id)) + (i.vlan_proto ? ' (' + escapeHtml(i.vlan_proto) + ')' : '') : '—';
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(i.name)}</td>
+                <td class="px-3 py-1.5">${typeLabel(i)}</td>
+                <td class="px-3 py-1.5">${link}</td>
+                <td class="px-3 py-1.5">${speed}</td>
+                <td class="px-3 py-1.5 text-center">${autoneg}</td>
+                <td class="px-3 py-1.5">${methodBadge(i.ip_method)}</td>
+                <td class="px-3 py-1.5 font-mono">${i.ipv4.length ? i.ipv4.map(escapeHtml).join('<br>') : '—'}</td>
+                <td class="px-3 py-1.5 font-mono">${(i.ipv6 && i.ipv6.length) ? i.ipv6.map(escapeHtml).join('<br>') : '—'}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(i.mac || '—'))}</td>
+                <td class="px-3 py-1.5">${vlan}</td>
+            </tr>`;
+        }).join('');
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">Type</th><th class="px-3 py-1.5">Link</th>
+                <th class="px-3 py-1.5">Speed/Duplex</th><th class="px-3 py-1.5 text-center">Auto-neg</th>
+                <th class="px-3 py-1.5">Addressing</th><th class="px-3 py-1.5">IPv4</th>
+                <th class="px-3 py-1.5">IPv6</th>
+                <th class="px-3 py-1.5">MAC</th><th class="px-3 py-1.5">VLAN</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+// E-Paper Network Diagnostic mode: a server-side config flag the display loop
+// reads live. Reflect the current server value into the toggle when the
+// Diagnostics sub-tab opens.
+async function syncNetDiagDisplayFromServer() {
+    const cb = document.getElementById('netdiag-display-enabled');
+    if (!cb) return;
+    try {
+        const cfg = await fetchAPI('/api/config');
+        const on = !!(cfg && cfg.network_diagnostic_mode);
+        cb.checked = on;
+        const note = document.getElementById('netdiag-display-note');
+        if (note) note.classList.toggle('hidden', !on);
+    } catch (e) { /* offline — leave the toggle as-is */ }
+}
+
+function onNetDiagDisplayToggled(cb) {
+    const note = document.getElementById('netdiag-display-note');
+    if (note) note.classList.toggle('hidden', !cb.checked);
+    postAPI('/api/config', { network_diagnostic_mode: cb.checked })
+        .then(() => addConsoleMessage(
+            cb.checked ? 'E-Paper: network diagnostic mode ON' : 'E-Paper: network diagnostic mode OFF',
+            'info'))
+        .catch(err => {
+            addConsoleMessage('Failed to toggle network diagnostic mode: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+            if (note) note.classList.toggle('hidden', !cb.checked);
+        });
+}
+
+// Detect the ISP/public IP reached through each interface (multi-WAN). Makes
+// outbound lookups server-side, so it's button-triggered, never auto-loaded.
+async function detectIsp() {
+    const out = document.getElementById('isp-results');
+    const btn = event && event.target ? event.target : null;
+    _ndBusy(btn, true, 'Detecting…');
+    out.innerHTML = '<p class="text-sm text-gray-400">Looking up the ISP behind each interface…</p>';
+    try {
+        const data = await fetchAPI('/api/net/isp');
+        if (!data.success) {
+            out.innerHTML = data.missing_tool
+                ? _ndMissingTool(data, 'detectIsp')
+                : '<p class="text-sm text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
+            return;
+        }
+        _ndLastIsp = data.results || [];
+        if (!_ndLastIsp.length) {
+            out.innerHTML = '<p class="text-sm text-gray-400">No interfaces with a usable address to query.</p>';
+            return;
+        }
+        const vpnCell = (r) => {
+            if (r.iface_is_vpn) return '<span class="text-amber-300">🔒 ' + escapeHtml(r.vpn_kind || 'tunnel') + '</span>';
+            if (r.tor_exit) return '<span class="text-amber-300">🧅 Tor exit</span>';
+            if (r.vpn_provider) return '<span class="text-amber-300">🔒 likely (' + escapeHtml(r.vpn_provider) + ')</span>';
+            return '<span class="text-gray-500">no</span>';
+        };
+        const ispCell = (r) => {
+            let s = r.isp || r.vpn_kind || r.org || '—';
+            if (r.vpn_endpoint) s += ' (peer ' + r.vpn_endpoint + ')';
+            return escapeHtml(String(s));
+        };
+        const rows = _ndLastIsp.map(r => {
+            if (r.error) {
+                return `<tr class="border-t border-slate-800">
+                    <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
+                    <td class="px-3 py-1.5 text-red-400" colspan="5">${escapeHtml(r.error)}</td>
+                </tr>`;
+            }
+            const loc = [r.city, r.region, r.country].filter(Boolean).map(escapeHtml).join(', ') || '—';
+            return `<tr class="border-t border-slate-800">
+                <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
+                <td class="px-3 py-1.5">${ispCell(r)}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.asn || '—'))}</td>
+                <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.public_ip || '—'))}</td>
+                <td class="px-3 py-1.5">${loc}</td>
+                <td class="px-3 py-1.5 text-gray-500">${escapeHtml(String(r.source || '—'))}</td>
+            </tr>`;
+        }).join('');
+        // VPN column hidden pending rework (vpnCell kept for re-enable). Backend
+        // still returns behind_vpn/tor_exit/vpn_provider and the CSV export.
+        out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
+            <thead><tr class="text-left text-xs uppercase text-gray-500">
+                <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">ISP</th>
+                <th class="px-3 py-1.5">ASN</th><th class="px-3 py-1.5">Public IP</th>
+                <th class="px-3 py-1.5">Location</th><th class="px-3 py-1.5">Source</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
+function exportIspCsv() {
+    _ndDownloadCsv('interface_isp',
+        ['Interface', 'ISP', 'ASN', 'Public IP', 'City', 'Region', 'Country', 'Source',
+         'Behind VPN', 'VPN kind', 'VPN endpoint', 'VPN provider', 'Tunnel iface', 'Error'],
+        (_ndLastIsp || []).map(r => [r.interface, r.isp || r.org, r.asn, r.public_ip,
+            r.city, r.region, r.country, r.source,
+            r.behind_vpn ? 'yes' : 'no', r.vpn_kind, r.vpn_endpoint, r.vpn_provider,
+            r.iface_is_vpn ? 'yes' : 'no', r.error]));
 }
 
 function showDiscoveredSubtab(name) {
@@ -1180,6 +2572,12 @@ async function loadTabData(tabName) {
     const alreadyPreloaded = preloadedTabs.has(tabName);
     
     switch(tabName) {
+        case 'terminal':
+            initTerminal();
+            break;
+        case 'rusense':
+            initRusense();
+            break;
         case 'dashboard':
             // Load dashboard stats immediately, defer console logs
             await loadDashboardData();
@@ -3995,6 +5393,9 @@ async function loadConfigData() {
     try {
         const config = await fetchAPI('/api/config');
         displayConfigForm(config);
+
+        // Reflect the server-stored RuSense tab visibility on the toggle here.
+        syncRusenseTabFromServer(config);
 
         // Load AI configuration
         loadAIConfiguration(config);
@@ -8895,6 +10296,75 @@ async function startBlueBorneScan() {
     }
 }
 
+// Shared handler for the CVE indicator scans (WhisperPair, Airoha RACE).
+async function runCveScan({ btnId, resultsId, targetId, endpoint, label, summaryKey }) {
+    const btn = document.getElementById(btnId);
+    const resultsDiv = document.getElementById(resultsId);
+    const targetInput = document.getElementById(targetId);
+
+    if (!btn || !resultsDiv || !targetInput) return;
+
+    const target = targetInput.value.trim();
+    if (!target || !target.match(/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/)) {
+        resultsDiv.classList.remove('hidden');
+        resultsDiv.innerHTML = '<div class="text-red-400">✗ Invalid MAC address format</div>';
+        return;
+    }
+
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    resultsDiv.classList.remove('hidden');
+    resultsDiv.textContent = `Scanning ${target} for ${label}...`;
+
+    try {
+        const response = await postAPI(endpoint, { target });
+
+        const isVulnerable = response.vulnerable || false;
+        const indicators = response.indicators || [];
+
+        resultsDiv.innerHTML = `
+            <div class="${isVulnerable ? 'text-red-400' : 'text-green-400'}">
+                ${isVulnerable ? '⚠ Candidate - potentially affected' : '✓ No indicators detected'}
+            </div>
+            ${response.cve ? `<div class="mt-1 text-xs text-gray-400">${response.cve}</div>` : ''}
+            ${indicators.length > 0 ? `<div class="mt-1 text-xs">${indicators.map(i => `• ${i}`).join('<br>')}</div>` : ''}
+            ${response.status ? `<div class="mt-1 text-xs text-gray-500">${response.status}</div>` : ''}
+        `;
+        addConsoleMessage(`${label} scan of ${target} complete`, 'info');
+        updatePentestSummary(summaryKey, response);
+    } catch (error) {
+        console.error(`${label} scan error:`, error);
+        resultsDiv.innerHTML = `<div class="text-red-400">✗ Error: ${error.message}</div>`;
+        addConsoleMessage(`${label} scan failed: ${error.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+    }
+}
+
+async function startWhisperPairScan() {
+    await runCveScan({
+        btnId: 'whisperpair-btn',
+        resultsId: 'whisperpair-results',
+        targetId: 'whisperpair-target',
+        endpoint: '/api/bluetooth/pentest/whisperpair-scan',
+        label: 'WhisperPair (CVE-2025-36911)',
+        summaryKey: 'whisperpair_scan',
+    });
+}
+
+async function startAirohaRaceScan() {
+    await runCveScan({
+        btnId: 'airoha-race-btn',
+        resultsId: 'airoha-race-results',
+        targetId: 'airoha-race-target',
+        endpoint: '/api/bluetooth/pentest/airoha-race-scan',
+        label: 'Airoha RACE (CVE-2025-20700)',
+        summaryKey: 'airoha_race_scan',
+    });
+}
+
 async function startMovementTracking() {
     const btn = document.getElementById('track-btn');
     const resultsDiv = document.getElementById('track-results');
@@ -8974,6 +10444,14 @@ function updatePentestSummary(testType, data) {
     if (pentestResults.blueborne_scan) {
         const vulnerable = pentestResults.blueborne_scan.data.vulnerable ? 'Vulnerable' : 'Safe';
         summaryLines.push(`BlueBorne Scan: ${vulnerable}`);
+    }
+    if (pentestResults.whisperpair_scan) {
+        const vulnerable = pentestResults.whisperpair_scan.data.vulnerable ? 'Candidate' : 'Safe';
+        summaryLines.push(`WhisperPair (CVE-2025-36911): ${vulnerable}`);
+    }
+    if (pentestResults.airoha_race_scan) {
+        const vulnerable = pentestResults.airoha_race_scan.data.vulnerable ? 'Candidate' : 'Safe';
+        summaryLines.push(`Airoha RACE (CVE-2025-20700): ${vulnerable}`);
     }
     if (pentestResults.movement_tracking) {
         const count = pentestResults.movement_tracking.data.readings?.length || 0;

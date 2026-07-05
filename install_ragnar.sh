@@ -260,6 +260,12 @@ package_candidates() {
         iputils-ping) echo "iputils-ping iputils" ;;
         libatlas-base-dev) echo "libatlas-base-dev atlas-devel" ;;
         arp-scan) echo "arp-scan arpscan" ;;
+        mtr-tiny) echo "mtr-tiny mtr" ;;
+        whois) echo "whois jwhois" ;;
+        speedtest-cli) echo "speedtest-cli python3-speedtest-cli python-speedtest-cli" ;;
+        lldpd) echo "lldpd" ;;
+        traceroute) echo "traceroute" ;;
+        ethtool) echo "ethtool" ;;
         bluez) echo "bluez" ;;
         hostapd) echo "hostapd" ;;
         dnsmasq) echo "dnsmasq" ;;
@@ -451,6 +457,12 @@ install_dependencies() {
         "sqlite3"
         "arp-scan"
         "tcpdump"
+        "traceroute"
+        "mtr-tiny"
+        "whois"
+        "lldpd"
+        "ethtool"
+        "speedtest-cli"
         "nikto"
         "sqlmap"
         "whatweb"
@@ -514,12 +526,60 @@ install_dependencies() {
     # Configure WiFi interfaces
     log "INFO" "Configuring WiFi interfaces..."
 
-    # Ensure WiFi is not blocked by rfkill
+    # Ensure no radios are soft-blocked by rfkill. New USB dongles (Bluetooth,
+    # and extra WiFi adapters used for monitor mode / packet injection) come up
+    # soft-blocked and stay dead until unblocked, so we unblock *all* radios,
+    # not just the built-in WiFi.
     if command -v rfkill >/dev/null 2>&1; then
-        rfkill unblock wifi
-        log "SUCCESS" "WiFi unblocked via rfkill"
+        rfkill unblock all
+        log "SUCCESS" "All radios unblocked via rfkill"
+
+        # Make it persistent: a one-time unblock does not survive reboots or
+        # cover dongles hot-plugged later. This udev rule re-runs the unblock
+        # whenever any radio device appears (at boot and on hot-plug), so a
+        # fresh clone/install "just works" without manual `rfkill unblock all`.
+        local rfkill_bin
+        rfkill_bin="$(command -v rfkill)"
+        cat > /etc/udev/rules.d/99-ragnar-rfkill.rules << EOF
+# Ragnar: auto-unblock every radio when it appears (boot + hot-plug).
+# USB Bluetooth and monitor-mode/injection WiFi dongles are soft-blocked by
+# default and stay dead until unblocked.
+SUBSYSTEM=="rfkill", ACTION=="add", RUN+="$rfkill_bin unblock all"
+EOF
+        chmod 644 /etc/udev/rules.d/99-ragnar-rfkill.rules
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules 2>/dev/null || true
+            udevadm trigger --subsystem-match=rfkill 2>/dev/null || true
+        fi
+        log "SUCCESS" "Installed persistent rfkill-unblock udev rule (survives reboot + hot-plug)"
     else
         log "WARNING" "rfkill not available - WiFi blocking status unknown"
+    fi
+
+    # Configure lldpd for switch discovery (Network > Switch & L2 tab).
+    # Enable decoding of CDP (Cisco), EDP (Extreme), FDP (Foundry) and SONMP
+    # (Nortel) in addition to LLDP so non-LLDP switches are discovered too.
+    if command -v lldpd >/dev/null 2>&1 || command -v lldpctl >/dev/null 2>&1; then
+        mkdir -p /etc/default
+        cat > /etc/default/lldpd << 'EOF'
+# Ragnar: decode CDP (Cisco), EDP (Extreme), FDP (Foundry), SONMP (Nortel)
+# neighbours in addition to LLDP, so switch discovery covers non-LLDP gear.
+DAEMON_ARGS="-c -e -f -s"
+EOF
+        systemctl enable lldpd 2>/dev/null || true
+        systemctl restart lldpd 2>/dev/null || true
+        log "SUCCESS" "Configured lldpd (LLDP/CDP/EDP/FDP/SONMP) for switch discovery"
+    else
+        log "WARNING" "lldpd not available - switch discovery (Switch & L2 tab) will be limited"
+    fi
+
+    # The speedtest diagnostic probes `speedtest-cli` first, then a bare
+    # `speedtest`. The apt speedtest-cli package usually ships both, but on
+    # distros where it only provides speedtest-cli, guarantee a `speedtest`
+    # alias too so neither lookup can miss. Mirrors provision_network_tools.sh.
+    if command -v speedtest-cli >/dev/null 2>&1 && ! command -v speedtest >/dev/null 2>&1; then
+        ln -sf "$(command -v speedtest-cli)" /usr/local/bin/speedtest \
+            && log "SUCCESS" "Linked speedtest -> speedtest-cli"
     fi
 
     # Create basic wpa_supplicant configuration if it doesn't exist
@@ -881,6 +941,16 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
         # Ensure spidev is installed for TFT SPI communication
         pip3 install spidev --break-system-packages >/dev/null 2>&1
         log "INFO" "SPI dependencies installed for TFT display"
+    elif [ "$EPD_VERSION" = "whisplay" ]; then
+        # TFT drivers ship with Ragnar in resources/waveshare_epd/, verify the file exists
+        if [ -f "$ragnar_PATH/resources/waveshare_epd/whisplay.py" ]; then
+            log "SUCCESS" "Whisplay TFT driver verified (resources/waveshare_epd/whisplay.py)"
+        else
+            log "ERROR" "Whisplay TFT driver not found at $ragnar_PATH/resources/waveshare_epd/whisplay.py"
+        fi
+        # Ensure spidev is installed for TFT SPI communication
+        pip3 install spidev --break-system-packages >/dev/null 2>&1
+        log "INFO" "SPI dependencies installed for TFT display"
     elif [ "$EPD_VERSION" = "ssd1306" ]; then
         if [ -f "$ragnar_PATH/resources/waveshare_epd/ssd1306.py" ]; then
             log "SUCCESS" "SSD1306 OLED driver verified (resources/waveshare_epd/ssd1306.py)"
@@ -951,6 +1021,13 @@ print('SUCCESS: Set shared_config.json epd_type to $EPD_VERSION')
     # Set correct permissions and ownership
     chown -R $ragnar_USER:$ragnar_USER /home/$ragnar_USER/Ragnar
     chmod -R 755 /home/$ragnar_USER/Ragnar
+
+    # Whitelist the checkout for root's git. The ragnar service runs as root
+    # while the files belong to the ragnar user; newer git refuses that mix
+    # ("detected dubious ownership"), which made the in-app updater fail on
+    # fresh installs until the path is added to root's global git config.
+    git config --global --get-all safe.directory 2>/dev/null | grep -qxF "/home/$ragnar_USER/Ragnar" \
+        || git config --global --add safe.directory "/home/$ragnar_USER/Ragnar"
     
     # Make utility scripts executable with proper ownership
     chmod +x $ragnar_PATH/kill_port_8000.sh 2>/dev/null || true
@@ -1631,22 +1708,24 @@ main() {
 
             echo -e "\n${BLUE}Select your TFT/OLED display:${NC}"
             echo "1. GC9A01      (1.28\" Round 240x240)"
-            echo "2. SSD1306     (0.96\" OLED 128x64)"
-            echo "3. LCD1602     (16x2 I2C Character LCD)"
-            echo "4. No display  (headless install)"
+            echo "2. Whisplay    (1.69\" ST7789 240x280, PiSugar HAT)"
+            echo "3. SSD1306     (0.96\" OLED 128x64)"
+            echo "4. LCD1602     (16x2 I2C Character LCD)"
+            echo "5. No display  (headless install)"
 
             while true; do
-                read -p "Enter your choice (1-4): " tft_choice
+                read -p "Enter your choice (1-5): " tft_choice
                 case $tft_choice in
                     1) EPD_VERSION="gc9a01"; break;;
-                    2) EPD_VERSION="ssd1306"; break;;
-                    3) EPD_VERSION="lcd1602"; break;;
-                    4)
+                    2) EPD_VERSION="whisplay"; break;;
+                    3) EPD_VERSION="ssd1306"; break;;
+                    4) EPD_VERSION="lcd1602"; break;;
+                    5)
                         select_headless_variant
                         EPD_VERSION=""
                         break
                         ;;
-                    *) echo -e "${RED}Invalid choice. Please select 1-4.${NC}";;
+                    *) echo -e "${RED}Invalid choice. Please select 1-5.${NC}";;
                 esac
             done
 

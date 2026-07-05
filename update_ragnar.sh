@@ -40,12 +40,27 @@ fi
 echo -e "\n${BLUE}Step 1: Stopping ragnar service...${NC}"
 systemctl stop ragnar.service
 
+echo -e "${BLUE}Step 1.5: Preparing git repository...${NC}"
+# Root runs this script while the checkout belongs to user 'ragnar' — newer
+# git refuses that mix ("detected dubious ownership") unless the path is
+# whitelisted in root's global config. Interrupted runs can also leave stale
+# lock files, and previous sudo runs leave root-owned files that break git.
+git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$ragnar_PATH" \
+    || git config --global --add safe.directory "$ragnar_PATH"
+# Clear ALL stale git locks (index/HEAD/shallow AND ref locks like
+# refs/remotes/origin/<branch>.lock, packed-refs.lock, config.lock) so an
+# interrupted run never leaves a lock that needs a manual service stop.
+find "$ragnar_PATH/.git" -name '*.lock' -type f -delete 2>/dev/null || true
+chown -R ragnar:ragnar "$ragnar_PATH" 2>/dev/null || true
+# Stash and merge commits need an author identity; root rarely has one.
+GIT_ID=(-c user.name="Ragnar Updater" -c user.email="ragnar-updater@localhost" -c pull.rebase=false)
+
 echo -e "${BLUE}Step 2: Backing up local changes...${NC}"
 if git diff --quiet && git diff --staged --quiet; then
     echo -e "${GREEN}No local changes to backup.${NC}"
 else
     echo -e "${YELLOW}Local changes detected. Creating backup...${NC}"
-    git stash push -m "Auto-backup before update $(date)"
+    git "${GIT_ID[@]}" stash push -m "Auto-backup before update $(date)"
     echo -e "${GREEN}Local changes backed up.${NC}"
 fi
 
@@ -64,17 +79,46 @@ echo -e "${BLUE}Step 3: Fetching latest updates...${NC}"
 git fetch origin
 
 echo -e "${BLUE}Step 4: Updating to latest version...${NC}"
-if git pull origin main; then
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+    # Detached checkout (e.g. a past checkout of a tag) - go back to main.
+    echo -e "${YELLOW}Detached checkout detected - switching back to main.${NC}"
+    git checkout main 2>/dev/null || git checkout -B main origin/main
+    CURRENT_BRANCH="main"
+fi
+if git "${GIT_ID[@]}" pull origin "$CURRENT_BRANCH"; then
     echo -e "${GREEN}Update completed successfully!${NC}"
 else
-    echo -e "${RED}Update failed. Attempting to restore backup...${NC}"
-    git stash pop
-    echo -e "${YELLOW}Backup restored. Please check for conflicts manually.${NC}"
-    exit 1
+    # Deterministic fallback: local changes are already in the stash and the
+    # runtime data is copied aside below, so matching origin exactly is safe
+    # and guarantees the update lands even on conflicted/diverged checkouts.
+    echo -e "${YELLOW}git pull failed - forcing checkout to match origin/$CURRENT_BRANCH (local changes stay in the stash)...${NC}"
+    if git fetch origin "$CURRENT_BRANCH" && git reset --hard "origin/$CURRENT_BRANCH"; then
+        echo -e "${GREEN}Update completed via forced sync.${NC}"
+    else
+        echo -e "${RED}Update failed. Attempting to restore backup...${NC}"
+        git "${GIT_ID[@]}" stash pop 2>/dev/null || true
+        echo -e "${YELLOW}Backup restored. Please check for conflicts manually.${NC}"
+        systemctl start ragnar.service
+        exit 1
+    fi
 fi
 
 echo -e "${BLUE}Step 5: Updating Python dependencies...${NC}"
-pip3 install --break-system-packages -r requirements.txt --upgrade
+# Fast path: one batch upgrade. If pip cannot satisfy the full set (e.g.
+# one bad/unsatisfiable pin) it installs NOTHING, silently leaving every
+# dependency un-upgraded. Fall back to installing each requirement on its
+# own so a single bad package can not block all the others.
+if ! pip3 install --break-system-packages --upgrade -r requirements.txt; then
+    echo -e "${YELLOW}Batch dependency install failed - retrying package-by-package so one bad pin can not block the rest...${NC}"
+    while IFS= read -r req || [ -n "$req" ]; do
+        req="${req%%#*}"                 # strip inline comments
+        req="$(echo "$req" | xargs)"     # trim whitespace
+        [ -z "$req" ] && continue
+        pip3 install --break-system-packages --upgrade "$req" \
+            || echo -e "  ${YELLOW}!${NC} Failed to install: $req (continuing)"
+    done < requirements.txt
+fi
 
 echo -e "${BLUE}Step 5.5: Restoring local runtime data...${NC}"
 for file in "${PRESERVE_FILES[@]}"; do
@@ -168,6 +212,21 @@ SVCEOF
     fi
 else
     echo -e "${GREEN}No Pwnagotchi installation found or migration script missing. Skipping.${NC}"
+fi
+
+echo -e "${BLUE}Step 6.8: Provisioning radios + network tools (background)...${NC}"
+# rfkill unblock, network diagnostic tools, and lldpd switch decoding now
+# live in one shared script so the in-app Update button provisions the same
+# things as this CLI updater (see webapp_modern.py _execute_git_update).
+# Run it in the background so slow apt installs never hold up the ragnar
+# service restart below -- the tools are not needed for ragnar to start.
+if [ -f "$ragnar_PATH/scripts/provision_network_tools.sh" ]; then
+    mkdir -p "$ragnar_PATH/data/logs"
+    nohup bash "$ragnar_PATH/scripts/provision_network_tools.sh" \
+        > "$ragnar_PATH/data/logs/provision_network_tools.log" 2>&1 &
+    echo -e "  ${GREEN}✓${NC} Provisioning started in background (log: data/logs/provision_network_tools.log)"
+else
+    echo -e "${YELLOW}provision_network_tools.sh missing - skipping tool provisioning.${NC}"
 fi
 
 echo -e "${BLUE}Step 7: Starting ragnar service...${NC}"
