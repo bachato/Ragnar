@@ -2088,21 +2088,10 @@ async function loadNetworkIdentity() {
         }
         row('Default gateway', gwHtml);
 
-        // Traffic via VPN — is the default route leaving through a tunnel?
-        const ve = d.vpn_egress;
-        if (ve) {
-            let veHtml;
-            if (ve.via_vpn) {
-                const via = escapeHtml(String(ve.interface || 'tunnel'))
-                    + (ve.kind ? ' · ' + escapeHtml(ve.kind) : '')
-                    + (ve.endpoint ? ' → ' + escapeHtml(ve.endpoint) : '');
-                veHtml = '<span class="text-amber-300">yes</span> <span class="text-gray-500">(via ' + via + ')</span>';
-            } else {
-                veHtml = '<span class="text-gray-400">no</span>'
-                    + (ve.interface ? ' <span class="text-gray-500">(default route via ' + escapeHtml(ve.interface) + ')</span>' : '');
-            }
-            row('Traffic via VPN', veHtml);
-        }
+        // 'Traffic via VPN' hidden pending rework: it only sees tunnels on the
+        // default route (local VPN), so it reports 'no' for VPN/Tor running on
+        // the router — misleading. Re-enable once router-level detection is
+        // reliable. (Backend still returns d.vpn_egress.)
 
         const src = (d.sources && d.sources.length)
             ? `<p class="text-[11px] text-gray-500 mt-2">Sources: ${d.sources.map(escapeHtml).join(', ')}</p>` : '';
@@ -2234,7 +2223,6 @@ async function detectIsp() {
                 return `<tr class="border-t border-slate-800">
                     <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
                     <td class="px-3 py-1.5 text-red-400" colspan="5">${escapeHtml(r.error)}</td>
-                    <td class="px-3 py-1.5">${vpnCell(r)}</td>
                 </tr>`;
             }
             const loc = [r.city, r.region, r.country].filter(Boolean).map(escapeHtml).join(', ') || '—';
@@ -2245,15 +2233,15 @@ async function detectIsp() {
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.public_ip || '—'))}</td>
                 <td class="px-3 py-1.5">${loc}</td>
                 <td class="px-3 py-1.5 text-gray-500">${escapeHtml(String(r.source || '—'))}</td>
-                <td class="px-3 py-1.5">${vpnCell(r)}</td>
             </tr>`;
         }).join('');
+        // VPN column hidden pending rework (vpnCell kept for re-enable). Backend
+        // still returns behind_vpn/tor_exit/vpn_provider and the CSV export.
         out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">ISP</th>
                 <th class="px-3 py-1.5">ASN</th><th class="px-3 py-1.5">Public IP</th>
                 <th class="px-3 py-1.5">Location</th><th class="px-3 py-1.5">Source</th>
-                <th class="px-3 py-1.5">VPN</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
