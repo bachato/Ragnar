@@ -10307,6 +10307,75 @@ async function startBlueBorneScan() {
     }
 }
 
+// Shared handler for the CVE indicator scans (WhisperPair, Airoha RACE).
+async function runCveScan({ btnId, resultsId, targetId, endpoint, label, summaryKey }) {
+    const btn = document.getElementById(btnId);
+    const resultsDiv = document.getElementById(resultsId);
+    const targetInput = document.getElementById(targetId);
+
+    if (!btn || !resultsDiv || !targetInput) return;
+
+    const target = targetInput.value.trim();
+    if (!target || !target.match(/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/)) {
+        resultsDiv.classList.remove('hidden');
+        resultsDiv.innerHTML = '<div class="text-red-400">✗ Invalid MAC address format</div>';
+        return;
+    }
+
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    resultsDiv.classList.remove('hidden');
+    resultsDiv.textContent = `Scanning ${target} for ${label}...`;
+
+    try {
+        const response = await postAPI(endpoint, { target });
+
+        const isVulnerable = response.vulnerable || false;
+        const indicators = response.indicators || [];
+
+        resultsDiv.innerHTML = `
+            <div class="${isVulnerable ? 'text-red-400' : 'text-green-400'}">
+                ${isVulnerable ? '⚠ Candidate - potentially affected' : '✓ No indicators detected'}
+            </div>
+            ${response.cve ? `<div class="mt-1 text-xs text-gray-400">${response.cve}</div>` : ''}
+            ${indicators.length > 0 ? `<div class="mt-1 text-xs">${indicators.map(i => `• ${i}`).join('<br>')}</div>` : ''}
+            ${response.status ? `<div class="mt-1 text-xs text-gray-500">${response.status}</div>` : ''}
+        `;
+        addConsoleMessage(`${label} scan of ${target} complete`, 'info');
+        updatePentestSummary(summaryKey, response);
+    } catch (error) {
+        console.error(`${label} scan error:`, error);
+        resultsDiv.innerHTML = `<div class="text-red-400">✗ Error: ${error.message}</div>`;
+        addConsoleMessage(`${label} scan failed: ${error.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+    }
+}
+
+async function startWhisperPairScan() {
+    await runCveScan({
+        btnId: 'whisperpair-btn',
+        resultsId: 'whisperpair-results',
+        targetId: 'whisperpair-target',
+        endpoint: '/api/bluetooth/pentest/whisperpair-scan',
+        label: 'WhisperPair (CVE-2025-36911)',
+        summaryKey: 'whisperpair_scan',
+    });
+}
+
+async function startAirohaRaceScan() {
+    await runCveScan({
+        btnId: 'airoha-race-btn',
+        resultsId: 'airoha-race-results',
+        targetId: 'airoha-race-target',
+        endpoint: '/api/bluetooth/pentest/airoha-race-scan',
+        label: 'Airoha RACE (CVE-2025-20700)',
+        summaryKey: 'airoha_race_scan',
+    });
+}
+
 async function startMovementTracking() {
     const btn = document.getElementById('track-btn');
     const resultsDiv = document.getElementById('track-results');
@@ -10386,6 +10455,14 @@ function updatePentestSummary(testType, data) {
     if (pentestResults.blueborne_scan) {
         const vulnerable = pentestResults.blueborne_scan.data.vulnerable ? 'Vulnerable' : 'Safe';
         summaryLines.push(`BlueBorne Scan: ${vulnerable}`);
+    }
+    if (pentestResults.whisperpair_scan) {
+        const vulnerable = pentestResults.whisperpair_scan.data.vulnerable ? 'Candidate' : 'Safe';
+        summaryLines.push(`WhisperPair (CVE-2025-36911): ${vulnerable}`);
+    }
+    if (pentestResults.airoha_race_scan) {
+        const vulnerable = pentestResults.airoha_race_scan.data.vulnerable ? 'Candidate' : 'Safe';
+        summaryLines.push(`Airoha RACE (CVE-2025-20700): ${vulnerable}`);
     }
     if (pentestResults.movement_tracking) {
         const count = pentestResults.movement_tracking.data.readings?.length || 0;

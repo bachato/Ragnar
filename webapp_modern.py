@@ -12807,11 +12807,53 @@ def pentest_blueborne():
             return jsonify({'error': 'Target MAC address required'}), 400
         
         result = bluetooth_pentest.blueborne_scan(target)
-        
+
         return jsonify(result)
-        
+
     except Exception as e:
         logger.error(f"Error scanning for BlueBorne: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/bluetooth/pentest/whisperpair-scan', methods=['POST'])
+def pentest_whisperpair():
+    """Scan for WhisperPair (CVE-2025-36911) Fast Pair exposure"""
+    try:
+        if not BLUETOOTH_PENTEST_AVAILABLE or bluetooth_pentest is None:
+            return jsonify({'error': 'Bluetooth pentest module not available'}), 503
+
+        data = request.get_json() or {}
+        target = data.get('target')
+
+        if not target:
+            return jsonify({'error': 'Target MAC address required'}), 400
+
+        result = bluetooth_pentest.whisperpair_scan(target)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error scanning for WhisperPair: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/bluetooth/pentest/airoha-race-scan', methods=['POST'])
+def pentest_airoha_race():
+    """Scan for Airoha RACE (CVE-2025-20700) missing GATT authentication"""
+    try:
+        if not BLUETOOTH_PENTEST_AVAILABLE or bluetooth_pentest is None:
+            return jsonify({'error': 'Bluetooth pentest module not available'}), 503
+
+        data = request.get_json() or {}
+        target = data.get('target')
+
+        if not target:
+            return jsonify({'error': 'Target MAC address required'}), 400
+
+        result = bluetooth_pentest.airoha_race_scan(target)
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Error scanning for Airoha RACE: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/bluetooth/pentest/track-movement', methods=['POST'])
