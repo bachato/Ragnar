@@ -1465,7 +1465,8 @@ def rusense_sensitivity():
     restarts the sensing service to apply live. Webapp runs as root."""
     import subprocess
     cfg = shared_data.config or {}
-    DEF_FLOOR, DEF_DEB = 0.16, 6
+    # Field-tested default balance: floor 0.15 with 6-frame debounce.
+    DEF_FLOOR, DEF_DEB = 0.15, 6
     if request.method == 'GET':
         return jsonify({
             'floor': float(cfg.get('rusense_presence_floor', DEF_FLOOR)),

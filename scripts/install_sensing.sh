@@ -146,9 +146,11 @@ Environment=SENSING_ALLOWED_HOSTS=$ALLOWED_HOSTS
 # DevKitC nodes sit near 0 empty and ~0.12 when a person moves, so 0.25
 # gated real motion out. 0.10 sits between DevKitC empty (~0-0.085) and
 # moving (~0.12-0.15). Tuning history: 0.10/0.13 too sensitive, 0.18 too high
-# (missed the person) -> 0.16 is the middle. Narrow window = empty noise sits
-# close to the motion signal. Override/retune per site via RUVIEW_PRESENCE_FLOOR.
-Environment=RUVIEW_PRESENCE_FLOOR=0.16
+# (missed the person) -> field-tested default balance is 0.15 with a 6-frame
+# debounce. Narrow window = empty noise sits close to the motion signal.
+# Override/retune per site via RUVIEW_PRESENCE_FLOOR / RUVIEW_DEBOUNCE_FRAMES.
+Environment=RUVIEW_PRESENCE_FLOOR=0.15
+Environment=RUVIEW_DEBOUNCE_FRAMES=6
 Environment=RUVIEW_NODE_VOTE=0.80
 Environment=RUVIEW_NONVOTING_NODES=1
 # Multi-node fusion guard: WiFi/ESP-NOW-synced ESP32 nodes drift 10-150 ms
