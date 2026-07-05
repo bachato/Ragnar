@@ -1305,57 +1305,49 @@
                     <div id="lldp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
                 <div class="glass rounded-xl p-4 sm:p-6">
-                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
-                        <div class="min-w-0">
-                            <h3 class="text-lg font-semibold">ARP Scan</h3>
-                            <p class="text-sm text-gray-400">Discover live hosts on the local segment via ARP.</p>
-                        </div>
-                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
-                            <input id="arp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-44 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runArpScan()">
-                            <button onclick="runArpScan()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan</button>
-                            <button onclick="exportArpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
-                        </div>
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">ARP Scan</h3>
+                        <p class="text-sm text-gray-400">Discover live hosts on the local segment via ARP.</p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="arp-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-auto sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runArpScan()">
+                        <button onclick="runArpScan()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan</button>
+                        <button onclick="exportArpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
                     </div>
                     <div id="arp-results" class="hidden mt-3 overflow-x-auto"></div>
                 </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
-                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
-                        <div class="min-w-0">
-                            <h3 class="text-lg font-semibold">Locate Port</h3>
-                            <p class="text-sm text-gray-400">Find which switch port this device is plugged into by blinking the link in a pattern — like a cable tester. Watch the switch: the port whose <strong>link LED</strong> flashes in cadence is the one. On a managed switch, Switch Discovery already names the port; this is the fallback for unmanaged switches. <span class="text-amber-400">Briefly drops the link on the chosen port.</span></p>
-                        </div>
-                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
-                            <input id="locate-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')locatePort()">
-                            <input id="locate-count" type="number" min="1" max="30" value="6" title="blink count" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                            <button onclick="locatePort()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Flash Port</button>
-                        </div>
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">Locate Port</h3>
+                        <p class="text-sm text-gray-400">Find which switch port this device is plugged into by blinking the link in a pattern — like a cable tester. Watch the switch: the port whose <strong>link LED</strong> flashes in cadence is the one. On a managed switch, Switch Discovery already names the port; this is the fallback for unmanaged switches. <span class="text-amber-400">Briefly drops the link on the chosen port.</span></p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="locate-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-auto sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')locatePort()">
+                        <input id="locate-count" type="number" min="1" max="30" value="6" title="blink count" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="locatePort()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Flash Port</button>
                     </div>
                     <div id="locate-results" class="hidden mt-3 text-sm"></div>
                 </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
-                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
-                        <div class="min-w-0">
-                            <h3 class="text-lg font-semibold">L2 Link Health</h3>
-                            <p class="text-sm text-gray-400">Listens passively for a few seconds and reports Layer-2 problems: STP root bridge &amp; loop churn, CDP/LLDP/DTP/VTP control frames, broadcast-storm rate, rogue DHCP servers, rogue IPv6 RA, and duplicate IPs. One "what's wrong at L2" snapshot.</p>
-                        </div>
-                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
-                            <input id="l2-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runL2Health()">
-                            <input id="l2-secs" type="number" min="3" max="30" value="12" title="seconds" class="w-full sm:w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                            <button onclick="runL2Health()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan L2</button>
-                        </div>
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">L2 Link Health</h3>
+                        <p class="text-sm text-gray-400">Listens passively for a few seconds and reports Layer-2 problems: STP root bridge &amp; loop churn, CDP/LLDP/DTP/VTP control frames, broadcast-storm rate, rogue DHCP servers, rogue IPv6 RA, and duplicate IPs. One "what's wrong at L2" snapshot.</p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="l2-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-auto sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runL2Health()">
+                        <input id="l2-secs" type="number" min="3" max="30" value="12" title="capture seconds" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runL2Health()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan L2</button>
                     </div>
                     <div id="l2-results" class="hidden mt-3 text-sm"></div>
                 </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
-                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
-                        <div class="min-w-0">
-                            <h3 class="text-lg font-semibold">PCAP Analyzer</h3>
-                            <p class="text-sm text-gray-400">Upload a <span class="font-mono">.pcap</span> / <span class="font-mono">.pcapng</span> capture (from Wireshark, tcpdump, the L2 scan, etc.) for instant triage — summary, protocol breakdown, top talkers, and tshark's expert findings (retransmissions, resets, dup-ACKs, malformed). Read-only; the file is deleted after analysis. Max 100&nbsp;MB.</p>
-                        </div>
-                        <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
-                            <input id="pcap-file" type="file" accept=".pcap,.pcapng,.cap,application/vnd.tcpdump.pcap" class="w-full sm:w-auto text-sm text-gray-300 file:mr-3 file:py-2 file:px-3 file:rounded file:border-0 file:text-sm file:bg-slate-700 file:text-gray-200 hover:file:bg-slate-600">
-                            <button onclick="analyzePcap()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Analyze</button>
-                        </div>
+                    <div class="mb-3">
+                        <h3 class="text-lg font-semibold">PCAP Analyzer</h3>
+                        <p class="text-sm text-gray-400">Upload a <span class="font-mono">.pcap</span> / <span class="font-mono">.pcapng</span> capture (from Wireshark, tcpdump, the L2 scan, etc.) for instant triage — summary, protocol breakdown, top talkers, and tshark's expert findings (retransmissions, resets, dup-ACKs, malformed). Read-only; the file is deleted after analysis. Max 100&nbsp;MB.</p>
+                    </div>
+                    <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                        <input id="pcap-file" type="file" accept=".pcap,.pcapng,.cap,application/vnd.tcpdump.pcap" class="w-full sm:w-auto sm:flex-1 sm:min-w-[14rem] max-w-full text-sm text-gray-300 file:mr-3 file:py-2 file:px-3 file:rounded file:border-0 file:text-sm file:bg-slate-700 file:text-gray-200 hover:file:bg-slate-600">
+                        <button onclick="analyzePcap()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Analyze</button>
                     </div>
                     <div id="pcap-results" class="hidden mt-3 text-sm"></div>
                 </div>
