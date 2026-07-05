@@ -278,6 +278,11 @@ export default {
           <h2 class="text-xl font-bold">Sensing Alerts</h2>
           <p class="text-ink-soft text-sm">Get a push notification when RuSense detects activity in a monitored
             space — no camera, no app open. Alerts are evaluated on the server, so they fire even when this tab is closed.</p>
+          <div class="rounded-lg bg-warn/15 text-warn px-3 py-2 text-sm">
+            ⚠ <strong>Experimental — not a life-safety device.</strong> RuSense infers presence from WiFi signal
+            changes; it can miss real events and raise false alarms. Don’t rely on it as your only alarm — always
+            keep a dedicated alarm (security, smoke/CO, or medical alert) for anything safety-critical.
+          </div>
           ${banner}
         </div>
 
