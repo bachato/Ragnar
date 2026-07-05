@@ -359,10 +359,11 @@ identity of the network it's attached to.
 For every interface (Ethernet and WiFi; virtual/loopback optionally included):
 
 - **Type** — **ethernet**, **wifi**, or **VPN**. VPN/tunnel links (WireGuard,
-  Tailscale, OpenVPN tun/tap, ZeroTier, PPP/L2TP, …) are detected by name and
-  by their tunnel link type, and flagged as **VPN** rather than being lumped in
-  with physical Ethernet — so a `tailscale0` or `wg0` is obvious at a glance and
-  isn't mistaken for a real wired port.
+  Tailscale, OpenVPN in tun *and* tap mode, ZeroTier, PPP/L2TP, GRE/IPsec, …)
+  are detected robustly — by the interface's tun/tap device flags and link type
+  (`ip -d link`, `wg show`), not just its name — so even a custom-named tunnel
+  is flagged as **VPN** rather than being mistaken for a real wired port. (VM
+  tap interfaces like `vnet*`/`macvtap*` are treated as virtual, not VPN.)
 - **MAC address** and **operational state** (up/down)
 - **IPv4 / IPv6 addresses** (link-local `fe80::` filtered out)
 - **IP method** — how the address was obtained: `dhcp`, `static`,

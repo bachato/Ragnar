@@ -451,7 +451,7 @@ def do_arp_scan(interface):
 # --------------------------------------------------------------------------
 
 # Container/virtual interfaces that are just noise on the Interfaces tab.
-_VIRTUAL_IFACE_RE = re.compile(r'^(veth|docker|br-|virbr|vmnet|vboxnet)')
+_VIRTUAL_IFACE_RE = re.compile(r'^(veth|docker|br-|virbr|vmnet|vboxnet|vnet|macvtap)')
 
 
 def _list_iface_names(include_virtual=False):
@@ -609,6 +609,15 @@ def _iface_link_kind(name):
     return None
 
 
+def _wg_interfaces():
+    """Names of active WireGuard interfaces (definitive, catches custom-named
+    tunnels the running iproute2 may not tag as 'wireguard'). Needs `wg`."""
+    if not _have('wg'):
+        return frozenset()
+    res = _run(['wg', 'show', 'interfaces'], timeout=5)
+    return frozenset(res['out'].split()) if res['rc'] == 0 else frozenset()
+
+
 def _wg_endpoint(name):
     """WireGuard peer endpoint (the VPN server's IP:port), if `wg` is available."""
     if not _have('wg'):
@@ -635,19 +644,28 @@ def _iface_vpn_info(name):
     prefix_kind = next((f for pre, f in _VPN_PREFIX_KINDS if n.startswith(pre)), None)
     arphrd_none = _iface_arphrd_none(name)
     strong = link_kind in _VPN_STRONG_KINDS
+    # Definitive: a tun/tap character device exposes tun_flags in sysfs. This
+    # catches OpenVPN in BOTH tun and tap (bridged) mode — a tap is ARPHRD_ETHER,
+    # so the arphrd_none heuristic alone missed it. (VM taps like vnet*/macvtap
+    # are filtered out of the interface list before typing.)
+    is_tuntap = os.path.exists(f'/sys/class/net/{name}/tun_flags')
+    # Definitive WireGuard, even for custom-named tunnels on an iproute2 that
+    # doesn't print the 'wireguard' link kind.
+    is_wg = (link_kind == 'WireGuard') or (arphrd_none and name in _wg_interfaces())
 
-    is_vpn = bool(product or prefix_kind or strong
+    is_vpn = bool(product or prefix_kind or strong or is_wg or is_tuntap
                   or n.startswith(_VPN_IFACE_PREFIXES)
                   or (link_kind and arphrd_none))
     if not is_vpn:
         return {'is_vpn': False, 'kind': None, 'endpoint': None}
 
     kind = (product
+            or ('WireGuard' if is_wg else None)
             or (link_kind if strong else None)
             or prefix_kind
             or (link_kind if link_kind and link_kind != 'tunnel' else None)
             or 'VPN tunnel')
-    endpoint = _wg_endpoint(name) if (kind == 'WireGuard' or link_kind == 'WireGuard') else None
+    endpoint = _wg_endpoint(name) if kind == 'WireGuard' else None
     return {'is_vpn': True, 'kind': kind, 'endpoint': endpoint}
 
 
@@ -1801,6 +1819,7 @@ _NET_TOOL_PKGS = {
     'dig': ('dig', 'dnsutils'),
     'iperf3': ('iperf3', 'iperf3'),
     'tcpdump': ('tcpdump', 'tcpdump'),
+    'wg': ('wg', 'wireguard-tools'),
     'tshark': ('tshark', 'tshark'),
 }
 
