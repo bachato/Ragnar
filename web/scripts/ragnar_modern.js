@@ -2101,8 +2101,10 @@ async function loadNetworkIdentity() {
                     + (ve.endpoint ? ' → ' + escapeHtml(ve.endpoint) : '');
                 veHtml = '<span class="text-amber-300">yes</span> <span class="text-gray-500">(via ' + via + ')</span>';
             } else {
-                veHtml = '<span id="vpn-egress-cell"><span class="text-gray-500">no local tunnel</span> '
-                    + '<button onclick="checkVpnEgress()" class="text-xs text-cyan-400 hover:text-cyan-300 underline">check egress (catches VPN/Tor on the router)</button></span>';
+                veHtml = '<span id="vpn-egress-result" class="text-gray-500">no local tunnel</span> '
+                    + '<select id="vpn-egress-iface" class="bg-slate-800 border border-slate-700 rounded text-xs text-gray-300 px-1 py-0.5 mx-1">'
+                    + '<option value="">auto (default route)</option></select>'
+                    + '<button onclick="checkVpnEgress()" class="text-xs text-cyan-400 hover:text-cyan-300 underline">check egress (catches VPN/Tor on the router)</button>';
             }
             row('Traffic via VPN', veHtml);
         }
@@ -2111,30 +2113,47 @@ async function loadNetworkIdentity() {
             ? `<p class="text-[11px] text-gray-500 mt-2">Sources: ${d.sources.map(escapeHtml).join(', ')}</p>` : '';
         out.innerHTML = `<table class="min-w-full text-sm">
             <tbody>${rows.join('')}</tbody></table>${src}`;
+        // Fill the egress-check interface selector (auto + each real NIC) so
+        // the LAN path can be tested even when WiFi carries the default route.
+        const sel = document.getElementById('vpn-egress-iface');
+        if (sel) {
+            fetchAPI('/api/net/interfaces').then(x => {
+                (x.interfaces || []).forEach(i => {
+                    const o = document.createElement('option');
+                    o.value = i.name;
+                    o.textContent = i.name + (i.type && i.type !== 'ethernet' ? ' (' + i.type + ')' : '');
+                    sel.appendChild(o);
+                });
+            }).catch(() => {});
+        }
     } catch (e) {
         out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     }
 }
 
 async function checkVpnEgress() {
-    const cell = document.getElementById('vpn-egress-cell');
+    const cell = document.getElementById('vpn-egress-result');
     if (!cell) return;
-    cell.innerHTML = '<span class="text-gray-400">checking egress… (public IP, known-VPN IP list, Tor exit)</span>';
+    const sel = document.getElementById('vpn-egress-iface');
+    const iface = sel && sel.value ? sel.value : '';
+    const label = iface ? 'via ' + escapeHtml(iface) : 'default route';
+    cell.innerHTML = '<span class="text-gray-400">checking egress ' + label + '… (public IP, known-VPN IP list, Tor exit)</span>';
     try {
-        const d = await fetchAPI('/api/net/vpn-check');
+        const d = await fetchAPI('/api/net/vpn-check' + (iface ? '?interface=' + encodeURIComponent(iface) : ''));
+        const ifNote = d.interface ? ' <span class="text-gray-500">[' + escapeHtml(d.interface) + ']</span>' : '';
         const why = (d.reasons && d.reasons.length)
             ? ' <span class="text-gray-500">(' + d.reasons.map(escapeHtml).join('; ') + ')</span>' : '';
         if (d.verdict === 'vpn') {
-            cell.innerHTML = '<span class="text-amber-300">yes</span>' + why;
+            cell.innerHTML = '<span class="text-amber-300">yes</span>' + ifNote + why;
         } else if (d.verdict === 'likely') {
-            cell.innerHTML = '<span class="text-amber-300">likely</span>' + why;
+            cell.innerHTML = '<span class="text-amber-300">likely</span>' + ifNote + why;
         } else if (d.verdict === 'no') {
             const via = [d.isp, d.public_ip].filter(Boolean).map(escapeHtml).join(' · ');
             const note = d.ip_list_checked ? '; egress IP not in the known-VPN list' : '';
-            cell.innerHTML = '<span class="text-gray-400">no</span>'
+            cell.innerHTML = '<span class="text-gray-400">no</span>' + ifNote
                 + (via ? ' <span class="text-gray-500">(egress via ' + via + note + ')</span>' : '');
         } else {
-            cell.innerHTML = '<span class="text-gray-500">unknown</span>' + why;
+            cell.innerHTML = '<span class="text-gray-500">unknown</span>' + ifNote + why;
         }
     } catch (e) {
         cell.innerHTML = '<span class="text-red-400">check failed: ' + escapeHtml(e.message) + '</span>';
