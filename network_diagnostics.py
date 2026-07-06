@@ -18,6 +18,7 @@ appropriate sudoers entries.
 import bisect
 import json
 import re
+import secrets
 import shutil
 import subprocess
 import ipaddress
@@ -26,6 +27,7 @@ import threading
 import time
 import socket
 import tempfile
+import urllib.parse
 from datetime import datetime
 
 try:
@@ -1273,10 +1275,81 @@ def _dig(name, resolver=None, rtype='A'):
                      ((res['err'] or 'no response').strip()[:120])}
 
 
+# Hostname TLDs that are legitimately internal, so a private/RFC1918 answer for
+# them is expected rather than a hijack signal.
+_INTERNAL_TLDS = ('.local', '.lan', '.internal', '.home', '.corp', '.intranet',
+                  '.localdomain', '.home.arpa')
+
+
+def _looks_public_name(name):
+    """True if `name` is a public FQDN (has a dot and a non-internal TLD), so a
+    private/loopback answer for it would be a hijack smell rather than normal
+    intranet resolution. Bare hostnames and internal TLDs return False."""
+    n = (name or '').strip().lower().rstrip('.')
+    if not n or '.' not in n:
+        return False
+    try:
+        ipaddress.ip_address(n)   # a literal IP isn't a name to poison
+        return False
+    except ValueError:
+        pass
+    return not n.endswith(_INTERNAL_TLDS)
+
+
+def _is_bogon(ip):
+    """True if `ip` is a private / loopback / link-local / unspecified / reserved
+    address — i.e. not a real public destination a public name should resolve to."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return (a.is_private or a.is_loopback or a.is_unspecified
+            or a.is_link_local or a.is_reserved or a.is_multicast)
+
+
+def _dns_nxdomain_probe(resolver, nonce_name):
+    """Ask `resolver` to resolve a random name that cannot exist. A well-behaved
+    resolver returns NXDOMAIN; a resolver that *synthesizes* an address (ISP
+    NXDOMAIN-redirect / typo-squat / portal) is rewriting DNS. Returns
+    {'rewriting': bool, 'redirect_ip': str|None, 'status': str|None}."""
+    d = _dig(nonce_name, resolver)
+    rewriting = (d['status'] == 'NOERROR' and bool(d['answers']))
+    return {'rewriting': rewriting,
+            'redirect_ip': d['answers'][0] if d['answers'] else None,
+            'status': d['status']}
+
+
+def _doh_lookup(name, rtype='A'):
+    """Resolve `name` over Cloudflare DNS-over-HTTPS (encrypted, tamper-resistant
+    to on-path :53 spoofing). Returns a set of A-record answers, or None when the
+    check couldn't run (curl missing / offline). An empty set means the encrypted
+    path returned no address (NXDOMAIN / no A record)."""
+    if not _have('curl'):
+        return None
+    q = urllib.parse.quote((name or '').strip(), safe='')
+    res = _run(['curl', '-s', '--max-time', '6',
+                '-H', 'accept: application/dns-json',
+                f'https://cloudflare-dns.com/dns-query?name={q}&type={rtype}'],
+               timeout=10)
+    if res['rc'] != 0 or not res['out'].strip():
+        return None
+    try:
+        d = json.loads(res['out'])
+    except ValueError:
+        return None
+    return {a['data'] for a in (d.get('Answer') or [])
+            if a.get('type') == 1 and a.get('data')}   # type 1 = A record
+
+
 def do_dns_doctor(name):
     """Resolve `name` through every system resolver plus public 1.1.1.1 / 8.8.8.8,
     reporting per-resolver answers, query latency and the DNSSEC AD flag, whether
-    the resolvers agree (split-DNS / hijack smell), and DoH/DoT reachability."""
+    the resolvers agree (split-DNS / hijack smell), and DoH/DoT reachability.
+
+    Also runs active DNS-poisoning / hijack probes: an NXDOMAIN-rewrite test (a
+    random name that must not resolve), a private-IP-for-a-public-name check, a
+    SERVFAIL/DNSSEC-bogus check, and a DoH cross-check comparing the encrypted
+    answer against the plaintext one. The combined verdict is in `poison`."""
     name = (name or '').strip()
     if not name:
         return {'success': False, 'error': 'hostname required'}
@@ -1292,10 +1365,20 @@ def do_dns_doctor(name):
         if pub not in seen:
             tested.append((pub, 'public'))
 
+    public_name = _looks_public_name(name)
+    nonce_name = 'nx-' + secrets.token_hex(10) + '.com'   # cannot be registered
+
     results, answer_sets = [], []
     for resolver, kind in tested:
         d = _dig(name, resolver)
         d.update({'resolver': resolver, 'kind': kind})
+        # Private/loopback answer for a public name = redirect/portal/blocklist.
+        d['bogon_answers'] = ([a for a in d['answers'] if _is_bogon(a)]
+                              if public_name else [])
+        # NXDOMAIN-rewrite probe against this same resolver (random name).
+        nx = _dns_nxdomain_probe(resolver, nonce_name)
+        d['nxdomain_rewrite'] = nx['rewriting']
+        d['nxdomain_redirect_ip'] = nx['redirect_ip']
         results.append(d)
         if d['answers']:
             answer_sets.append(set(d['answers']))
@@ -1305,11 +1388,86 @@ def do_dns_doctor(name):
     # real split-DNS / hijack smell.
     consistent = len(answer_sets) < 2 or bool(set.intersection(*answer_sets))
 
+    # --- Poisoning / hijack verdict -------------------------------------------
+    # Public resolvers (1.1.1.1 / 8.8.8.8) are the trust anchor; the system/ISP
+    # resolvers are what an attacker or captive network would tamper with.
+    public_union = set()
+    for r in results:
+        if r['kind'] == 'public' and r['answers']:
+            public_union |= set(r['answers'])
+
+    reasons = []
+
+    # 1. NXDOMAIN rewriting: a resolver invented an address for a name that
+    #    cannot exist. Public resolvers act as the control (they must NXDOMAIN).
+    nx_rewriters = [{'resolver': r['resolver'], 'kind': r['kind'],
+                     'redirect_ip': r['nxdomain_redirect_ip']}
+                    for r in results if r['nxdomain_rewrite']]
+    if nx_rewriters:
+        who = ', '.join(x['resolver'] for x in nx_rewriters)
+        reasons.append(f'NXDOMAIN rewriting: {who} synthesized an address for a '
+                       f'name that does not exist (ISP redirect / portal / typo page)')
+
+    # 2. Private/bogon address returned for a public name.
+    bogon_hits = [{'resolver': r['resolver'], 'kind': r['kind'],
+                   'ips': r['bogon_answers']}
+                  for r in results if r['bogon_answers']]
+    if bogon_hits:
+        who = ', '.join(x['resolver'] for x in bogon_hits)
+        reasons.append(f'private/bogon address for a public name from {who} '
+                       f'(redirect, blocklist sinkhole or captive portal)')
+
+    # 3. SERVFAIL where another resolver answered — a validating resolver
+    #    refusing a name others resolve is the DNSSEC-bogus (tampered) signature.
+    servfail = [r['resolver'] for r in results if r['status'] == 'SERVFAIL']
+    if servfail and answer_sets:
+        reasons.append(f'SERVFAIL from {", ".join(servfail)} while other resolvers '
+                       f'answered — possible DNSSEC validation failure (tampered record)')
+
+    # 4. System resolver's answer shares nothing with the public resolvers'.
+    #    Soft signal (CDN/anycast can legitimately differ), so it's "suspected".
+    sys_disjoint = [r['resolver'] for r in results
+                    if r['kind'] == 'system' and r['answers']
+                    and public_union and set(r['answers']).isdisjoint(public_union)]
+    if sys_disjoint:
+        reasons.append(f'{", ".join(sys_disjoint)} returned an answer with nothing in '
+                       f'common with public resolvers (split-DNS, or a hijack if unexpected)')
+
+    # 5. DoH cross-check: compare the encrypted (tamper-resistant) answer with the
+    #    plaintext public answer. Disjoint => on-path :53 spoofing of the clear path.
+    doh_answers = _doh_lookup(name)
+    doh = {'checked': doh_answers is not None,
+           'answers': sorted(doh_answers) if doh_answers else [],
+           'mismatch': None}
+    if doh_answers is not None and doh_answers and public_union:
+        doh['mismatch'] = doh_answers.isdisjoint(public_union)
+        if doh['mismatch']:
+            reasons.append('DoH (encrypted) answer disjoint from the plaintext answer '
+                           '— strong sign of on-path DNS spoofing')
+
+    # Strong = confirmed tampering; soft = worth a second look.
+    strong = bool(nx_rewriters or bogon_hits or doh['mismatch'])
+    soft = bool(servfail or sys_disjoint)
+    verdict = 'hijacked' if strong else ('suspicious' if soft else 'clean')
+
+    poison = {
+        'verdict': verdict,                 # clean | suspicious | hijacked
+        'hijack_suspected': verdict != 'clean',
+        'reasons': reasons,
+        'public_name': public_name,
+        'nxdomain_rewriters': nx_rewriters,
+        'bogon_hits': bogon_hits,
+        'servfail_resolvers': servfail,
+        'system_disjoint_resolvers': sys_disjoint,
+        'doh': doh,
+    }
+
     return {'success': True, 'name': name, 'results': results,
             'consistent': consistent,
             'dnssec_ok': any(r['ad'] for r in results),
             'doh_reachable': _tcp_reachable('1.1.1.1', 443),
-            'dot_reachable': _tcp_reachable('1.1.1.1', 853)}
+            'dot_reachable': _tcp_reachable('1.1.1.1', 853),
+            'poison': poison}
 
 
 def _tcp_reachable(host, port, timeout=4):

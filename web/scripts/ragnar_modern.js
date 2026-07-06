@@ -1467,22 +1467,46 @@ async function runDns() {
                 : '<p class="text-sm text-red-400">Error: ' + escapeHtml(d.error || 'failed') + '</p>';
             return;
         }
+        const bogonSet = {};
+        (d.results || []).forEach(r => { (r.bogon_answers || []).forEach(ip => { bogonSet[r.resolver + '|' + ip] = 1; }); });
         const rows = (d.results || []).map(r => {
-            const ans = (r.answers && r.answers.length) ? r.answers.map(escapeHtml).join('<br>')
+            const ans = (r.answers && r.answers.length)
+                ? r.answers.map(ip => bogonSet[r.resolver + '|' + ip]
+                    ? '<span class="text-red-400" title="private/bogon address for a public name">' + escapeHtml(ip) + ' ⚠</span>'
+                    : escapeHtml(ip)).join('<br>')
                 : '<span class="text-red-400">' + escapeHtml(r.error || (r.status || 'no answer')) + '</span>';
+            const flags = [];
+            if (r.nxdomain_rewrite) flags.push('<span class="text-red-400" title="synthesized an answer for a non-existent name">NXDOMAIN-rewrite</span>');
+            if (r.status === 'SERVFAIL') flags.push('<span class="text-amber-300" title="possible DNSSEC validation failure">SERVFAIL</span>');
+            const flagCell = flags.length ? '<div class="text-xs mt-0.5">' + flags.join(' · ') + '</div>' : '';
             return `<tr class="border-t border-slate-800">
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(r.resolver)}</td>
                 <td class="px-3 py-1.5 text-gray-500">${escapeHtml(r.kind)}</td>
-                <td class="px-3 py-1.5 font-mono">${ans}</td>
+                <td class="px-3 py-1.5 font-mono">${ans}${flagCell}</td>
                 <td class="px-3 py-1.5 text-right">${r.query_ms != null ? r.query_ms + ' ms' : '—'}</td>
                 <td class="px-3 py-1.5 text-center">${r.ad ? '<span class="text-green-400">✓</span>' : '<span class="text-gray-500">—</span>'}</td>
             </tr>`;
         }).join('');
+        const p = d.poison || {};
+        let poisonBanner = '';
+        if (p.verdict === 'hijacked') {
+            poisonBanner = '<div class="mb-2 px-3 py-2 rounded bg-red-950/60 border border-red-800 text-red-300 text-sm">🛑 <strong>DNS poisoning / hijack detected</strong></div>';
+        } else if (p.verdict === 'suspicious') {
+            poisonBanner = '<div class="mb-2 px-3 py-2 rounded bg-amber-950/50 border border-amber-800 text-amber-300 text-sm">⚠ <strong>Possible DNS tampering</strong> — review the signals below</div>';
+        } else if (p.verdict === 'clean') {
+            poisonBanner = '<div class="mb-2 px-3 py-2 rounded bg-green-950/40 border border-green-900 text-green-400 text-sm">✓ No DNS poisoning signals</div>';
+        }
+        const reasonsList = (p.reasons && p.reasons.length)
+            ? '<ul class="text-xs text-gray-400 mb-2 list-disc pl-5">' + p.reasons.map(x => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul>'
+            : '';
+        const dohInfo = (p.doh && p.doh.checked)
+            ? ' · DoH cross-check ' + (p.doh.mismatch ? '<span class="text-red-400">mismatch</span>' : '<span class="text-green-400">match</span>')
+            : '';
         const banner = d.consistent
             ? '<span class="text-green-400">✓ resolvers agree (shared answer)</span>'
             : '<span class="text-amber-300">⚠ resolvers returned disjoint answers — normal for CDN/anycast, but a hijack/split-DNS smell if unexpected</span>';
-        out.innerHTML = `<p class="text-xs mb-2">${banner} · DNSSEC ${d.dnssec_ok ? '<span class="text-green-400">validated</span>' : '<span class="text-gray-500">not validated</span>'}
-            · DoH ${d.doh_reachable ? '✓' : '✗'} · DoT ${d.dot_reachable ? '✓' : '✗'}</p>
+        out.innerHTML = poisonBanner + reasonsList + `<p class="text-xs mb-2">${banner} · DNSSEC ${d.dnssec_ok ? '<span class="text-green-400">validated</span>' : '<span class="text-gray-500">not validated</span>'}
+            · DoH ${d.doh_reachable ? '✓' : '✗'} · DoT ${d.dot_reachable ? '✓' : '✗'}${dohInfo}</p>
             <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Resolver</th><th class="px-3 py-1.5"></th><th class="px-3 py-1.5">Answers</th>
