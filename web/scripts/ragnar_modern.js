@@ -2088,10 +2088,24 @@ async function loadNetworkIdentity() {
         }
         row('Default gateway', gwHtml);
 
-        // 'Traffic via VPN' hidden pending rework: it only sees tunnels on the
-        // default route (local VPN), so it reports 'no' for VPN/Tor running on
-        // the router — misleading. Re-enable once router-level detection is
-        // reliable. (Backend still returns d.vpn_egress.)
+        // Traffic via VPN — a local tunnel on the default route is shown
+        // instantly; anything else needs the *egress* checked (VPN/Tor on the
+        // router is invisible locally), which makes outbound calls, so that
+        // runs on demand via the button (checkVpnEgress → /api/net/vpn-check).
+        const ve = d.vpn_egress;
+        if (ve) {
+            let veHtml;
+            if (ve.via_vpn) {
+                const via = escapeHtml(String(ve.interface || 'tunnel'))
+                    + (ve.kind ? ' · ' + escapeHtml(ve.kind) : '')
+                    + (ve.endpoint ? ' → ' + escapeHtml(ve.endpoint) : '');
+                veHtml = '<span class="text-amber-300">yes</span> <span class="text-gray-500">(via ' + via + ')</span>';
+            } else {
+                veHtml = '<span id="vpn-egress-cell"><span class="text-gray-500">no local tunnel</span> '
+                    + '<button onclick="checkVpnEgress()" class="text-xs text-cyan-400 hover:text-cyan-300 underline">check egress (catches VPN/Tor on the router)</button></span>';
+            }
+            row('Traffic via VPN', veHtml);
+        }
 
         const src = (d.sources && d.sources.length)
             ? `<p class="text-[11px] text-gray-500 mt-2">Sources: ${d.sources.map(escapeHtml).join(', ')}</p>` : '';
@@ -2099,6 +2113,31 @@ async function loadNetworkIdentity() {
             <tbody>${rows.join('')}</tbody></table>${src}`;
     } catch (e) {
         out.innerHTML = '<p class="text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    }
+}
+
+async function checkVpnEgress() {
+    const cell = document.getElementById('vpn-egress-cell');
+    if (!cell) return;
+    cell.innerHTML = '<span class="text-gray-400">checking egress… (public IP, known-VPN IP list, Tor exit)</span>';
+    try {
+        const d = await fetchAPI('/api/net/vpn-check');
+        const why = (d.reasons && d.reasons.length)
+            ? ' <span class="text-gray-500">(' + d.reasons.map(escapeHtml).join('; ') + ')</span>' : '';
+        if (d.verdict === 'vpn') {
+            cell.innerHTML = '<span class="text-amber-300">yes</span>' + why;
+        } else if (d.verdict === 'likely') {
+            cell.innerHTML = '<span class="text-amber-300">likely</span>' + why;
+        } else if (d.verdict === 'no') {
+            const via = [d.isp, d.public_ip].filter(Boolean).map(escapeHtml).join(' · ');
+            const note = d.ip_list_checked ? '; egress IP not in the known-VPN list' : '';
+            cell.innerHTML = '<span class="text-gray-400">no</span>'
+                + (via ? ' <span class="text-gray-500">(egress via ' + via + note + ')</span>' : '');
+        } else {
+            cell.innerHTML = '<span class="text-gray-500">unknown</span>' + why;
+        }
+    } catch (e) {
+        cell.innerHTML = '<span class="text-red-400">check failed: ' + escapeHtml(e.message) + '</span>';
     }
 }
 
@@ -2210,8 +2249,11 @@ async function detectIsp() {
         const vpnCell = (r) => {
             if (r.iface_is_vpn) return '<span class="text-amber-300">🔒 ' + escapeHtml(r.vpn_kind || 'tunnel') + '</span>';
             if (r.tor_exit) return '<span class="text-amber-300">🧅 Tor exit</span>';
+            if (r.vpn_ip_match) return '<span class="text-amber-300">🔒 yes (known VPN IP)</span>';
             if (r.vpn_provider) return '<span class="text-amber-300">🔒 likely (' + escapeHtml(r.vpn_provider) + ')</span>';
-            return '<span class="text-gray-500">no</span>';
+            if (r.vpn_ip_match === false) return '<span class="text-gray-500">no</span>';
+            // IP-range list unavailable: only the weaker name/Tor checks ran
+            return '<span class="text-gray-500" title="known-VPN IP list not synced yet — name and Tor checks only">no</span>';
         };
         const ispCell = (r) => {
             let s = r.isp || r.vpn_kind || r.org || '—';
@@ -2223,6 +2265,7 @@ async function detectIsp() {
                 return `<tr class="border-t border-slate-800">
                     <td class="px-3 py-1.5 font-mono font-semibold">${escapeHtml(r.interface)}</td>
                     <td class="px-3 py-1.5 text-red-400" colspan="5">${escapeHtml(r.error)}</td>
+                    <td class="px-3 py-1.5">${vpnCell(r)}</td>
                 </tr>`;
             }
             const loc = [r.city, r.region, r.country].filter(Boolean).map(escapeHtml).join(', ') || '—';
@@ -2233,15 +2276,15 @@ async function detectIsp() {
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(String(r.public_ip || '—'))}</td>
                 <td class="px-3 py-1.5">${loc}</td>
                 <td class="px-3 py-1.5 text-gray-500">${escapeHtml(String(r.source || '—'))}</td>
+                <td class="px-3 py-1.5">${vpnCell(r)}</td>
             </tr>`;
         }).join('');
-        // VPN column hidden pending rework (vpnCell kept for re-enable). Backend
-        // still returns behind_vpn/tor_exit/vpn_provider and the CSV export.
         out.innerHTML = `<table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">Interface</th><th class="px-3 py-1.5">ISP</th>
                 <th class="px-3 py-1.5">ASN</th><th class="px-3 py-1.5">Public IP</th>
                 <th class="px-3 py-1.5">Location</th><th class="px-3 py-1.5">Source</th>
+                <th class="px-3 py-1.5">VPN</th>
             </tr></thead><tbody>${rows}</tbody></table>`;
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
@@ -2253,10 +2296,13 @@ async function detectIsp() {
 function exportIspCsv() {
     _ndDownloadCsv('interface_isp',
         ['Interface', 'ISP', 'ASN', 'Public IP', 'City', 'Region', 'Country', 'Source',
-         'Behind VPN', 'VPN kind', 'VPN endpoint', 'VPN provider', 'Tunnel iface', 'Error'],
+         'Behind VPN', 'Known VPN IP', 'VPN kind', 'VPN endpoint', 'VPN provider',
+         'Tunnel iface', 'Error'],
         (_ndLastIsp || []).map(r => [r.interface, r.isp || r.org, r.asn, r.public_ip,
             r.city, r.region, r.country, r.source,
-            r.behind_vpn ? 'yes' : 'no', r.vpn_kind, r.vpn_endpoint, r.vpn_provider,
+            r.behind_vpn ? 'yes' : 'no',
+            r.vpn_ip_match === true ? 'yes' : r.vpn_ip_match === false ? 'no' : 'unchecked',
+            r.vpn_kind, r.vpn_endpoint, r.vpn_provider,
             r.iface_is_vpn ? 'yes' : 'no', r.error]));
 }
 

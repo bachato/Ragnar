@@ -15,6 +15,7 @@ The Ragnar service runs as root, so the wrapped tools are invoked directly
 appropriate sudoers entries.
 """
 
+import bisect
 import json
 import re
 import shutil
@@ -797,6 +798,100 @@ def _vpn_provider_match(*fields):
     return next((k for k in _VPN_PROVIDER_HINTS if k in hay), None)
 
 
+# --------------------------------------------------------------------------
+# Known-VPN egress IP ranges (X4BNet lists_vpn, ASN-derived, rebuilt upstream
+# daily). This is the signal that catches a VPN running on the *router*: the
+# public egress IP is the VPN server's no matter where the tunnel terminates,
+# so an IP-range match works even when Ragnar's own NIC looks ordinary and
+# the ISP-name match misses (most VPN ASNs don't carry a brand name).
+# Synced to a local file and checked offline -- no per-lookup network call.
+# --------------------------------------------------------------------------
+
+_VPN_LIST_URL = 'https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv4.txt'
+_VPN_LIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'data', 'vpn_ip_ranges.txt')
+_VPN_LIST_MAX_AGE = 7 * 24 * 3600  # ASN-derived, moves slowly; weekly is plenty
+_VPN_LIST_MIN_BYTES = 10000        # sanity floor -- the real list is ~150 KB
+_vpn_list_lock = threading.Lock()
+_vpn_list_ranges = None            # sorted [(first_int, last_int)], parsed cache
+_vpn_list_mtime = None             # mtime the cache was parsed from
+
+
+def _vpn_list_refresh():
+    """Ensure a reasonably fresh local copy of the VPN-range list; download
+    (atomically) when missing or older than _VPN_LIST_MAX_AGE. Returns the
+    path if a usable -- possibly stale -- file exists afterwards, else None."""
+    try:
+        if time.time() - os.path.getmtime(_VPN_LIST_PATH) < _VPN_LIST_MAX_AGE:
+            return _VPN_LIST_PATH
+    except OSError:
+        pass
+    if _have('curl'):
+        try:
+            os.makedirs(os.path.dirname(_VPN_LIST_PATH), exist_ok=True)
+        except OSError:
+            pass
+        tmp = _VPN_LIST_PATH + '.tmp'
+        res = _run(['curl', '-sf', '--max-time', '20', '-o', tmp, _VPN_LIST_URL],
+                   timeout=25)
+        try:
+            if res['rc'] == 0 and os.path.getsize(tmp) >= _VPN_LIST_MIN_BYTES:
+                os.replace(tmp, _VPN_LIST_PATH)
+                return _VPN_LIST_PATH
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return _VPN_LIST_PATH if os.path.exists(_VPN_LIST_PATH) else None
+
+
+def _vpn_list_load():
+    """Sorted (first, last) int ranges from the cached list, reparsed only when
+    the file changes. Returns None when no list is available (never synced and
+    currently offline)."""
+    global _vpn_list_ranges, _vpn_list_mtime
+    with _vpn_list_lock:
+        path = _vpn_list_refresh()
+        if not path:
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+            if _vpn_list_ranges is not None and mtime == _vpn_list_mtime:
+                return _vpn_list_ranges
+            ranges = []
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    try:
+                        net = ipaddress.ip_network(line, strict=False)
+                    except ValueError:
+                        continue
+                    if net.version == 4:
+                        ranges.append((int(net.network_address),
+                                       int(net.broadcast_address)))
+        except OSError:
+            return _vpn_list_ranges  # keep whatever was parsed before
+        ranges.sort()
+        _vpn_list_ranges = ranges
+        _vpn_list_mtime = mtime
+        return _vpn_list_ranges
+
+
+def _vpn_ip_lookup(ip):
+    """Is this public IP inside a known VPN-provider range? True/False, or
+    None when it can't be checked (no list available, or not an IPv4)."""
+    try:
+        n = int(ipaddress.IPv4Address(ip))
+    except (ValueError, TypeError):
+        return None
+    ranges = _vpn_list_load()
+    if not ranges:
+        return None
+    i = bisect.bisect_right(ranges, (n, 0xFFFFFFFF)) - 1
+    return i >= 0 and ranges[i][1] >= n
+
+
 def _tor_exit_check(iface):
     """Authoritatively detect whether egress through `iface` leaves via a Tor
     exit node, by asking the Tor Project's own checker (which sees our exit IP).
@@ -966,9 +1061,11 @@ def _isp_lookup_iface(iface):
             if d.get('ip'):
                 asn, isp = _parse_ipinfo_org(d.get('org'))
                 vp = _vpn_provider_match(isp, d.get('org'), asn) or ('Tor' if tor_exit else None)
+                ip_match = _vpn_ip_lookup(d.get('ip'))
                 return {'interface': iface, 'public_ip': d.get('ip'),
                         'isp': isp, 'asn': asn, 'org': d.get('org'),
-                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn or tor_exit),
+                        'vpn_provider': vp, 'vpn_ip_match': ip_match,
+                        'behind_vpn': bool(vp or iface_is_vpn or tor_exit or ip_match),
                         'city': d.get('city'), 'region': d.get('region'),
                         'country': d.get('country'), 'source': 'ipinfo.io', **vpn_fields}
         except ValueError:
@@ -984,9 +1081,11 @@ def _isp_lookup_iface(iface):
             if d.get('status') == 'success':
                 asn, _ = _parse_ipinfo_org(d.get('as'))
                 vp = _vpn_provider_match(d.get('isp'), d.get('org'), d.get('as')) or ('Tor' if tor_exit else None)
+                ip_match = _vpn_ip_lookup(d.get('query'))
                 return {'interface': iface, 'public_ip': d.get('query'),
                         'isp': d.get('isp'), 'asn': asn, 'org': d.get('org') or d.get('as'),
-                        'vpn_provider': vp, 'behind_vpn': bool(vp or iface_is_vpn or tor_exit),
+                        'vpn_provider': vp, 'vpn_ip_match': ip_match,
+                        'behind_vpn': bool(vp or iface_is_vpn or tor_exit or ip_match),
                         'city': d.get('city'), 'region': d.get('regionName'),
                         'country': d.get('country'), 'source': 'ip-api.com', **vpn_fields}
         except ValueError:
@@ -1033,6 +1132,61 @@ def do_isp(interface=None):
 
     results = [_isp_lookup_iface(name) for name in candidates]
     return {'success': True, 'results': results, 'count': len(results)}
+
+
+def do_vpn_check():
+    """Egress VPN verdict for this network's default route, combining every
+    signal we have. Catches both a VPN on this host (tunnel default route)
+    and one running upstream on the router, where the local interface looks
+    ordinary: the egress public IP is then the VPN server's, so the known-VPN
+    IP-range match and the Tor exit check still see it.
+
+    verdict: 'vpn'     -- confirmed (local tunnel, Tor exit, or egress IP in a
+                          known VPN range)
+             'likely'  -- ISP/ASN name looks like a VPN provider/hosting
+                          backbone, but the IP-range list didn't confirm
+             'no'      -- egress identified and no signal fired
+             'unknown' -- couldn't identify the egress (offline / no route)
+
+    Makes outbound calls (geo-IP + Tor checker); on-demand only."""
+    route_if = _default_route_iface()
+    if not route_if:
+        return {'success': True, 'verdict': 'unknown', 'interface': None,
+                'reasons': ['no default route -- this host has no internet egress']}
+
+    r = _isp_lookup_iface(route_if)
+    reasons = []
+    if r.get('iface_is_vpn'):
+        via = (r.get('vpn_kind') or 'tunnel') \
+            + (' → ' + r['vpn_endpoint'] if r.get('vpn_endpoint') else '')
+        reasons.append(f'default route is a local tunnel ({via})')
+    if r.get('tor_exit'):
+        reasons.append('egress is a Tor exit node (check.torproject.org)')
+    if r.get('vpn_ip_match'):
+        reasons.append('egress IP is in a known VPN-provider range')
+    confirmed = bool(reasons)
+    if r.get('vpn_provider') and r['vpn_provider'] != 'Tor':
+        reasons.append(f"ISP/ASN name matches '{r['vpn_provider']}'")
+
+    if confirmed:
+        verdict = 'vpn'
+    elif r.get('vpn_provider'):
+        verdict = 'likely'
+    elif r.get('public_ip'):
+        verdict = 'no'
+    else:
+        verdict = 'unknown'
+        reasons.append(r.get('error') or 'could not identify the public egress')
+
+    return {'success': True, 'verdict': verdict, 'interface': route_if,
+            'reasons': reasons, 'public_ip': r.get('public_ip'),
+            'isp': r.get('isp'), 'asn': r.get('asn'),
+            'tor_exit': r.get('tor_exit'), 'vpn_ip_match': r.get('vpn_ip_match'),
+            'vpn_provider': r.get('vpn_provider'),
+            'iface_is_vpn': r.get('iface_is_vpn'),
+            'vpn_kind': r.get('vpn_kind'), 'vpn_endpoint': r.get('vpn_endpoint'),
+            # was the IP-range list actually consulted? (None = unavailable)
+            'ip_list_checked': r.get('vpn_ip_match') is not None}
 
 
 # --------------------------------------------------------------------------
@@ -2006,6 +2160,11 @@ def register_network_diagnostics(app, logger=None):
         iface = (request.args.get('interface') or '').strip() or None
         _log(f"net/isp {iface or 'all'}")
         return jsonify(do_isp(interface=iface))
+
+    @app.route('/api/net/vpn-check', methods=['GET'])
+    def net_vpn_check():
+        _log("net/vpn-check")
+        return jsonify(do_vpn_check())
 
     @app.route('/api/net/dns', methods=['POST'])
     def net_dns():
