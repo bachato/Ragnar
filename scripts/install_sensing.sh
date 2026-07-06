@@ -110,6 +110,12 @@ log "Binary installed at $INSTALL_BIN"
 # every start via ExecStartPre, so a deleted/replaced repo dir self-heals.)
 as_root install -d -o "$RUN_USER" -g "$RUN_USER" \
     "$RAGNAR_DIR/data/recordings" "$RAGNAR_DIR/data/models"
+# `install -d` fixes the dirs but not files inside them: root-run updates and
+# backup-restores leave root-owned recordings/model files the server can then
+# no longer overwrite (recording/start fails with "internal_error").
+as_root chown -R "$RUN_USER:$RUN_USER" \
+    "$RAGNAR_DIR/data/recordings" "$RAGNAR_DIR/data/models"
+as_root chown -f "$RUN_USER:$RUN_USER" "$RAGNAR_DIR/data/adaptive_model.json" || true
 log "Ensured data dirs: data/recordings, data/models (owner $RUN_USER)"
 
 # ── 2. Step aside any external RuView unit (port conflict) ───────────────────
@@ -135,9 +141,11 @@ Wants=network-online.target
 Type=simple
 User=$RUN_USER
 WorkingDirectory=$RAGNAR_DIR
-# Recreate the data dirs on every (re)start so a replaced/deleted repo dir or a
-# missing data/ self-heals — relative recording writes need these to exist.
-ExecStartPre=/bin/mkdir -p $RAGNAR_DIR/data/recordings $RAGNAR_DIR/data/models
+# Recreate the data dirs and re-assert their ownership on every (re)start
+# ('+' = run as root). Root-run updates/backup-restores leave root-owned
+# files the server (User=$RUN_USER) can't overwrite — recording/start then
+# fails with "internal_error" and the adaptive model can't be saved.
+ExecStartPre=+/bin/sh -c 'mkdir -p $RAGNAR_DIR/data/recordings $RAGNAR_DIR/data/models && chown -R $RUN_USER:$RUN_USER $RAGNAR_DIR/data/recordings $RAGNAR_DIR/data/models; chown -f $RUN_USER:$RUN_USER $RAGNAR_DIR/data/adaptive_model.json; true'
 Environment=RUST_LOG=info
 Environment=SENSING_ALLOWED_HOSTS=$ALLOWED_HOSTS
 # Presence floor: smoothed-motion (sm) threshold above which a node reports

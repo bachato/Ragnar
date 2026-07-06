@@ -162,6 +162,7 @@ data/output/zombies/
 # Runtime data files (generated during execution)
 data/ragnar.db
 data/livestatus.csv
+data/vpn_ip_ranges.txt
 data/netkb.csv
 data/pwnagotchi_status.json
 data/logs/temp_log.txt
