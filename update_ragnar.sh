@@ -144,6 +144,20 @@ chmod +x "$ragnar_PATH/kill_port_8000.sh" 2>/dev/null || true
 chmod +x "$ragnar_PATH/update_ragnar.sh" 2>/dev/null || true
 chmod +x "$ragnar_PATH/scripts/"*.sh 2>/dev/null || true
 
+# RuSense sensing unit: upgrade the data-dir ExecStartPre to the root-run
+# ('+') self-heal variant that also re-asserts ownership. Without it, files
+# left root-owned by sudo runs make CSI recording fail ("internal_error" on
+# recording/start) and block adaptive-model saves, since the sensing server
+# runs as user ragnar. Idempotent: only rewrites the old plain-mkdir line;
+# install_sensing.sh writes the new form on fresh installs.
+SENSING_UNIT="/etc/systemd/system/ragnar-sensing.service"
+if [ -f "$SENSING_UNIT" ] && grep -q '^ExecStartPre=/bin/mkdir' "$SENSING_UNIT"; then
+    sed -i "s|^ExecStartPre=/bin/mkdir .*|ExecStartPre=+/bin/sh -c 'mkdir -p $ragnar_PATH/data/recordings $ragnar_PATH/data/models \&\& chown -R ragnar:ragnar $ragnar_PATH/data/recordings $ragnar_PATH/data/models; chown -f ragnar:ragnar $ragnar_PATH/data/adaptive_model.json; true'|" "$SENSING_UNIT"
+    systemctl daemon-reload
+    systemctl try-restart ragnar-sensing.service 2>/dev/null || true
+    echo -e "${GREEN}Patched ragnar-sensing.service with ownership self-heal.${NC}"
+fi
+
 echo -e "${BLUE}Step 6.5: Validating actions.json configuration...${NC}"
 python3 << 'PYTHON_EOF'
 import json
