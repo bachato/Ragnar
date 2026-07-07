@@ -302,3 +302,32 @@ class PushoverService:
             target=self.send, args=(message, title, priority, sound), daemon=True
         ).start()
         return True
+
+    def notify_net_integrity(self, message, priority=1, sound="siren"):
+        """Send a network-integrity alert (DNS poisoning / ARP spoofing detected).
+
+        Gated by pushover_enabled + configuration; deduped so the SAME ongoing
+        condition isn't re-sent every monitor cycle (the caller only invokes this
+        on a transition into a bad verdict, and this adds a cooldown backstop).
+        Sent on a daemon thread so the monitor loop never blocks. Returns True if
+        a send was dispatched."""
+        if not self.is_enabled():
+            return False
+        if not self.shared_data.config.get("pushover_notify_net_integrity", True):
+            return False
+        try:
+            cooldown = float(self.shared_data.config.get("net_integrity_notify_cooldown_s", 300))
+        except (TypeError, ValueError):
+            cooldown = 300.0
+        now = time.time()
+        with self._lock:
+            last = getattr(self, "_net_integrity_last_sent", 0.0)
+            if now - last < cooldown:
+                return False
+            self._net_integrity_last_sent = now
+        threading.Thread(
+            target=self.send,
+            args=(message, "Ragnar — Network integrity", priority, sound),
+            daemon=True,
+        ).start()
+        return True

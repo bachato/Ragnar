@@ -1154,6 +1154,24 @@
                     </div>
                     <p id="netdiag-display-note" class="text-xs text-gray-500 mt-2 hidden">Active — the e-Paper is showing the network diagnostic screen. Turn off to restore the normal display.</p>
                 </div>
+                <!-- Passive network-integrity monitor (DNS poisoning + ARP spoofing) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex items-center justify-between gap-4">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Network Integrity Monitor</h3>
+                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong> and <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) in the background, and sends a Pushover alert if the verdict goes bad. Makes outbound DNS/DoH calls each cycle — off by default.</p>
+                        </div>
+                        <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                            <input type="checkbox" id="netint-enabled" class="sr-only peer" onchange="onNetIntegrityToggled(this)">
+                            <div class="w-11 h-6 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                        </label>
+                    </div>
+                    <div id="netint-status" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
+                    <div class="mt-3 flex flex-wrap items-center gap-2">
+                        <button onclick="netIntegrityRefresh(true)" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Check now</button>
+                        <span class="text-xs text-gray-500">Runs the DNS Doctor and ARP Poisoning checks below.</span>
+                    </div>
+                </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
                     <div class="glass rounded-xl p-4 sm:p-6">
@@ -1219,12 +1237,24 @@
                     <!-- DNS Doctor -->
                     <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                         <h3 class="text-lg font-semibold mb-1">DNS Doctor</h3>
+                        <p class="text-xs text-amber-300/90 mb-2">Checks for DNS poisoning / hijacking — NXDOMAIN rewriting, private/bogon answers for a public name, SERVFAIL/DNSSEC-bogus, resolver divergence, and a DoH cross-check.</p>
                         <p class="text-sm text-gray-400 mb-3">Resolves a name through every system resolver plus public 1.1.1.1 / 8.8.8.8 — per-resolver answers &amp; latency, DNSSEC, and whether they agree (split-DNS / hijack smell). Also checks DoH/DoT reachability.</p>
                         <div class="flex flex-col sm:flex-row gap-2">
                             <input id="dns-target" type="text" inputmode="url" autocomplete="off" placeholder="hostname (e.g. example.com)" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runDns()">
                             <button onclick="runDns()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Diagnose DNS</button>
                         </div>
                         <div id="dns-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- ARP Poisoning -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">ARP Poisoning</h3>
+                        <p class="text-xs text-amber-300/90 mb-2">Checks for ARP spoofing / MITM — the default gateway's MAC changed from the trusted baseline, or one MAC answering for many IPs (subnet impersonation).</p>
+                        <p class="text-sm text-gray-400 mb-3">Reads the kernel neighbour table (no capture). The first check learns the gateway's MAC as the trusted baseline; after a legitimate router change, click "Trust current gateway" to re-learn it.</p>
+                        <div class="flex flex-wrap gap-2">
+                            <button onclick="runArpCheck()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check ARP</button>
+                            <button onclick="netIntegrityTrustGateway()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Set the current gateway MAC as the trusted baseline — use after a legitimate router/gateway change">Trust current gateway</button>
+                        </div>
+                        <div id="arp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                     </div>
                     <!-- Path MTU -->
                     <div class="glass rounded-xl p-4 sm:p-6">
@@ -5604,7 +5634,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260707-dnspoison"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260707-arpcard"></script>
 
 </body>
 </html>

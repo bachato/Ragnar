@@ -1215,6 +1215,129 @@ def _rusense_notify_loop():
         _time.sleep(1 if active else 5)
 
 
+# ==========================================================================
+# Passive network-integrity monitor: periodically checks for DNS poisoning
+# and ARP spoofing, surfaces a dashboard chip (/api/net/integrity) and fires a
+# Pushover alert when a verdict goes bad. Opt-in via net_integrity_monitor_enabled.
+# ==========================================================================
+
+_net_integrity_lock = threading.Lock()
+_net_integrity_state = {
+    'enabled': False, 'ts': None, 'overall': 'unknown',
+    'dns': None, 'arp': None,
+}
+# Verdict severity so we only alert on a transition into (or deeper into) a bad
+# state, not every cycle it stays bad. Covers both per-check verdicts (DNS:
+# hijacked, ARP: spoofed) and the derived overall (compromised).
+_NET_INTEGRITY_RANK = {'clean': 0, 'unknown': 0, 'suspicious': 1,
+                       'suspect': 1, 'hijacked': 2, 'spoofed': 2, 'compromised': 2}
+
+
+def _net_integrity_check_once():
+    """Run the DNS-poison and ARP-spoof checks once, update shared state, and
+    alert on a worsening verdict. Returns the overall verdict string."""
+    import network_diagnostics as nd
+
+    name = shared_data.config.get('netdiag_dns_test_name', 'example.com')
+    dns_v, arp_v = 'unknown', 'unknown'
+    dns_reasons, arp_reasons = [], []
+
+    try:
+        d = nd.do_dns_doctor(name)
+        if d.get('success'):
+            p = d.get('poison') or {}
+            dns_v = p.get('verdict', 'unknown')
+            dns_reasons = p.get('reasons') or []
+    except Exception as exc:
+        logger.debug(f"[net-integrity] DNS check failed: {exc}")
+
+    try:
+        a = nd.do_arp_check()
+        if a.get('success'):
+            arp_v = a.get('verdict', 'unknown')
+            arp_reasons = a.get('reasons') or []
+    except Exception as exc:
+        logger.debug(f"[net-integrity] ARP check failed: {exc}")
+
+    dns_rank = _NET_INTEGRITY_RANK.get(dns_v, 0)
+    arp_rank = _NET_INTEGRITY_RANK.get(arp_v, 0)
+    worst = max(dns_rank, arp_rank)
+    overall = {0: 'clean', 1: 'suspicious', 2: 'compromised'}[worst]
+
+    with _net_integrity_lock:
+        prev_rank = _NET_INTEGRITY_RANK.get(_net_integrity_state.get('overall'), 0)
+        _net_integrity_state.update({
+            'enabled': True, 'ts': datetime.now().isoformat(), 'overall': overall,
+            'dns': {'name': name, 'verdict': dns_v, 'reasons': dns_reasons},
+            'arp': {'verdict': arp_v, 'reasons': arp_reasons},
+        })
+
+    # Alert only when the situation worsens (rank increases) into a bad state.
+    if worst >= 1 and worst > prev_rank:
+        reasons = (dns_reasons if dns_rank >= arp_rank else arp_reasons) or \
+                  (dns_reasons + arp_reasons)
+        headline = 'compromised' if worst >= 2 else 'suspicious'
+        bits = []
+        if dns_rank >= 1:
+            bits.append(f'DNS {dns_v}')
+        if arp_rank >= 1:
+            bits.append(f'ARP {arp_v}')
+        msg = f"Network integrity {headline}: {', '.join(bits)}."
+        if reasons:
+            msg += ' ' + reasons[0]
+        try:
+            from pushover_service import PushoverService
+            _po = getattr(shared_data, '_pushover_service', None)
+            if _po is None:
+                _po = PushoverService(shared_data)
+                shared_data._pushover_service = _po
+            _po.notify_net_integrity(msg, priority=(1 if worst >= 2 else 0))
+        except Exception as exc:
+            logger.debug(f"[net-integrity] pushover alert skipped: {exc}")
+        logger.warning(f"[net-integrity] {msg}")
+
+    return overall
+
+
+def net_integrity_monitor_loop():
+    """Background poller for the passive network-integrity monitor. No-op while
+    disabled; when enabled, checks every net_integrity_interval_min minutes."""
+    import time as _time
+    _time.sleep(20)   # let the app + pushover service settle first
+    while not getattr(shared_data, 'webapp_should_exit', False):
+        if not shared_data.config.get('net_integrity_monitor_enabled', False):
+            with _net_integrity_lock:
+                _net_integrity_state['enabled'] = False
+            _time.sleep(15)
+            continue
+        try:
+            _net_integrity_check_once()
+        except Exception as exc:
+            logger.debug(f"[net-integrity] monitor cycle failed: {exc}")
+        try:
+            interval = max(1, int(shared_data.config.get('net_integrity_interval_min', 5)))
+        except (TypeError, ValueError):
+            interval = 5
+        # Sleep the interval in short steps so a config toggle / shutdown is seen.
+        for _ in range(interval * 60 // 5):
+            if getattr(shared_data, 'webapp_should_exit', False):
+                return
+            if not shared_data.config.get('net_integrity_monitor_enabled', False):
+                break
+            _time.sleep(5)
+
+
+@app.route('/api/net/integrity', methods=['GET'])
+def net_integrity_status():
+    """Last verdict from the passive network-integrity monitor (for the
+    dashboard chip). Reflects config even when the monitor hasn't run yet."""
+    with _net_integrity_lock:
+        state = dict(_net_integrity_state)
+    state['monitor_enabled'] = bool(shared_data.config.get('net_integrity_monitor_enabled', False))
+    state['interval_min'] = shared_data.config.get('net_integrity_interval_min', 5)
+    return jsonify({'success': True, **state})
+
+
 @app.route('/api/rusense/geofence', methods=['GET'])
 def rusense_geofence_status():
     """Diagnostic: the geofence's last verdict + how many node corners are
@@ -19833,6 +19956,7 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         socketio.start_background_task(background_arp_scan_loop)
         socketio.start_background_task(background_health_monitor)
         socketio.start_background_task(_rusense_notify_loop)
+        socketio.start_background_task(net_integrity_monitor_loop)
 
         logger.info("✅ All background threads started successfully")
 

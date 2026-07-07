@@ -450,6 +450,146 @@ def do_arp_scan(interface):
 
 
 # --------------------------------------------------------------------------
+# ARP spoofing / poisoning detection: watch the gateway's IP->MAC binding
+# against a learned baseline (a MITM inserting itself changes it), and flag a
+# single MAC answering for many IPs (one host impersonating the whole subnet).
+# The kernel neighbour table is authoritative and needs no capture, so this is
+# cheap enough to run on a schedule from the integrity monitor.
+# --------------------------------------------------------------------------
+
+_ARP_BASELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'data', 'arp_baseline.json')
+_arp_baseline_lock = threading.Lock()
+# A MAC bound to at least this many IPs in the neighbour table is treated as a
+# possible impersonator. Proxy-ARP routers can legitimately answer for a few, so
+# keep the floor above normal noise.
+_ARP_IMPERSONATOR_MIN_IPS = 4
+
+
+def _neigh_entries():
+    """Parse `ip -4 neigh` into [(ip, mac, state)] for entries with a lladdr."""
+    res = _run(['ip', '-4', 'neigh', 'show'], timeout=5)
+    out = []
+    for line in res['out'].splitlines():
+        m = re.match(r'^(\d+\.\d+\.\d+\.\d+)\b.*?\blladdr\s+([0-9a-fA-F:]{17})\s+(\w+)', line)
+        if m:
+            out.append((m.group(1), m.group(2).lower(), m.group(3)))
+    return out
+
+
+def _neigh_mac(ip):
+    """Current MAC bound to `ip` in the kernel neighbour table, or None. Sends a
+    single ping first if the entry is missing, to populate it."""
+    if not ip:
+        return None
+    for i, mac, _ in _neigh_entries():
+        if i == ip:
+            return mac
+    _run(['ping', '-n', '-c', '1', '-W', '1', ip], timeout=3)
+    for i, mac, _ in _neigh_entries():
+        if i == ip:
+            return mac
+    return None
+
+
+def _arp_baseline_load():
+    try:
+        with open(_ARP_BASELINE_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _arp_baseline_save(d):
+    try:
+        os.makedirs(os.path.dirname(_ARP_BASELINE_PATH), exist_ok=True)
+        tmp = _ARP_BASELINE_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _ARP_BASELINE_PATH)
+    except OSError:
+        pass
+
+
+def do_arp_baseline(action='get'):
+    """Manage the trusted gateway IP->MAC baseline the spoof check compares
+    against. action='reset' clears it so the current binding is re-learned on
+    the next check (use after a legitimate router/gateway change)."""
+    with _arp_baseline_lock:
+        if action == 'reset':
+            _arp_baseline_save({})
+            return {'success': True, 'reset': True, 'gateways': {}}
+        return {'success': True, 'gateways': (_arp_baseline_load().get('gateways') or {})}
+
+
+def do_arp_check(interface=None, learn=True):
+    """Detect ARP spoofing / poisoning from the kernel neighbour table.
+
+    Signals: (1) the default gateway's MAC no longer matches the trusted
+    baseline — the classic MITM signature (an attacker ARP-replies as the
+    gateway to intercept traffic); (2) one MAC answering for many IPs — a host
+    impersonating much of the subnet. First run learns the gateway baseline.
+
+    verdict: 'spoofed'    -- gateway MAC changed from the trusted baseline
+             'suspicious' -- a MAC is impersonating several IPs
+             'clean'      -- gateway matches baseline, no impersonators
+             'unknown'    -- no gateway, or its MAC couldn't be resolved"""
+    gw = _default_gateway()
+    if not gw:
+        return {'success': True, 'verdict': 'unknown', 'gateway': None,
+                'reasons': ['no default gateway on this host — nothing to check'],
+                'impersonators': [], 'neighbor_count': 0}
+
+    gw_mac = _neigh_mac(gw)
+    reasons = []
+    verdict = 'clean'
+    learned = False
+    with _arp_baseline_lock:
+        baseline = _arp_baseline_load()
+        gws = baseline.setdefault('gateways', {})
+        base_mac = gws.get(gw)
+        if gw_mac and not base_mac and learn:
+            gws[gw] = gw_mac
+            _arp_baseline_save(baseline)
+            base_mac = gw_mac
+            learned = True
+
+    if not gw_mac:
+        verdict = 'unknown'
+        reasons.append(f'could not resolve the gateway {gw} MAC (no ARP reply)')
+    elif base_mac and gw_mac != base_mac:
+        verdict = 'spoofed'
+        reasons.append(f'gateway {gw} MAC changed from trusted {base_mac} to {gw_mac} '
+                       '— classic ARP-spoofing / MITM signature')
+
+    # One MAC claiming many IPs (attacker impersonating multiple hosts). The
+    # gateway MAC is excluded — a router legitimately fronts its own address.
+    entries = _neigh_entries()
+    mac_ips = {}
+    for ip, mac, _ in entries:
+        mac_ips.setdefault(mac, set()).add(ip)
+    impersonators = [{'mac': mac, 'ips': sorted(ips)}
+                     for mac, ips in mac_ips.items()
+                     if len(ips) >= _ARP_IMPERSONATOR_MIN_IPS and mac != gw_mac]
+    if impersonators:
+        if verdict == 'clean':
+            verdict = 'suspicious'
+        for imp in impersonators:
+            ips = imp['ips']
+            reasons.append(f"MAC {imp['mac']} answers for {len(ips)} IPs "
+                           f"({', '.join(ips[:4])}{'…' if len(ips) > 4 else ''}) "
+                           '— possible ARP spoofing')
+
+    return {'success': True, 'verdict': verdict,
+            'gateway': {'ip': gw, 'mac': gw_mac, 'baseline': base_mac,
+                        'learned': learned},
+            'impersonators': impersonators,
+            'neighbor_count': len(entries),
+            'reasons': reasons}
+
+
+# --------------------------------------------------------------------------
 # Interfaces: link speed / duplex / auto-neg, static-vs-DHCP, IP/CIDR, VLAN
 # --------------------------------------------------------------------------
 
@@ -2331,6 +2471,22 @@ def register_network_diagnostics(app, logger=None):
             return _bad('Invalid or missing interface')
         _log(f"net/arp-scan {iface}")
         return jsonify(do_arp_scan(iface))
+
+    @app.route('/api/net/arp-check', methods=['GET'])
+    def net_arp_check():
+        _log("net/arp-check")
+        return jsonify(do_arp_check())
+
+    @app.route('/api/net/arp-baseline', methods=['GET', 'POST'])
+    def net_arp_baseline():
+        # POST {action:'reset'} clears the trusted gateway baseline so the
+        # current binding is re-learned (after a legitimate gateway change).
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/arp-baseline {action}")
+        return jsonify(do_arp_baseline(action))
 
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():
