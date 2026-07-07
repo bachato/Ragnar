@@ -2404,6 +2404,109 @@ async function runArpCheck() {
     }
 }
 
+// ---- MAC Watch card (spoofing + randomization + tracking, detection-only) --
+const _MACWATCH_VERDICT_STYLE = {
+    clean:         ['bg-green-950/40 border-green-900 text-green-400', '✓ No MAC spoofing or rotation detected'],
+    randomization: ['bg-sky-950/40 border-sky-900 text-sky-300', 'ℹ Privacy-randomized MACs present (no spoofing)'],
+    suspicious:    ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Device rotating randomized MACs — being tracked'],
+    spoofed:       ['bg-red-950/60 border-red-800 text-red-300', '🛑 MAC spoofing / cloning detected'],
+    unknown:       ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+async function runMacWatch(scan) {
+    const out = document.getElementById('macwatch-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, scan ? 'Scanning…' : 'Reading…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">' + (scan ? 'Sweeping the segment (arp-scan)…' : 'Reading neighbour table…') + '</p>';
+    try {
+        const d = await fetchAPI('/api/net/mac-watch?scan=' + (scan ? '1' : '0'));
+        if (!d || d.success === false) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
+            return;
+        }
+        const [cls, label] = _MACWATCH_VERDICT_STYLE[d.verdict] || _MACWATCH_VERDICT_STYLE.unknown;
+        const s = d.summary || {};
+        let html = `<div class="mb-3 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+
+        // Summary chips
+        const chip = (n, txt, bad) =>
+            `<span class="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs ${bad && n ? 'text-red-300' : 'text-gray-300'}">
+                <span class="font-mono font-semibold">${n}</span>${escapeHtml(txt)}</span>`;
+        html += '<div class="flex flex-wrap gap-2 mb-3">' +
+            chip(s.observed || 0, ' seen') +
+            chip(s.spoofed || 0, ' spoofed', true) +
+            chip(s.clones || 0, ' cloned', true) +
+            chip(s.past_events || 0, ' past events', true) +
+            chip(s.randomized || 0, ' randomized') +
+            chip(s.virtual || 0, ' virtual') +
+            chip(s.tracks || 0, ' tracked devices') +
+            '</div>';
+
+        // Spoofed / disguised-vendor MACs
+        if (d.spoofed && d.spoofed.length) {
+            html += '<p class="text-xs uppercase text-red-400 mt-3 mb-1">Spoofed (vendor OUI + locally-administered bit)</p>' +
+                '<ul class="text-xs text-gray-300 list-disc pl-5">' +
+                d.spoofed.map(c => `<li class="font-mono">${escapeHtml(c.mac)} <span class="text-gray-500">(${escapeHtml(c.vendor || '?')})</span> → ${escapeHtml((c.ips || []).join(', ') || 'unknown IP')}</li>`).join('') +
+                '</ul>';
+        }
+        // Cloned MACs (one MAC, many IPs)
+        if (d.clones && d.clones.length) {
+            html += '<p class="text-xs uppercase text-red-400 mt-3 mb-1">Cloned (one MAC, several IPs)</p>' +
+                '<ul class="text-xs text-gray-300 list-disc pl-5">' +
+                d.clones.map(c => `<li class="font-mono">${escapeHtml(c.mac)} → ${escapeHtml((c.ips || []).slice(0, 6).join(', '))}${(c.ips || []).length > 6 ? '…' : ''}</li>`).join('') +
+                '</ul>';
+        }
+        // Tracked devices (rotating randomized MACs)
+        if (d.tracks && d.tracks.length) {
+            html += '<p class="text-xs uppercase text-amber-400 mt-3 mb-1">Tracked devices (rotating randomized MACs)</p>';
+            html += d.tracks.map(t =>
+                `<div class="mb-2 pl-3 border-l-2 border-amber-700/60">
+                    <div class="text-sm text-amber-200 font-mono">${escapeHtml(t.ip)} <span class="text-xs text-gray-500">— ${t.macs.length} MACs, ${t.changes} change(s), first ${escapeHtml(t.span || '—')}</span></div>
+                    <div class="text-xs text-gray-400 font-mono">${t.macs.map(escapeHtml).join(' → ')}</div>
+                </div>`).join('');
+        }
+        // Past events (identity changes over time)
+        const past = (d.events || []).filter(e => e.severity === 'high');
+        if (past.length) {
+            html += '<p class="text-xs uppercase text-amber-400 mt-3 mb-1">Past MAC changes (identity flips)</p>' +
+                '<ul class="text-xs text-gray-400 list-disc pl-5">' +
+                past.slice(0, 8).map(e => `<li class="font-mono">${escapeHtml(e.ip)}: ${escapeHtml(e.old_mac)} → ${escapeHtml(e.new_mac)} <span class="text-gray-500">(${escapeHtml(e.ago || '')})</span></li>`).join('') +
+                '</ul>';
+        }
+        // Randomization inventory
+        const r = d.randomization || {};
+        if (r.count || r.virtual) {
+            html += `<p class="text-xs text-gray-400 mt-3">Randomization inventory: <span class="text-gray-200">${r.count || 0}</span> privacy-randomized` +
+                (r.ephemeral ? `, <span class="text-amber-300">${r.ephemeral}</span> short-lived (active rotation)` : '') +
+                (r.virtual ? `, <span class="text-gray-200">${r.virtual}</span> virtual/VM` : '') + '.</p>';
+        }
+        // Reasons narrative
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-3 list-disc pl-5">' +
+                d.reasons.map(x => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul>';
+        }
+        if (!d.oui_db) {
+            html += '<p class="text-xs text-gray-600 mt-2">OUI vendor database not installed — spoof detection uses the built-in seed only. Install arp-scan for full vendor coverage.</p>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function macWatchReset() {
+    try {
+        await postAPI('/api/net/mac-watch-reset', {});
+        addConsoleMessage('MAC Watch history cleared', 'info');
+        const out = document.getElementById('macwatch-results');
+        if (out) { out.classList.remove('hidden'); out.innerHTML = '<p class="text-sm text-gray-400">History cleared — run a scan to rebuild it.</p>'; }
+    } catch (e) {
+        addConsoleMessage('Failed to reset MAC Watch history: ' + e.message, 'error');
+    }
+}
+
 // Detect the ISP/public IP reached through each interface (multi-WAN). Makes
 // outbound lookups server-side, so it's button-triggered, never auto-loaded.
 async function detectIsp() {
