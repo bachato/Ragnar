@@ -1169,7 +1169,7 @@
                     <div id="netint-status" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
                     <div class="mt-3 flex flex-wrap items-center gap-2">
                         <button onclick="netIntegrityRefresh(true)" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Check now</button>
-                        <button onclick="netIntegrityTrustGateway()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap" title="Set the current gateway MAC as the trusted baseline — use after a legitimate router/gateway change">Trust current gateway</button>
+                        <span class="text-xs text-gray-500">Runs the DNS Doctor and ARP Poisoning checks below.</span>
                     </div>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
@@ -1244,6 +1244,17 @@
                             <button onclick="runDns()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Diagnose DNS</button>
                         </div>
                         <div id="dns-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- ARP Poisoning -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">ARP Poisoning</h3>
+                        <p class="text-xs text-amber-300/90 mb-2">Checks for ARP spoofing / MITM — the default gateway's MAC changed from the trusted baseline, or one MAC answering for many IPs (subnet impersonation).</p>
+                        <p class="text-sm text-gray-400 mb-3">Reads the kernel neighbour table (no capture). The first check learns the gateway's MAC as the trusted baseline; after a legitimate router change, click "Trust current gateway" to re-learn it.</p>
+                        <div class="flex flex-wrap gap-2">
+                            <button onclick="runArpCheck()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check ARP</button>
+                            <button onclick="netIntegrityTrustGateway()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Set the current gateway MAC as the trusted baseline — use after a legitimate router/gateway change">Trust current gateway</button>
+                        </div>
+                        <div id="arp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                     </div>
                     <!-- Path MTU -->
                     <div class="glass rounded-xl p-4 sm:p-6">
@@ -5623,7 +5634,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260707-netintegrity"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260707-arpcard"></script>
 
 </body>
 </html>

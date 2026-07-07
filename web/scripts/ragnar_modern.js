@@ -2347,11 +2347,60 @@ function onNetIntegrityToggled(cb) {
 async function netIntegrityTrustGateway() {
     try {
         await postAPI('/api/net/arp-baseline', { action: 'reset' });
-        await fetchAPI('/api/net/arp-check');   // re-learn the current binding
-        addConsoleMessage('Gateway ARP baseline reset to current', 'info');
-        netIntegrityRefresh(true);
+        addConsoleMessage('Gateway ARP baseline reset — re-learning current binding', 'info');
+        await runArpCheck();          // re-learns + shows the new baseline in the ARP card
+        netIntegrityRefresh(false);   // refresh the monitor chip from stored state
     } catch (e) {
         addConsoleMessage('Failed to reset gateway baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- ARP Poisoning card (on-demand) ---------------------------------------
+const _ARP_VERDICT_STYLE = {
+    clean:      ['bg-green-950/40 border-green-900 text-green-400', '✓ No ARP spoofing detected'],
+    suspicious: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Possible ARP spoofing'],
+    spoofed:    ['bg-red-950/60 border-red-800 text-red-300', '🛑 ARP spoofing / MITM detected'],
+    unknown:    ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine (no gateway / no ARP reply)'],
+};
+async function runArpCheck() {
+    const out = document.getElementById('arp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, 'Checking…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Reading neighbour table…</p>';
+    try {
+        const d = await fetchAPI('/api/net/arp-check');
+        if (!d || d.success === false) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
+            return;
+        }
+        const [cls, label] = _ARP_VERDICT_STYLE[d.verdict] || _ARP_VERDICT_STYLE.unknown;
+        const gw = d.gateway || {};
+        const mismatch = gw.baseline && gw.mac && gw.baseline !== gw.mac;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += '<table class="min-w-full text-sm text-gray-300 whitespace-nowrap"><tbody>' +
+            `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Gateway</td><td class="px-3 py-1.5 font-mono">${escapeHtml(gw.ip || '—')}</td></tr>` +
+            `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Current MAC</td><td class="px-3 py-1.5 font-mono ${mismatch ? 'text-red-400' : ''}">${escapeHtml(gw.mac || '—')}</td></tr>` +
+            `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Trusted MAC</td><td class="px-3 py-1.5 font-mono">${escapeHtml(gw.baseline || '—')}${gw.learned ? ' <span class="text-xs text-gray-500">(learned now)</span>' : ''}</td></tr>` +
+            `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Neighbours</td><td class="px-3 py-1.5">${d.neighbor_count != null ? d.neighbor_count : '—'}</td></tr>` +
+            '</tbody></table>';
+        if (d.impersonators && d.impersonators.length) {
+            html += '<p class="text-xs text-gray-400 mt-2">One MAC answering for many IPs:</p><ul class="text-xs text-gray-400 list-disc pl-5">' +
+                d.impersonators.map(i => {
+                    const ips = i.ips || [];
+                    return '<li class="font-mono">' + escapeHtml(i.mac) + ' → ' + escapeHtml(ips.slice(0, 6).join(', ')) + (ips.length > 6 ? '…' : '') + '</li>';
+                }).join('') + '</ul>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
     }
 }
 
