@@ -716,6 +716,14 @@ class SharedData:
             # Hostname the K4-long DNS Doctor key resolves for its poison/hijack
             # check on the e-Paper (no keyboard on the panel, so it's preset).
             "netdiag_dns_test_name": "example.com",
+            # Passive network-integrity monitor: periodically runs the DNS-poison
+            # and ARP-spoof checks in the background, surfaces a dashboard chip and
+            # fires a Pushover alert on a bad verdict. OFF by default — it makes
+            # outbound DNS/DoH calls each cycle; opt in from Network > Diagnostics.
+            "net_integrity_monitor_enabled": False,
+            "net_integrity_interval_min": 5,        # minutes between checks
+            "pushover_notify_net_integrity": True,  # alert on poison/spoof (when monitor on)
+            "net_integrity_notify_cooldown_s": 300, # min seconds between repeat alerts
             # Browser terminal (interactive shell over the web UI). OFF by
             # default — it exposes a shell on the Pi (as the 'ragnar' user),
             # gated by login. Enable in Settings only if you want it.

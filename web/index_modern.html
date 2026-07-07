@@ -1154,6 +1154,24 @@
                     </div>
                     <p id="netdiag-display-note" class="text-xs text-gray-500 mt-2 hidden">Active — the e-Paper is showing the network diagnostic screen. Turn off to restore the normal display.</p>
                 </div>
+                <!-- Passive network-integrity monitor (DNS poisoning + ARP spoofing) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex items-center justify-between gap-4">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Network Integrity Monitor</h3>
+                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong> and <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) in the background, and sends a Pushover alert if the verdict goes bad. Makes outbound DNS/DoH calls each cycle — off by default.</p>
+                        </div>
+                        <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                            <input type="checkbox" id="netint-enabled" class="sr-only peer" onchange="onNetIntegrityToggled(this)">
+                            <div class="w-11 h-6 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                        </label>
+                    </div>
+                    <div id="netint-status" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
+                    <div class="mt-3 flex flex-wrap items-center gap-2">
+                        <button onclick="netIntegrityRefresh(true)" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Check now</button>
+                        <button onclick="netIntegrityTrustGateway()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap" title="Set the current gateway MAC as the trusted baseline — use after a legitimate router/gateway change">Trust current gateway</button>
+                    </div>
+                </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
                     <div class="glass rounded-xl p-4 sm:p-6">
@@ -5604,7 +5622,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260707-dnspoison"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260707-netintegrity"></script>
 
 </body>
 </html>

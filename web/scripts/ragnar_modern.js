@@ -1220,6 +1220,7 @@ function showNetworkSubtab(name) {
     } else if (name === 'diagnostics') {
         populateMtrSources();
         syncNetDiagDisplayFromServer();
+        syncNetIntegrityFromServer();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
@@ -2267,6 +2268,91 @@ function onNetDiagDisplayToggled(cb) {
             cb.checked = !cb.checked;
             if (note) note.classList.toggle('hidden', !cb.checked);
         });
+}
+
+// ---- Network Integrity Monitor (DNS poisoning + ARP spoofing) --------------
+const _NETINT_STYLE = {
+    clean:       ['bg-green-950/40 border-green-900 text-green-400', '✓'],
+    suspicious:  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠'],
+    compromised: ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
+    hijacked:    ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
+    spoofed:     ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
+    unknown:     ['bg-slate-800 border-slate-700 text-slate-400', '—'],
+};
+function _netintChip(label, verdict) {
+    const [cls, icon] = _NETINT_STYLE[verdict] || _NETINT_STYLE.unknown;
+    return `<span class="px-2.5 py-1 rounded border ${cls}">${icon} ${label}: ${escapeHtml(verdict || 'unknown')}</span>`;
+}
+function renderNetIntegrity(d) {
+    const out = document.getElementById('netint-status');
+    if (!out) return;
+    if (!d || d.success === false) { out.innerHTML = ''; return; }
+    const dnsV = (d.dns && d.dns.verdict) || 'unknown';
+    const arpV = (d.arp && d.arp.verdict) || 'unknown';
+    const chips = [_netintChip('Overall', d.overall || 'unknown'),
+                   _netintChip('DNS', dnsV), _netintChip('ARP', arpV)].join(' ');
+    const reasons = [].concat((d.dns && d.dns.reasons) || [], (d.arp && d.arp.reasons) || []);
+    const when = d.ts ? new Date(d.ts).toLocaleString() : (d.monitor_enabled ? 'awaiting first check…' : 'monitor off');
+    let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}</span>`;
+    if (reasons.length) {
+        html += '<ul class="text-xs text-gray-400 w-full list-disc pl-5 mt-1">' +
+            reasons.slice(0, 3).map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+    }
+    out.innerHTML = html;
+}
+async function netIntegrityRefresh(force) {
+    // force=true also runs the on-demand ARP + DNS checks so the chips update
+    // immediately even when the background monitor is disabled.
+    try {
+        if (force) {
+            const name = 'example.com';
+            const [arp, dns] = await Promise.all([
+                fetchAPI('/api/net/arp-check').catch(() => null),
+                postAPI('/api/net/dns', { name }).catch(() => null),
+            ]);
+            const dnsV = dns && dns.poison ? dns.poison.verdict : 'unknown';
+            const arpV = arp ? arp.verdict : 'unknown';
+            const rank = { clean: 0, unknown: 0, suspicious: 1, hijacked: 2, spoofed: 2 };
+            const worst = Math.max(rank[dnsV] || 0, rank[arpV] || 0);
+            renderNetIntegrity({
+                overall: ['clean', 'suspicious', 'compromised'][worst],
+                ts: new Date().toISOString(), monitor_enabled: true,
+                dns: { verdict: dnsV, reasons: (dns && dns.poison && dns.poison.reasons) || [] },
+                arp: { verdict: arpV, reasons: (arp && arp.reasons) || [] },
+            });
+            return;
+        }
+        renderNetIntegrity(await fetchAPI('/api/net/integrity'));
+    } catch (e) { /* offline — leave chips as-is */ }
+}
+async function syncNetIntegrityFromServer() {
+    const cb = document.getElementById('netint-enabled');
+    try {
+        const d = await fetchAPI('/api/net/integrity');
+        if (cb) cb.checked = !!d.monitor_enabled;
+        renderNetIntegrity(d);
+    } catch (e) { /* offline */ }
+}
+function onNetIntegrityToggled(cb) {
+    postAPI('/api/config', { net_integrity_monitor_enabled: cb.checked })
+        .then(() => {
+            addConsoleMessage('Network integrity monitor ' + (cb.checked ? 'ON' : 'OFF'), 'info');
+            if (cb.checked) netIntegrityRefresh(true); else renderNetIntegrity({ monitor_enabled: false });
+        })
+        .catch(err => {
+            addConsoleMessage('Failed to toggle integrity monitor: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+        });
+}
+async function netIntegrityTrustGateway() {
+    try {
+        await postAPI('/api/net/arp-baseline', { action: 'reset' });
+        await fetchAPI('/api/net/arp-check');   // re-learn the current binding
+        addConsoleMessage('Gateway ARP baseline reset to current', 'info');
+        netIntegrityRefresh(true);
+    } catch (e) {
+        addConsoleMessage('Failed to reset gateway baseline: ' + e.message, 'error');
+    }
 }
 
 // Detect the ISP/public IP reached through each interface (multi-WAN). Makes
