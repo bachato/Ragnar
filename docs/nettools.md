@@ -13,8 +13,10 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2**, and
 
 All tools are served under `/api/net/*` by `network_diagnostics.py`, a
 self-contained module wrapped so a failure there can never take down the rest of
-the web app. Nothing runs as a background daemon — each tool executes on demand
-when you click it.
+the web app. Every tool executes on demand when you click it — with one opt-in
+exception, the [Network Integrity Monitor](#-network-integrity-monitor), which
+watches for DNS poisoning and ARP spoofing in the background and can push you an
+alert.
 
 ### Tool index
 
@@ -24,7 +26,9 @@ when you click it.
 | [Traceroute](#traceroute) | Diagnostics | `POST /api/net/traceroute` |
 | [MTR](#mtr) | Diagnostics | `POST /api/net/mtr` |
 | [WHOIS](#whois) | Diagnostics | `POST /api/net/whois` |
-| [DNS Doctor](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
+| [DNS Doctor (poisoning check)](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
+| [ARP Poisoning](#arp-poisoning) | Diagnostics | `GET /api/net/arp-check`, `/arp-baseline` |
+| [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
 | [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
 | [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
 | [LAN Throughput (iperf3)](#lan-throughput-iperf3) | Diagnostics | `POST /api/net/iperf3`, `/iperf3-server` |
@@ -40,6 +44,7 @@ when you click it.
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
 | [Network Identity](#network-identity) | Interfaces | `GET /api/net/identity` |
 | [ISP / WAN + VPN Detection](#isp--wan-detection) | Interfaces | `GET /api/net/isp` |
+| [VPN Egress Check](#vpn-egress-check) | Interfaces | `GET /api/net/vpn-check` |
 
 ---
 
@@ -88,6 +93,28 @@ tunnel, bridge and container interfaces. Toggle it off to restore the normal
 Ragnar display. The setting is persisted (`network_diagnostic_mode` in the
 config) and shared across sessions.
 
+#### Field-test key pad (2.7" HAT)
+
+On the 2.7" e-Paper HAT the four hardware keys become a **standalone field
+tester** while this mode is active — so you can run live tests on the switch
+with no laptop. Each key has a **short press** and a **long press** (hold
+~0.6 s); a test's result stays on the panel until **KEY1** dismisses it. Outside
+this mode the keys keep their normal Ragnar / wardriving behaviour (they act on
+press) — the netdiag layer only takes over the keys when the toggle is on.
+
+| Key | Short press | Long press (hold ~0.6 s) |
+|-----|-------------|--------------------------|
+| **KEY1** | Next diagnostic page | **Pause / resume** the auto-cycle |
+| **KEY2** | **Locate port** — blink the switch link LED | **L2 health** capture (~12 s) |
+| **KEY3** | **Ping the gateway** (LAN) | **Ping the internet** (`8.8.8.8`, WAN) |
+| **KEY4** | **Speed test** | **DNS Doctor** — poisoning/hijack verdict |
+
+KEY4-long resolves a preset hostname (`netdiag_dns_test_name`, default
+`example.com`, since the panel has no keyboard) and shows a big
+**CLEAN / SUSPECT / HIJACK** verdict. Tests run on a background thread so a key
+press is never blocked, and the panel wakes immediately on a press rather than
+waiting out the 5 s cycle.
+
 > Applies to the e-Paper display. Headless installs (no display) accept the
 > toggle but have nothing to render it on.
 
@@ -135,12 +162,77 @@ Registration/ownership lookup for a domain or IP.
 ### DNS Doctor
 Resolves a hostname through **every system resolver plus public 1.1.1.1 /
 8.8.8.8**, and reports per resolver: the **answers**, **query latency**, the
-**DNSSEC AD** (authenticated) flag, and status. It then tells you whether all
-resolvers **agree** — a mismatch is the fingerprint of split-DNS or DNS
-hijacking. Also reports **DoH** (443) and **DoT** (853) reachability. Far more
-than a name→IP lookup: it's a resolver-health and integrity check.
+**DNSSEC AD** (authenticated) flag, and status. Also reports **DoH** (443) and
+**DoT** (853) reachability. Far more than a name→IP lookup: it's a
+resolver-health and **DNS-poisoning / hijack detector**.
 
-- Endpoint: `POST /api/net/dns` `{name}` · binary: `dig` (`dnsutils`)
+Alongside the per-resolver table it runs active poisoning probes and returns a
+`poison` verdict — **clean**, **suspicious**, or **hijacked** — with the reasons:
+
+- **NXDOMAIN rewriting** — queries a random name that *cannot* exist; a resolver
+  that synthesizes an address for it is rewriting DNS (ISP redirect / typo /
+  captive page). The public resolvers act as the control.
+- **Private/bogon answer for a public name** — an RFC1918 / loopback / reserved
+  address returned for a public hostname (redirect, blocklist sinkhole, portal).
+- **SERVFAIL / DNSSEC-bogus** — a validating resolver refusing a name others
+  resolve is the signature of a tampered (DNSSEC-bogus) record.
+- **Resolver divergence** — the system/ISP resolver's answer shares nothing with
+  the public resolvers' (split-DNS, or a hijack if unexpected). CDN/anycast
+  variance is tolerated, so this is a *soft* signal.
+- **DoH cross-check** — resolves the same name over Cloudflare DoH (encrypted,
+  tamper-resistant) and compares to the plaintext answer; a mismatch is a strong
+  sign of on-path :53 spoofing.
+
+Strong signals (NXDOMAIN rewrite, bogon answer, DoH mismatch) → **hijacked**;
+soft signals (SERVFAIL, divergence) → **suspicious**. The verdict is shown as a
+banner in the web panel, is available on the e-Paper **KEY4-long** result page,
+and drives the [Network Integrity Monitor](#-network-integrity-monitor).
+
+- Endpoint: `POST /api/net/dns` `{name}` · binaries: `dig` (`dnsutils`), `curl`
+
+### ARP Poisoning
+Detects **ARP spoofing / MITM** from the kernel neighbour table (`ip neigh`) —
+no packet capture needed. Two signals, returned as a **clean / suspicious /
+spoofed** verdict:
+
+- **Gateway MAC change** — the default gateway's IP→MAC binding is compared
+  against a **trusted baseline**. An attacker who ARP-replies as the gateway to
+  intercept traffic changes that MAC — the classic man-in-the-middle signature →
+  **spoofed**. The first check *learns* the current gateway MAC as the baseline
+  (`data/arp_baseline.json`); after a legitimate router swap, **Trust current
+  gateway** re-learns it.
+- **Subnet impersonation** — one MAC answering for many IPs (≥4) in the
+  neighbour table, i.e. a host impersonating much of the segment → **suspicious**
+  (the gateway's own MAC is excluded so a router fronting its address is fine).
+
+The result shows the verdict, the current vs. trusted gateway MAC (highlighted
+on mismatch), the neighbour count, any impersonator MACs and the reasons. This
+is the *active* complement to the passive duplicate-IP check in
+[L2 Link Health](#l2-link-health), and it feeds the
+[Network Integrity Monitor](#-network-integrity-monitor).
+
+- Endpoints: `GET /api/net/arp-check`,
+  `GET|POST /api/net/arp-baseline` `{action:reset}` · uses `ip neigh` (iproute2)
+
+### 🛡️ Network Integrity Monitor
+The one **passive, alerting** tool in the suite (everything else is on-demand).
+When enabled it runs the [DNS Doctor](#dns-doctor) poisoning check and the
+[ARP Poisoning](#arp-poisoning) check on a schedule (default **every 5 min**),
+derives an overall verdict — **clean / suspicious / compromised** — and:
+
+- Surfaces a live **dashboard chip** (Overall / DNS / ARP) in the Diagnostics
+  sub-tab, with the reasons and last-check time.
+- Sends a **Pushover alert** when the verdict *worsens* into a bad state (it
+  alerts on the transition, not every cycle, with a cooldown backstop).
+
+**Off by default**, because it makes outbound DNS/DoH calls each cycle — opt in
+with the toggle. When you first enable it, be on a trusted network: the first
+cycle learns the gateway ARP baseline. **Check now** runs both checks
+immediately (works even while the monitor is off).
+
+- Endpoint: `GET /api/net/integrity` · config: `net_integrity_monitor_enabled`,
+  `net_integrity_interval_min`, `pushover_notify_net_integrity`,
+  `net_integrity_notify_cooldown_s`
 
 ### Path MTU / Black-hole
 Discovers the **path MTU** to a target and flags an **MTU black hole** — a hop
@@ -262,6 +354,10 @@ interface, returning IP, MAC and (where known) NIC vendor for each responder.
 The fastest way to inventory a subnet you're attached to. Results export to CSV.
 
 - Endpoint: `GET /api/net/arp-scan?interface=<iface>` · binary: `arp-scan`
+
+> This is an **inventory** sweep, not a security check. For ARP **spoofing /
+> poisoning** detection (gateway-MAC watch + subnet impersonation), see
+> [ARP Poisoning](#arp-poisoning) in the Diagnostics sub-tab.
 
 ### L2 Link Health
 Listens **passively** on an interface for a few seconds (`tcpdump`) and reports
@@ -442,6 +538,38 @@ the diagnostic you're after.
 > (from the speedtest client's own geolocation) — ISP / WAN Detection is the
 > per-interface complement for multi-homed setups.
 
+### VPN Egress Check
+A focused **"is my traffic leaving through a VPN?"** verdict for one path,
+combining every signal Ragnar has. It follows the **default route** by default,
+or a specific `interface` if you pass one (e.g. to test the LAN path while WiFi
+carries the default route). Returns **vpn / likely / no / unknown**:
+
+- **Local tunnel** — the egress interface is itself a tunnel (WireGuard /
+  Tailscale / OpenVPN / IPsec / GRE …), identified from the link type
+  (`ip -d link`) and name, with the WireGuard **peer endpoint** when `wg` is
+  available.
+- **Known-VPN egress IP** — the public egress IP falls inside a **known
+  VPN-provider range** (an ASN-derived list synced locally from
+  [X4BNet/lists_vpn](https://github.com/X4BNet/lists_vpn) and checked offline).
+  This is the signal that catches a VPN running **on the router**, where
+  Ragnar's own NIC looks like an ordinary LAN port.
+- **Tor exit** — the egress is confirmed a Tor exit node via the Tor Project's
+  own checker (again catching Tor/VPN upstream on the router).
+- **Provider ASN name** — the egress ISP/ASN name matches a commercial-VPN
+  provider or VPN-hosting backbone (`mullvad`, `m247`, …) → *likely* (best-effort,
+  since many VPNs share hosting ASNs).
+
+This complements the per-interface [ISP / WAN Detection](#isp--wan-detection)
+above: that answers "which link goes to which ISP", this answers "is *this* path
+behind a VPN — including one running on the router that the interface heuristics
+alone would miss".
+
+> **Privacy:** makes outbound calls (geo-IP + the Tor checker) bound to the
+> tested interface. On-demand only, never polled.
+
+- Endpoint: `GET /api/net/vpn-check` or
+  `GET /api/net/vpn-check?interface=<iface>` · binary: `curl`
+
 ---
 
 ## Design notes
@@ -449,9 +577,11 @@ the diagnostic you're after.
 - **Never blocks, never crashes the app.** The command runner treats a missing
   binary as exit code 127, a timeout as 124, and any other failure as a plain
   error string — no tool can hang the web UI or raise into the request handler.
-- **On-demand only.** Nothing polls in the background; a tool runs when you ask
-  it to. Tools that touch the wire (Locate Port's link-flap, L2 Link Health and
-  PTP captures, ISP lookups) are always explicit, button-triggered actions.
+- **On-demand by default.** Tools run when you ask them to; the ones that touch
+  the wire (Locate Port's link-flap, L2 Link Health and PTP captures, ISP/VPN
+  lookups) are always explicit, button-triggered actions. The single background
+  poller is the opt-in [Network Integrity Monitor](#-network-integrity-monitor),
+  which is off unless you enable it.
 - **CSV export** is available for the Switch Discovery, ARP Scan, Interfaces,
   Network Identity and ISP / WAN tables.
 - **Offline-capable.** Everything except the internet-facing tools (Speed Test,
