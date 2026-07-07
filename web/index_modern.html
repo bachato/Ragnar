@@ -1237,6 +1237,7 @@
                     <!-- DNS Doctor -->
                     <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                         <h3 class="text-lg font-semibold mb-1">DNS Doctor</h3>
+                        <p class="text-xs text-amber-300/90 mb-2">Checks for DNS poisoning / hijacking — NXDOMAIN rewriting, private/bogon answers for a public name, SERVFAIL/DNSSEC-bogus, resolver divergence, and a DoH cross-check.</p>
                         <p class="text-sm text-gray-400 mb-3">Resolves a name through every system resolver plus public 1.1.1.1 / 8.8.8.8 — per-resolver answers &amp; latency, DNSSEC, and whether they agree (split-DNS / hijack smell). Also checks DoH/DoT reachability.</p>
                         <div class="flex flex-col sm:flex-row gap-2">
                             <input id="dns-target" type="text" inputmode="url" autocomplete="off" placeholder="hostname (e.g. example.com)" class="w-full flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')runDns()">
