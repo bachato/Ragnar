@@ -709,7 +709,13 @@ class SharedData:
             # When True, the e-Paper shows an Ethernet-focused network
             # diagnostic screen (link / IP / switch port), auto-cycling pages
             # every 5s. Web-toggled from Network > Diagnostics. e-Paper only.
+            # In this mode the 2.7" HAT keys become a field-test pad (see
+            # epd_button.py): K1 nav/pause, K2 locate-port/L2-health,
+            # K3 ping gateway/internet, K4 speedtest/DNS-poison check.
             "network_diagnostic_mode": False,
+            # Hostname the K4-long DNS Doctor key resolves for its poison/hijack
+            # check on the e-Paper (no keyboard on the panel, so it's preset).
+            "netdiag_dns_test_name": "example.com",
             # Browser terminal (interactive shell over the web UI). OFF by
             # default — it exposes a shell on the Pi (as the 'ragnar' user),
             # gated by login. Enable in Settings only if you want it.

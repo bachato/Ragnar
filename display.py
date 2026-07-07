@@ -856,15 +856,17 @@ class Display:
     # Network Diagnostic mode (Ethernet-focused, internet-independent)
     # ------------------------------------------------------------------
 
-    def _netdiag_sleep(self, seconds):
-        """Sleep up to `seconds`, waking early if the display is exiting or the
-        network-diagnostic toggle is switched off, so the normal display
-        resumes promptly."""
+    def _netdiag_sleep(self, seconds, bl=None, seq0=0):
+        """Sleep up to `seconds`, waking early if the display is exiting, the
+        network-diagnostic toggle is switched off, or a HAT key fired (the
+        button listener bumps netdiag_seq), so key presses feel responsive."""
         steps = max(1, int(seconds / 0.1))
         for _ in range(steps):
             if self.shared_data.display_should_exit:
                 return
             if not self.shared_data.config.get('network_diagnostic_mode', False):
+                return
+            if bl is not None and getattr(bl, 'netdiag_seq', 0) != seq0:
                 return
             time.sleep(0.1)
 
@@ -910,7 +912,7 @@ class Display:
         return {'eth': eth, 'eth_count': len(eth_list),
                 'gateway': gateway, 'dns': nameservers, 'lldp': lldp}
 
-    def _render_netdiag_page(self, image, draw, page):
+    def _render_netdiag_page(self, image, draw, page, frozen=False):
         """Render one Ethernet network-diagnostic sub-page. Space on the panel
         is scarce, so each page shows only the handful of facts an engineer
         actually needs when diagnosing a switch port."""
@@ -918,8 +920,9 @@ class Display:
         data = self._get_cached_page_data('netdiag', self._fetch_netdiag_data, ttl=10)
         names = ["LINK", "IP", "SWITCH"]
         name = names[page % len(names)]
+        state = "PAUSED" if frozen else "auto5s"
         self._draw_page_frame(draw, f"NET {name}",
-                              hint=f"Ethernet diag  {page + 1}/{NETDIAG_PAGE_COUNT}  auto 5s")
+                              hint=f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}  K1nav K2port K3png K4dns")
         y = int(28 * sy)
         if not data:
             self._draw_stat_rows(draw, y, [("Status", "gathering...")])
@@ -999,6 +1002,72 @@ class Display:
                 ("Proto", n.get('protocol') or '—'),
                 ("Mgmt IP", n.get('mgmt_ip') or '—'),
             ])
+
+    def _draw_wrapped_note(self, draw, y, text, max_lines=3):
+        """Word-wrap a short note across up to max_lines using the small font."""
+        w = getattr(self, 'render_w', self.shared_data.width)
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        font = self.shared_data.font_arial9
+        pad_x = int(6 * sx)
+        avail = w - 2 * pad_x
+        lines, cur = [], ''
+        for word in str(text).split():
+            trial = (cur + ' ' + word).strip()
+            if font.getlength(trial) <= avail or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+                if len(lines) >= max_lines:
+                    break
+        if cur and len(lines) < max_lines:
+            lines.append(cur)
+        line_h = int(11 * sy)
+        for ln in lines[:max_lines]:
+            draw.text((pad_x, y), ln, font=font, fill=0)
+            y += line_h
+        return y
+
+    def _render_netdiag_result(self, image, draw, result):
+        """Render a one-shot netdiag test result (triggered by a HAT key). Holds
+        on screen until KEY1 returns to the auto-cycling pages."""
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        title = str(result.get('title') or 'TEST')
+        running = result.get('running')
+        hint = "running..." if running else "K1 back to pages"
+        self._draw_page_frame(draw, f"NET {title}", hint=hint)
+        y = int(28 * sy)
+        if running:
+            self._draw_stat_rows(draw, y, [("Status", "running..."),
+                                           ("Please", "wait a few s")])
+            return
+        verdict = result.get('verdict')
+        if verdict:
+            big = str(verdict[0])
+            font_big = self.shared_data.font_viking
+            tw = font_big.getlength(big)
+            draw.text(((w - tw) / 2, y), big, font=font_big, fill=0)
+            y += int(24 * sy)
+        y = self._draw_stat_rows(draw, y, result.get('rows') or [])
+        note = result.get('note')
+        if note:
+            self._draw_wrapped_note(draw, y + int(3 * sy), note)
+
+    def _commit_netdiag_frame(self, image):
+        """Push a rendered netdiag frame to the panel and the web mirror."""
+        epd_img = _apply_epd_rotation(image, self.screen_reversed)
+        self.epd_helper.display_partial(epd_img)
+        self.epd_helper.display_partial(epd_img)
+        web_img = _apply_web_rotation(image, self.web_screen_reversed)
+        try:
+            with open(os.path.join(self.shared_data.webdir, "screen.png"), 'wb') as img_file:
+                web_img.save(img_file)
+                img_file.flush()
+                os.fsync(img_file.fileno())
+        except Exception:
+            pass
 
     def _fetch_network_data(self):
         """Fetch real host data from database."""
@@ -2851,25 +2920,47 @@ class Display:
                 # Rendered + committed here so the standard page pipeline is
                 # bypassed entirely while active.
                 if self.shared_data.config.get('network_diagnostic_mode', False):
-                    page = getattr(self, '_netdiag_page', 0) % NETDIAG_PAGE_COUNT
+                    # The 2.7" HAT keys drive this mode (see epd_button.py): the
+                    # button listener owns the current page / freeze state and
+                    # posts one-shot test results for us to render.
+                    bl = (self.button_listener
+                          if (self.button_listener and self.button_listener.available)
+                          else None)
+                    seq0 = getattr(bl, 'netdiag_seq', 0) if bl else 0
+                    result = getattr(bl, 'netdiag_result', None) if bl else None
+                    if result is not None:
+                        try:
+                            self._render_netdiag_result(image, draw, result)
+                        except Exception as e:
+                            logger.debug(f"netdiag result render error: {e}")
+                        self._commit_netdiag_frame(image)
+                        # Refresh ~1s while a test runs so completion shows fast;
+                        # once done, hold the result until a key wakes us.
+                        self._netdiag_sleep(1.0 if result.get('running') else NETDIAG_CYCLE_SECONDS, bl, seq0)
+                        continue
+                    frozen = bool(getattr(bl, 'netdiag_frozen', False)) if bl else False
+                    if bl is not None:
+                        page = bl.netdiag_page % NETDIAG_PAGE_COUNT
+                    else:
+                        page = getattr(self, '_netdiag_page', 0) % NETDIAG_PAGE_COUNT
                     try:
-                        self._render_netdiag_page(image, draw, page)
+                        self._render_netdiag_page(image, draw, page, frozen=frozen)
                     except Exception as e:
                         logger.debug(f"netdiag render error: {e}")
-                    self._netdiag_page = (page + 1) % NETDIAG_PAGE_COUNT
-                    epd_img = _apply_epd_rotation(image, self.screen_reversed)
-                    self.epd_helper.display_partial(epd_img)
-                    self.epd_helper.display_partial(epd_img)
-                    web_img = _apply_web_rotation(image, self.web_screen_reversed)
-                    try:
-                        with open(os.path.join(self.shared_data.webdir, "screen.png"), 'wb') as img_file:
-                            web_img.save(img_file)
-                            img_file.flush()
-                            os.fsync(img_file.fileno())
-                    except Exception:
-                        pass
-                    self._netdiag_sleep(NETDIAG_CYCLE_SECONDS)
+                    if not frozen:
+                        nextp = (page + 1) % NETDIAG_PAGE_COUNT
+                        if bl is not None:
+                            bl.netdiag_page = nextp
+                        else:
+                            self._netdiag_page = nextp
+                    self._commit_netdiag_frame(image)
+                    self._netdiag_sleep(NETDIAG_CYCLE_SECONDS, bl, seq0)
                     continue
+                # Not in net-diag mode: drop any stale one-shot result / freeze so
+                # re-entering the mode later starts clean on the pages.
+                if self.button_listener is not None and getattr(self.button_listener, 'netdiag_result', None) is not None:
+                    self.button_listener.netdiag_result = None
+                    self.button_listener.netdiag_frozen = False
 
                 # Wardriving display override: render the wardriving page when
                 # the engine is running, OR — if wardriving-on-boot is set and
