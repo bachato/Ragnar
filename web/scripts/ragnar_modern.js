@@ -2308,33 +2308,51 @@ function renderNetIntegrity(d) {
     }
     out.innerHTML = html;
 }
+const _NETINT_RANK = { clean: 0, unknown: 0, suspicious: 1, hijacked: 2, spoofed: 2, rogue: 2, starvation: 2 };
 async function netIntegrityRefresh(force) {
-    // force=true also runs the on-demand ARP + DNS checks so the chips update
-    // immediately even when the background monitor is disabled.
+    // force=true also runs the on-demand DNS + ARP + DHCP checks so the chips
+    // update immediately even when the background monitor is disabled.
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
     try {
         if (force) {
+            if (btn) { btn.disabled = true; btn.dataset.orig = btn.textContent; btn.textContent = 'Checking…'; }
             const name = 'example.com';
-            const [arp, dns, dhcp] = await Promise.all([
+            // DNS + ARP are fast — render them right away so the button feels
+            // responsive. DHCP discovery (nmap) takes a few seconds, so it's
+            // fetched separately and patched into its chip when it lands.
+            const [arp, dns] = await Promise.all([
                 fetchAPI('/api/net/arp-check').catch(() => null),
                 postAPI('/api/net/dns', { name }).catch(() => null),
-                fetchAPI('/api/net/dhcp-guardian?quick=1').catch(() => null),
             ]);
             const dnsV = dns && dns.poison ? dns.poison.verdict : 'unknown';
             const arpV = arp ? arp.verdict : 'unknown';
-            const dhcpV = dhcp ? dhcp.verdict : 'unknown';
-            const rank = { clean: 0, unknown: 0, suspicious: 1, hijacked: 2, spoofed: 2, rogue: 2, starvation: 2 };
-            const worst = Math.max(rank[dnsV] || 0, rank[arpV] || 0, rank[dhcpV] || 0);
-            renderNetIntegrity({
-                overall: ['clean', 'suspicious', 'compromised'][worst],
+            const state = {
+                overall: ['clean', 'suspicious', 'compromised'][Math.max(_NETINT_RANK[dnsV] || 0, _NETINT_RANK[arpV] || 0)],
                 ts: new Date().toISOString(), monitor_enabled: true,
                 dns: { verdict: dnsV, reasons: (dns && dns.poison && dns.poison.reasons) || [] },
                 arp: { verdict: arpV, reasons: (arp && arp.reasons) || [] },
-                dhcp: { verdict: dhcpV, reasons: (dhcp && dhcp.reasons) || [] },
+                dhcp: { verdict: 'checking…', reasons: [] },
+            };
+            renderNetIntegrity(state);
+            // Slow DHCP check — update the chip (and overall) once it resolves.
+            fetchAPI('/api/net/dhcp-guardian?quick=1').then(dhcp => {
+                const dhcpV = dhcp ? dhcp.verdict : 'unknown';
+                state.dhcp = { verdict: dhcpV, reasons: (dhcp && dhcp.reasons) || [] };
+                state.overall = ['clean', 'suspicious', 'compromised'][Math.max(
+                    _NETINT_RANK[dnsV] || 0, _NETINT_RANK[arpV] || 0, _NETINT_RANK[dhcpV] || 0)];
+                renderNetIntegrity(state);
+            }).catch(() => {
+                state.dhcp = { verdict: 'unknown', reasons: [] };
+                renderNetIntegrity(state);
+            }).finally(() => {
+                if (btn) { btn.disabled = false; btn.textContent = btn.dataset.orig || 'Check now'; }
             });
             return;
         }
         renderNetIntegrity(await fetchAPI('/api/net/integrity'));
-    } catch (e) { /* offline — leave chips as-is */ }
+    } catch (e) { /* offline — leave chips as-is */
+        if (btn) { btn.disabled = false; btn.textContent = btn.dataset.orig || 'Check now'; }
+    }
 }
 async function syncNetIntegrityFromServer() {
     const cb = document.getElementById('netint-enabled');

@@ -1207,7 +1207,10 @@ def do_dhcp_guardian(interface=None, capture_seconds=6, learn=True, quick=False)
     verdict = 'clean'
 
     # --- (1) rogue / fake DHCP server -------------------------------------
-    offers, offer_err = _dhcp_discover(iface)
+    # quick mode (background monitor / e-Paper / "Check now") uses a shorter
+    # OFFER wait — a legitimate local server answers in well under a second, so
+    # 4s is plenty and keeps the interactive path snappy.
+    offers, offer_err = _dhcp_discover(iface, 4 if quick else _DHCP_DISCOVER_TIMEOUT_S)
     server_ids = sorted({o['server_id'] for o in offers if o.get('server_id')})
     learned = False
     rogue_servers = []
