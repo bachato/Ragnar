@@ -1221,6 +1221,7 @@ function showNetworkSubtab(name) {
         populateMtrSources();
         syncNetDiagDisplayFromServer();
         syncNetIntegrityFromServer();
+        _macWatchFillIfaces();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
@@ -2412,15 +2413,35 @@ const _MACWATCH_VERDICT_STYLE = {
     spoofed:       ['bg-red-950/60 border-red-800 text-red-300', '🛑 MAC spoofing / cloning detected'],
     unknown:       ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
 };
+// Fill the MAC Watch interface selector (Auto + each real NIC, WiFi/LAN
+// labelled) so a sweep can target a chosen segment. Called on card render and
+// before the first scan; keeps the current selection if already populated.
+function _macWatchFillIfaces() {
+    const sel = document.getElementById('macwatch-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function runMacWatch(scan) {
     const out = document.getElementById('macwatch-results');
     if (!out) return;
     const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('macwatch-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
     _ndBusy(btn, true, scan ? 'Scanning…' : 'Reading…');
     out.classList.remove('hidden');
-    out.innerHTML = '<p class="text-sm text-gray-400">' + (scan ? 'Sweeping the segment (arp-scan)…' : 'Reading neighbour table…') + '</p>';
+    out.innerHTML = '<p class="text-sm text-gray-400">' + (scan ? ('Sweeping ' + (iface ? escapeHtml(iface) : 'the default segment') + ' (arp-scan)…') : 'Reading neighbour table…') + '</p>';
     try {
-        const d = await fetchAPI('/api/net/mac-watch?scan=' + (scan ? '1' : '0'));
+        _macWatchFillIfaces();
+        const d = await fetchAPI('/api/net/mac-watch?scan=' + (scan ? '1' : '0') + (iface ? '&interface=' + encodeURIComponent(iface) : ''));
         if (!d || d.success === false) {
             out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
             return;
@@ -2428,6 +2449,7 @@ async function runMacWatch(scan) {
         const [cls, label] = _MACWATCH_VERDICT_STYLE[d.verdict] || _MACWATCH_VERDICT_STYLE.unknown;
         const s = d.summary || {};
         let html = `<div class="mb-3 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Source: ${escapeHtml(d.source || '—')}</p>`;
 
         // Summary chips
         const chip = (n, txt, bad) =>

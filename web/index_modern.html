@@ -1265,7 +1265,10 @@
                                 <p class="text-sm text-gray-400 mb-3">Also inventories privacy-randomized MACs on the segment, and <strong>tracks</strong> a device that rotates through several randomized addresses — following it across the MACs it hides behind. Reads the neighbour table (+ optional arp-scan sweep); history persists so past events survive restarts. Cross-MAC tracking here is IP-anchored (capture-free); true fingerprint tracking needs monitor mode.</p>
                             </div>
                         </div>
-                        <div class="flex flex-wrap gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <select id="macwatch-iface" title="Interface for the arp-scan sweep — pick your WiFi or LAN NIC to scan that subnet" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Auto (default route)</option>
+                            </select>
                             <button onclick="runMacWatch(true)" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan (arp-scan sweep)</button>
                             <button onclick="runMacWatch(false)" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Read the kernel neighbour table only — no traffic generated">Quick (neighbour table)</button>
                             <button onclick="macWatchReset()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Clear the MAC-watch history (first/last-seen, per-IP history, change events)">Reset history</button>
@@ -5650,7 +5653,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260707-macwatch"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260708-macwatch-iface"></script>
 
 </body>
 </html>

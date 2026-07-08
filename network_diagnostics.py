@@ -845,10 +845,13 @@ def do_mac_watch(scan=True, interface=None):
         m = _mac_norm(mac)
         if m and m not in local:
             seen.setdefault(m, set()).add(ip)
+    scan_iface = None       # interface the arp-scan sweep actually ran on
+    scanned = False         # whether an arp-scan sweep was performed
     if scan and _have('arp-scan'):
-        iface = interface if _valid_iface(interface or '') else _default_route_iface()
-        if iface:
-            sweep = do_arp_scan(iface)
+        scan_iface = interface if _valid_iface(interface or '') else _default_route_iface()
+        if scan_iface:
+            scanned = True
+            sweep = do_arp_scan(scan_iface)
             for h in (sweep.get('hosts') or []):
                 m = _mac_norm(h.get('mac'))
                 if m and m not in local:
@@ -1005,6 +1008,10 @@ def do_mac_watch(scan=True, interface=None):
         'randomization': randomization,
         'tracks': tracks,
         'gateway': {'ip': gw, 'mac': gw_mac},
+        'interface': scan_iface,
+        'scanned': scanned,
+        'source': (f'arp-scan sweep on {scan_iface}' if scanned
+                   else 'neighbour table (all interfaces)'),
         'oui_db': bool(len(_load_oui_db()) > len(_MAC_VENDOR_SEED)),
         'reasons': reasons,
     }
