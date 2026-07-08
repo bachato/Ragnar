@@ -27,6 +27,15 @@ if : > >(tee -a "$WRAPPER_LOG" 2>/dev/null) 2>/dev/null; then
 fi
 echo "[kiosk-run] start $(date -Iseconds) user=$(id -un) HOME=${HOME:-unset} DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}"
 
+# Pi model + RAM — used to tune Chromium for low-memory boards (Pi Zero 2 W has
+# only 512 MB, where Chromium OOM-crashes without the low-end flags below).
+PI_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown)"
+MEM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+MEM_MB=$(( MEM_KB / 1024 ))
+LOW_MEM=0
+[[ "$MEM_MB" -gt 0 && "$MEM_MB" -le 1024 ]] && LOW_MEM=1
+echo "[kiosk-run] board: ${PI_MODEL} | RAM: ${MEM_MB}MB | low_mem=${LOW_MEM}"
+
 # Default config values (mirror shared.py defaults)
 KIOSK_URL="http://localhost:8000"
 KIOSK_ROTATION="0"
@@ -63,17 +72,47 @@ echo "[kiosk-run] target URL: $FINAL_URL"
 PROFILE_DIR="$HOME/.config/ragnar-kiosk-chromium"
 mkdir -p "$PROFILE_DIR" 2>/dev/null || true
 
+# After a power-cut the Pi never shuts Chromium down cleanly, so it shows the
+# "Restore pages? Chrome didn't shut down correctly" banner over the kiosk —
+# the #1 kiosk complaint. Rewrite the last-session exit state to clean so the
+# banner never appears. (--disable-session-crashed-bubble alone isn't reliable
+# across Chromium versions; this is.)
+PREFS="$PROFILE_DIR/Default/Preferences"
+if [[ -f "$PREFS" ]]; then
+    sed -i 's/"exit_type":"[^"]*"/"exit_type":"Normal"/; s/"exited_cleanly":false/"exited_cleanly":true/' "$PREFS" 2>/dev/null || true
+fi
+
+# Chromium flags. Kept identical across both launch modes (session + own-X) by
+# building the array once here and reusing it below.
 CHROMIUM_ARGS=(
     --kiosk
     --noerrdialogs
     --disable-infobars
     --disable-translate
     --disable-features=TranslateUI,Translate
+    --disable-session-crashed-bubble
+    --disable-pinch
+    --overscroll-history-navigation=0
     --no-first-run
     --check-for-update-interval=31536000
+    --disable-dev-shm-usage
+    --password-store=basic
     --user-data-dir="$PROFILE_DIR"
     --app="$FINAL_URL"
 )
+
+# Low-memory boards (Pi Zero 2 W, 512 MB): trim Chromium's footprint so it
+# doesn't get OOM-killed to a black screen. Harmless on bigger Pis but only
+# applied where it matters.
+if [[ "$LOW_MEM" -eq 1 ]]; then
+    CHROMIUM_ARGS+=(
+        --enable-low-end-device-mode
+        --renderer-process-limit=1
+        --disable-gpu-shader-disk-cache
+        --disable-features=TranslateUI,Translate,CalculateNativeWinOcclusion
+    )
+    echo "[kiosk-run] low-memory board — applied Chromium low-end flags"
+fi
 
 # Wait for Ragnar's web server to actually answer (max 60s).
 for i in $(seq 1 60); do
@@ -176,16 +215,9 @@ if [[ "$KIOSK_HIDE_CURSOR" == "true" ]] && command -v unclutter >/dev/null 2>&1;
     unclutter -idle 0 -root &
 fi
 
-exec "$BROWSER" \\
-    --kiosk \\
-    --noerrdialogs \\
-    --disable-infobars \\
-    --disable-translate \\
-    --disable-features=TranslateUI,Translate \\
-    --no-first-run \\
-    --check-for-update-interval=31536000 \\
-    --user-data-dir="\$HOME/.config/ragnar-kiosk-chromium" \\
-    --app="$FINAL_URL"
+# Same hardened Chromium flags as the session-mode launch (built by the parent).
+$(declare -p CHROMIUM_ARGS)
+exec "$BROWSER" "\${CHROMIUM_ARGS[@]}"
 EOF
 chmod +x "$SESSION_SCRIPT"
 

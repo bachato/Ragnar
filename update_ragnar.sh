@@ -177,6 +177,16 @@ if [ -f /etc/systemd/system.conf ]; then
     echo -e "  ${GREEN}✓${NC} systemd watchdog set (RuntimeWatchdogSec=15)"
 fi
 
+echo -e "${BLUE}Step 6.7: Refreshing kiosk wrapper (if installed)...${NC}"
+# Existing kiosk installs keep a COPY of the wrapper at /usr/local/bin; the
+# active copy only updates when kiosk is re-installed. Refresh it here so the
+# Pi Zero2W/4/5 hardening reaches boxes that just `git pull` + update.
+KIOSK_WRAPPER_SRC="$ragnar_PATH/scripts/ragnar_kiosk_run.sh"
+if [ -f /usr/local/bin/ragnar-kiosk-run ] && [ -f "$KIOSK_WRAPPER_SRC" ]; then
+    install -m 0755 "$KIOSK_WRAPPER_SRC" /usr/local/bin/ragnar-kiosk-run
+    echo -e "  ${GREEN}✓${NC} Kiosk wrapper refreshed from repo"
+fi
+
 echo -e "${BLUE}Step 6.5: Validating actions.json configuration...${NC}"
 python3 << 'PYTHON_EOF'
 import json

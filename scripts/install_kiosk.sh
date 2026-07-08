@@ -28,6 +28,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "[kiosk-install] starting at $(date -Iseconds)"
 echo "[kiosk-install] repo root: $REPO_ROOT"
+echo "[kiosk-install] board: $(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown) | RAM: $(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)MB"
 
 # Detect if a desktop session is already running on this Pi.
 detect_desktop_mode() {
@@ -136,6 +137,13 @@ if [[ "$MODE" == "service" ]]; then
     if [[ "$HAS_X" -eq 0 ]]; then
         echo "[kiosk-install] no X detected — adding minimal X stack"
         PKGS_TO_INSTALL+=(xserver-xorg xinit x11-xserver-utils openbox)
+    fi
+    # xserver-xorg-legacy provides the suid Xorg.wrap that lets a non-root user
+    # start X (our needs_root_rights=yes + allowed_users=anybody below). On Pi OS
+    # Bookworm — the default on Pi 5 — X is rootless by default and this package
+    # isn't pulled in, so the kiosk service fails to start X without it.
+    if [[ ! -f /usr/lib/xorg/Xorg.wrap ]] && ! dpkg -s xserver-xorg-legacy >/dev/null 2>&1; then
+        PKGS_TO_INSTALL+=(xserver-xorg-legacy)
     fi
     if ! command -v xauth >/dev/null 2>&1; then
         PKGS_TO_INSTALL+=(xauth)
