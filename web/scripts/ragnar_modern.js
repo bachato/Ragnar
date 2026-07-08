@@ -1222,6 +1222,7 @@ function showNetworkSubtab(name) {
         syncNetDiagDisplayFromServer();
         syncNetIntegrityFromServer();
         _macWatchFillIfaces();
+        _dhcpFillIfaces();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
@@ -2279,6 +2280,8 @@ const _NETINT_STYLE = {
     compromised: ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
     hijacked:    ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
     spoofed:     ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
+    rogue:       ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
+    starvation:  ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
     unknown:     ['bg-slate-800 border-slate-700 text-slate-400', '—'],
 };
 function _netintChip(label, verdict) {
@@ -2291,9 +2294,12 @@ function renderNetIntegrity(d) {
     if (!d || d.success === false) { out.innerHTML = ''; return; }
     const dnsV = (d.dns && d.dns.verdict) || 'unknown';
     const arpV = (d.arp && d.arp.verdict) || 'unknown';
+    const dhcpV = (d.dhcp && d.dhcp.verdict) || 'unknown';
     const chips = [_netintChip('Overall', d.overall || 'unknown'),
-                   _netintChip('DNS', dnsV), _netintChip('ARP', arpV)].join(' ');
-    const reasons = [].concat((d.dns && d.dns.reasons) || [], (d.arp && d.arp.reasons) || []);
+                   _netintChip('DNS', dnsV), _netintChip('ARP', arpV),
+                   _netintChip('DHCP', dhcpV)].join(' ');
+    const reasons = [].concat((d.dns && d.dns.reasons) || [], (d.arp && d.arp.reasons) || [],
+                              (d.dhcp && d.dhcp.reasons) || []);
     const when = d.ts ? new Date(d.ts).toLocaleString() : (d.monitor_enabled ? 'awaiting first check…' : 'monitor off');
     let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}</span>`;
     if (reasons.length) {
@@ -2308,19 +2314,22 @@ async function netIntegrityRefresh(force) {
     try {
         if (force) {
             const name = 'example.com';
-            const [arp, dns] = await Promise.all([
+            const [arp, dns, dhcp] = await Promise.all([
                 fetchAPI('/api/net/arp-check').catch(() => null),
                 postAPI('/api/net/dns', { name }).catch(() => null),
+                fetchAPI('/api/net/dhcp-guardian?quick=1').catch(() => null),
             ]);
             const dnsV = dns && dns.poison ? dns.poison.verdict : 'unknown';
             const arpV = arp ? arp.verdict : 'unknown';
-            const rank = { clean: 0, unknown: 0, suspicious: 1, hijacked: 2, spoofed: 2 };
-            const worst = Math.max(rank[dnsV] || 0, rank[arpV] || 0);
+            const dhcpV = dhcp ? dhcp.verdict : 'unknown';
+            const rank = { clean: 0, unknown: 0, suspicious: 1, hijacked: 2, spoofed: 2, rogue: 2, starvation: 2 };
+            const worst = Math.max(rank[dnsV] || 0, rank[arpV] || 0, rank[dhcpV] || 0);
             renderNetIntegrity({
                 overall: ['clean', 'suspicious', 'compromised'][worst],
                 ts: new Date().toISOString(), monitor_enabled: true,
                 dns: { verdict: dnsV, reasons: (dns && dns.poison && dns.poison.reasons) || [] },
                 arp: { verdict: arpV, reasons: (arp && arp.reasons) || [] },
+                dhcp: { verdict: dhcpV, reasons: (dhcp && dhcp.reasons) || [] },
             });
             return;
         }
@@ -2403,6 +2412,103 @@ async function runArpCheck() {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     } finally {
         _ndBusy(btn, false);
+    }
+}
+
+// ---- DHCP Guardian card (rogue DHCP + starvation, detection-only) ----------
+const _DHCP_VERDICT_STYLE = {
+    clean:      ['bg-green-950/40 border-green-900 text-green-400', '✓ No rogue DHCP server or starvation detected'],
+    suspicious: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ DHCP anomaly — review below'],
+    rogue:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue / fake DHCP server detected'],
+    starvation: ['bg-red-950/60 border-red-800 text-red-300', '🛑 DHCP starvation (pool-exhaustion) detected'],
+    unknown:    ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _dhcpFillIfaces() {
+    const sel = document.getElementById('dhcp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runDhcpGuardian() {
+    const out = document.getElementById('dhcp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('dhcp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    _ndBusy(btn, true, 'Scanning…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Provoking DHCP offers and watching for a DISCOVER flood… (a few seconds)</p>';
+    try {
+        _dhcpFillIfaces();
+        const d = await fetchAPI('/api/net/dhcp-guardian' + (iface ? '?interface=' + encodeURIComponent(iface) : ''));
+        if (!d || d.success === false) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
+            return;
+        }
+        const [cls, label] = _DHCP_VERDICT_STYLE[d.verdict] || _DHCP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · active gateway: <span class="font-mono">${escapeHtml(d.gateway || '—')}</span>${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+
+        // DHCP servers table
+        const servers = d.servers || [];
+        if (servers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">DHCP servers that answered (' + servers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Server</th><th class="px-2 py-1">Offered gateway</th><th class="px-2 py-1">Offered DNS</th><th class="px-2 py-1">Lease</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                servers.map(s => {
+                    const badge = s.rogue ? '<span class="text-red-300">🛑 rogue</span>'
+                        : (s.trusted ? '<span class="text-green-400">✓ trusted</span>' : '<span class="text-amber-300">? new</span>');
+                    const gwBad = d.gateway && s.router && s.router !== d.gateway;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${s.rogue ? 'text-red-300' : ''}">${escapeHtml(s.server_id || '—')}</td>
+                        <td class="px-2 py-1 font-mono ${gwBad ? 'text-red-300' : ''}">${escapeHtml(s.router || '—')}</td>
+                        <td class="px-2 py-1 font-mono">${escapeHtml((s.dns || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${escapeHtml(s.lease || '—')}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        } else {
+            html += '<p class="text-xs text-gray-400 mt-2">No DHCP server answered (static addressing, or the pool may be exhausted).</p>';
+        }
+
+        // Starvation stats
+        const st = d.starvation || {};
+        if (st.captured) {
+            html += `<p class="text-xs text-gray-400 mt-2">Starvation watch: <span class="text-gray-200">${st.clients || 0}</span> distinct clients / <span class="text-gray-200">${st.requests || 0}</span> requests in the capture window.</p>`;
+        } else if (st.error) {
+            html += `<p class="text-xs text-gray-600 mt-2">Starvation capture skipped: ${escapeHtml(st.error)}</p>`;
+        }
+        if (d.arp_verdict && d.arp_verdict !== 'clean' && d.arp_verdict !== 'unknown') {
+            html += `<p class="text-xs text-red-300 mt-1">Gateway ARP verdict: ${escapeHtml(d.arp_verdict)}</p>`;
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function dhcpTrustCurrent() {
+    try {
+        await postAPI('/api/net/dhcp-baseline', { action: 'reset' });
+        addConsoleMessage('DHCP baseline reset — re-learning current server(s)', 'info');
+        await runDhcpGuardian();
+    } catch (e) {
+        addConsoleMessage('Failed to reset DHCP baseline: ' + e.message, 'error');
     }
 }
 

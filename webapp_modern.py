@@ -1230,7 +1230,8 @@ _net_integrity_state = {
 # state, not every cycle it stays bad. Covers both per-check verdicts (DNS:
 # hijacked, ARP: spoofed) and the derived overall (compromised).
 _NET_INTEGRITY_RANK = {'clean': 0, 'unknown': 0, 'suspicious': 1,
-                       'suspect': 1, 'hijacked': 2, 'spoofed': 2, 'compromised': 2}
+                       'suspect': 1, 'hijacked': 2, 'spoofed': 2, 'compromised': 2,
+                       'rogue': 2, 'starvation': 2}
 
 
 def _net_integrity_check_once():
@@ -1239,8 +1240,8 @@ def _net_integrity_check_once():
     import network_diagnostics as nd
 
     name = shared_data.config.get('netdiag_dns_test_name', 'example.com')
-    dns_v, arp_v = 'unknown', 'unknown'
-    dns_reasons, arp_reasons = [], []
+    dns_v, arp_v, dhcp_v = 'unknown', 'unknown', 'unknown'
+    dns_reasons, arp_reasons, dhcp_reasons = [], [], []
 
     try:
         d = nd.do_dns_doctor(name)
@@ -1259,9 +1260,21 @@ def _net_integrity_check_once():
     except Exception as exc:
         logger.debug(f"[net-integrity] ARP check failed: {exc}")
 
+    # DHCP: rogue-server discovery only (quick=True skips the starvation capture)
+    # so the background cycle stays fast; opt-in alongside the monitor.
+    if shared_data.config.get('net_integrity_check_dhcp', True):
+        try:
+            h = nd.do_dhcp_guardian(quick=True)
+            if h.get('success'):
+                dhcp_v = h.get('verdict', 'unknown')
+                dhcp_reasons = h.get('reasons') or []
+        except Exception as exc:
+            logger.debug(f"[net-integrity] DHCP check failed: {exc}")
+
     dns_rank = _NET_INTEGRITY_RANK.get(dns_v, 0)
     arp_rank = _NET_INTEGRITY_RANK.get(arp_v, 0)
-    worst = max(dns_rank, arp_rank)
+    dhcp_rank = _NET_INTEGRITY_RANK.get(dhcp_v, 0)
+    worst = max(dns_rank, arp_rank, dhcp_rank)
     overall = {0: 'clean', 1: 'suspicious', 2: 'compromised'}[worst]
 
     with _net_integrity_lock:
@@ -1270,18 +1283,22 @@ def _net_integrity_check_once():
             'enabled': True, 'ts': datetime.now().isoformat(), 'overall': overall,
             'dns': {'name': name, 'verdict': dns_v, 'reasons': dns_reasons},
             'arp': {'verdict': arp_v, 'reasons': arp_reasons},
+            'dhcp': {'verdict': dhcp_v, 'reasons': dhcp_reasons},
         })
 
     # Alert only when the situation worsens (rank increases) into a bad state.
     if worst >= 1 and worst > prev_rank:
-        reasons = (dns_reasons if dns_rank >= arp_rank else arp_reasons) or \
-                  (dns_reasons + arp_reasons)
+        reasons = max((dns_reasons, dns_rank), (arp_reasons, arp_rank),
+                      (dhcp_reasons, dhcp_rank), key=lambda t: t[1])[0] or \
+                  (dns_reasons + arp_reasons + dhcp_reasons)
         headline = 'compromised' if worst >= 2 else 'suspicious'
         bits = []
         if dns_rank >= 1:
             bits.append(f'DNS {dns_v}')
         if arp_rank >= 1:
             bits.append(f'ARP {arp_v}')
+        if dhcp_rank >= 1:
+            bits.append(f'DHCP {dhcp_v}')
         msg = f"Network integrity {headline}: {', '.join(bits)}."
         if reasons:
             msg += ' ' + reasons[0]
