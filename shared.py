@@ -133,6 +133,7 @@ SIZE_KEY_TO_DEFAULT_DRIVER = {
     "3in7":     "epd3in7",
     "4in26":    "epd4in26",
     "1in28_tft": "gc9a01",
+    "1in44_lcd": "st7735s",
     "1in69_tft": "whisplay",
     "0in96_oled": "ssd1306",
     "1602_lcd": "lcd1602",
@@ -175,6 +176,10 @@ DISPLAY_PROFILES = {
     "epd4in26":    {"ref_width": DESIGN_REF_WIDTH, "ref_height": DESIGN_REF_HEIGHT, "default_flip": False},
     # GC9A01 1.28" 240x240 round colour TFT LCD
     "gc9a01":      {"ref_width": DESIGN_REF_WIDTH, "ref_height": DESIGN_REF_WIDTH, "default_flip": False},
+    # Waveshare 1.44" LCD HAT — ST7735S 128x128 square colour TFT (with keys +
+    # joystick). Square panel: use a square reference so the layout isn't
+    # stretched; the on-screen frame/stat pages scale to fit 128x128.
+    "st7735s":     {"ref_width": 128, "ref_height": 128, "default_flip": False},
     # Whisplay HAT 1.69" ST7789 240x280 colour TFT LCD (ref height keeps the
     # 240:280 aspect so the layout isn't stretched: 122 * 280/240 = 142)
     "whisplay":    {"ref_width": DESIGN_REF_WIDTH, "ref_height": 142, "default_flip": False},

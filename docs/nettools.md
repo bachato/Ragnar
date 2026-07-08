@@ -122,8 +122,28 @@ KEY4-long resolves a preset hostname (`netdiag_dns_test_name`, default
 press is never blocked, and the panel wakes immediately on a press rather than
 waiting out the 5 s cycle.
 
-> Applies to the e-Paper display. Headless installs (no display) accept the
-> toggle but have nothing to render it on.
+#### Field-test pad (1.44" LCD HAT + joystick)
+
+The Waveshare **1.44" LCD HAT** (ST7735S, 128×128) carries **3 keys plus a
+5-way joystick**, so navigation and tests get separate controls — no long-press
+needed for the common ones. Select it in **Display settings** as *"1.44" ST7735S
+LCD HAT + joystick"*. While Network Diagnostic mode is on:
+
+| Input | Action |
+|-------|--------|
+| **Joystick ← / ↑** | Previous diagnostic page |
+| **Joystick → / ↓** | Next diagnostic page |
+| **Joystick press** | Dismiss a shown result, else **pause / resume** the auto-cycle |
+| **KEY1** short / long | **Ping the gateway** (LAN) / **Ping the internet** (`8.8.8.8`, WAN) |
+| **KEY2** short / long | **Locate port** — blink the switch link LED / **L2 health** capture (~12 s) |
+| **KEY3** short / long | **Speed test** / **DNS Doctor** — poisoning/hijack verdict |
+
+Outside net-diag mode the joystick pages through the normal Ragnar screens,
+**KEY1** swaps to/from Pwnagotchi, **KEY2** rotates the screen, and a joystick
+press restarts the service.
+
+> Applies to the e-Paper / LCD display. Headless installs (no display) accept
+> the toggle but have nothing to render it on.
 
 ---
 

@@ -146,9 +146,19 @@ class Display:
         # y_stretch is no longer needed — scale_factor_y handles vertical spacing
         self.y_stretch = 1.0
 
-        # Hardware button support (2.7" HAT has KEY1-KEY4)
+        # Hardware button support.
+        #  * 1.44" LCD HAT (ST7735S): 3 keys + 5-way joystick (own pin set)
+        #  * 2.7" e-Paper HAT: KEY1-KEY4 (only when the panel is "wide")
+        # Both drive the same page/net-diag state the render loop reads.
         self.button_listener = None
-        if self.is_wide and EPDButtonListener is not None:
+        if self.config.get("epd_type") == "st7735s":
+            try:
+                from lcdhat_input import LCDHATInputListener
+                self.button_listener = LCDHATInputListener(shared_data)
+                self.button_listener.start()
+            except Exception as e:
+                logger.warning(f"LCD HAT input listener unavailable: {e}")
+        elif self.is_wide and EPDButtonListener is not None:
             self.button_listener = EPDButtonListener(shared_data)
             self.button_listener.start()
 
@@ -802,15 +812,23 @@ class Display:
         draw.text((int(4 * sx), int(4 * sy)), title, font=font_title, fill=0)
         draw.line((1, int(22 * sy), w - 1, int(22 * sy)), fill=0)
         draw.line((1, h - int(18 * sy), w - 1, h - int(18 * sy)), fill=0)
+        # Trim the footer hint so it never overflows a narrow panel (e.g. the
+        # 128px LCD HAT); on wider e-paper it already fits, so this is a no-op.
+        avail = w - int(8 * sx)
+        while hint and font.getlength(hint) > avail:
+            hint = hint[:-1]
         draw.text((int(4 * sx), h - int(16 * sy)), hint, font=font, fill=0)
 
     def _draw_stat_rows(self, draw, y, stats):
         """Draw key-value stat rows. Returns final y position."""
         w = getattr(self, 'render_w', self.shared_data.width)
+        h = getattr(self, 'render_h', self.shared_data.height)
         sx = getattr(self, 'render_sx', self.scale_factor_x)
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         font = self.shared_data.font_arial9
-        line_h = int(14 * sy)
+        # Tighten row spacing on a short panel so tall pages (up to ~7 rows) fit
+        # a 128px square without spilling into the footer band.
+        line_h = int(12 * sy) if h < 150 else int(14 * sy)
         pad_x = int(6 * sx)
         for label, value in stats:
             val_str = str(value)[:22]
@@ -948,8 +966,14 @@ class Display:
         names = ["LINK", "IP", "SWITCH", "DHCP"]
         name = names[page % len(names)]
         state = "PAUSED" if frozen else "auto5s"
-        self._draw_page_frame(draw, f"NET {name}",
-                              hint=f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}  K1nav K2port K3png K4dns")
+        # Narrow panels (128px LCD HAT) have no room for the key legend, and its
+        # joystick drives navigation anyway — show just the page counter/state.
+        render_w = getattr(self, 'render_w', self.shared_data.width)
+        if render_w < 150:
+            hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}"
+        else:
+            hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}  K1nav K2port K3png K4dns"
+        self._draw_page_frame(draw, f"NET {name}", hint=hint)
         y = int(28 * sy)
         if not data:
             self._draw_stat_rows(draw, y, [("Status", "gathering...")])

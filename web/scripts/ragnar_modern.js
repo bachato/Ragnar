@@ -523,6 +523,7 @@ function epdTypeToSizeKey(epd_type) {
     if (epd_type.startsWith('epd3in7')) return '3in7';
     if (epd_type.startsWith('epd4in26')) return '4in26';
     if (epd_type === 'gc9a01') return '1in28_tft';
+    if (epd_type === 'st7735s') return '1in44_lcd';
     if (epd_type === 'whisplay') return '1in69_tft';
     if (epd_type === 'ssd1306') return '0in96_oled';
     if (epd_type === 'lcd1602') return 'lcd1602';
@@ -538,6 +539,7 @@ const displaySelectOptions = {
         { value: '3in7', label: '3.7" e-Paper (280x480)' },
         { value: '4in26', label: '4.26" e-Paper (800x480)' },
         { value: '1in28_tft', label: '1.28" GC9A01 Round TFT (240x240)' },
+        { value: '1in44_lcd', label: '1.44" ST7735S LCD HAT + joystick (128x128)' },
         { value: '1in69_tft', label: '1.69" Whisplay ST7789 TFT (240x280)' },
         { value: '0in96_oled', label: '0.96" SSD1306 OLED (128x64)' },
         { value: 'lcd1602', label: '16×2 LCD1602 Character LCD (I2C)' },
@@ -13298,8 +13300,9 @@ function displayConfigForm(config) {
         const isMax7219 = val === 'max7219_8panel' || val === 'max7219_4panel';
         const isSsd1306 = val === '0in96_oled';
         const isGc9a01 = val === '1in28_tft';
+        const isSt7735s = val === '1in44_lcd';
         const isLcd1602 = val === 'lcd1602';
-        const isEpaper = !isMax7219 && !isSsd1306 && !isGc9a01 && !isLcd1602;
+        const isEpaper = !isMax7219 && !isSsd1306 && !isGc9a01 && !isSt7735s && !isLcd1602;
         if (colorRow) colorRow.style.display = isGc9a01 ? '' : 'none';
         if (addrRow) addrRow.style.display = isSsd1306 ? '' : 'none';
         if (lcdAddrRow) lcdAddrRow.style.display = isLcd1602 ? '' : 'none';

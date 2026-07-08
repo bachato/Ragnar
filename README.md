@@ -77,6 +77,7 @@ web will be down during wardrive without ap or wifi connection.
 - **LAN-First Connectivity** — Prefers Ethernet when present, manages WiFi as fallback
 - **Smart WiFi Management** — Auto-connects to known networks, falls back to AP mode, captive portal for configuration
 - **E-Paper Display** — Real-time status showing targets, vulnerabilities, credentials, and network info
+- **Color TFT / OLED Displays** — GC9A01 1.28" round TFT, ST7735S 1.44" LCD HAT (128×128, with 3 keys + 5-way joystick), and SSD1306 0.96" OLED. Selectable under Display settings. The 1.44" HAT's joystick and keys drive [Network Diagnostic Mode](docs/nettools.md#-e-paper-network-diagnostic-mode) as a standalone field tester.
 - **MAX7219 LED Matrix Display** — Cascaded 8×8 LED panel arrays (4-panel 32×8 or 8-panel 64×8). Scrolls SSID, IP, targets, and status. SPI-connected: DIN→GPIO10, CS→GPIO8, CLK→GPIO11.
 - **WiFi Pineapple Pager** — Full-color LCD display with button controls, LED indicators, and auto-dim. See [Pager section](#-wifi-pineapple-pager)
 - **Hardware-Bound Authentication** — Optional login with full database encryption at rest. See [Security & Authentication](docs/SECURITY.md)
