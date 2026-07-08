@@ -1215,6 +1215,7 @@ function showNetworkSubtab(name) {
     } else if (name === 'switch') {
         loadLldp();
         _dhcpFillIfaces();
+        dhcpSnoopStatus();
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
         loadInterfaces();
@@ -2527,6 +2528,114 @@ async function dhcpTrustCurrent() {
         await runDhcpGuardian();
     } catch (e) {
         addConsoleMessage('Failed to reset DHCP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- DHCP Snooping (inline bridge) -----------------------------------------
+function _snoopFillSelect(sel, nics, current) {
+    if (!sel) return;
+    sel.innerHTML = '';
+    nics.forEach(n => {
+        const o = document.createElement('option');
+        o.value = n; o.textContent = n;
+        if (n === current) o.selected = true;
+        sel.appendChild(o);
+    });
+}
+async function dhcpSnoopStatus() {
+    const out = document.getElementById('dhcp-snoop-status');
+    try {
+        const d = await fetchAPI('/api/net/dhcp-snoop/status');
+        if (!d || d.success === false) { if (out) out.textContent = 'Status unavailable'; return; }
+        const nics = d.wired_nics || [];
+        // The management NIC is never eligible to be bridged.
+        const bridgeable = nics.filter(n => n !== d.default_iface);
+        _snoopFillSelect(document.getElementById('snoop-trusted'), nics, d.trusted);
+        _snoopFillSelect(document.getElementById('snoop-untrusted'), nics, d.untrusted);
+        _snoopFillSelect(document.getElementById('snoop-brA'), bridgeable);
+        _snoopFillSelect(document.getElementById('snoop-brB'), bridgeable);
+        const sb = d.snoop_bridge;
+        const inline = d.inline_ready
+            ? `<span class="text-green-400">✓ inline bridge ${escapeHtml(sb.name)} up (${(sb.members || []).map(escapeHtml).join(', ')})</span>`
+            : `<span class="text-amber-300">not inline yet</span> — no ${escapeHtml('rgsnoop0')} bridge with two members`;
+        const cfg = (d.trusted && d.untrusted)
+            ? ` · trusted <span class="font-mono text-gray-300">${escapeHtml(d.trusted)}</span>, untrusted <span class="font-mono text-gray-300">${escapeHtml(d.untrusted)}</span>`
+            : ' · <span class="text-amber-300">ports not set</span>';
+        if (out) out.innerHTML = inline + cfg + `<br>Wired NICs: <span class="font-mono">${nics.map(escapeHtml).join(', ') || 'none'}</span> · mgmt: <span class="font-mono">${escapeHtml(d.default_iface || '—')}</span> (never bridged)`;
+    } catch (e) { if (out) out.textContent = 'Status error: ' + e.message; }
+}
+async function dhcpSnoopSavePorts() {
+    const t = (document.getElementById('snoop-trusted') || {}).value;
+    const u = (document.getElementById('snoop-untrusted') || {}).value;
+    if (!t || !u) { addConsoleMessage('Pick both trusted and untrusted ports', 'warning'); return; }
+    if (t === u) { addConsoleMessage('Trusted and untrusted ports must differ', 'warning'); return; }
+    try {
+        const d = await postAPI('/api/net/dhcp-snoop/config', { trusted: t, untrusted: u });
+        if (d && d.success) { addConsoleMessage(`DHCP snoop ports saved: trusted ${t}, untrusted ${u}`, 'success'); dhcpSnoopStatus(); }
+        else addConsoleMessage('Failed to save ports: ' + ((d && d.error) || 'error'), 'error');
+    } catch (e) { addConsoleMessage('Failed to save ports: ' + e.message, 'error'); }
+}
+async function dhcpSnoopBridge(action) {
+    const a = (document.getElementById('snoop-brA') || {}).value;
+    const b = (document.getElementById('snoop-brB') || {}).value;
+    if (action === 'create') {
+        if (!a || !b || a === b) { addConsoleMessage('Pick two different wired NICs for the bridge', 'warning'); return; }
+        if (!confirm(`Bridge ${a} + ${b} into rgsnoop0? Their two segments become one L2 domain. Only do this on a Pi cabled inline.`)) return;
+    } else if (!confirm('Remove the rgsnoop0 inline bridge?')) return;
+    try {
+        const d = await postAPI('/api/net/dhcp-snoop/setup', { action, iface_a: a, iface_b: b });
+        if (d && d.success) {
+            addConsoleMessage(action === 'destroy' ? 'Inline bridge removed' : `Inline bridge rgsnoop0 up (${(d.members || []).join(', ')})`, 'success');
+            dhcpSnoopStatus();
+        } else addConsoleMessage('Bridge ' + action + ' failed: ' + ((d && d.error) || 'error'), 'error');
+    } catch (e) { addConsoleMessage('Bridge ' + action + ' failed: ' + e.message, 'error'); }
+}
+const _SNOOP_VERDICT_STYLE = {
+    clean:      ['bg-green-950/40 border-green-900 text-green-400', '✓ No rogue DHCP server on the untrusted port'],
+    rogue:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue DHCP server on the untrusted (client) port'],
+    starvation: ['bg-red-950/60 border-red-800 text-red-300', '🛑 DHCP starvation (pool exhaustion)'],
+    unknown:    ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+async function runDhcpSnoop() {
+    const out = document.getElementById('dhcp-snoop-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const secs = parseInt((document.getElementById('snoop-secs') || {}).value, 10) || 20;
+    _ndBusy(btn, true, 'Snooping…');
+    out.classList.remove('hidden');
+    out.innerHTML = `<p class="text-sm text-gray-400">Passively snooping DHCP on the wire for ${secs}s…</p>`;
+    try {
+        const d = await fetchAPI('/api/net/dhcp-snoop?seconds=' + secs);
+        if (!d || d.success === false) {
+            const hint = d && d.need_config ? ' — set the trusted/untrusted ports first' : '';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + escapeHtml(hint) + '</p>';
+            return;
+        }
+        const [cls, label] = _SNOOP_VERDICT_STYLE[d.verdict] || _SNOOP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">${d.packets} DHCP packet(s) seen · trusted <span class="font-mono">${escapeHtml(d.trusted)}</span> · untrusted <span class="font-mono">${escapeHtml(d.untrusted)}</span> · ${d.client_count} client(s)</p>`;
+        const servers = d.servers || [];
+        if (servers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">DHCP servers seen (by ingress port)</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead><tr class="text-left text-gray-500"><th class="px-2 py-1">Server</th><th class="px-2 py-1">Port</th><th class="px-2 py-1">Offers GW</th><th class="px-2 py-1">Status</th></tr></thead><tbody>' +
+                servers.map(s => `<tr class="border-t border-slate-800"><td class="px-2 py-1 font-mono ${s.rogue ? 'text-red-300' : ''}">${escapeHtml(s.server || '—')}</td><td class="px-2 py-1 font-mono">${escapeHtml(s.port || '—')}</td><td class="px-2 py-1 font-mono">${escapeHtml(s.router || '—')}</td><td class="px-2 py-1">${s.rogue ? '<span class="text-red-300">🛑 rogue (untrusted)</span>' : '<span class="text-green-400">✓ trusted</span>'}</td></tr>`).join('') +
+                '</tbody></table>';
+        }
+        const b = d.bindings || [];
+        if (b.length) {
+            html += `<p class="text-xs uppercase text-gray-400 mt-3 mb-1">Binding table (${b.length})</p>` +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead><tr class="text-left text-gray-500"><th class="px-2 py-1">Client MAC</th><th class="px-2 py-1">IP</th><th class="px-2 py-1">Server</th><th class="px-2 py-1">Lease</th><th class="px-2 py-1">Port</th></tr></thead><tbody>' +
+                b.map(x => `<tr class="border-t border-slate-800"><td class="px-2 py-1 font-mono">${escapeHtml(x.mac || '—')}</td><td class="px-2 py-1 font-mono">${escapeHtml(x.ip || '—')}</td><td class="px-2 py-1 font-mono">${escapeHtml(x.server || '—')}</td><td class="px-2 py-1">${x.lease ? escapeHtml(String(x.lease)) + 's' : '—'}</td><td class="px-2 py-1 font-mono">${escapeHtml(x.port || '—')}</td></tr>`).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' + d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
     }
 }
 

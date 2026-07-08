@@ -168,6 +168,7 @@ data/pwnagotchi_status.json
 data/arp_baseline.json
 data/mac_watch.json
 data/dhcp_baseline.json
+data/dhcp_snoop.json
 data/logs/temp_log.txt
 data/networks/*/db/*.db
 data/networks/*/intelligence/*.json

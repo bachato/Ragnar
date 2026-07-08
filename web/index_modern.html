@@ -1380,6 +1380,40 @@
                     </div>
                     <div id="dhcp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- DHCP Snooping (inline bridge) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                        <h3 class="text-lg font-semibold">DHCP Snooping <span class="text-xs font-normal text-gray-500">(inline bridge)</span></h3>
+                        <button onclick="dhcpSnoopStatus()" class="text-xs text-cyan-400 hover:text-cyan-300 underline whitespace-nowrap">Refresh status</button>
+                    </div>
+                    <p class="text-xs text-amber-300/90 mb-2 mt-1">Enterprise-grade, detection-only. With two NICs <strong>bridged inline</strong> (Pi sits between the client segment and the uplink), every DHCP packet transits the box per port. A DHCP <strong>server</strong> reply (OFFER/ACK) arriving on the <strong>untrusted</strong> (client) port is a rogue server by definition — zero false positives — and OFFER/ACKs build a live <strong>binding table</strong> (MAC ↔ IP ↔ lease ↔ port).</p>
+                    <p class="text-sm text-gray-400 mb-3">Mark the uplink NIC (toward the real DHCP server) <em>trusted</em> and the client NIC <em>untrusted</em>. Bring your own bridge/SPAN, or create one below from two wired NICs. <span class="text-amber-400">Inline blocking is intentionally not enabled — this only detects.</span></p>
+                    <div id="dhcp-snoop-status" class="text-xs text-gray-400 mb-3">Loading status…</div>
+                    <div class="flex flex-wrap items-end gap-2 mb-3">
+                        <label class="text-xs text-gray-400">Trusted (uplink)
+                            <select id="snoop-trusted" class="mt-1 block w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                        </label>
+                        <label class="text-xs text-gray-400">Untrusted (client)
+                            <select id="snoop-untrusted" class="mt-1 block w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                        </label>
+                        <button onclick="dhcpSnoopSavePorts()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Save ports</button>
+                        <input id="snoop-secs" type="number" min="4" max="60" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runDhcpSnoop()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Snoop now</button>
+                    </div>
+                    <details class="mb-2">
+                        <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">Advanced: create / remove the inline bridge (rgsnoop0)</summary>
+                        <div class="mt-2 p-3 rounded border border-amber-900/60 bg-amber-950/20">
+                            <p class="text-xs text-amber-300/90 mb-2">Enslaves two wired NICs into a bridge so the box is inline. Refuses the management / default-route / wireless interface. <span class="text-amber-400">Only do this on a Pi actually cabled inline — the two NICs' segments become one L2 domain.</span></p>
+                            <div class="flex flex-wrap items-end gap-2">
+                                <select id="snoop-brA" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                                <select id="snoop-brB" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                                <button onclick="dhcpSnoopBridge('create')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Create bridge</button>
+                                <button onclick="dhcpSnoopBridge('destroy')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Remove bridge</button>
+                            </div>
+                        </div>
+                    </details>
+                    <div id="dhcp-snoop-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="mb-3">
                         <h3 class="text-lg font-semibold">Locate Port</h3>
@@ -5668,7 +5702,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260708-dhcp-switchtab"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260708-dhcp-snoop"></script>
 
 </body>
 </html>

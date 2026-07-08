@@ -30,6 +30,7 @@ alert.
 | [ARP Poisoning](#arp-poisoning) | Diagnostics | `GET /api/net/arp-check`, `/arp-baseline` |
 | [MAC Watch](#mac-watch) | Diagnostics | `GET /api/net/mac-watch`, `POST /api/net/mac-watch-reset` |
 | [DHCP Guardian](#dhcp-guardian) | Switch & L2 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
+| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
 | [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
 | [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
 | [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
@@ -453,6 +454,42 @@ only, so the background cycle stays fast) and adds a **DHCP page** to the
   `GET|POST /api/net/dhcp-baseline` `{action:reset}` · store:
   `data/dhcp_baseline.json` · binaries: `nmap`
   (broadcast-dhcp-discover) + `tcpdump`
+
+### DHCP Snooping (inline)
+The **enterprise-grade** version of [DHCP Guardian](#dhcp-guardian), for when the
+Pi has **two NICs bridged inline** (it sits between the client segment and the
+uplink, so every DHCP packet transits it). This is the managed-switch *DHCP
+snooping* model, and it's strictly stronger than active probing — **detection
+only** (it never drops or rewrites a frame; inline blocking is a deliberate
+future opt-in).
+
+- **Trusted vs. untrusted ports** — you mark the uplink NIC (toward the real
+  DHCP server) *trusted* and the client NIC *untrusted*. A DHCP **server**
+  message (OFFER/ACK/NAK) that ingresses the **untrusted** port is a rogue
+  server *by definition* — zero false positives, no baseline needed. Ingress
+  port is read from `tcpdump -i any -Q in` (LINUX_SLL2 tags each frame with its
+  interface).
+- **Binding table** — every OFFER/ACK records **client-MAC ↔ assigned-IP ↔
+  server ↔ lease ↔ ingress-port**, the same table a switch keeps, and the basis
+  for spotting IP spoofing / feeding dynamic ARP inspection later.
+- **Starvation** — distinct client hardware addresses (chaddr) flooding
+  DISCOVERs are counted straight off the wire.
+
+Bring your own bridge or SPAN/mirror port, or use the **guarded setup helper**
+to enslave two wired NICs into `rgsnoop0` — it refuses the management /
+default-route / wireless interface so it can't cut its own link. verdict:
+**clean / rogue / starvation**.
+
+> **Needs the inline hardware.** With no bridge the box only sees broadcast
+> DISCOVERs (unicast OFFERs won't transit), so `status` reports *not inline yet*
+> until two NICs share a bridge. This is the natural home for a 2-Ethernet
+> (OTG-hub) build; pair it with the hardware watchdog the installer enables.
+
+- Endpoints: `GET /api/net/dhcp-snoop` `?trusted=<if>&untrusted=<if>&seconds=<n>`,
+  `GET /api/net/dhcp-snoop/status`, `GET|POST /api/net/dhcp-snoop/config`
+  `{trusted,untrusted}`, `POST /api/net/dhcp-snoop/setup`
+  `{action:create|destroy,iface_a,iface_b}` · store: `data/dhcp_snoop.json` ·
+  binaries: `tcpdump`, `ip`
 
 ### L2 Link Health
 Listens **passively** on an interface for a few seconds (`tcpdump`) and reports
