@@ -1004,6 +1004,12 @@ def do_mac_watch(scan=True, interface=None):
         },
         'spoofed': spoofed,
         'clones': clones,
+        # Every MAC seen this pass, worst class first, so the UI can list them.
+        'observed_macs': sorted(
+            current,
+            key=lambda c: ({'spoofed_vendor_oui': 0, 'universal': 1,
+                            'randomized': 2, 'virtual_laa': 3}.get(c['klass'], 4),
+                           c['ips'][0] if c['ips'] else '', c['mac'])),
         'events': [dict(e, ago=_fmt_ago(now - e['ts'])) for e in recent_events[-20:]][::-1],
         'randomization': randomization,
         'tracks': tracks,

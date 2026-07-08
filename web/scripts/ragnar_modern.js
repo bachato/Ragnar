@@ -2503,6 +2503,31 @@ async function runMacWatch(scan) {
                 (r.ephemeral ? `, <span class="text-amber-300">${r.ephemeral}</span> short-lived (active rotation)` : '') +
                 (r.virtual ? `, <span class="text-gray-200">${r.virtual}</span> virtual/VM` : '') + '.</p>';
         }
+        // Full list of every MAC observed this pass, worst class first.
+        const obs = d.observed_macs || [];
+        if (obs.length) {
+            const KLASS = {
+                spoofed_vendor_oui: ['Spoofed', 'text-red-300'],
+                universal:          ['Vendor', 'text-gray-300'],
+                randomized:         ['Randomized', 'text-sky-300'],
+                virtual_laa:        ['Virtual/VM', 'text-gray-400'],
+            };
+            html += `<p class="text-xs uppercase text-gray-400 mt-4 mb-1">All MACs observed (${obs.length})</p>` +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">MAC</th><th class="px-2 py-1">Type</th><th class="px-2 py-1">Vendor</th><th class="px-2 py-1">IP(s)</th></tr>' +
+                '</thead><tbody>' +
+                obs.map(c => {
+                    const [lbl, cls] = KLASS[c.klass] || [c.klass, 'text-gray-400'];
+                    const ips = (c.ips || []);
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${c.klass === 'spoofed_vendor_oui' ? 'text-red-300' : ''}">${escapeHtml(c.mac)}</td>
+                        <td class="px-2 py-1 ${cls}">${escapeHtml(lbl)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(c.vendor || '—')}</td>
+                        <td class="px-2 py-1 font-mono">${escapeHtml(ips.slice(0, 4).join(', ')) || '—'}${ips.length > 4 ? '…' : ''}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
         // Reasons narrative
         if (d.reasons && d.reasons.length) {
             html += '<ul class="text-xs text-gray-400 mt-3 list-disc pl-5">' +
