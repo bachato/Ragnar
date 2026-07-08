@@ -158,6 +158,17 @@ if [ -f "$SENSING_UNIT" ] && grep -q '^ExecStartPre=/bin/mkdir' "$SENSING_UNIT";
     echo -e "${GREEN}Patched ragnar-sensing.service with ownership self-heal.${NC}"
 fi
 
+# Lift the multi-node fusion guard from the old 200 ms to 350 ms — field logs
+# showed real-world timestamp spread reaching ~330 ms, so 200 ms rejected fusion
+# cycles ("Timestamp spread exceeds guard interval"). Only rewrites the exact old
+# default, so a hand-tuned value is left alone; idempotent.
+if [ -f "$SENSING_UNIT" ] && grep -q '^Environment=WDP_GUARD_INTERVAL_US=200000' "$SENSING_UNIT"; then
+    sed -i 's|^Environment=WDP_GUARD_INTERVAL_US=200000|Environment=WDP_GUARD_INTERVAL_US=350000|' "$SENSING_UNIT"
+    systemctl daemon-reload
+    systemctl try-restart ragnar-sensing.service 2>/dev/null || true
+    echo -e "${GREEN}Raised sensing fusion guard to 350 ms (was 200 ms).${NC}"
+fi
+
 echo -e "${BLUE}Step 6.6: Ensuring hardware watchdog (auto-reboot on hard hang)...${NC}"
 # Unattended / inline devices should reboot fast if the Pi wedges rather than
 # black-holing the link. Enable the BCM watchdog and have systemd pet it.

@@ -139,8 +139,18 @@ class DatabaseManager:
         conn = None
         try:
             with self.lock:
-                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                # timeout: wait up to 30s for a lock instead of erroring instantly.
+                conn = sqlite3.connect(self.db_path, check_same_thread=False,
+                                       timeout=30)
                 conn.row_factory = sqlite3.Row  # Enable dict-like access
+                # WAL lets readers (the dashboard) run concurrently with the
+                # writer (the scanner) instead of blocking — this is what fixes
+                # the recurring "database is locked" on /api/dashboard/stats.
+                # WAL is persisted in the DB header, so this converts the file
+                # once and stays; setting it per-connection is a cheap no-op.
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("PRAGMA synchronous=NORMAL")  # safe under WAL, less fsync
                 conn.execute("PRAGMA foreign_keys = ON")  # Enable foreign keys
                 yield conn
                 conn.commit()
