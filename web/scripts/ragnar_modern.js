@@ -1217,6 +1217,7 @@ function showNetworkSubtab(name) {
     } else if (name === 'switch') {
         loadLldp();
         _dhcpFillIfaces();
+        _igmpFillIfaces();
         dhcpSnoopStatus();
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
@@ -2530,6 +2531,99 @@ async function dhcpTrustCurrent() {
         await runDhcpGuardian();
     } catch (e) {
         addConsoleMessage('Failed to reset DHCP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- IGMP Watch (passive multicast security scanner) -----------------------
+const _IGMP_VERDICT_STYLE = {
+    clean:        ['bg-green-950/40 border-green-900 text-green-400', '✓ No IGMP / multicast anomalies detected'],
+    recon:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Multicast reconnaissance — a host is enumerating groups'],
+    unauthorized: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Unauthorized multicast join detected'],
+    anomaly:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 IGMP anomaly — possible rogue querier / takeover'],
+    storm:        ['bg-red-950/60 border-red-800 text-red-300', '🛑 IGMP storm / flood detected'],
+    unknown:      ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _igmpFillIfaces() {
+    const sel = document.getElementById('igmp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runIgmpWatch() {
+    const out = document.getElementById('igmp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('igmp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('igmp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '12';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing IGMP on the segment…</p>';
+    try {
+        _igmpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/igmp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runIgmpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _IGMP_VERDICT_STYLE[d.verdict] || _IGMP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s window · ${d.packets} IGMP msgs (${d.rate_per_s}/s)${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        const q = d.queriers || [], tq = d.trusted_queriers || [];
+        if (q.length || tq.length) {
+            const rogue = q.filter(x => tq.length && tq.indexOf(x) < 0);
+            html += `<p class="text-xs text-gray-400 mb-1">Querier(s): ` +
+                (q.length ? q.map(x => `<span class="font-mono ${rogue.indexOf(x) >= 0 ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(x)}</span>`).join(', ') : '<span class="text-gray-500">none seen</span>') +
+                (tq.length ? ` · trusted: <span class="font-mono text-gray-500">${escapeHtml(tq.join(', '))}</span>` : '') + `</p>`;
+        }
+        const groups = d.groups || [];
+        if (groups.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Multicast groups joined (' + groups.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Group</th><th class="px-2 py-1">Scope</th><th class="px-2 py-1">Members</th></tr>' +
+                '</thead><tbody>' +
+                groups.map(g => {
+                    const nm = g.name ? ` <span class="text-gray-500">(${escapeHtml(g.name)})</span>` : '';
+                    const flag = g.new ? ' <span class="text-amber-300">•new</span>' : '';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${g.new && g.sensitive ? 'text-amber-300' : ''}">${escapeHtml(g.group)}${nm}${flag}</td>
+                        <td class="px-2 py-1 ${g.sensitive ? 'text-gray-300' : 'text-gray-500'}">${escapeHtml(g.scope)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((g.members || []).join(', ') || '—')}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function igmpTrustBaseline() {
+    try {
+        await postAPI('/api/net/igmp-baseline', { action: 'reset' });
+        addConsoleMessage('IGMP baseline reset — re-learning current querier(s) & memberships', 'info');
+        await runIgmpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset IGMP baseline: ' + e.message, 'error');
     }
 }
 

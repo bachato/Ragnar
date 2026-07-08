@@ -3042,6 +3042,444 @@ def do_l2_health(interface, seconds=12):
 
 
 # --------------------------------------------------------------------------
+# IGMP Watch: passive IGMP-snooping security scanner (detection-only)
+# --------------------------------------------------------------------------
+# IGMP is the low-volume control plane of IPv4 multicast: hosts announce group
+# membership (reports/joins), the multicast router periodically queries. That
+# makes it a cheap, high-signal thing to watch on a Pi Zero 2 W — a few
+# packets a minute on a healthy segment. This scanner is PASSIVE: one short
+# tcpdump window, parsed and classified. It never joins a group, never sends a
+# query, never becomes a querier. Four things it looks for:
+#   1. Storm / flood   — an IGMP report/query rate far above normal noise
+#      (report floods are a real multicast DoS and a switch-CPU exhaustion vector).
+#   2. Anomaly         — >1 querier on the segment. There must be exactly one;
+#      a second, lower-IP querier is the classic "become the querier to draw all
+#      multicast to yourself" attack, plus version downgrades (v3->v2/v1).
+#   3. Reconnaissance  — one host joining a wide spread of distinct groups (or
+#      sweeping group-specific queries): multicast stream enumeration.
+#   4. Unauthorized join — a host joining an admin-scoped / globally-scoped group
+#      it has never been seen on, measured against a learned baseline.
+#
+# Passive-floor doctrine (see MAC Watch / L2 Health): thresholds sit above the
+# ordinary chatter (mDNS 224.0.0.251, SSDP 239.255.255.250, ~125s general
+# queries) so a normal segment reads clean. First run learns the querier(s) and
+# host->group memberships into data/igmp_watch.json; "Trust current" re-learns.
+
+_IGMP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'igmp_watch.json')
+_igmp_watch_lock = threading.Lock()
+
+# Total IGMP messages/sec at or above which the window is a storm. IGMP is
+# intrinsically low-rate, so even a modest sustained rate is abnormal.
+_IGMP_STORM_RATE = 30.0
+# One source emitting at or above this many messages in the window is flooding
+# on its own (report-flood DoS), independent of the aggregate rate.
+_IGMP_SRC_FLOOD = 120
+# One source joining at or above this many distinct groups in the window is
+# enumerating multicast (reconnaissance).
+_IGMP_RECON_GROUPS = 20
+# Keep at most this many anomaly events in the store (newest wins).
+_IGMP_EVENTS_CAP = 200
+
+# Well-known multicast groups, for readable output and to avoid flagging normal
+# service discovery as an unauthorized join.
+_IGMP_WELL_KNOWN = {
+    '224.0.0.1': 'all-hosts', '224.0.0.2': 'all-routers',
+    '224.0.0.5': 'OSPF', '224.0.0.6': 'OSPF-DR', '224.0.0.9': 'RIPv2',
+    '224.0.0.13': 'PIM', '224.0.0.18': 'VRRP', '224.0.0.22': 'IGMPv3',
+    '224.0.0.102': 'HSRPv2/GLBP', '224.0.0.251': 'mDNS', '224.0.0.252': 'LLMNR',
+    '224.0.1.1': 'NTP', '224.0.1.129': 'PTP', '239.255.255.250': 'SSDP/UPnP',
+    '239.255.255.253': 'SLP',
+}
+
+
+def _igmp_scope(group):
+    """Classify a multicast group address into a readable scope. Returns
+    (scope, sensitive) — sensitive=True means a join there is worth policing
+    (admin/global/SSM), False for link-local control traffic (normal)."""
+    try:
+        octets = [int(x) for x in group.split('.')]
+        if len(octets) != 4:
+            return ('invalid', False)
+    except (ValueError, AttributeError):
+        return ('invalid', False)
+    a, b, c, _d = octets
+    if a == 224 and b == 0 and c == 0:
+        return ('link-local control', False)   # 224.0.0.0/24 — normal
+    if a == 239:
+        return ('admin-scoped (private)', True)  # 239.0.0.0/8
+    if a == 232:
+        return ('source-specific (SSM)', True)   # 232.0.0.0/8
+    if 224 <= a <= 238:
+        return ('globally-scoped', True)
+    return ('other', False)
+
+
+_IGMP_IP_RE = r'(\d{1,3}(?:\.\d{1,3}){3})'
+
+
+def _parse_igmp_capture(output):
+    """Parse `tcpdump -nn -t -v 'igmp'` text into a list of membership events:
+    {src, group, kind, version}. kind is 'query' | 'report' | 'leave'.
+
+    Handles v1/v2 reports (dst == group), v2 leaves, and v3 reports whose group
+    records tcpdump prints as `gaddr <addr> ...` (one event per group record).
+    Robust to tcpdump version differences: it keys off the `igmp` keyword and
+    pulls every group address it can find rather than a single rigid format."""
+    events = []
+    ver_re = re.compile(r'igmp\s+v(\d)', re.I)
+    src_re = re.compile(r'^' + _IGMP_IP_RE + r'\s*>\s*' + _IGMP_IP_RE)
+    gaddr_re = re.compile(r'gaddr\s+' + _IGMP_IP_RE, re.I)
+    # v3 record modes that mean "leaving / no interest" vs joining.
+    leave_modes = ('to_in', 'is_in', 'block')
+    for raw in output.splitlines():
+        line = raw.strip()
+        if 'igmp' not in line.lower():
+            continue
+        sm = src_re.search(line)
+        src = sm.group(1) if sm else None
+        dst = sm.group(2) if sm else None
+        vm = ver_re.search(line)
+        version = int(vm.group(1)) if vm else 2
+        low = line.lower()
+        if 'query' in low:
+            events.append({'src': src, 'group': None, 'kind': 'query',
+                           'version': version})
+            continue
+        if 'leave' in low:
+            # v2 leave-group: the left group is named after "leave" or is dst.
+            lm = re.search(r'leave.*?' + _IGMP_IP_RE, low)
+            grp = (lm.group(1) if lm else None) or (dst if dst != '224.0.0.2' else None)
+            events.append({'src': src, 'group': grp, 'kind': 'leave',
+                           'version': version})
+            continue
+        if 'report' in low:
+            gaddrs = gaddr_re.findall(line)
+            if gaddrs:
+                # v3 report — one event per group record.
+                for g in gaddrs:
+                    # crude record-mode read near this gaddr; default to report.
+                    seg = low.split(g.lower(), 1)[-1][:24]
+                    kind = 'leave' if any(m in seg for m in leave_modes) and '{ }' in seg else 'report'
+                    events.append({'src': src, 'group': g, 'kind': kind,
+                                   'version': version})
+            else:
+                # v1/v2 report — the destination address IS the group.
+                grp = None
+                rm = re.search(r'report\s+' + _IGMP_IP_RE, low)
+                grp = rm.group(1) if rm else (dst if dst and dst not in _IGMP_WELL_KNOWN else dst)
+                events.append({'src': src, 'group': grp, 'kind': 'report',
+                               'version': version})
+    return events
+
+
+def _igmp_watch_load():
+    try:
+        with open(_IGMP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _igmp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_IGMP_WATCH_PATH), exist_ok=True)
+        tmp = _IGMP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _IGMP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_igmp_baseline(action='get'):
+    """Manage the learned IGMP baseline (trusted querier(s) + known host->group
+    memberships). action='reset' clears it so the current segment is re-learned
+    on the next scan (use after a legitimate multicast/router change)."""
+    with _igmp_watch_lock:
+        if action == 'reset':
+            _igmp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _igmp_watch_load()
+        return {'success': True, 'baseline': {
+            'queriers': sorted(b.get('queriers') or []),
+            'groups': sorted((b.get('members') or {}).keys()),
+        }}
+
+
+def _igmp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed IGMP events. Returns the result payload
+    (minus interface). Separated from capture so the self-test can drive it with
+    synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    total = len(events)
+    rate = round(total / seconds, 1)
+
+    queriers = sorted({e['src'] for e in events if e['kind'] == 'query' and e['src']})
+    per_src = {}
+    src_groups = {}
+    members = {}
+    for e in events:
+        s = e.get('src')
+        if s:
+            per_src[s] = per_src.get(s, 0) + 1
+        g = e.get('group')
+        if g and e['kind'] == 'report':
+            src_groups.setdefault(s, set()).add(g)
+            members.setdefault(g, set()).add(s)
+
+    trusted_q = set(baseline.get('queriers') or [])
+    known_members = {g: set(v) for g, v in (baseline.get('members') or {}).items()}
+    learned = False
+    # Learn-on-first-run: an empty baseline adopts the current querier(s) and
+    # memberships as trusted (mirrors ARP/DHCP baseline behaviour).
+    if learn and not trusted_q and not known_members and (queriers or members):
+        baseline['queriers'] = queriers
+        baseline['members'] = {g: sorted(v) for g, v in members.items()}
+        learned = True
+        trusted_q = set(queriers)
+        known_members = {g: set(v) for g, v in members.items()}
+
+    findings = []       # (level, category, text)
+    categories = set()
+
+    # (1) storm / flood
+    if rate >= _IGMP_STORM_RATE:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'IGMP rate {rate}/s over {seconds}s ({total} msgs) — '
+                         'far above normal; multicast report/query flood'))
+    floods = sorted([(s, n) for s, n in per_src.items() if n >= _IGMP_SRC_FLOOD],
+                    key=lambda x: -x[1])
+    for s, n in floods:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'{s} sent {n} IGMP messages in {seconds}s — single-source flood'))
+
+    # (2) anomaly — rogue / extra querier, version downgrade
+    if len(queriers) > 1:
+        categories.add('anomaly')
+        extra = [q for q in queriers if q not in trusted_q] or queriers[1:]
+        findings.append(('crit', 'anomaly',
+                         f'{len(queriers)} IGMP queriers on the segment '
+                         f'({", ".join(queriers)}) — there must be exactly one; '
+                         f'possible rogue querier ({", ".join(extra)}) drawing multicast'))
+    elif queriers and trusted_q and queriers[0] not in trusted_q:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'querier is {queriers[0]}, not the trusted '
+                         f'{", ".join(sorted(trusted_q))} — querier takeover'))
+    q_versions = sorted({e['version'] for e in events if e['kind'] == 'query'})
+    if len(q_versions) > 1:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'mixed IGMP query versions {q_versions} — possible '
+                         'version-downgrade to force weaker v1/v2'))
+
+    # (3) reconnaissance — a source joining many distinct groups
+    recon = sorted([(s, len(g)) for s, g in src_groups.items() if len(g) >= _IGMP_RECON_GROUPS],
+                   key=lambda x: -x[1])
+    recon_srcs = {s for s, _n in recon}
+    for s, n in recon:
+        categories.add('recon')
+        findings.append(('warn', 'recon',
+                         f'{s} joined {n} distinct multicast groups in {seconds}s '
+                         '— multicast group enumeration (reconnaissance)'))
+
+    # (4) unauthorized join — a new host on a sensitive (admin/global/SSM) group.
+    # A source already flagged as recon is folded under that finding — its joins
+    # are the enumeration, not N separate unauthorized alerts.
+    unauth = []
+    if trusted_q or known_members:   # only meaningful once a baseline exists
+        for g, srcs in members.items():
+            scope, sensitive = _igmp_scope(g)
+            if not sensitive:
+                continue
+            for s in srcs:
+                if s in recon_srcs:
+                    continue
+                if s not in known_members.get(g, set()):
+                    unauth.append((s, g, scope))
+    for s, g, scope in unauth:
+        categories.add('unauthorized')
+        name = _IGMP_WELL_KNOWN.get(g)
+        findings.append(('warn', 'unauthorized',
+                         f'{s} joined {g}{" (" + name + ")" if name else ""} '
+                         f'[{scope}] — not in the learned baseline (unauthorized join)'))
+
+    # verdict = most severe triggered category
+    order = ['storm', 'anomaly', 'unauthorized', 'recon']
+    verdict = next((c for c in order if c in categories), 'clean')
+    if not findings:
+        findings.append(('ok', 'clean', 'No IGMP anomalies in the capture window.'))
+
+    groups_out = []
+    for g in sorted(members.keys()):
+        scope, sensitive = _igmp_scope(g)
+        srcs = sorted(members[g])
+        new = bool((trusted_q or known_members) and
+                   any(s not in known_members.get(g, set()) for s in srcs))
+        groups_out.append({'group': g, 'name': _IGMP_WELL_KNOWN.get(g),
+                           'scope': scope, 'sensitive': sensitive,
+                           'members': srcs, 'new': new})
+
+    top_joiners = sorted(([{'src': s, 'groups': len(g)} for s, g in src_groups.items()]),
+                         key=lambda x: -x['groups'])[:8]
+
+    return {
+        'success': True, 'verdict': verdict, 'seconds': seconds,
+        'packets': total, 'rate_per_s': rate, 'learned': learned,
+        'queriers': queriers, 'trusted_queriers': sorted(trusted_q),
+        'groups': groups_out, 'top_joiners': top_joiners,
+        'findings': [{'level': l, 'category': c, 'text': t} for l, c, t in findings],
+        'reasons': [t for _l, _c, t in findings if _l != 'ok'],
+    }
+
+
+def _igmp_capture(interface, seconds):
+    """Run one passive tcpdump IGMP window and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '256', '-c', '20000', 'igmp'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_igmp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive IGMP-snooping security scanner (detection-only). Captures IGMP for
+    a few seconds and classifies the segment: storm / anomaly / recon /
+    unauthorized / clean. Learns the querier(s) + memberships on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 30)
+
+    text, err = _igmp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_igmp_capture(text)
+
+    with _igmp_watch_lock:
+        baseline = _igmp_watch_load()
+        result = _igmp_analyze(events, seconds, baseline, learn=learn)
+        # Persist a freshly-learned baseline, and append anomaly events to history.
+        if result.get('learned'):
+            _igmp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _igmp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_IGMP_EVENTS_CAP:]
+            _igmp_watch_save(b)
+
+    result['interface'] = iface
+    return result
+
+
+def _igmp_selftest():
+    """Self-test the IGMP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted tcpdump text through the real parser + classifier,
+    and — if Scapy is available — also builds real IGMP packets into a pcap and
+    parses them back through tcpdump, exercising the capture->parse path end to
+    end (mirrors the MAC Watch self-test approach). Returns a results dict."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_igmp_capture(text)
+        res = _igmp_analyze(events, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect,
+                          'got': res['verdict'], 'events': len(events),
+                          'pass': ok})
+        return res
+
+    # 1. clean: one querier + normal service-discovery joins.
+    clean = "\n".join([
+        "192.168.1.1 > 224.0.0.1: igmp query v2",
+        "192.168.1.50 > 224.0.0.251: igmp v2 report 224.0.0.251",
+        "192.168.1.51 > 239.255.255.250: igmp v2 report 239.255.255.250",
+    ])
+    run('clean', clean, 12, {}, 'clean')
+
+    # 2. storm: a report flood from one host.
+    storm = "\n".join(
+        [f"192.168.1.77 > 239.1.2.3: igmp v2 report 239.1.2.3" for _ in range(400)])
+    run('storm', storm, 5, {'queriers': ['192.168.1.1'], 'members': {}}, 'storm')
+
+    # 3. anomaly: a second (rogue) querier appears.
+    anomaly = "\n".join([
+        "192.168.1.1 > 224.0.0.1: igmp query v2",
+        "192.168.1.9 > 224.0.0.1: igmp query v2",
+    ])
+    run('anomaly', anomaly, 12, {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+
+    # 4. recon: one host enumerates many groups.
+    recon = "\n".join(
+        [f"192.168.1.66 > 239.0.0.{i}: igmp v2 report 239.0.0.{i}" for i in range(1, 41)])
+    run('recon', recon, 10, {'queriers': ['192.168.1.1'],
+                             'members': {'239.0.0.1': ['192.168.1.66']}}, 'recon')
+
+    # 5. unauthorized: a new host joins an admin-scoped group not in baseline.
+    unauth = "192.168.1.200 > 239.5.5.5: igmp v2 report 239.5.5.5"
+    run('unauthorized', unauth, 12,
+        {'queriers': ['192.168.1.1'], 'members': {'239.1.1.1': ['192.168.1.50']}},
+        'unauthorized')
+
+    # 6. v3 group-record parse (via gaddr) — assert the group is extracted.
+    v3 = ("192.168.1.50 > 224.0.0.22: igmp v3 report, 1 group record(s) "
+          "[gaddr 239.9.9.9 to_ex { }]")
+    v3_events = _parse_igmp_capture(v3)
+    v3_ok = any(e['group'] == '239.9.9.9' and e['kind'] == 'report' for e in v3_events)
+    scenarios.append({'name': 'v3-parse', 'expect': 'group 239.9.9.9',
+                      'got': str([e.get('group') for e in v3_events]),
+                      'pass': v3_ok})
+
+    # Optional Scapy end-to-end: craft real IGMP packets -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import IP, Ether, wrpcap  # noqa
+        try:
+            from scapy.contrib.igmp import IGMP
+        except Exception:
+            IGMP = None
+        if IGMP is not None and _have('tcpdump'):
+            pkts = [Ether() / IP(src='192.168.1.50', dst='239.7.7.7') /
+                    IGMP(type=0x16, gaddr='239.7.7.7')]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'igmp'],
+                       timeout=10)
+            evs = _parse_igmp_capture(res['out'])
+            got = [e.get('group') for e in evs]
+            scapy_result = {'ran': True, 'groups': got,
+                            'pass': any(g == '239.7.7.7' for g in got),
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # PCAP Analyzer: triage an uploaded capture with tshark/capinfos
 # --------------------------------------------------------------------------
 
@@ -3612,6 +4050,24 @@ def register_network_diagnostics(app, logger=None):
         _log("net/mac-watch-reset")
         return jsonify(do_mac_watch_reset())
 
+    @app.route('/api/net/igmp-watch', methods=['GET'])
+    def net_igmp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 30)
+        _log(f"net/igmp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_igmp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/igmp-baseline', methods=['GET', 'POST'])
+    def net_igmp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/igmp-baseline {action}")
+        return jsonify(do_igmp_baseline(action))
+
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():
         _log("net/identity")
@@ -3715,3 +4171,78 @@ def register_network_diagnostics(app, logger=None):
         except Exception:
             pass
     return app
+
+
+# --------------------------------------------------------------------------
+# Small CLI — currently the IGMP Watch scanner and its self-test, so the
+# passive multicast checks can run standalone (cron, SSH, CI) without the web
+# app.  Usage:
+#     python3 network_diagnostics.py igmp-watch [--iface eth0] [--seconds 12] [--json]
+#     python3 network_diagnostics.py igmp-selftest [--json]
+# --------------------------------------------------------------------------
+
+def _cli(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        prog='network_diagnostics',
+        description='Ragnar passive network diagnostics (CLI subset).')
+    sub = p.add_subparsers(dest='cmd')
+
+    w = sub.add_parser('igmp-watch', help='passive IGMP-snooping security scan')
+    w.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    w.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-30)')
+    w.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    w.add_argument('--json', action='store_true', help='emit JSON')
+
+    st = sub.add_parser('igmp-selftest', help='self-test the IGMP detectors (no root)')
+    st.add_argument('--json', action='store_true', help='emit JSON')
+
+    args = p.parse_args(argv)
+    if args.cmd == 'igmp-watch':
+        r = do_igmp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            v = r['verdict'].upper()
+            print(f"IGMP Watch [{r['interface']}] {r['seconds']}s: {v}  "
+                  f"({r['packets']} msgs, {r['rate_per_s']}/s)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            if r.get('queriers'):
+                print(f"  queriers: {', '.join(r['queriers'])}")
+            for g in r.get('groups', []):
+                flag = ' *NEW*' if g.get('new') else ''
+                nm = f" {g['name']}" if g.get('name') else ''
+                print(f"  group {g['group']}{nm} [{g['scope']}]"
+                      f" <- {', '.join(g['members'])}{flag}")
+            for f in r.get('findings', []):
+                print(f"  [{f['level']}] {f['text']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'igmp-selftest':
+        r = _igmp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                mark = 'PASS' if s['pass'] else 'FAIL'
+                print(f"  [{mark}] {s['name']}: expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"groups={sc.get('groups')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"IGMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    p.print_help()
+    return 2
+
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(_cli())

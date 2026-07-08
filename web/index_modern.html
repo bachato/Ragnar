@@ -1414,6 +1414,21 @@
                     </details>
                     <div id="dhcp-snoop-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- IGMP Watch -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">IGMP Watch</h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive IGMP-snooping security scanner — <strong>detection-only</strong>, never joins a group or becomes a querier. Watches the multicast control plane for <strong>storms/floods</strong> (report-flood DoS), <strong>anomalies</strong> (a rogue second querier drawing all multicast to itself, version downgrades), <strong>reconnaissance</strong> (a host enumerating many groups) and <strong>unauthorized joins</strong> (a host on an admin/globally-scoped group it shouldn't be).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the chosen segment. The first scan learns the current querier(s) and host→group memberships as the trusted baseline (<span class="font-mono">data/igmp_watch.json</span>); after a legitimate multicast/router change, click "Trust current".</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="igmp-iface" title="Interface for the IGMP capture — pick the LAN/WiFi NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="igmp-secs" type="number" min="4" max="30" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runIgmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan multicast</button>
+                        <button onclick="igmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current querier(s) and memberships as the trusted baseline — use after a legitimate multicast/router change">Trust current</button>
+                    </div>
+                    <div id="igmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="mb-3">
                         <h3 class="text-lg font-semibold">Locate Port</h3>
@@ -5702,7 +5717,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260708-lcdhat"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-igmp"></script>
 
 </body>
 </html>

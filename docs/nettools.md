@@ -42,6 +42,7 @@ alert.
 | [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2 | `GET /api/net/lldp` |
 | [ARP Scan](#arp-scan) | Switch & L2 | `GET /api/net/arp-scan` |
 | [L2 Link Health](#l2-link-health) | Switch & L2 | `POST /api/net/l2-health` |
+| [IGMP Watch](#igmp-watch) | Switch & L2 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
 | [Locate Port](#locate-port) | Switch & L2 | `POST /api/net/locate-port` |
 | [PCAP Analyzer](#pcap-analyzer) | Switch & L2 | `POST /api/net/pcap` |
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
@@ -528,6 +529,48 @@ Findings are ranked (warn / info / ok). This is the one-tap "why is this
 segment misbehaving" check that normally needs a laptop and Wireshark.
 
 - Endpoint: `POST /api/net/l2-health` `{interface, seconds}` · binary: `tcpdump`
+
+### IGMP Watch
+A **passive** IGMP-snooping security scanner for the IPv4 multicast control
+plane — **detection-only**: it never joins a group, sends a query, or becomes a
+querier. One short `tcpdump` window is parsed and classified into four things:
+
+- **Storm / flood** — an IGMP report/query rate far above normal (IGMP is
+  intrinsically low-volume), or a single source flooding reports. This is a real
+  multicast DoS and a switch-CPU exhaustion vector.
+- **Anomaly** — more than one **querier** on the segment. There must be exactly
+  one; a second, lower-IP querier is the classic *"become the querier to draw
+  all multicast to yourself"* attack. Also flags mixed query versions
+  (a v3→v2/v1 downgrade).
+- **Reconnaissance** — one host joining a wide spread of **distinct groups** —
+  multicast stream enumeration.
+- **Unauthorized join** — a host on an **admin-scoped** (239/8), **globally-scoped**
+  or **SSM** (232/8) group it has never been seen on, measured against a learned
+  baseline. Link-local control groups (224.0.0.0/24) and normal service discovery
+  (mDNS, SSDP) are recognised and not flagged.
+
+Following the passive-floor doctrine (see [MAC Watch](#mac-watch) /
+[L2 Link Health](#l2-link-health)), thresholds sit above ordinary chatter so a
+healthy segment reads clean. The **first scan learns** the current querier(s) and
+host→group memberships as the trusted baseline (`data/igmp_watch.json`); after a
+legitimate multicast/router change, click **Trust current** to re-learn. Comfortable
+on a Pi Zero 2 W even off a busy SPAN, since IGMP is low-rate control traffic.
+
+There is also a small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py igmp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py igmp-selftest     # self-test the detectors, no root
+```
+
+`igmp-selftest` drives the real parser + classifier with synthetic captures
+(clean / storm / rogue-querier / recon / unauthorized / v3 group-record parse),
+and — when [Scapy](https://scapy.net) is installed — additionally crafts real
+IGMP packets into a pcap and parses them back through `tcpdump`, exercising the
+capture→parse path end to end.
+
+- Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
+  `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### Locate Port
 Physically find **which switch port** the device is plugged into — the software
