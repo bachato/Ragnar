@@ -1256,20 +1256,6 @@
                         </div>
                         <div id="arp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                     </div>
-                    <!-- DHCP Guardian -->
-                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
-                        <h3 class="text-lg font-semibold mb-1">DHCP Guardian</h3>
-                        <p class="text-xs text-amber-300/90 mb-2">DHCP-snooping-style monitor — detection-only, never runs a DHCP server. Detects <strong>rogue / fake DHCP servers</strong> (a second server, or one handing out the wrong gateway/DNS — a turnkey MITM) and <strong>DHCP starvation</strong> (pool-exhaustion floods). Cross-checks the offered gateway against the ARP baseline for a combined DHCP+ARP MITM signal.</p>
-                        <p class="text-sm text-gray-400 mb-3">Provokes every DHCP server on the segment to reply (<span class="font-mono">broadcast-dhcp-discover</span>) and passively watches for a DISCOVER flood. The first scan learns the current server as the trusted baseline (<span class="font-mono">data/dhcp_baseline.json</span>); after a legitimate DHCP/router change, click "Trust current server".</p>
-                        <div class="flex flex-wrap items-center gap-2">
-                            <select id="dhcp-iface" title="Interface for the DHCP scan — pick your WiFi or LAN NIC to scan that segment" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                                <option value="">Auto (default route)</option>
-                            </select>
-                            <button onclick="runDhcpGuardian()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan DHCP</button>
-                            <button onclick="dhcpTrustCurrent()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Set the current DHCP server(s) as the trusted baseline — use after a legitimate DHCP-server / router change">Trust current server</button>
-                        </div>
-                        <div id="dhcp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
-                    </div>
                     <!-- MAC Watch -->
                     <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                         <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
@@ -1379,6 +1365,20 @@
                         <button onclick="exportArpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
                     </div>
                     <div id="arp-results" class="hidden mt-3 overflow-x-auto"></div>
+                </div>
+                <!-- DHCP Guardian -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">DHCP Guardian</h3>
+                    <p class="text-xs text-amber-300/90 mb-2">DHCP-snooping-style monitor — detection-only, never runs a DHCP server. Detects <strong>rogue / fake DHCP servers</strong> (a second server, or one handing out the wrong gateway/DNS — a turnkey MITM) and <strong>DHCP starvation</strong> (pool-exhaustion floods). Cross-checks the offered gateway against the ARP baseline for a combined DHCP+ARP MITM signal.</p>
+                    <p class="text-sm text-gray-400 mb-3">Provokes every DHCP server on the segment to reply (<span class="font-mono">broadcast-dhcp-discover</span>) and passively watches for a DISCOVER flood. The first scan learns the current server as the trusted baseline (<span class="font-mono">data/dhcp_baseline.json</span>); after a legitimate DHCP/router change, click "Trust current server".</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="dhcp-iface" title="Interface for the DHCP scan — pick your WiFi or LAN NIC to scan that segment" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <button onclick="runDhcpGuardian()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan DHCP</button>
+                        <button onclick="dhcpTrustCurrent()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Set the current DHCP server(s) as the trusted baseline — use after a legitimate DHCP-server / router change">Trust current server</button>
+                    </div>
+                    <div id="dhcp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="mb-3">
@@ -5668,7 +5668,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260708-dhcp-checknow"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260708-dhcp-switchtab"></script>
 
 </body>
 </html>

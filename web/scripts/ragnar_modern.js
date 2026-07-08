@@ -1214,6 +1214,7 @@ function showNetworkSubtab(name) {
         loadNetworkData();
     } else if (name === 'switch') {
         loadLldp();
+        _dhcpFillIfaces();
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
         loadInterfaces();
@@ -1222,7 +1223,6 @@ function showNetworkSubtab(name) {
         syncNetDiagDisplayFromServer();
         syncNetIntegrityFromServer();
         _macWatchFillIfaces();
-        _dhcpFillIfaces();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
