@@ -158,6 +158,25 @@ if [ -f "$SENSING_UNIT" ] && grep -q '^ExecStartPre=/bin/mkdir' "$SENSING_UNIT";
     echo -e "${GREEN}Patched ragnar-sensing.service with ownership self-heal.${NC}"
 fi
 
+echo -e "${BLUE}Step 6.6: Ensuring hardware watchdog (auto-reboot on hard hang)...${NC}"
+# Unattended / inline devices should reboot fast if the Pi wedges rather than
+# black-holing the link. Enable the BCM watchdog and have systemd pet it.
+# Idempotent; the config.txt bit applies on the next reboot.
+BOOT_CFG=""
+for c in /boot/firmware/config.txt /boot/config.txt; do
+    [ -f "$c" ] && { BOOT_CFG="$c"; break; }
+done
+if [ -n "$BOOT_CFG" ] && ! grep -q '^dtparam=watchdog=on' "$BOOT_CFG"; then
+    echo 'dtparam=watchdog=on' >> "$BOOT_CFG"
+    echo -e "  ${GREEN}✓${NC} Enabled dtparam=watchdog=on in $BOOT_CFG (reboot to apply)"
+fi
+if [ -f /etc/systemd/system.conf ]; then
+    sed -i '/^#\?RuntimeWatchdogSec=/d;/^#\?RebootWatchdogSec=/d' /etc/systemd/system.conf
+    printf 'RuntimeWatchdogSec=15\nRebootWatchdogSec=2min\n' >> /etc/systemd/system.conf
+    systemctl daemon-reexec 2>/dev/null || true
+    echo -e "  ${GREEN}✓${NC} systemd watchdog set (RuntimeWatchdogSec=15)"
+fi
+
 echo -e "${BLUE}Step 6.5: Validating actions.json configuration...${NC}"
 python3 << 'PYTHON_EOF'
 import json
