@@ -81,6 +81,10 @@ PREFS="$PROFILE_DIR/Default/Preferences"
 if [[ -f "$PREFS" ]]; then
     sed -i 's/"exit_type":"[^"]*"/"exit_type":"Normal"/; s/"exited_cleanly":false/"exited_cleanly":true/' "$PREFS" 2>/dev/null || true
 fi
+# A crash/kill leaves Chromium's singleton lock behind, which makes the *next*
+# launch abort immediately — exactly what turns one failure into a restart loop.
+# Clear the stale locks so a restart can actually come up.
+rm -f "$PROFILE_DIR"/Singleton{Lock,Socket,Cookie} 2>/dev/null || true
 
 # Chromium flags. Kept identical across both launch modes (session + own-X) by
 # building the array once here and reusing it below.
@@ -114,42 +118,51 @@ if [[ "$LOW_MEM" -eq 1 ]]; then
     echo "[kiosk-run] low-memory board — applied Chromium low-end flags"
 fi
 
-# Touchscreen support: only enable Chromium touch events + an on-screen keyboard
-# when a real touch device is present, so HDMI-only setups are unaffected.
-# Detection is via udev's ID_INPUT_TOUCHSCREEN, with a device-name fallback.
-# Force it either way with RAGNAR_KIOSK_TOUCH=on|off|auto (default auto).
+# Input detection: decide (a) whether to force Chromium touch events, and
+# (b) whether to launch an on-screen keyboard. The OSK is wanted for a touch
+# screen OR a keyboardless setup — a mouse-only HDMI kiosk still needs a way to
+# type (login, terminal, WiFi passphrase), clicked with the mouse. Touch DOM
+# events are only forced when an actual touchscreen is present.
+#   RAGNAR_KIOSK_TOUCH=on|off|auto  overrides touch detection (default auto)
+#   RAGNAR_KIOSK_OSK=on|off|auto    overrides the on-screen keyboard (default auto)
 TOUCH_MODE="${RAGNAR_KIOSK_TOUCH:-auto}"
+OSK_MODE="${RAGNAR_KIOSK_OSK:-auto}"
 TOUCH_PRESENT=0
-if [[ "$TOUCH_MODE" == "on" ]]; then
-    TOUCH_PRESENT=1
-elif [[ "$TOUCH_MODE" == "auto" ]]; then
-    if command -v udevadm >/dev/null 2>&1; then
-        for dev in /dev/input/event*; do
-            [[ -e "$dev" ]] || continue
-            if udevadm info --query=property --name="$dev" 2>/dev/null \
-                 | grep -q '^ID_INPUT_TOUCHSCREEN=1'; then
-                TOUCH_PRESENT=1; break
-            fi
-        done
-    fi
-    if [[ "$TOUCH_PRESENT" -eq 0 ]] && grep -qi 'touch' /proc/bus/input/devices 2>/dev/null; then
-        TOUCH_PRESENT=1
-    fi
+KBD_PRESENT=0
+if command -v udevadm >/dev/null 2>&1; then
+    for dev in /dev/input/event*; do
+        [[ -e "$dev" ]] || continue
+        props="$(udevadm info --query=property --name="$dev" 2>/dev/null || true)"
+        grep -q '^ID_INPUT_TOUCHSCREEN=1' <<<"$props" && TOUCH_PRESENT=1
+        grep -q '^ID_INPUT_KEYBOARD=1'    <<<"$props" && KBD_PRESENT=1
+    done
 fi
+# Device-name fallback if udev didn't classify a touchscreen.
+if [[ "$TOUCH_PRESENT" -eq 0 ]] && grep -qi 'touch' /proc/bus/input/devices 2>/dev/null; then
+    TOUCH_PRESENT=1
+fi
+case "$TOUCH_MODE" in on) TOUCH_PRESENT=1 ;; off) TOUCH_PRESENT=0 ;; esac
+
+# On-screen keyboard wanted for a touchscreen or a keyboardless (mouse-only) box.
+OSK_WANTED=0
+case "$OSK_MODE" in
+    on)  OSK_WANTED=1 ;;
+    off) OSK_WANTED=0 ;;
+    *)   { [[ "$TOUCH_PRESENT" -eq 1 ]] || [[ "$KBD_PRESENT" -eq 0 ]]; } && OSK_WANTED=1 ;;
+esac
+
 if [[ "$TOUCH_PRESENT" -eq 1 ]]; then
     # Force touch event support in the DOM (Chromium usually auto-detects, but
     # this makes tap/scroll reliable across versions and headless X starts).
     CHROMIUM_ARGS+=( --touch-events=enabled )
-    echo "[kiosk-run] touchscreen detected (mode=$TOUCH_MODE) — touch events on, on-screen keyboard enabled"
-else
-    echo "[kiosk-run] no touchscreen detected (mode=$TOUCH_MODE) — on-screen keyboard skipped"
 fi
+echo "[kiosk-run] input: touchscreen=$TOUCH_PRESENT keyboard=$KBD_PRESENT -> touch_events=$TOUCH_PRESENT osk=$OSK_WANTED (touch=$TOUCH_MODE osk=$OSK_MODE)"
 
-# Launch an on-screen keyboard when a touchscreen is present. Best-effort and
-# backgrounded — never blocks or fails the kiosk. Wayland uses squeekboard
-# (follows text-input focus); X uses matchbox-keyboard / onboard.
+# Launch an on-screen keyboard when wanted. Best-effort and backgrounded — never
+# blocks or fails the kiosk. Wayland uses squeekboard (follows text-input focus);
+# X uses matchbox-keyboard / onboard (both fully clickable with a mouse).
 launch_osk() {
-    [[ "${TOUCH_PRESENT:-0}" -eq 1 ]] || return 0
+    [[ "${OSK_WANTED:-0}" -eq 1 ]] || return 0
     local sess="${1:-x}"
     if [[ "$sess" == "wayland" ]] && command -v squeekboard >/dev/null 2>&1; then
         echo "[kiosk-run] starting squeekboard (Wayland on-screen keyboard)"
@@ -161,7 +174,7 @@ launch_osk() {
         echo "[kiosk-run] starting onboard (on-screen keyboard)"
         onboard >/dev/null 2>&1 &
     else
-        echo "[kiosk-run] WARN: touchscreen present but no on-screen keyboard installed"
+        echo "[kiosk-run] WARN: on-screen keyboard wanted but none installed (matchbox-keyboard/squeekboard)"
     fi
 }
 
@@ -216,6 +229,15 @@ fi
 # ---------------------------------------------------------------------------
 echo "[kiosk-run] no session env — spinning up own X server"
 
+# We run as the (non-root) kiosk user, so starting X needs the suid Xorg.wrap.
+# On Bookworm (Pi 5 default) it's absent unless xserver-xorg-legacy is installed,
+# and X then exits immediately -> systemd restart loop with a bare status=1.
+# Warn loudly so the journal actually says why.
+if [[ "$(id -u)" -ne 0 && ! -e /usr/lib/xorg/Xorg.wrap && ! -e /usr/libexec/Xorg.wrap ]]; then
+    echo "[kiosk-run] WARN: non-root X but Xorg.wrap is missing — X will likely fail." >&2
+    echo "[kiosk-run] WARN: fix with: sudo apt-get install xserver-xorg-legacy" >&2
+fi
+
 XORG_LOG="$LOG_DIR/kiosk-Xorg.log"
 mkdir -p "$HOME/.local/share/xorg" 2>/dev/null || true
 rm -f /tmp/.X0-lock 2>/dev/null || true
@@ -267,8 +289,9 @@ if [[ "$KIOSK_HIDE_CURSOR" == "true" ]] && command -v unclutter >/dev/null 2>&1;
     unclutter -idle 0 -root &
 fi
 
-# On-screen keyboard for touchscreens (this path is always X, so no squeekboard).
-if [[ "$TOUCH_PRESENT" -eq 1 ]]; then
+# On-screen keyboard (this path is always X, so no squeekboard). Wanted for a
+# touchscreen or a keyboardless mouse-only setup.
+if [[ "$OSK_WANTED" -eq 1 ]]; then
     if command -v matchbox-keyboard >/dev/null 2>&1; then
         matchbox-keyboard >/dev/null 2>&1 &
     elif command -v onboard >/dev/null 2>&1; then
@@ -282,4 +305,18 @@ exec "$BROWSER" "\${CHROMIUM_ARGS[@]}"
 EOF
 chmod +x "$SESSION_SCRIPT"
 
-exec xinit "$SESSION_SCRIPT" -- /usr/bin/X :0 vt7 -nolisten tcp -auth "$XAUTHORITY" -logfile "$XORG_LOG" -keeptty
+# Run X (rather than exec) so we can surface the real failure into the journal.
+# A bare "Main process exited, status=1/FAILURE" restart loop is otherwise
+# undebuggable remotely — here we tail the Xorg log on any non-signal exit.
+_kiosk_term() { [[ -n "${XINIT_PID:-}" ]] && kill -TERM "$XINIT_PID" 2>/dev/null || true; }
+trap _kiosk_term TERM INT
+xinit "$SESSION_SCRIPT" -- /usr/bin/X :0 vt7 -nolisten tcp \
+      -auth "$XAUTHORITY" -logfile "$XORG_LOG" -keeptty &
+XINIT_PID=$!
+if wait "$XINIT_PID"; then rc=0; else rc=$?; fi
+if [[ "$rc" -ne 0 && "$rc" -ne 143 && "$rc" -ne 130 ]]; then
+    echo "[kiosk-run] X/xinit exited with code $rc — last Xorg log lines:" >&2
+    tail -n 25 "$XORG_LOG" 2>/dev/null >&2 || true
+    echo "[kiosk-run] full detail: $XORG_LOG and $WRAPPER_LOG" >&2
+fi
+exit "$rc"

@@ -274,6 +274,10 @@ cat > "$SERVICE_FILE" <<EOF
 Description=Ragnar on-screen kiosk (Chromium fullscreen)
 After=network-online.target ragnar.service
 Wants=network-online.target
+# Cap the restart loop: if it fails 5 times in 2 minutes, stop and stay stopped
+# instead of hammering (a broken kiosk should surface, not spin 89 times).
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -289,7 +293,8 @@ Environment=RAGNAR_BROWSER=$BROWSER_BIN
 ExecStartPre=+/bin/sh -c 'rm -f /tmp/.X0-lock; rm -rf /tmp/.X11-unix/X0'
 ExecStart=$WRAPPER_DST
 Restart=on-failure
-RestartSec=5
+# 10s (not 5) so a dying Xorg releases the VT/DRM master before the next start.
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target

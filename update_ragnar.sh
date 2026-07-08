@@ -210,6 +210,21 @@ if [ -f /usr/local/bin/ragnar-kiosk-run ] && [ -f "$KIOSK_WRAPPER_SRC" ]; then
             && echo -e "  ${GREEN}✓${NC} On-screen keyboard installed ($OSK_PKG)" \
             || echo -e "  ${YELLOW}⚠${NC} Could not install on-screen keyboard ($OSK_PKG)"
     fi
+    # Cap the kiosk restart loop on existing service-mode installs (drop-in, so
+    # we don't rewrite the generated unit). Idempotent.
+    if [ -f /etc/systemd/system/ragnar-kiosk.service ]; then
+        install -d -m 0755 /etc/systemd/system/ragnar-kiosk.service.d
+        cat > /etc/systemd/system/ragnar-kiosk.service.d/10-restart-limit.conf <<'DROPIN'
+[Unit]
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+RestartSec=10
+DROPIN
+        systemctl daemon-reload 2>/dev/null || true
+        echo -e "  ${GREEN}✓${NC} Kiosk restart-loop cap applied (drop-in)"
+    fi
 fi
 
 echo -e "${BLUE}Step 6.5: Validating actions.json configuration...${NC}"

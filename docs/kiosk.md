@@ -42,29 +42,50 @@ board at launch:
 
 The board model and RAM are logged at startup in `/var/log/ragnar/kiosk-wrapper.log`.
 
-## Touchscreen support
+## Touchscreen & on-screen keyboard
 
-Touchscreens work automatically. When the wrapper **detects a touch device**
-(via udev's `ID_INPUT_TOUCHSCREEN`, with a device-name fallback) it:
+The wrapper inspects the attached input devices at launch (via udev) and adapts:
 
-- enables Chromium touch events (`--touch-events=enabled`) so tap-to-click and
-  drag-scroll are reliable, and
-- launches an **on-screen keyboard** so you can type into fields (login, the Web
-  Terminal, WiFi passphrases) with no physical keyboard:
-  - **Wayland** (Pi OS Desktop) → `squeekboard`, which follows text-input focus.
-  - **X** (Pi OS Lite) → `matchbox-keyboard` (falls back to `onboard`).
+- **Touchscreen detected** → Chromium touch events are forced
+  (`--touch-events=enabled`) so tap-to-click and drag-scroll are reliable, **and**
+  an on-screen keyboard is launched.
+- **No physical keyboard** (e.g. an HDMI screen with only a mouse) → an on-screen
+  keyboard is launched too, so you can still type into fields (login, the Web
+  Terminal, WiFi passphrases) by clicking the keys with the mouse.
+- **Mouse + keyboard, no touch** → nothing extra is added; the kiosk behaves as a
+  normal fullscreen browser.
 
-HDMI-only setups are unaffected — with no touch device detected, neither the
-touch flag nor the keyboard is activated.
+On-screen keyboard by session type:
+- **Wayland** (Pi OS Desktop) → `squeekboard`, which follows text-input focus.
+- **X** (Pi OS Lite) → `matchbox-keyboard` (falls back to `onboard`).
 
-**Override detection** with the `RAGNAR_KIOSK_TOUCH` environment variable on the
-service/autostart entry: `auto` (default), `on` (force touch + keyboard), or
-`off` (disable). The on-screen keyboard packages are installed best-effort at
-kiosk install time and never block the install if unavailable.
+**Overrides** (set on the service/autostart entry):
+- `RAGNAR_KIOSK_TOUCH=on|off|auto` — force/disable touch events (default `auto`).
+- `RAGNAR_KIOSK_OSK=on|off|auto` — force/disable the on-screen keyboard
+  (default `auto`). Useful if a wireless-mouse dongle advertises a phantom
+  keyboard interface and the keyboardless auto-detection misfires.
+
+The keyboard packages are installed best-effort at kiosk install/update time and
+never block the install if unavailable.
 
 ## Troubleshooting
 
-- Wrapper log: `/var/log/ragnar/kiosk-wrapper.log` (board, RAM, touch detection,
-  which OSK launched, target URL).
+**Logs (on the Pi):**
+- Wrapper log: `/var/log/ragnar/kiosk-wrapper.log` — board, RAM, the
+  `input: touchscreen=… keyboard=… osk=…` line, which OSK launched, target URL.
 - Xorg log (service mode): `/var/log/ragnar/kiosk-Xorg.log`.
-- Service state: `journalctl -u ragnar-kiosk` on the Pi.
+- Service state: `journalctl -u ragnar-kiosk`.
+
+**Crash loop** (`status=1/FAILURE`, restart counter climbing) in service mode is
+almost always X failing to start. The service now stops itself after 5 failures
+in 2 minutes instead of spinning, and the wrapper dumps the last Xorg log lines
+into the journal on failure. The most common cause on **Pi 5 / Bookworm** is a
+missing suid `Xorg.wrap` — fix with:
+
+```
+sudo apt-get install xserver-xorg-legacy
+```
+
+(Fresh installs pull this in automatically.) After fixing the root cause, clear
+the failure counter with `sudo systemctl reset-failed ragnar-kiosk` and start it
+again.
