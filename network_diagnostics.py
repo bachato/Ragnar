@@ -590,6 +590,440 @@ def do_arp_check(interface=None, learn=True):
 
 
 # --------------------------------------------------------------------------
+# MAC Watch — detection-only MAC-spoofing + randomization detector & tracker.
+#
+# Three jobs, all passive (reads the kernel neighbour table, optionally an
+# arp-scan sweep — no capture, and it never spoofs anything itself):
+#   1. Spoofing / cloning: a vendor OUI wearing the locally-administered bit
+#      (disguised vendor), the same MAC bound to several IPs (a clone), and an
+#      IP whose MAC changed identity over time (the past-spoofing signature).
+#   2. Randomization: privacy (locally-administered, vendor-less) MACs on the
+#      segment, reported as an aggregate inventory rather than per-MAC noise so
+#      a busy Wi-Fi segment full of iPhones doesn't drown a real spoof.
+#   3. Tracking: an IP that cycles through several randomized MACs over time is
+#      one device rotating to hide — grouped into a track so it can be followed
+#      across the addresses it hides behind.
+#
+# A small JSON store keeps first/last-seen, per-IP MAC history and change
+# events, so "current AND past" spoofing/rotation survives across checks and
+# restarts. True cross-MAC device tracking on a switched/Wi-Fi segment needs
+# probe-request fingerprinting (monitor-mode only); this IP-anchored version is
+# the honest, capture-free approximation and is labelled as such in the UI.
+# --------------------------------------------------------------------------
+
+_MAC_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'mac_watch.json')
+_mac_watch_lock = threading.Lock()
+
+# A randomized MAC seen within this window counts as "current" segment activity.
+_MAC_WATCH_WINDOW_S = 24 * 3600
+# A randomized MAC whose whole lifetime was shorter than this is "ephemeral" —
+# the fingerprint of active privacy rotation (device changing address rapidly).
+_MAC_EPHEMERAL_S = 15 * 60
+# Keep at most this many change events in the store (newest wins).
+_MAC_EVENTS_CAP = 200
+# One MAC bound to at least this many distinct IPs at once is a clone candidate.
+_MAC_CLONE_MIN_IPS = 2
+
+# Locally-administered VM / container prefixes — tracked apart from privacy
+# randomization so virtual NICs don't inflate the randomized count or look like
+# a spoof. Keyed by the leading octets (lowercase, colon-separated).
+_MAC_VIRTUAL_PREFIXES = {
+    '02:42': 'Docker',
+    '52:54:00': 'QEMU/KVM',
+    '0a:00:27': 'VirtualBox host-only',
+    '02:00:4c': 'Microsoft NDIS loopback',
+    '02:50:41': 'Parallels',
+}
+
+# Always-present universal (LAA-clear) vendor OUI seed, used even when the
+# arp-scan / nmap OUI database isn't installed. Only universal prefixes belong
+# here — a prefix with the locally-administered bit set can never be a
+# legitimately-registered OUI, and seeding one would make it read as a spoof.
+_MAC_VENDOR_SEED = {
+    'b8:27:eb': 'Raspberry Pi', 'dc:a6:32': 'Raspberry Pi',
+    'e4:5f:01': 'Raspberry Pi', 'd8:3a:dd': 'Raspberry Pi',
+    '2c:cf:67': 'Raspberry Pi', '28:cd:c1': 'Raspberry Pi',
+    '3c:22:fb': 'Apple', 'a4:83:e7': 'Apple', 'f0:18:98': 'Apple',
+    '00:1b:63': 'Apple', 'ac:bc:32': 'Apple', '90:9c:4a': 'Apple',
+    '00:50:56': 'VMware', '00:0c:29': 'VMware', '00:05:69': 'VMware',
+    '08:00:27': 'VirtualBox', '00:15:5d': 'Microsoft Hyper-V',
+    '00:16:6c': 'Samsung', 'e8:50:8b': 'Samsung', '5c:0a:5b': 'Samsung',
+    '3c:97:0e': 'Intel', '00:1b:21': 'Intel', '34:13:e8': 'Intel',
+    '00:1a:a1': 'Cisco', '00:1b:0d': 'Cisco',
+    '50:c7:bf': 'TP-Link', 'a4:2b:b0': 'TP-Link', 'c0:06:c3': 'TP-Link',
+    '00:14:6c': 'Netgear', '20:e5:2a': 'Netgear',
+    '24:0a:c4': 'Espressif', '30:ae:a4': 'Espressif',
+    '7c:9e:bd': 'Espressif', 'a0:20:a6': 'Espressif',
+    '00:e0:fc': 'Huawei', 'ec:b5:fa': 'Philips',
+}
+
+_OUI_DB_PATHS = ('/usr/share/arp-scan/ieee-oui.txt',
+                 '/usr/share/nmap/nmap-mac-prefixes')
+# Cap the loaded OUI table so a pathological file can't blow memory.
+_OUI_DB_CAP = 60000
+_oui_db_cache = None
+_oui_db_lock = threading.Lock()
+
+
+def _mac_norm(mac):
+    """Normalise a MAC to lowercase colon form, or None if it isn't a MAC."""
+    if not mac or not isinstance(mac, str):
+        return None
+    hexs = re.sub(r'[^0-9a-fA-F]', '', mac)
+    if len(hexs) != 12:
+        return None
+    hexs = hexs.lower()
+    return ':'.join(hexs[i:i + 2] for i in range(0, 12, 2))
+
+
+def _mac_first_octet(mac):
+    try:
+        return int(mac[0:2], 16)
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_laa(mac):
+    """True if the locally-administered (privacy/spoof) bit is set."""
+    b0 = _mac_first_octet(mac)
+    return b0 is not None and bool(b0 & 0x02)
+
+
+def _is_universal_prefix(oui):
+    """True if a 6-hex OUI could be a legitimately-registered (LAA-clear) OUI.
+    Filters junk out of the vendor table so an LAA/randomization range in a full
+    manuf file can't be mistaken for a real vendor by the spoof check."""
+    try:
+        b0 = int(oui[0:2], 16)
+    except (ValueError, TypeError, IndexError):
+        return False
+    return not (b0 & 0x02) and not (b0 & 0x01)
+
+
+def _load_oui_db():
+    """Load {6-hex-prefix: vendor} from the arp-scan / nmap OUI DB if present,
+    merged over the built-in seed. Universal prefixes only; cached."""
+    global _oui_db_cache
+    if _oui_db_cache is not None:
+        return _oui_db_cache
+    with _oui_db_lock:
+        if _oui_db_cache is not None:
+            return _oui_db_cache
+        db = {}
+        for oui, vendor in _MAC_VENDOR_SEED.items():
+            db[oui.replace(':', '')] = vendor
+        for path in _OUI_DB_PATHS:
+            try:
+                with open(path, encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        parts = re.split(r'\s+', line, maxsplit=1)
+                        if len(parts) != 2:
+                            continue
+                        pfx = re.sub(r'[^0-9a-fA-F]', '', parts[0]).lower()
+                        if len(pfx) < 6:
+                            continue
+                        pfx = pfx[:6]
+                        if not _is_universal_prefix(pfx):
+                            continue
+                        db.setdefault(pfx, parts[1].strip())
+                        if len(db) >= _OUI_DB_CAP:
+                            break
+            except OSError:
+                continue
+            if len(db) >= _OUI_DB_CAP:
+                break
+        _oui_db_cache = db
+        return db
+
+
+def _vendor_for_prefix(prefix6):
+    return _load_oui_db().get(prefix6)
+
+
+def _classify_mac(mac):
+    """Classify one MAC. Returns {klass, vendor, note}.
+
+    klass ∈ {'universal', 'spoofed_vendor_oui', 'virtual_laa', 'randomized',
+             'invalid'}. A universal address is a normal burned-in NIC; the
+    three LAA buckets are kept distinct so privacy randomization (benign, an
+    aggregate) never gets conflated with a vendor OUI wearing the LAA bit
+    (impersonation) or with a VM/container NIC."""
+    m = _mac_norm(mac)
+    if not m:
+        return {'klass': 'invalid', 'vendor': None, 'note': 'not a MAC'}
+    b0 = _mac_first_octet(m)
+    prefix6 = m.replace(':', '')[:6]
+    if b0 & 0x01:  # multicast/broadcast — never a valid source address
+        return {'klass': 'invalid', 'vendor': None, 'note': 'multicast/broadcast'}
+    if not (b0 & 0x02):  # universal — legitimately-registered OUI
+        vendor = _vendor_for_prefix(prefix6)
+        return {'klass': 'universal', 'vendor': vendor, 'note': None}
+    # Locally-administered: virtual, disguised-vendor, or privacy randomization.
+    for pfx, name in _MAC_VIRTUAL_PREFIXES.items():
+        if m.startswith(pfx):
+            return {'klass': 'virtual_laa', 'vendor': name, 'note': 'VM/container NIC'}
+    # Clear the LAA bit and see whether the underlying OUI is a real vendor — a
+    # registered vendor OUI can't legitimately carry the LAA bit, so this is the
+    # impersonation signature (a spoofer picked a plausible vendor prefix).
+    deladdr = '%02x%s' % (b0 & ~0x02, prefix6[2:])
+    vendor = _vendor_for_prefix(deladdr)
+    if vendor:
+        return {'klass': 'spoofed_vendor_oui', 'vendor': vendor,
+                'note': f'vendor OUI ({vendor}) with the locally-administered bit set'}
+    return {'klass': 'randomized', 'vendor': None, 'note': 'privacy-randomized MAC'}
+
+
+def _local_macs():
+    """Own NIC MACs, so this host's interfaces are never counted or flagged."""
+    macs = set()
+    res = _run(['ip', '-o', 'link', 'show'], timeout=5)
+    for m in re.finditer(r'link/\w+\s+([0-9a-fA-F:]{17})', res['out']):
+        norm = _mac_norm(m.group(1))
+        if norm:
+            macs.add(norm)
+    return macs
+
+
+def _mac_watch_load():
+    try:
+        with open(_MAC_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mac_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_MAC_WATCH_PATH), exist_ok=True)
+        tmp = _MAC_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _MAC_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def _fmt_ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f'{seconds}s ago'
+    if seconds < 3600:
+        return f'{seconds // 60}m ago'
+    if seconds < 86400:
+        return f'{seconds // 3600}h ago'
+    return f'{seconds // 86400}d ago'
+
+
+def do_mac_watch_reset():
+    """Clear the MAC-watch history (first/last-seen, per-IP history, events)."""
+    with _mac_watch_lock:
+        _mac_watch_save({})
+    return {'success': True, 'reset': True}
+
+
+def do_mac_watch(scan=True, interface=None):
+    """Detect current + past MAC spoofing/cloning and randomization, and track
+    devices that rotate randomized MACs. Detection-only; nothing is spoofed.
+
+    scan=True adds an arp-scan sweep (active but harmless) to widen coverage
+    beyond whatever is already in the neighbour table; scan=False reads the
+    neighbour table only (works unprivileged, no traffic generated)."""
+    now = time.time()
+    gw = _default_gateway()
+    gw_mac = _neigh_mac(gw) if gw else None
+    local = _local_macs()
+
+    # Current (ip, mac) observations from the neighbour table, optionally
+    # widened by an arp-scan sweep. Deduped; own-NIC MACs dropped.
+    seen = {}  # mac -> set(ips)
+    for ip, mac, _state in _neigh_entries():
+        m = _mac_norm(mac)
+        if m and m not in local:
+            seen.setdefault(m, set()).add(ip)
+    scan_iface = None       # interface the arp-scan sweep actually ran on
+    scanned = False         # whether an arp-scan sweep was performed
+    if scan and _have('arp-scan'):
+        scan_iface = interface if _valid_iface(interface or '') else _default_route_iface()
+        if scan_iface:
+            scanned = True
+            sweep = do_arp_scan(scan_iface)
+            for h in (sweep.get('hosts') or []):
+                m = _mac_norm(h.get('mac'))
+                if m and m not in local:
+                    seen.setdefault(m, set()).add(h.get('ip'))
+
+    # Classify every currently-seen MAC.
+    current = []
+    for mac, ips in seen.items():
+        info = _classify_mac(mac)
+        if info['klass'] == 'invalid':
+            continue
+        current.append({'mac': mac, 'ips': sorted(i for i in ips if i),
+                        'klass': info['klass'], 'vendor': info['vendor'],
+                        'note': info['note']})
+
+    # --- update the persistent store (this is what makes "past" possible) ----
+    with _mac_watch_lock:
+        store = _mac_watch_load()
+        macs = store.setdefault('macs', {})
+        ip_hist = store.setdefault('ip_history', {})
+        events = store.setdefault('events', [])
+
+        for c in current:
+            rec = macs.setdefault(c['mac'], {'first': now, 'count': 0,
+                                             'ips': [], 'klass': c['klass'],
+                                             'vendor': c['vendor']})
+            rec['last'] = now
+            rec['count'] = rec.get('count', 0) + 1
+            rec['klass'] = c['klass']
+            rec['vendor'] = c['vendor']
+            rec['ips'] = sorted(set(rec.get('ips', [])) | set(c['ips']))
+            # Per-IP identity history — a change here is the past-spoof signal.
+            for ip in c['ips']:
+                hist = ip_hist.setdefault(ip, [])
+                if not hist or hist[-1]['mac'] != c['mac']:
+                    if hist and hist[-1]['mac'] != c['mac']:
+                        old = hist[-1]
+                        oc = _classify_mac(old['mac'])
+                        # A randomized<->randomized flip on one IP is ordinary
+                        # privacy rotation (DHCP re-lease); only flag identity
+                        # changes that involve a real/burned-in vendor address.
+                        privacy_only = (oc['klass'] in ('randomized', 'virtual_laa')
+                                        and c['klass'] in ('randomized', 'virtual_laa'))
+                        events.append({
+                            'ts': now, 'ip': ip,
+                            'old_mac': old['mac'], 'new_mac': c['mac'],
+                            'old_klass': oc['klass'], 'new_klass': c['klass'],
+                            'severity': 'low' if privacy_only else 'high',
+                        })
+                    hist.append({'mac': c['mac'], 'first': now, 'last': now})
+                else:
+                    hist[-1]['last'] = now
+                # Bound per-IP history growth.
+                if len(hist) > 40:
+                    del hist[:len(hist) - 40]
+
+        if len(events) > _MAC_EVENTS_CAP:
+            del events[:len(events) - _MAC_EVENTS_CAP]
+        _mac_watch_save(store)
+
+    # --- assemble findings ---------------------------------------------------
+    reasons = []
+    verdict = 'clean'
+
+    # (1) Disguised-vendor spoofs seen right now.
+    spoofed = [c for c in current if c['klass'] == 'spoofed_vendor_oui']
+    for c in spoofed:
+        reasons.append(f"{c['mac']} is a {c['vendor']} vendor OUI with the "
+                       f"locally-administered bit set — MAC-spoofing signature "
+                       f"(IP {', '.join(c['ips']) or 'unknown'})")
+
+    # (2) Clones — one MAC currently bound to several IPs (gateway excluded).
+    clones = [c for c in current
+              if len(c['ips']) >= _MAC_CLONE_MIN_IPS and c['mac'] != gw_mac]
+    for c in clones:
+        reasons.append(f"{c['mac']} answers for {len(c['ips'])} IPs "
+                       f"({', '.join(c['ips'][:4])}"
+                       f"{'…' if len(c['ips']) > 4 else ''}) — cloned/duplicated MAC")
+
+    # (3) Past spoofing — identity changes on an IP within the window.
+    with _mac_watch_lock:
+        events = (_mac_watch_load().get('events') or [])
+    recent_events = [e for e in events if now - e.get('ts', 0) <= _MAC_WATCH_WINDOW_S]
+    hi_events = [e for e in recent_events if e.get('severity') == 'high']
+    for e in hi_events[-8:]:
+        reasons.append(f"IP {e['ip']} changed MAC {e['old_mac']} → {e['new_mac']} "
+                       f"({_fmt_ago(now - e['ts'])}) — possible spoof/clone in the past")
+
+    # (4) Randomization inventory (aggregate, not per-MAC).
+    randomized = [c for c in current if c['klass'] == 'randomized']
+    virtual = [c for c in current if c['klass'] == 'virtual_laa']
+    with _mac_watch_lock:
+        macs_store = (_mac_watch_load().get('macs') or {})
+    ephemeral = 0
+    for mac, rec in macs_store.items():
+        if rec.get('klass') != 'randomized':
+            continue
+        life = rec.get('last', 0) - rec.get('first', 0)
+        if 0 <= life < _MAC_EPHEMERAL_S and rec.get('count', 0) >= 1:
+            ephemeral += 1
+    randomization = {
+        'count': len(randomized),
+        'ephemeral': ephemeral,
+        'virtual': len(virtual),
+        'macs': [c['mac'] for c in randomized],
+        'virtual_macs': [{'mac': c['mac'], 'vendor': c['vendor']} for c in virtual],
+    }
+    if randomized:
+        note = (f"{len(randomized)} randomized (privacy) MAC(s) on the segment"
+                + (f", {ephemeral} short-lived (active rotation)" if ephemeral else ""))
+        reasons.append(note)
+
+    # (5) Tracking — an IP that cycled through >=2 randomized MACs is one device
+    # rotating to hide. Group its randomized addresses into a followable track.
+    tracks = []
+    with _mac_watch_lock:
+        ip_hist = (_mac_watch_load().get('ip_history') or {})
+    for ip, hist in ip_hist.items():
+        rand_macs, first, last = [], None, None
+        for h in hist:
+            if _classify_mac(h['mac'])['klass'] == 'randomized':
+                rand_macs.append(h['mac'])
+                first = h['first'] if first is None else min(first, h['first'])
+                last = h['last'] if last is None else max(last, h['last'])
+        uniq = sorted(set(rand_macs))
+        if len(uniq) >= 2 and last and now - last <= _MAC_WATCH_WINDOW_S:
+            tracks.append({'ip': ip, 'macs': uniq, 'changes': len(uniq) - 1,
+                           'first': first, 'last': last,
+                           'span': _fmt_ago(now - first) if first else None})
+    tracks.sort(key=lambda t: len(t['macs']), reverse=True)
+    for t in tracks[:6]:
+        reasons.append(f"device at {t['ip']} rotated through {len(t['macs'])} "
+                       f"randomized MACs — tracked across its address changes")
+
+    if spoofed or clones or hi_events:
+        verdict = 'spoofed'
+    elif tracks or randomized:
+        verdict = 'suspicious' if tracks else 'randomization'
+
+    return {
+        'success': True, 'verdict': verdict,
+        'summary': {
+            'observed': len(current),
+            'spoofed': len(spoofed),
+            'clones': len(clones),
+            'past_events': len(hi_events),
+            'randomized': len(randomized),
+            'virtual': len(virtual),
+            'tracks': len(tracks),
+        },
+        'spoofed': spoofed,
+        'clones': clones,
+        # Every MAC seen this pass, worst class first, so the UI can list them.
+        'observed_macs': sorted(
+            current,
+            key=lambda c: ({'spoofed_vendor_oui': 0, 'universal': 1,
+                            'randomized': 2, 'virtual_laa': 3}.get(c['klass'], 4),
+                           c['ips'][0] if c['ips'] else '', c['mac'])),
+        'events': [dict(e, ago=_fmt_ago(now - e['ts'])) for e in recent_events[-20:]][::-1],
+        'randomization': randomization,
+        'tracks': tracks,
+        'gateway': {'ip': gw, 'mac': gw_mac},
+        'interface': scan_iface,
+        'scanned': scanned,
+        'source': (f'arp-scan sweep on {scan_iface}' if scanned
+                   else 'neighbour table (all interfaces)'),
+        'oui_db': bool(len(_load_oui_db()) > len(_MAC_VENDOR_SEED)),
+        'reasons': reasons,
+    }
+
+
+# --------------------------------------------------------------------------
 # Interfaces: link speed / duplex / auto-neg, static-vs-DHCP, IP/CIDR, VLAN
 # --------------------------------------------------------------------------
 
@@ -2487,6 +2921,20 @@ def register_network_diagnostics(app, logger=None):
             action = 'reset' if (data.get('action') == 'reset') else 'get'
         _log(f"net/arp-baseline {action}")
         return jsonify(do_arp_baseline(action))
+
+    @app.route('/api/net/mac-watch', methods=['GET'])
+    def net_mac_watch():
+        # scan=0 reads the neighbour table only (no arp-scan sweep, silent);
+        # default runs an arp-scan sweep to widen coverage.
+        scan = request.args.get('scan', '1') not in ('0', 'false', 'no')
+        iface = (request.args.get('interface') or '').strip() or None
+        _log(f"net/mac-watch scan={scan}")
+        return jsonify(do_mac_watch(scan=scan, interface=iface))
+
+    @app.route('/api/net/mac-watch-reset', methods=['POST'])
+    def net_mac_watch_reset():
+        _log("net/mac-watch-reset")
+        return jsonify(do_mac_watch_reset())
 
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():
