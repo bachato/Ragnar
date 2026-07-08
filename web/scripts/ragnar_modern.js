@@ -1233,7 +1233,8 @@ function showNetworkSubtab(name) {
 
 // Last-fetched payloads for each net panel, so "Export CSV" has data to dump.
 let _ndLastLldp = [], _ndLastArp = null, _ndLastIfaces = [],
-    _ndLastMtr = null, _ndLastIdentity = null, _ndLastIsp = [];
+    _ndLastMtr = null, _ndLastIdentity = null, _ndLastIsp = [],
+    _ndLastMacWatch = null;
 
 // Build a CSV from a header row + rows (arrays of cells) and download it.
 function _ndDownloadCsv(nameBase, header, rows) {
@@ -2446,6 +2447,7 @@ async function runMacWatch(scan) {
             out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
             return;
         }
+        _ndLastMacWatch = d;
         const [cls, label] = _MACWATCH_VERDICT_STYLE[d.verdict] || _MACWATCH_VERDICT_STYLE.unknown;
         const s = d.summary || {};
         let html = `<div class="mb-3 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
@@ -2552,6 +2554,20 @@ async function macWatchReset() {
     } catch (e) {
         addConsoleMessage('Failed to reset MAC Watch history: ' + e.message, 'error');
     }
+}
+function exportMacWatchCsv() {
+    const d = _ndLastMacWatch;
+    const TYPE = { spoofed_vendor_oui: 'Spoofed', universal: 'Vendor',
+                  randomized: 'Randomized', virtual_laa: 'Virtual/VM' };
+    _ndDownloadCsv('mac_watch' + (d && d.interface ? '_' + d.interface : ''),
+        ['MAC', 'Type', 'Vendor', 'IPs', 'Flag', 'Note'],
+        ((d && d.observed_macs) || []).map(c => {
+            const ips = c.ips || [];
+            const flag = c.klass === 'spoofed_vendor_oui' ? 'SPOOFED'
+                : (ips.length > 1 ? 'CLONE (multiple IPs)' : '');
+            return [c.mac, TYPE[c.klass] || c.klass, c.vendor || '',
+                    ips.join(' '), flag, c.note || ''];
+        }));
 }
 
 // Detect the ISP/public IP reached through each interface (multi-WAN). Makes
