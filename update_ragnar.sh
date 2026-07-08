@@ -196,6 +196,20 @@ KIOSK_WRAPPER_SRC="$ragnar_PATH/scripts/ragnar_kiosk_run.sh"
 if [ -f /usr/local/bin/ragnar-kiosk-run ] && [ -f "$KIOSK_WRAPPER_SRC" ]; then
     install -m 0755 "$KIOSK_WRAPPER_SRC" /usr/local/bin/ragnar-kiosk-run
     echo -e "  ${GREEN}✓${NC} Kiosk wrapper refreshed from repo"
+    # Seed the on-screen keyboard so touchscreen typing works on existing kiosk
+    # installs too (not just fresh installs). Best-effort, guarded, idempotent:
+    # squeekboard for the Wayland/autostart path, matchbox-keyboard for the X
+    # service path. The wrapper only launches it when a touchscreen is detected.
+    if [ -f /etc/systemd/system/ragnar-kiosk.service ]; then
+        OSK_PKG="matchbox-keyboard"; command -v matchbox-keyboard >/dev/null 2>&1 && OSK_PKG=""
+    else
+        OSK_PKG="squeekboard"; command -v squeekboard >/dev/null 2>&1 && OSK_PKG=""
+    fi
+    if [ -n "$OSK_PKG" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$OSK_PKG" >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓${NC} On-screen keyboard installed ($OSK_PKG)" \
+            || echo -e "  ${YELLOW}⚠${NC} Could not install on-screen keyboard ($OSK_PKG)"
+    fi
 fi
 
 echo -e "${BLUE}Step 6.5: Validating actions.json configuration...${NC}"

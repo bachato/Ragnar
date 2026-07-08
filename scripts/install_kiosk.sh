@@ -162,6 +162,23 @@ else
     echo "[kiosk-install] all required packages already present"
 fi
 
+# On-screen keyboard so a touchscreen kiosk can type (login, terminal, WiFi
+# passphrases). Installed best-effort — a missing package must never block the
+# kiosk. The wrapper only launches it when it actually detects a touchscreen.
+#   - autostart/Wayland (Pi OS Bookworm desktop) -> squeekboard (focus-following)
+#   - service/X (Pi OS Lite)                      -> matchbox-keyboard (lightweight)
+OSK_PKG=""
+if [[ "$MODE" == "autostart" ]]; then
+    command -v squeekboard >/dev/null 2>&1 || OSK_PKG="squeekboard"
+else
+    command -v matchbox-keyboard >/dev/null 2>&1 || OSK_PKG="matchbox-keyboard"
+fi
+if [[ -n "$OSK_PKG" ]]; then
+    echo "[kiosk-install] installing on-screen keyboard: $OSK_PKG (best-effort, for touchscreens)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$OSK_PKG" \
+        || echo "[kiosk-install] WARN: could not install $OSK_PKG — touch keyboard unavailable"
+fi
+
 # Re-detect browser after install
 if [[ -z "$BROWSER_BIN" ]]; then
     for bin in chromium-browser chromium firefox-esr; do
