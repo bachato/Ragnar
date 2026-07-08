@@ -27,6 +27,15 @@ if : > >(tee -a "$WRAPPER_LOG" 2>/dev/null) 2>/dev/null; then
 fi
 echo "[kiosk-run] start $(date -Iseconds) user=$(id -un) HOME=${HOME:-unset} DISPLAY=${DISPLAY:-unset} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}"
 
+# Pi model + RAM — used to tune Chromium for low-memory boards (Pi Zero 2 W has
+# only 512 MB, where Chromium OOM-crashes without the low-end flags below).
+PI_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown)"
+MEM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+MEM_MB=$(( MEM_KB / 1024 ))
+LOW_MEM=0
+[[ "$MEM_MB" -gt 0 && "$MEM_MB" -le 1024 ]] && LOW_MEM=1
+echo "[kiosk-run] board: ${PI_MODEL} | RAM: ${MEM_MB}MB | low_mem=${LOW_MEM}"
+
 # Default config values (mirror shared.py defaults)
 KIOSK_URL="http://localhost:8000"
 KIOSK_ROTATION="0"
@@ -63,17 +72,111 @@ echo "[kiosk-run] target URL: $FINAL_URL"
 PROFILE_DIR="$HOME/.config/ragnar-kiosk-chromium"
 mkdir -p "$PROFILE_DIR" 2>/dev/null || true
 
+# After a power-cut the Pi never shuts Chromium down cleanly, so it shows the
+# "Restore pages? Chrome didn't shut down correctly" banner over the kiosk —
+# the #1 kiosk complaint. Rewrite the last-session exit state to clean so the
+# banner never appears. (--disable-session-crashed-bubble alone isn't reliable
+# across Chromium versions; this is.)
+PREFS="$PROFILE_DIR/Default/Preferences"
+if [[ -f "$PREFS" ]]; then
+    sed -i 's/"exit_type":"[^"]*"/"exit_type":"Normal"/; s/"exited_cleanly":false/"exited_cleanly":true/' "$PREFS" 2>/dev/null || true
+fi
+# A crash/kill leaves Chromium's singleton lock behind, which makes the *next*
+# launch abort immediately — exactly what turns one failure into a restart loop.
+# Clear the stale locks so a restart can actually come up.
+rm -f "$PROFILE_DIR"/Singleton{Lock,Socket,Cookie} 2>/dev/null || true
+
+# Chromium flags. Kept identical across both launch modes (session + own-X) by
+# building the array once here and reusing it below.
 CHROMIUM_ARGS=(
     --kiosk
     --noerrdialogs
     --disable-infobars
     --disable-translate
     --disable-features=TranslateUI,Translate
+    --disable-session-crashed-bubble
+    --disable-pinch
+    --overscroll-history-navigation=0
     --no-first-run
     --check-for-update-interval=31536000
+    --disable-dev-shm-usage
+    --password-store=basic
     --user-data-dir="$PROFILE_DIR"
     --app="$FINAL_URL"
 )
+
+# Low-memory boards (Pi Zero 2 W, 512 MB): trim Chromium's footprint so it
+# doesn't get OOM-killed to a black screen. Harmless on bigger Pis but only
+# applied where it matters.
+if [[ "$LOW_MEM" -eq 1 ]]; then
+    CHROMIUM_ARGS+=(
+        --enable-low-end-device-mode
+        --renderer-process-limit=1
+        --disable-gpu-shader-disk-cache
+        --disable-features=TranslateUI,Translate,CalculateNativeWinOcclusion
+    )
+    echo "[kiosk-run] low-memory board — applied Chromium low-end flags"
+fi
+
+# Input detection: decide (a) whether to force Chromium touch events, and
+# (b) whether to launch an on-screen keyboard. The OSK is wanted for a touch
+# screen OR a keyboardless setup — a mouse-only HDMI kiosk still needs a way to
+# type (login, terminal, WiFi passphrase), clicked with the mouse. Touch DOM
+# events are only forced when an actual touchscreen is present.
+#   RAGNAR_KIOSK_TOUCH=on|off|auto  overrides touch detection (default auto)
+#   RAGNAR_KIOSK_OSK=on|off|auto    overrides the on-screen keyboard (default auto)
+TOUCH_MODE="${RAGNAR_KIOSK_TOUCH:-auto}"
+OSK_MODE="${RAGNAR_KIOSK_OSK:-auto}"
+TOUCH_PRESENT=0
+KBD_PRESENT=0
+if command -v udevadm >/dev/null 2>&1; then
+    for dev in /dev/input/event*; do
+        [[ -e "$dev" ]] || continue
+        props="$(udevadm info --query=property --name="$dev" 2>/dev/null || true)"
+        grep -q '^ID_INPUT_TOUCHSCREEN=1' <<<"$props" && TOUCH_PRESENT=1
+        grep -q '^ID_INPUT_KEYBOARD=1'    <<<"$props" && KBD_PRESENT=1
+    done
+fi
+# Device-name fallback if udev didn't classify a touchscreen.
+if [[ "$TOUCH_PRESENT" -eq 0 ]] && grep -qi 'touch' /proc/bus/input/devices 2>/dev/null; then
+    TOUCH_PRESENT=1
+fi
+case "$TOUCH_MODE" in on) TOUCH_PRESENT=1 ;; off) TOUCH_PRESENT=0 ;; esac
+
+# On-screen keyboard wanted for a touchscreen or a keyboardless (mouse-only) box.
+OSK_WANTED=0
+case "$OSK_MODE" in
+    on)  OSK_WANTED=1 ;;
+    off) OSK_WANTED=0 ;;
+    *)   { [[ "$TOUCH_PRESENT" -eq 1 ]] || [[ "$KBD_PRESENT" -eq 0 ]]; } && OSK_WANTED=1 ;;
+esac
+
+if [[ "$TOUCH_PRESENT" -eq 1 ]]; then
+    # Force touch event support in the DOM (Chromium usually auto-detects, but
+    # this makes tap/scroll reliable across versions and headless X starts).
+    CHROMIUM_ARGS+=( --touch-events=enabled )
+fi
+echo "[kiosk-run] input: touchscreen=$TOUCH_PRESENT keyboard=$KBD_PRESENT -> touch_events=$TOUCH_PRESENT osk=$OSK_WANTED (touch=$TOUCH_MODE osk=$OSK_MODE)"
+
+# Launch an on-screen keyboard when wanted. Best-effort and backgrounded — never
+# blocks or fails the kiosk. Wayland uses squeekboard (follows text-input focus);
+# X uses matchbox-keyboard / onboard (both fully clickable with a mouse).
+launch_osk() {
+    [[ "${OSK_WANTED:-0}" -eq 1 ]] || return 0
+    local sess="${1:-x}"
+    if [[ "$sess" == "wayland" ]] && command -v squeekboard >/dev/null 2>&1; then
+        echo "[kiosk-run] starting squeekboard (Wayland on-screen keyboard)"
+        squeekboard >/dev/null 2>&1 &
+    elif command -v matchbox-keyboard >/dev/null 2>&1; then
+        echo "[kiosk-run] starting matchbox-keyboard (on-screen keyboard)"
+        matchbox-keyboard >/dev/null 2>&1 &
+    elif command -v onboard >/dev/null 2>&1; then
+        echo "[kiosk-run] starting onboard (on-screen keyboard)"
+        onboard >/dev/null 2>&1 &
+    else
+        echo "[kiosk-run] WARN: on-screen keyboard wanted but none installed (matchbox-keyboard/squeekboard)"
+    fi
+}
 
 # Wait for Ragnar's web server to actually answer (max 60s).
 for i in $(seq 1 60); do
@@ -116,6 +219,7 @@ if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
         *) : ;;  # 0 = no rotation
     esac
 
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then launch_osk wayland; else launch_osk x; fi
     exec "$BROWSER" "${CHROMIUM_ARGS[@]}"
 fi
 
@@ -124,6 +228,15 @@ fi
 # This is the Pi OS Lite / systemd-service path.
 # ---------------------------------------------------------------------------
 echo "[kiosk-run] no session env — spinning up own X server"
+
+# We run as the (non-root) kiosk user, so starting X needs the suid Xorg.wrap.
+# On Bookworm (Pi 5 default) it's absent unless xserver-xorg-legacy is installed,
+# and X then exits immediately -> systemd restart loop with a bare status=1.
+# Warn loudly so the journal actually says why.
+if [[ "$(id -u)" -ne 0 && ! -e /usr/lib/xorg/Xorg.wrap && ! -e /usr/libexec/Xorg.wrap ]]; then
+    echo "[kiosk-run] WARN: non-root X but Xorg.wrap is missing — X will likely fail." >&2
+    echo "[kiosk-run] WARN: fix with: sudo apt-get install xserver-xorg-legacy" >&2
+fi
 
 XORG_LOG="$LOG_DIR/kiosk-Xorg.log"
 mkdir -p "$HOME/.local/share/xorg" 2>/dev/null || true
@@ -176,17 +289,34 @@ if [[ "$KIOSK_HIDE_CURSOR" == "true" ]] && command -v unclutter >/dev/null 2>&1;
     unclutter -idle 0 -root &
 fi
 
-exec "$BROWSER" \\
-    --kiosk \\
-    --noerrdialogs \\
-    --disable-infobars \\
-    --disable-translate \\
-    --disable-features=TranslateUI,Translate \\
-    --no-first-run \\
-    --check-for-update-interval=31536000 \\
-    --user-data-dir="\$HOME/.config/ragnar-kiosk-chromium" \\
-    --app="$FINAL_URL"
+# On-screen keyboard (this path is always X, so no squeekboard). Wanted for a
+# touchscreen or a keyboardless mouse-only setup.
+if [[ "$OSK_WANTED" -eq 1 ]]; then
+    if command -v matchbox-keyboard >/dev/null 2>&1; then
+        matchbox-keyboard >/dev/null 2>&1 &
+    elif command -v onboard >/dev/null 2>&1; then
+        onboard >/dev/null 2>&1 &
+    fi
+fi
+
+# Same hardened Chromium flags as the session-mode launch (built by the parent).
+$(declare -p CHROMIUM_ARGS)
+exec "$BROWSER" "\${CHROMIUM_ARGS[@]}"
 EOF
 chmod +x "$SESSION_SCRIPT"
 
-exec xinit "$SESSION_SCRIPT" -- /usr/bin/X :0 vt7 -nolisten tcp -auth "$XAUTHORITY" -logfile "$XORG_LOG" -keeptty
+# Run X (rather than exec) so we can surface the real failure into the journal.
+# A bare "Main process exited, status=1/FAILURE" restart loop is otherwise
+# undebuggable remotely — here we tail the Xorg log on any non-signal exit.
+_kiosk_term() { [[ -n "${XINIT_PID:-}" ]] && kill -TERM "$XINIT_PID" 2>/dev/null || true; }
+trap _kiosk_term TERM INT
+xinit "$SESSION_SCRIPT" -- /usr/bin/X :0 vt7 -nolisten tcp \
+      -auth "$XAUTHORITY" -logfile "$XORG_LOG" -keeptty &
+XINIT_PID=$!
+if wait "$XINIT_PID"; then rc=0; else rc=$?; fi
+if [[ "$rc" -ne 0 && "$rc" -ne 143 && "$rc" -ne 130 ]]; then
+    echo "[kiosk-run] X/xinit exited with code $rc — last Xorg log lines:" >&2
+    tail -n 25 "$XORG_LOG" 2>/dev/null >&2 || true
+    echo "[kiosk-run] full detail: $XORG_LOG and $WRAPPER_LOG" >&2
+fi
+exit "$rc"

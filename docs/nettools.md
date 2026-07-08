@@ -29,6 +29,8 @@ alert.
 | [DNS Doctor (poisoning check)](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
 | [ARP Poisoning](#arp-poisoning) | Diagnostics | `GET /api/net/arp-check`, `/arp-baseline` |
 | [MAC Watch](#mac-watch) | Diagnostics | `GET /api/net/mac-watch`, `POST /api/net/mac-watch-reset` |
+| [DHCP Guardian](#dhcp-guardian) | Switch & L2 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
+| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
 | [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
 | [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
 | [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
@@ -78,7 +80,7 @@ into a switch and read the essentials off the screen with **no laptop and no
 internet**. Everything shown is gathered locally (`ip` / `ethtool` /
 `lldpctl` / `resolv.conf`), so it works on an isolated or dead network.
 
-The display auto-cycles three pages every **5 seconds**:
+The display auto-cycles four pages every **5 seconds**:
 
 1. **LINK** — the physical wired port: interface, link up/down, negotiated
    speed, duplex, auto-negotiation, MAC. (Instantly spot a port that fell back
@@ -88,6 +90,10 @@ The display auto-cycles three pages every **5 seconds**:
 3. **SWITCH** — the switch you're plugged into, via LLDP/CDP: switch name, the
    **exact port** (e.g. `GigabitEthernet1/0/12`), VLAN, **PoE** class/wattage,
    protocol, and management IP.
+4. **DHCP** — the [DHCP Guardian](#dhcp-guardian) rogue-server watch: verdict,
+   how many DHCP servers answered, the server-id and gateway it offers vs. your
+   active gateway, and a **ROGUE!** count if a fake server is present. The scan
+   runs in the background so the page never blocks the cycle.
 
 It focuses on the **physical** wired NIC (`eth*` / `en*`), ignoring VPN,
 tunnel, bridge and container interfaces. Toggle it off to restore the normal
@@ -270,12 +276,13 @@ tracking as the neighbour-table approximation.
 
 ### 🛡️ Network Integrity Monitor
 The one **passive, alerting** tool in the suite (everything else is on-demand).
-When enabled it runs the [DNS Doctor](#dns-doctor) poisoning check and the
-[ARP Poisoning](#arp-poisoning) check on a schedule (default **every 5 min**),
-derives an overall verdict — **clean / suspicious / compromised** — and:
+When enabled it runs the [DNS Doctor](#dns-doctor) poisoning check, the
+[ARP Poisoning](#arp-poisoning) check and the [DHCP Guardian](#dhcp-guardian)
+rogue-server check on a schedule (default **every 5 min**), derives an overall
+verdict — **clean / suspicious / compromised** — and:
 
-- Surfaces a live **dashboard chip** (Overall / DNS / ARP) in the Diagnostics
-  sub-tab, with the reasons and last-check time.
+- Surfaces a live **dashboard chip** (Overall / DNS / ARP / DHCP) in the
+  Diagnostics sub-tab, with the reasons and last-check time.
 - Sends a **Pushover alert** when the verdict *worsens* into a bad state (it
   alerts on the transition, not every cycle, with a cooldown backstop).
 
@@ -285,8 +292,8 @@ cycle learns the gateway ARP baseline. **Check now** runs both checks
 immediately (works even while the monitor is off).
 
 - Endpoint: `GET /api/net/integrity` · config: `net_integrity_monitor_enabled`,
-  `net_integrity_interval_min`, `pushover_notify_net_integrity`,
-  `net_integrity_notify_cooldown_s`
+  `net_integrity_interval_min`, `net_integrity_check_dhcp`,
+  `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`
 
 ### Path MTU / Black-hole
 Discovers the **path MTU** to a target and flags an **MTU black hole** — a hop
@@ -412,6 +419,77 @@ The fastest way to inventory a subnet you're attached to. Results export to CSV.
 > This is an **inventory** sweep, not a security check. For ARP **spoofing /
 > poisoning** detection (gateway-MAC watch + subnet impersonation), see
 > [ARP Poisoning](#arp-poisoning) in the Diagnostics sub-tab.
+
+### DHCP Guardian
+**DHCP-snooping-style** monitor — the DHCP layer is the one L2 service the suite
+hadn't covered, and arguably the highest-value one after DNS: whoever answers
+DHCP hands you your gateway and DNS, so a rogue DHCP server is a turnkey
+man-in-the-middle. **Detection-only** — it never runs a DHCP server or hands out
+leases. Two signals, rolled into a **clean / rogue / starvation** verdict:
+
+- **Rogue / fake DHCP server** — an active `broadcast-dhcp-discover` provokes
+  *every* DHCP server on the segment to OFFER. More than one distinct server, a
+  server that isn't the **trusted baseline**, or one offering a gateway/DNS that
+  differs from the one you're actually using → **rogue** (DHCP steering). The
+  first scan *learns* the current single server as trusted
+  (`data/dhcp_baseline.json`); after a legitimate DHCP/router change, **Trust
+  current server** re-learns it. The offered gateway is cross-checked against the
+  [ARP Poisoning](#arp-poisoning) baseline, so a DHCP steer backed by ARP
+  spoofing reads as one **combined DHCP+ARP MITM** finding.
+- **DHCP starvation** — a short passive `tcpdump` capture counts client
+  DISCOVER/REQUEST messages and the **distinct client hardware addresses**
+  (chaddr) behind them; a burst of many distinct chaddrs in a few seconds is the
+  pool-exhaustion signature (the classic precursor that clears the field for a
+  rogue server) → **starvation**.
+
+The result shows the verdict, every DHCP server that answered (server-id,
+offered gateway/DNS, lease, and a trusted / new / rogue badge), the starvation
+capture stats, and the gateway's ARP verdict. An **interface selector**
+(Auto / WiFi / LAN) targets the scan at a chosen segment. It feeds the
+[Network Integrity Monitor](#-network-integrity-monitor) (rogue-server check
+only, so the background cycle stays fast) and adds a **DHCP page** to the
+[e-Paper Network Diagnostic Mode](#-e-paper-network-diagnostic-mode).
+
+- Endpoints: `GET /api/net/dhcp-guardian` `?interface=<if>&seconds=<n>&quick=0|1`,
+  `GET|POST /api/net/dhcp-baseline` `{action:reset}` · store:
+  `data/dhcp_baseline.json` · binaries: `nmap`
+  (broadcast-dhcp-discover) + `tcpdump`
+
+### DHCP Snooping (inline)
+The **enterprise-grade** version of [DHCP Guardian](#dhcp-guardian), for when the
+Pi has **two NICs bridged inline** (it sits between the client segment and the
+uplink, so every DHCP packet transits it). This is the managed-switch *DHCP
+snooping* model, and it's strictly stronger than active probing — **detection
+only** (it never drops or rewrites a frame; inline blocking is a deliberate
+future opt-in).
+
+- **Trusted vs. untrusted ports** — you mark the uplink NIC (toward the real
+  DHCP server) *trusted* and the client NIC *untrusted*. A DHCP **server**
+  message (OFFER/ACK/NAK) that ingresses the **untrusted** port is a rogue
+  server *by definition* — zero false positives, no baseline needed. Ingress
+  port is read from `tcpdump -i any -Q in` (LINUX_SLL2 tags each frame with its
+  interface).
+- **Binding table** — every OFFER/ACK records **client-MAC ↔ assigned-IP ↔
+  server ↔ lease ↔ ingress-port**, the same table a switch keeps, and the basis
+  for spotting IP spoofing / feeding dynamic ARP inspection later.
+- **Starvation** — distinct client hardware addresses (chaddr) flooding
+  DISCOVERs are counted straight off the wire.
+
+Bring your own bridge or SPAN/mirror port, or use the **guarded setup helper**
+to enslave two wired NICs into `rgsnoop0` — it refuses the management /
+default-route / wireless interface so it can't cut its own link. verdict:
+**clean / rogue / starvation**.
+
+> **Needs the inline hardware.** With no bridge the box only sees broadcast
+> DISCOVERs (unicast OFFERs won't transit), so `status` reports *not inline yet*
+> until two NICs share a bridge. This is the natural home for a 2-Ethernet
+> (OTG-hub) build; pair it with the hardware watchdog the installer enables.
+
+- Endpoints: `GET /api/net/dhcp-snoop` `?trusted=<if>&untrusted=<if>&seconds=<n>`,
+  `GET /api/net/dhcp-snoop/status`, `GET|POST /api/net/dhcp-snoop/config`
+  `{trusted,untrusted}`, `POST /api/net/dhcp-snoop/setup`
+  `{action:create|destroy,iface_a,iface_b}` · store: `data/dhcp_snoop.json` ·
+  binaries: `tcpdump`, `ip`
 
 ### L2 Link Health
 Listens **passively** on an interface for a few seconds (`tcpdump`) and reports

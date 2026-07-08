@@ -635,6 +635,23 @@ EOF
     sed -i '/^#DefaultLimitNPROC=/d' /etc/systemd/user.conf
     echo "DefaultLimitNPROC=4096" >> /etc/systemd/user.conf
 
+    # --- Hardware watchdog (auto-reboot on a hard hang) --------------------
+    # Sensible for an unattended / inline device: if the Pi wedges, the
+    # hardware watchdog reboots it fast instead of sitting there black-holing
+    # the link. Enable the BCM watchdog in config.txt and have systemd pet it.
+    # Idempotent; the config.txt bit takes effect on the next reboot.
+    local boot_cfg=""
+    for c in /boot/firmware/config.txt /boot/config.txt; do
+        [ -f "$c" ] && { boot_cfg="$c"; break; }
+    done
+    if [ -n "$boot_cfg" ] && ! grep -q '^dtparam=watchdog=on' "$boot_cfg"; then
+        echo 'dtparam=watchdog=on' >> "$boot_cfg"
+        log "INFO" "Enabled hardware watchdog in $boot_cfg (applies after reboot)"
+    fi
+    # systemd opens /dev/watchdog and resets the box if it (or the kernel) hangs.
+    sed -i '/^#\?RuntimeWatchdogSec=/d;/^#\?RebootWatchdogSec=/d' /etc/systemd/system.conf
+    printf 'RuntimeWatchdogSec=15\nRebootWatchdogSec=2min\n' >> /etc/systemd/system.conf
+
     # Create /etc/security/limits.d/90-ragnar-limits.conf with both file and process limits
     cat > /etc/security/limits.d/90-ragnar-limits.conf << EOF
 # Ragnar System Limits Configuration

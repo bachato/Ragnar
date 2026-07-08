@@ -1024,6 +1024,633 @@ def do_mac_watch(scan=True, interface=None):
 
 
 # --------------------------------------------------------------------------
+# DHCP Guardian — DHCP-snooping-style monitor (detection-only).
+#
+# The DHCP layer is the one L2 service Ragnar hadn't covered, and it's arguably
+# the second-highest-value one after DNS: whoever answers DHCP hands you your
+# gateway and DNS, so a rogue DHCP server is a turnkey man-in-the-middle. Two
+# jobs, both passive/harmless (it never runs a DHCP server or hands out leases):
+#
+#   1. Rogue / fake DHCP server — an active `broadcast-dhcp-discover` provokes
+#      *every* DHCP server on the segment to OFFER. More than one distinct
+#      server, or a server offering a gateway/DNS that differs from the trusted
+#      one, is the rogue-server / MITM signature. The offered gateway's MAC is
+#      cross-checked against the ARP baseline (do_arp_check) so a DHCP steer
+#      backed by ARP spoofing reads as one combined finding.
+#   2. DHCP starvation — a short passive tcpdump capture counts client DISCOVER/
+#      REQUEST messages and the distinct client hardware addresses behind them;
+#      a burst of many distinct chaddrs in a few seconds is the pool-exhaustion
+#      signature (the classic precursor that clears the field for the rogue).
+#
+# A trusted-server baseline (data/dhcp_baseline.json) is learned on first run —
+# like the ARP baseline — so a *new* server or a *changed* offered gateway is
+# flagged even against an otherwise-quiet segment. verdict: clean / suspicious /
+# rogue / starvation.
+# --------------------------------------------------------------------------
+
+_DHCP_BASELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'data', 'dhcp_baseline.json')
+_dhcp_baseline_lock = threading.Lock()
+
+# Distinct client hardware addresses seen in the capture window at or above
+# which we call it starvation (a normal segment shows a handful at most).
+_DHCP_STARV_MIN_CLIENTS = 12
+# nmap's per-server OFFER wait; long enough for a slow server to answer, short
+# enough to keep the whole scan bounded.
+_DHCP_DISCOVER_TIMEOUT_S = 8
+
+
+def _dhcp_baseline_load():
+    try:
+        with open(_DHCP_BASELINE_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _dhcp_baseline_save(d):
+    try:
+        os.makedirs(os.path.dirname(_DHCP_BASELINE_PATH), exist_ok=True)
+        tmp = _DHCP_BASELINE_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _DHCP_BASELINE_PATH)
+    except OSError:
+        pass
+
+
+def do_dhcp_baseline(action='get'):
+    """Manage the trusted DHCP-server baseline the rogue check compares against.
+    action='reset' clears it so the current server(s) are re-learned on the next
+    scan (use after a legitimate DHCP-server/gateway change)."""
+    with _dhcp_baseline_lock:
+        if action == 'reset':
+            _dhcp_baseline_save({})
+            return {'success': True, 'reset': True, 'servers': {}}
+        return {'success': True, 'servers': (_dhcp_baseline_load().get('servers') or {})}
+
+
+def _parse_dhcp_discover(output):
+    """Parse `nmap --script broadcast-dhcp-discover` output into a list of
+    OFFERs: {server_id, router, dns[], offered_ip, lease, domain, iface}. Each
+    'Response N of M' block is one responding DHCP server."""
+    offers = []
+    cur = None
+
+    def _flush():
+        if cur and (cur.get('server_id') or cur.get('offered_ip')):
+            offers.append(cur)
+
+    for raw in output.splitlines():
+        line = raw.strip().lstrip('|_').strip()
+        m = re.match(r'Response\s+\d+\s+of\s+\d+', line)
+        if m:
+            _flush()
+            cur = {'server_id': None, 'router': None, 'dns': [],
+                   'offered_ip': None, 'lease': None, 'domain': None, 'iface': None}
+            continue
+        if cur is None:
+            continue
+        m = re.match(r'Server Identifier:\s*(\d+\.\d+\.\d+\.\d+)', line)
+        if m:
+            cur['server_id'] = m.group(1); continue
+        m = re.match(r'Router:\s*(.+)', line)
+        if m:
+            cur['router'] = m.group(1).strip(); continue
+        m = re.match(r'Domain Name Server:\s*(.+)', line)
+        if m:
+            cur['dns'] = [x.strip() for x in re.split(r'[,\s]+', m.group(1).strip()) if x.strip()]
+            continue
+        m = re.match(r'IP Offered:\s*(\d+\.\d+\.\d+\.\d+)', line)
+        if m:
+            cur['offered_ip'] = m.group(1); continue
+        m = re.match(r'IP Address Lease Time:\s*(.+)', line)
+        if m:
+            cur['lease'] = m.group(1).strip(); continue
+        m = re.match(r'Domain Name:\s*(.+)', line)
+        if m:
+            cur['domain'] = m.group(1).strip(); continue
+        m = re.match(r'Interface:\s*(\S+)', line)
+        if m:
+            cur['iface'] = m.group(1); continue
+    _flush()
+    return offers
+
+
+def _dhcp_discover(interface, timeout_s=_DHCP_DISCOVER_TIMEOUT_S):
+    """Provoke every DHCP server on the segment to OFFER, via nmap's
+    broadcast-dhcp-discover. Returns (offers, error)."""
+    if not _have('nmap'):
+        return [], 'nmap is not installed (needed for rogue-DHCP discovery)'
+    cmd = ['nmap', '--script', 'broadcast-dhcp-discover',
+           '--script-args', f'broadcast-dhcp-discover.timeout={int(timeout_s)}']
+    if interface and _valid_iface(interface):
+        cmd += ['-e', interface]
+    res = _run(cmd, timeout=int(timeout_s) + 25)
+    if res['rc'] == 127:
+        return [], 'nmap not found'
+    return _parse_dhcp_discover(res['out']), None
+
+
+def _parse_dhcp_capture(output):
+    """Parse verbose `tcpdump` DHCP output into client-request stats:
+    (requests, distinct_client_macs). Counts DISCOVER/REQUEST (client→server)
+    and the distinct BOOTP client hardware addresses (chaddr) behind them —
+    chaddr is what a starvation tool spoofs, so distinct chaddrs is the signal."""
+    requests = 0
+    clients = set()
+    kind = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = re.search(r'DHCP-Message.*?:\s*(\w+)', line)
+        if m:
+            kind = m.group(1).lower()
+            if kind in ('discover', 'request'):
+                requests += 1
+            continue
+        m = re.search(r'Client-Ethernet-Address\s+([0-9a-fA-F:]{17})', line)
+        if m and kind in ('discover', 'request'):
+            clients.add(m.group(1).lower())
+    return requests, clients
+
+
+def _dhcp_capture(interface, seconds):
+    """Passively capture DHCP client requests for `seconds` and return
+    (requests, distinct_clients, error). No traffic generated."""
+    if not _have('tcpdump'):
+        return 0, 0, 'tcpdump is not installed (needed for starvation capture)'
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return 0, 0, 'no interface to capture on'
+    cmd = ['tcpdump', '-i', iface, '-n', '-e', '-v', '-l',
+           'udp and (port 67 or port 68)']
+    # tcpdump has no built-in duration cap; run it under a timeout and read what
+    # it buffered. SIGTERM (rc 124) is the normal, expected end of the window.
+    res = _run(cmd, timeout=max(2, int(seconds)))
+    if res['rc'] == 127:
+        return 0, 0, 'tcpdump not found'
+    requests, clients = _parse_dhcp_capture(res['out'])
+    return requests, len(clients), None
+
+
+def do_dhcp_guardian(interface=None, capture_seconds=6, learn=True, quick=False):
+    """DHCP-snooping-style rogue-server + starvation detector (detection-only).
+
+    quick=True skips the passive starvation capture (rogue-server discovery
+    only) — used by the background integrity monitor and the e-Paper page so
+    they stay fast. verdict: clean / suspicious / rogue / starvation."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    gw = _default_gateway()
+    _, resolv_dns, _ = _read_resolv_conf()
+    reasons = []
+    verdict = 'clean'
+
+    # --- (1) rogue / fake DHCP server -------------------------------------
+    # quick mode (background monitor / e-Paper / "Check now") uses a shorter
+    # OFFER wait — a legitimate local server answers in well under a second, so
+    # 4s is plenty and keeps the interactive path snappy.
+    offers, offer_err = _dhcp_discover(iface, 4 if quick else _DHCP_DISCOVER_TIMEOUT_S)
+    server_ids = sorted({o['server_id'] for o in offers if o.get('server_id')})
+    learned = False
+    rogue_servers = []
+
+    with _dhcp_baseline_lock:
+        baseline = _dhcp_baseline_load()
+        trusted = baseline.setdefault('servers', {})
+        # First scan with exactly one server learns it as the trusted baseline
+        # (mirrors the ARP gateway-baseline learn-on-first-run behaviour).
+        if learn and not trusted and len(server_ids) == 1:
+            sid = server_ids[0]
+            o = next(o for o in offers if o.get('server_id') == sid)
+            trusted[sid] = {'router': o.get('router'), 'dns': o.get('dns') or []}
+            _dhcp_baseline_save(baseline)
+            learned = True
+        trusted_ids = set(trusted.keys())
+
+    # A server that isn't the trusted one — or a trusted one whose offered
+    # gateway changed — is rogue. If nothing is trusted yet, ≥2 servers is the
+    # rogue signal on its own.
+    for o in offers:
+        sid = o.get('server_id')
+        if not sid:
+            continue
+        base = trusted.get(sid)
+        if trusted_ids and sid not in trusted_ids:
+            rogue_servers.append(o)
+            reasons.append(f"rogue DHCP server {sid} on the segment "
+                           f"(offers gateway {o.get('router') or '?'}, "
+                           f"DNS {', '.join(o.get('dns') or []) or '?'})")
+        elif base and o.get('router') and base.get('router') and o['router'] != base['router']:
+            rogue_servers.append(o)
+            reasons.append(f"DHCP server {sid} changed the offered gateway from "
+                           f"trusted {base['router']} to {o['router']} — DHCP steering")
+        elif gw and o.get('router') and o['router'] != gw:
+            # Offered gateway differs from the one actually in use — steering.
+            rogue_servers.append(o)
+            reasons.append(f"DHCP server {sid} offers gateway {o['router']}, "
+                           f"but your active gateway is {gw} — possible DHCP steering")
+
+    if not trusted_ids and len(server_ids) >= 2:
+        reasons.append(f"{len(server_ids)} DHCP servers answered "
+                       f"({', '.join(server_ids)}) — only one is legitimate")
+
+    # Cross-check the active gateway's ARP binding: a rogue DHCP steer is far
+    # more dangerous when the gateway MAC is also spoofed (full MITM).
+    arp = {}
+    try:
+        arp = do_arp_check(learn=False)
+    except Exception:
+        arp = {}
+    if rogue_servers and arp.get('verdict') == 'spoofed':
+        reasons.append("gateway MAC is ALSO ARP-spoofed — combined DHCP+ARP "
+                       "man-in-the-middle")
+
+    # --- (2) starvation ----------------------------------------------------
+    starv = {'requests': 0, 'clients': 0, 'captured': False, 'error': None}
+    if not quick:
+        req, clients, cap_err = _dhcp_capture(iface, capture_seconds)
+        starv = {'requests': req, 'clients': clients,
+                 'captured': cap_err is None, 'error': cap_err}
+        if clients >= _DHCP_STARV_MIN_CLIENTS:
+            reasons.append(f"{clients} distinct DHCP clients requested leases in "
+                           f"{capture_seconds}s ({req} requests) — DHCP starvation "
+                           "(pool-exhaustion) signature")
+
+    # --- verdict -----------------------------------------------------------
+    if starv['clients'] >= _DHCP_STARV_MIN_CLIENTS:
+        verdict = 'starvation'
+    elif rogue_servers or (not trusted_ids and len(server_ids) >= 2):
+        verdict = 'rogue'
+    elif offer_err and not offers:
+        # No server answered at all — could be a static segment, or a pool that
+        # a starvation attack already drained. Informational, not an alarm.
+        verdict = 'clean'
+        reasons.append(offer_err)
+    elif not offers:
+        reasons.append("no DHCP server answered — static addressing, or the "
+                       "pool may be exhausted")
+
+    return {
+        'success': True, 'verdict': verdict, 'interface': iface,
+        'gateway': gw, 'resolver_dns': resolv_dns,
+        'servers': [{
+            'server_id': o.get('server_id'), 'router': o.get('router'),
+            'dns': o.get('dns') or [], 'offered_ip': o.get('offered_ip'),
+            'lease': o.get('lease'), 'domain': o.get('domain'),
+            'trusted': o.get('server_id') in trusted_ids,
+            'rogue': o in rogue_servers,
+        } for o in offers],
+        'server_count': len(server_ids),
+        'trusted_count': len(trusted_ids),
+        'learned': learned,
+        'rogue_count': len(rogue_servers),
+        'arp_verdict': arp.get('verdict'),
+        'starvation': starv,
+        'reasons': reasons,
+    }
+
+
+# --------------------------------------------------------------------------
+# DHCP Snooping (inline bridge) — enterprise-grade rogue-DHCP detection.
+#
+# When the Pi sits INLINE with two NICs bridged (rgsnoop0 = eth_a + eth_b), it
+# sees every DHCP packet transiting the link, per ingress port. That unlocks the
+# managed-switch "DHCP snooping" model, which is strictly stronger than the
+# active-probe DHCP Guardian above:
+#
+#   * Trusted vs. untrusted ports. You designate the uplink NIC (toward the real
+#     DHCP server) trusted and the client NIC untrusted. A DHCP *server* message
+#     (OFFER/ACK/NAK) that ingresses the UNTRUSTED port is, by definition, a
+#     rogue server — no baseline, no guessing, zero false positives.
+#   * Binding table. From the OFFER/ACK it records client-MAC ↔ assigned-IP ↔
+#     server ↔ lease ↔ ingress-port — the same table a switch keeps, and the
+#     basis for spotting IP spoofing / feeding dynamic ARP inspection later.
+#   * Starvation. Distinct client hardware addresses (chaddr) flooding DISCOVERs
+#     on the untrusted side are counted directly off the wire.
+#
+# Detection-only for now (it never drops or rewrites a frame); inline *blocking*
+# with an nftables/ebtables bridge rule is a deliberate future opt-in. Ingress
+# port comes from `tcpdump -i any -Q in` (LINUX_SLL2 tags each packet with its
+# interface). The bridge itself is optional — bring your own br0/SPAN, or use
+# the guarded setup helper to enslave two wired NICs into rgsnoop0.
+# --------------------------------------------------------------------------
+
+_DHCP_SNOOP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'dhcp_snoop.json')
+_dhcp_snoop_lock = threading.Lock()
+_DHCP_SNOOP_BRIDGE = 'rgsnoop0'          # bridge the setup helper creates
+_DHCP_SNOOP_WIRED_RE = re.compile(r'^(eth|en|usb)')   # eligible wired NICs
+
+
+def _dhcp_snoop_load():
+    try:
+        with open(_DHCP_SNOOP_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _dhcp_snoop_save(d):
+    try:
+        os.makedirs(os.path.dirname(_DHCP_SNOOP_PATH), exist_ok=True)
+        tmp = _DHCP_SNOOP_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _DHCP_SNOOP_PATH)
+    except OSError:
+        pass
+
+
+def _iface_master(iface):
+    """The bridge (or bond) an interface is enslaved to, or None."""
+    res = _run(['ip', '-o', 'link', 'show', 'dev', iface], timeout=5)
+    m = re.search(r'\bmaster\s+(\S+)', res['out'])
+    return m.group(1) if m else None
+
+
+def _bridge_members(bridge):
+    """Interfaces enslaved to `bridge`."""
+    res = _run(['ip', '-o', 'link', 'show', 'master', bridge], timeout=5)
+    out = []
+    for line in res['out'].splitlines():
+        m = re.match(r'^\d+:\s+([^:@]+)', line)
+        if m:
+            out.append(m.group(1).strip())
+    return out
+
+
+def _list_bridges():
+    res = _run(['ip', '-o', 'link', 'show', 'type', 'bridge'], timeout=5)
+    out = []
+    for line in res['out'].splitlines():
+        m = re.match(r'^\d+:\s+([^:@]+)', line)
+        if m:
+            name = m.group(1).strip()
+            out.append({'name': name, 'members': _bridge_members(name)})
+    return out
+
+
+def _wired_nics():
+    """Physical wired NICs eligible to be bridged (eth*/en*/usb*), excluding the
+    default-route interface and anything already in a non-snoop bridge."""
+    names = []
+    for n in _list_iface_names(include_virtual=False):
+        if _DHCP_SNOOP_WIRED_RE.match(n) and not _is_wireless(n):
+            names.append(n)
+    return names
+
+
+def do_dhcp_snoop_config(trusted=None, untrusted=None):
+    """Get or set the trusted/untrusted port designation (persisted). Pass both
+    to set; pass neither to just read."""
+    with _dhcp_snoop_lock:
+        cfg = _dhcp_snoop_load()
+        if trusted is not None and untrusted is not None:
+            if not _valid_iface(trusted) or not _valid_iface(untrusted):
+                return {'success': False, 'error': 'invalid interface name'}
+            if trusted == untrusted:
+                return {'success': False, 'error': 'trusted and untrusted must differ'}
+            cfg['trusted'] = trusted
+            cfg['untrusted'] = untrusted
+            _dhcp_snoop_save(cfg)
+        return {'success': True, 'trusted': cfg.get('trusted'),
+                'untrusted': cfg.get('untrusted')}
+
+
+def do_dhcp_snoop_status():
+    """Report the inline-snooping setup: bridges present, eligible wired NICs,
+    the default-route interface (never bridged), and the trusted/untrusted
+    config — everything the UI needs to guide wiring."""
+    bridges = _list_bridges()
+    snoop_bridge = next((b for b in bridges if b['name'] == _DHCP_SNOOP_BRIDGE), None)
+    with _dhcp_snoop_lock:
+        cfg = _dhcp_snoop_load()
+    return {
+        'success': True,
+        'bridges': bridges,
+        'snoop_bridge': snoop_bridge,
+        'wired_nics': _wired_nics(),
+        'default_iface': _default_route_iface(),
+        'trusted': cfg.get('trusted'),
+        'untrusted': cfg.get('untrusted'),
+        'inline_ready': bool(snoop_bridge and len(snoop_bridge['members']) >= 2),
+    }
+
+
+def do_dhcp_snoop_setup(iface_a, iface_b, action='create'):
+    """Guarded bridge setup: enslave two wired NICs into rgsnoop0 so the box is
+    inline. Refuses the default-route / wireless / management interface so it
+    can't cut its own link. Detection-only bridge (no IP on it)."""
+    if action == 'destroy':
+        with _dhcp_snoop_lock:
+            for m in _bridge_members(_DHCP_SNOOP_BRIDGE):
+                _run(['ip', 'link', 'set', m, 'nomaster'], timeout=5)
+                _run(['ip', 'link', 'set', m, 'down'], timeout=5)
+            _run(['ip', 'link', 'set', _DHCP_SNOOP_BRIDGE, 'down'], timeout=5)
+            r = _run(['ip', 'link', 'del', _DHCP_SNOOP_BRIDGE], timeout=5)
+        if r['rc'] not in (0, 1):
+            return {'success': False, 'error': r['err'] or 'failed to remove bridge'}
+        return {'success': True, 'destroyed': True}
+
+    # ---- create: validate hard before touching any link --------------------
+    default_if = _default_route_iface()
+    for i in (iface_a, iface_b):
+        if not _valid_iface(i):
+            return {'success': False, 'error': f'invalid interface {i!r}'}
+        if not _DHCP_SNOOP_WIRED_RE.match(i) or _is_wireless(i):
+            return {'success': False, 'error': f'{i} is not an eligible wired NIC'}
+        if i == default_if:
+            return {'success': False,
+                    'error': f'{i} carries the default route — refusing to bridge the '
+                             'management interface (you would cut your own link)'}
+        if i not in _list_iface_names(include_virtual=True):
+            return {'success': False, 'error': f'{i} not found'}
+        m = _iface_master(i)
+        if m and m != _DHCP_SNOOP_BRIDGE:
+            return {'success': False, 'error': f'{i} is already enslaved to {m}'}
+    if iface_a == iface_b:
+        return {'success': False, 'error': 'need two different interfaces'}
+
+    with _dhcp_snoop_lock:
+        # Create the bridge if absent; enslave both members; bring everything up.
+        if _DHCP_SNOOP_BRIDGE not in [b['name'] for b in _list_bridges()]:
+            r = _run(['ip', 'link', 'add', 'name', _DHCP_SNOOP_BRIDGE, 'type', 'bridge'], timeout=5)
+            if r['rc'] != 0:
+                return {'success': False, 'error': r['err'] or 'failed to create bridge'}
+        for i in (iface_a, iface_b):
+            _run(['ip', 'link', 'set', i, 'master', _DHCP_SNOOP_BRIDGE], timeout=5)
+            _run(['ip', 'link', 'set', i, 'up'], timeout=5)
+        _run(['ip', 'link', 'set', _DHCP_SNOOP_BRIDGE, 'up'], timeout=5)
+        members = _bridge_members(_DHCP_SNOOP_BRIDGE)
+
+    return {'success': True, 'bridge': _DHCP_SNOOP_BRIDGE, 'members': members}
+
+
+# DHCP message types by the direction they flow, so we can tell a *server*
+# message (only a DHCP server sends these) from a *client* request.
+_DHCP_SERVER_MSGS = {'offer', 'ack', 'nak'}
+_DHCP_CLIENT_MSGS = {'discover', 'request', 'decline', 'release', 'inform'}
+
+
+def _parse_dhcp_snoop(output, members=None):
+    """Parse `tcpdump -i any -Q in -e -n -v` DHCP output into per-packet records:
+    {iface, src_ip, src_port, dst_port, is_server, msg_type, chaddr, yiaddr,
+     server_id, router, lease}. `members` (if given) filters to those ingress
+     interfaces. Each packet is a header line (timestamp + ingress iface + IP
+     src>dst) followed by indented option lines until the next header."""
+    packets = []
+    cur = None
+
+    def _flush():
+        if cur and cur.get('msg_type'):
+            packets.append(cur)
+
+    for raw in output.splitlines():
+        # Header line: "<ts> <iface> In  ifindex N <mac> ethertype ...: IP a.b.c.d.p > e.f.g.h.q: ..."
+        h = re.match(r'^\d\d:\d\d:\d\d\.\d+\s+(\S+)\s+In\b', raw)
+        if h:
+            _flush()
+            iface = h.group(1)
+            cur = None
+            mip = re.search(r'\bIP\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)\s+>\s+(\d+\.\d+\.\d+\.\d+)\.(\d+)', raw)
+            if not mip:
+                continue
+            src_port, dst_port = int(mip.group(2)), int(mip.group(4))
+            if {src_port, dst_port} & {67, 68} == set():
+                continue
+            if members is not None and iface not in members:
+                continue
+            cur = {'iface': iface, 'src_ip': mip.group(1), 'src_port': src_port,
+                   'dst_ip': mip.group(3), 'dst_port': dst_port,
+                   'is_server': src_port == 67, 'msg_type': None,
+                   'chaddr': None, 'yiaddr': None, 'server_id': None,
+                   'router': None, 'lease': None}
+            continue
+        if cur is None:
+            continue
+        line = raw.strip()
+        m = re.search(r'DHCP-Message.*?:\s*(\w+)', line)
+        if m:
+            cur['msg_type'] = m.group(1).lower(); continue
+        m = re.search(r'Client-Ethernet-Address\s+([0-9a-fA-F:]{17})', line)
+        if m:
+            cur['chaddr'] = m.group(1).lower(); continue
+        m = re.match(r'Your-IP\s+(\d+\.\d+\.\d+\.\d+)', line)
+        if m:
+            cur['yiaddr'] = m.group(1); continue
+        m = re.search(r'Server-ID.*?:\s*(\d+\.\d+\.\d+\.\d+)', line)
+        if m:
+            cur['server_id'] = m.group(1); continue
+        m = re.search(r'(?:Default-Gateway|Router).*?:\s*(\d+\.\d+\.\d+\.\d+)', line)
+        if m:
+            cur['router'] = m.group(1); continue
+        m = re.search(r'Lease-Time.*?:\s*(\d+)', line)
+        if m:
+            cur['lease'] = int(m.group(1)); continue
+    _flush()
+    return packets
+
+
+def _dhcp_snoop_capture(members, seconds):
+    """Passively capture inbound DHCP on all interfaces for `seconds`, tagged by
+    ingress port. Returns (packets, error). No traffic generated."""
+    if not _have('tcpdump'):
+        return [], 'tcpdump is not installed'
+    cmd = ['tcpdump', '-i', 'any', '-Q', 'in', '-n', '-e', '-v', '-l',
+           'udp and (port 67 or port 68)']
+    res = _run(cmd, timeout=max(2, int(seconds)))
+    if res['rc'] == 127:
+        return [], 'tcpdump not found'
+    return _parse_dhcp_snoop(res['out'], members=members), None
+
+
+def do_dhcp_snoop(trusted=None, untrusted=None, seconds=20):
+    """Inline DHCP-snooping pass. Captures real DHCP off the wire per ingress
+    port and applies the trusted/untrusted model:
+
+      * any DHCP *server* message on the UNTRUSTED port  -> rogue (definitive)
+      * OFFER/ACK anywhere                               -> binding-table entry
+      * many distinct chaddrs in DISCOVERs               -> starvation
+
+    verdict: clean / rogue / starvation. Detection-only."""
+    with _dhcp_snoop_lock:
+        cfg = _dhcp_snoop_load()
+    trusted = trusted or cfg.get('trusted')
+    untrusted = untrusted or cfg.get('untrusted')
+    if not trusted or not untrusted:
+        return {'success': False,
+                'error': 'trusted and untrusted ports are not set — designate them first',
+                'need_config': True}
+
+    members = [trusted, untrusted]
+    packets, err = _dhcp_snoop_capture(members, seconds)
+    if err:
+        return {'success': False, 'error': err}
+
+    reasons = []
+    rogue_msgs = []          # server messages seen on the untrusted port
+    bindings = {}            # chaddr -> latest binding
+    servers = {}             # server_id/ip -> {port, trusted}
+    client_macs = set()
+
+    for p in packets:
+        on_trusted = p['iface'] == trusted
+        if p['is_server'] and p['msg_type'] in _DHCP_SERVER_MSGS:
+            sid = p.get('server_id') or p.get('src_ip')
+            servers.setdefault(sid, {'port': p['iface'],
+                                     'trusted': on_trusted,
+                                     'router': p.get('router')})
+            if not on_trusted:
+                rogue_msgs.append(p)
+            if p['msg_type'] in ('offer', 'ack') and p.get('chaddr'):
+                bindings[p['chaddr']] = {
+                    'mac': p['chaddr'], 'ip': p.get('yiaddr'),
+                    'server': sid, 'router': p.get('router'),
+                    'lease': p.get('lease'), 'port': p['iface'],
+                    'via': p['msg_type']}
+        elif p['msg_type'] in _DHCP_CLIENT_MSGS and p.get('chaddr'):
+            client_macs.add(p['chaddr'])
+
+    rogue_servers = sorted({(m.get('server_id') or m['src_ip']) for m in rogue_msgs})
+    for sid in rogue_servers:
+        info = servers.get(sid, {})
+        reasons.append(f"rogue DHCP server {sid} answering on the UNTRUSTED port "
+                       f"{untrusted}" + (f" (offers gateway {info.get('router')})"
+                                         if info.get('router') else "")
+                       + " — a DHCP server must never appear on the client side")
+
+    starvation = len(client_macs)
+    if starvation >= _DHCP_STARV_MIN_CLIENTS:
+        reasons.append(f"{starvation} distinct DHCP clients requested leases in "
+                       f"{seconds}s — starvation (pool-exhaustion) signature")
+
+    verdict = 'clean'
+    if rogue_servers:
+        verdict = 'rogue'
+    elif starvation >= _DHCP_STARV_MIN_CLIENTS:
+        verdict = 'starvation'
+    if not packets:
+        reasons.append("no DHCP seen on the wire during the window — quiet segment, "
+                       "or the box may not actually be inline (bridge the two NICs)")
+
+    return {
+        'success': True, 'verdict': verdict,
+        'trusted': trusted, 'untrusted': untrusted,
+        'packets': len(packets),
+        'servers': [{'server': sid, 'port': i['port'], 'trusted': i['trusted'],
+                     'router': i.get('router'),
+                     'rogue': not i['trusted']} for sid, i in servers.items()],
+        'bindings': list(bindings.values()),
+        'binding_count': len(bindings),
+        'rogue_count': len(rogue_servers),
+        'client_count': starvation,
+        'reasons': reasons,
+    }
+
+
+# --------------------------------------------------------------------------
 # Interfaces: link speed / duplex / auto-neg, static-vs-DHCP, IP/CIDR, VLAN
 # --------------------------------------------------------------------------
 
@@ -2921,6 +3548,55 @@ def register_network_diagnostics(app, logger=None):
             action = 'reset' if (data.get('action') == 'reset') else 'get'
         _log(f"net/arp-baseline {action}")
         return jsonify(do_arp_baseline(action))
+
+    @app.route('/api/net/dhcp-guardian', methods=['GET'])
+    def net_dhcp_guardian():
+        iface = (request.args.get('interface') or '').strip() or None
+        secs = _clamp_int(request.args.get('seconds'), 6, 2, 20)
+        quick = request.args.get('quick', '0') in ('1', 'true', 'yes')
+        _log(f"net/dhcp-guardian iface={iface} quick={quick}")
+        return jsonify(do_dhcp_guardian(interface=iface, capture_seconds=secs, quick=quick))
+
+    @app.route('/api/net/dhcp-baseline', methods=['GET', 'POST'])
+    def net_dhcp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/dhcp-baseline {action}")
+        return jsonify(do_dhcp_baseline(action))
+
+    @app.route('/api/net/dhcp-snoop/status', methods=['GET'])
+    def net_dhcp_snoop_status():
+        _log("net/dhcp-snoop/status")
+        return jsonify(do_dhcp_snoop_status())
+
+    @app.route('/api/net/dhcp-snoop/config', methods=['GET', 'POST'])
+    def net_dhcp_snoop_config():
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            t = (data.get('trusted') or '').strip() or None
+            u = (data.get('untrusted') or '').strip() or None
+            _log(f"net/dhcp-snoop/config trusted={t} untrusted={u}")
+            return jsonify(do_dhcp_snoop_config(trusted=t, untrusted=u))
+        return jsonify(do_dhcp_snoop_config())
+
+    @app.route('/api/net/dhcp-snoop/setup', methods=['POST'])
+    def net_dhcp_snoop_setup():
+        data = request.get_json(silent=True) or {}
+        action = 'destroy' if (data.get('action') == 'destroy') else 'create'
+        a = (data.get('iface_a') or '').strip()
+        b = (data.get('iface_b') or '').strip()
+        _log(f"net/dhcp-snoop/setup {action} {a} {b}")
+        return jsonify(do_dhcp_snoop_setup(a, b, action=action))
+
+    @app.route('/api/net/dhcp-snoop', methods=['GET'])
+    def net_dhcp_snoop():
+        t = (request.args.get('trusted') or '').strip() or None
+        u = (request.args.get('untrusted') or '').strip() or None
+        secs = _clamp_int(request.args.get('seconds'), 20, 4, 60)
+        _log(f"net/dhcp-snoop trusted={t} untrusted={u} secs={secs}")
+        return jsonify(do_dhcp_snoop(trusted=t, untrusted=u, seconds=secs))
 
     @app.route('/api/net/mac-watch', methods=['GET'])
     def net_mac_watch():

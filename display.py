@@ -88,8 +88,8 @@ except ImportError:
     PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC = 0, 1, 2, 3, 4, 5
 
 # Network Diagnostic mode: number of auto-cycling e-Paper sub-pages
-# (0=LINK, 1=IP, 2=SWITCH). See Display._render_netdiag_page.
-NETDIAG_PAGE_COUNT = 3
+# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP). See Display._render_netdiag_page.
+NETDIAG_PAGE_COUNT = 4
 NETDIAG_CYCLE_SECONDS = 5
 
 class Display:
@@ -912,13 +912,40 @@ class Display:
         return {'eth': eth, 'eth_count': len(eth_list),
                 'gateway': gateway, 'dns': nameservers, 'lldp': lldp}
 
+    def _netdiag_dhcp(self):
+        """Non-blocking rogue-DHCP summary for the e-Paper DHCP page. The scan
+        (nmap broadcast-dhcp-discover) takes ~10s, so it runs in a background
+        thread and the page shows the last result — the render never blocks.
+        Refreshes at most every ~3 min, and only while this page is on screen."""
+        st = getattr(self, '_netdiag_dhcp_state', None)
+        if st is None:
+            st = self._netdiag_dhcp_state = {'ts': 0, 'data': None, 'scanning': False}
+        now = time.time()
+        if not st['scanning'] and (now - st['ts']) > 180:
+            st['scanning'] = True
+
+            def _worker():
+                try:
+                    import network_diagnostics as nd
+                    d = nd.do_dhcp_guardian(quick=True)   # rogue-server only, fast-ish
+                except Exception as e:
+                    logger.debug(f"netdiag dhcp fetch error: {e}")
+                    d = None
+                if d:
+                    st['data'] = d
+                st['ts'] = time.time()
+                st['scanning'] = False
+
+            threading.Thread(target=_worker, daemon=True).start()
+        return st
+
     def _render_netdiag_page(self, image, draw, page, frozen=False):
         """Render one Ethernet network-diagnostic sub-page. Space on the panel
         is scarce, so each page shows only the handful of facts an engineer
         actually needs when diagnosing a switch port."""
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         data = self._get_cached_page_data('netdiag', self._fetch_netdiag_data, ttl=10)
-        names = ["LINK", "IP", "SWITCH"]
+        names = ["LINK", "IP", "SWITCH", "DHCP"]
         name = names[page % len(names)]
         state = "PAUSED" if frozen else "auto5s"
         self._draw_page_frame(draw, f"NET {name}",
@@ -967,7 +994,7 @@ class Display:
                 rows.append(("DNS#2", dns[1]))
             self._draw_stat_rows(draw, y, rows)
 
-        else:  # page 2: SWITCH — LLDP/CDP neighbour + PoE
+        elif page == 2:  # SWITCH — LLDP/CDP neighbour + PoE
             lldp = data.get('lldp') or {}
             if not lldp.get('installed', True):
                 self._draw_stat_rows(draw, y, [("LLDP", "not installed"),
@@ -1002,6 +1029,30 @@ class Display:
                 ("Proto", n.get('protocol') or '—'),
                 ("Mgmt IP", n.get('mgmt_ip') or '—'),
             ])
+
+        else:  # page 3: DHCP — rogue-server / snooping watch
+            st = self._netdiag_dhcp()
+            d = st.get('data')
+            if not d:
+                self._draw_stat_rows(draw, y, [
+                    ("DHCP", "scanning..." if st.get('scanning') else "no data"),
+                    ("Wait", "~10s"),
+                ])
+                return
+            servers = d.get('servers') or []
+            verdict = str(d.get('verdict', '?')).upper()
+            rows = [
+                ("Verdict", verdict),
+                ("Servers", str(d.get('server_count', 0))),
+            ]
+            if servers:
+                s0 = servers[0]
+                rows.append(("Server", s0.get('server_id') or '—'))
+                rows.append(("Offers GW", s0.get('router') or '—'))
+            rows.append(("Your GW", d.get('gateway') or '—'))
+            if d.get('rogue_count'):
+                rows.append(("ROGUE!", str(d.get('rogue_count'))))
+            self._draw_stat_rows(draw, y, rows)
 
     def _draw_wrapped_note(self, draw, y, text, max_lines=3):
         """Word-wrap a short note across up to max_lines using the small font."""

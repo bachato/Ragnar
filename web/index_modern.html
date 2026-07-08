@@ -1147,9 +1147,9 @@
                             <h3 class="text-lg font-semibold">E-Paper Network Diagnostic Mode</h3>
                             <p class="text-sm text-gray-400">Turns the e-Paper display into an Ethernet-focused field tool — link speed/duplex, addressing, and the switch port you're plugged into (LLDP/CDP + PoE). Works with no internet and auto-cycles pages every 5&nbsp;seconds. Ideal for diagnosing a switch on-site.</p>
                         </div>
-                        <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                        <label class="toggle-switch relative inline-flex items-center cursor-pointer shrink-0">
                             <input type="checkbox" id="netdiag-display-enabled" class="sr-only peer" onchange="onNetDiagDisplayToggled(this)">
-                            <div class="w-11 h-6 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                            <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
                         </label>
                     </div>
                     <p id="netdiag-display-note" class="text-xs text-gray-500 mt-2 hidden">Active — the e-Paper is showing the network diagnostic screen. Turn off to restore the normal display.</p>
@@ -1159,17 +1159,17 @@
                     <div class="flex items-center justify-between gap-4">
                         <div class="min-w-0">
                             <h3 class="text-lg font-semibold">Network Integrity Monitor</h3>
-                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong> and <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) in the background, and sends a Pushover alert if the verdict goes bad. Makes outbound DNS/DoH calls each cycle — off by default.</p>
+                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong>, <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) and <strong>rogue DHCP servers</strong> in the background, and sends a Pushover alert if the verdict goes bad. Makes outbound DNS/DoH calls each cycle — off by default.</p>
                         </div>
-                        <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                        <label class="toggle-switch relative inline-flex items-center cursor-pointer shrink-0">
                             <input type="checkbox" id="netint-enabled" class="sr-only peer" onchange="onNetIntegrityToggled(this)">
-                            <div class="w-11 h-6 bg-slate-600 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                            <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
                         </label>
                     </div>
                     <div id="netint-status" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
                     <div class="mt-3 flex flex-wrap items-center gap-2">
                         <button onclick="netIntegrityRefresh(true)" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Check now</button>
-                        <span class="text-xs text-gray-500">Runs the DNS Doctor and ARP Poisoning checks below.</span>
+                        <span class="text-xs text-gray-500">Runs the DNS Doctor, ARP Poisoning and DHCP Guardian checks below.</span>
                     </div>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
@@ -1365,6 +1365,54 @@
                         <button onclick="exportArpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button>
                     </div>
                     <div id="arp-results" class="hidden mt-3 overflow-x-auto"></div>
+                </div>
+                <!-- DHCP Guardian -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">DHCP Guardian</h3>
+                    <p class="text-xs text-amber-300/90 mb-2">DHCP-snooping-style monitor — detection-only, never runs a DHCP server. Detects <strong>rogue / fake DHCP servers</strong> (a second server, or one handing out the wrong gateway/DNS — a turnkey MITM) and <strong>DHCP starvation</strong> (pool-exhaustion floods). Cross-checks the offered gateway against the ARP baseline for a combined DHCP+ARP MITM signal.</p>
+                    <p class="text-sm text-gray-400 mb-3">Provokes every DHCP server on the segment to reply (<span class="font-mono">broadcast-dhcp-discover</span>) and passively watches for a DISCOVER flood. The first scan learns the current server as the trusted baseline (<span class="font-mono">data/dhcp_baseline.json</span>); after a legitimate DHCP/router change, click "Trust current server".</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="dhcp-iface" title="Interface for the DHCP scan — pick your WiFi or LAN NIC to scan that segment" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <button onclick="runDhcpGuardian()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan DHCP</button>
+                        <button onclick="dhcpTrustCurrent()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Set the current DHCP server(s) as the trusted baseline — use after a legitimate DHCP-server / router change">Trust current server</button>
+                    </div>
+                    <div id="dhcp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- DHCP Snooping (inline bridge) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                        <h3 class="text-lg font-semibold">DHCP Snooping <span class="text-xs font-normal text-gray-500">(inline bridge)</span></h3>
+                        <button onclick="dhcpSnoopStatus()" class="text-xs text-cyan-400 hover:text-cyan-300 underline whitespace-nowrap">Refresh status</button>
+                    </div>
+                    <p class="text-xs text-amber-300/90 mb-2 mt-1">Enterprise-grade, detection-only. With two NICs <strong>bridged inline</strong> (Pi sits between the client segment and the uplink), every DHCP packet transits the box per port. A DHCP <strong>server</strong> reply (OFFER/ACK) arriving on the <strong>untrusted</strong> (client) port is a rogue server by definition — zero false positives — and OFFER/ACKs build a live <strong>binding table</strong> (MAC ↔ IP ↔ lease ↔ port).</p>
+                    <p class="text-sm text-gray-400 mb-3">Mark the uplink NIC (toward the real DHCP server) <em>trusted</em> and the client NIC <em>untrusted</em>. Bring your own bridge/SPAN, or create one below from two wired NICs. <span class="text-amber-400">Inline blocking is intentionally not enabled — this only detects.</span></p>
+                    <div id="dhcp-snoop-status" class="text-xs text-gray-400 mb-3">Loading status…</div>
+                    <div class="flex flex-wrap items-end gap-2 mb-3">
+                        <label class="text-xs text-gray-400">Trusted (uplink)
+                            <select id="snoop-trusted" class="mt-1 block w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                        </label>
+                        <label class="text-xs text-gray-400">Untrusted (client)
+                            <select id="snoop-untrusted" class="mt-1 block w-full sm:w-40 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                        </label>
+                        <button onclick="dhcpSnoopSavePorts()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Save ports</button>
+                        <input id="snoop-secs" type="number" min="4" max="60" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runDhcpSnoop()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Snoop now</button>
+                    </div>
+                    <details class="mb-2">
+                        <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">Advanced: create / remove the inline bridge (rgsnoop0)</summary>
+                        <div class="mt-2 p-3 rounded border border-amber-900/60 bg-amber-950/20">
+                            <p class="text-xs text-amber-300/90 mb-2">Enslaves two wired NICs into a bridge so the box is inline. Refuses the management / default-route / wireless interface. <span class="text-amber-400">Only do this on a Pi actually cabled inline — the two NICs' segments become one L2 domain.</span></p>
+                            <div class="flex flex-wrap items-end gap-2">
+                                <select id="snoop-brA" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                                <select id="snoop-brB" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"></select>
+                                <button onclick="dhcpSnoopBridge('create')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Create bridge</button>
+                                <button onclick="dhcpSnoopBridge('destroy')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Remove bridge</button>
+                            </div>
+                        </div>
+                    </details>
+                    <div id="dhcp-snoop-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="mb-3">
@@ -4571,9 +4619,9 @@
                         <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
                                 <h4 class="font-medium">Web Terminal</h4>
-                                <label class="relative inline-flex items-center cursor-pointer">
+                                <label class="toggle-switch relative inline-flex items-center cursor-pointer">
                                     <input type="checkbox" id="terminal-enabled" class="sr-only peer" onchange="onTerminalToggled(this)">
-                                    <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-Ragnar-600"></div>
+                                    <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
                                 </label>
                             </div>
                             <div class="text-sm text-gray-400 mb-2">
@@ -4588,9 +4636,9 @@
                         <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
                                 <h4 class="font-medium">WiFi Sensing (RuSense)</h4>
-                                <label class="relative inline-flex items-center cursor-pointer">
+                                <label class="toggle-switch relative inline-flex items-center cursor-pointer">
                                     <input type="checkbox" id="rusense-tab-enabled" class="sr-only peer" onchange="onRusenseTabToggled(this)">
-                                    <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+                                    <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
                                 </label>
                             </div>
                             <div class="text-sm text-gray-400 mb-3">
@@ -4627,9 +4675,9 @@
                         <div class="glass rounded-lg p-4">
                             <div class="flex items-center justify-between mb-3">
                                 <h4 class="font-medium">On-screen Display</h4>
-                                <label class="relative inline-flex items-center cursor-pointer">
+                                <label class="toggle-switch relative inline-flex items-center cursor-pointer">
                                     <input type="checkbox" id="kiosk-enabled" class="sr-only peer" onchange="onKioskEnabledToggled(this)">
-                                    <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-cyan-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+                                    <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
                                 </label>
                             </div>
                             <div class="text-sm text-gray-400 mb-3">
@@ -5654,7 +5702,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260708-macwatch-csv"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260708-dhcp-snoop"></script>
 
 </body>
 </html>

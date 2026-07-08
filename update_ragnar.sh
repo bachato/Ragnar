@@ -158,6 +158,75 @@ if [ -f "$SENSING_UNIT" ] && grep -q '^ExecStartPre=/bin/mkdir' "$SENSING_UNIT";
     echo -e "${GREEN}Patched ragnar-sensing.service with ownership self-heal.${NC}"
 fi
 
+# Lift the multi-node fusion guard from the old 200 ms to 350 ms — field logs
+# showed real-world timestamp spread reaching ~330 ms, so 200 ms rejected fusion
+# cycles ("Timestamp spread exceeds guard interval"). Only rewrites the exact old
+# default, so a hand-tuned value is left alone; idempotent.
+if [ -f "$SENSING_UNIT" ] && grep -q '^Environment=WDP_GUARD_INTERVAL_US=200000' "$SENSING_UNIT"; then
+    sed -i 's|^Environment=WDP_GUARD_INTERVAL_US=200000|Environment=WDP_GUARD_INTERVAL_US=350000|' "$SENSING_UNIT"
+    systemctl daemon-reload
+    systemctl try-restart ragnar-sensing.service 2>/dev/null || true
+    echo -e "${GREEN}Raised sensing fusion guard to 350 ms (was 200 ms).${NC}"
+fi
+
+echo -e "${BLUE}Step 6.6: Ensuring hardware watchdog (auto-reboot on hard hang)...${NC}"
+# Unattended / inline devices should reboot fast if the Pi wedges rather than
+# black-holing the link. Enable the BCM watchdog and have systemd pet it.
+# Idempotent; the config.txt bit applies on the next reboot.
+BOOT_CFG=""
+for c in /boot/firmware/config.txt /boot/config.txt; do
+    [ -f "$c" ] && { BOOT_CFG="$c"; break; }
+done
+if [ -n "$BOOT_CFG" ] && ! grep -q '^dtparam=watchdog=on' "$BOOT_CFG"; then
+    echo 'dtparam=watchdog=on' >> "$BOOT_CFG"
+    echo -e "  ${GREEN}✓${NC} Enabled dtparam=watchdog=on in $BOOT_CFG (reboot to apply)"
+fi
+if [ -f /etc/systemd/system.conf ]; then
+    sed -i '/^#\?RuntimeWatchdogSec=/d;/^#\?RebootWatchdogSec=/d' /etc/systemd/system.conf
+    printf 'RuntimeWatchdogSec=15\nRebootWatchdogSec=2min\n' >> /etc/systemd/system.conf
+    systemctl daemon-reexec 2>/dev/null || true
+    echo -e "  ${GREEN}✓${NC} systemd watchdog set (RuntimeWatchdogSec=15)"
+fi
+
+echo -e "${BLUE}Step 6.7: Refreshing kiosk wrapper (if installed)...${NC}"
+# Existing kiosk installs keep a COPY of the wrapper at /usr/local/bin; the
+# active copy only updates when kiosk is re-installed. Refresh it here so the
+# Pi Zero2W/4/5 hardening reaches boxes that just `git pull` + update.
+KIOSK_WRAPPER_SRC="$ragnar_PATH/scripts/ragnar_kiosk_run.sh"
+if [ -f /usr/local/bin/ragnar-kiosk-run ] && [ -f "$KIOSK_WRAPPER_SRC" ]; then
+    install -m 0755 "$KIOSK_WRAPPER_SRC" /usr/local/bin/ragnar-kiosk-run
+    echo -e "  ${GREEN}✓${NC} Kiosk wrapper refreshed from repo"
+    # Seed the on-screen keyboard so touchscreen typing works on existing kiosk
+    # installs too (not just fresh installs). Best-effort, guarded, idempotent:
+    # squeekboard for the Wayland/autostart path, matchbox-keyboard for the X
+    # service path. The wrapper only launches it when a touchscreen is detected.
+    if [ -f /etc/systemd/system/ragnar-kiosk.service ]; then
+        OSK_PKG="matchbox-keyboard"; command -v matchbox-keyboard >/dev/null 2>&1 && OSK_PKG=""
+    else
+        OSK_PKG="squeekboard"; command -v squeekboard >/dev/null 2>&1 && OSK_PKG=""
+    fi
+    if [ -n "$OSK_PKG" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$OSK_PKG" >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓${NC} On-screen keyboard installed ($OSK_PKG)" \
+            || echo -e "  ${YELLOW}⚠${NC} Could not install on-screen keyboard ($OSK_PKG)"
+    fi
+    # Cap the kiosk restart loop on existing service-mode installs (drop-in, so
+    # we don't rewrite the generated unit). Idempotent.
+    if [ -f /etc/systemd/system/ragnar-kiosk.service ]; then
+        install -d -m 0755 /etc/systemd/system/ragnar-kiosk.service.d
+        cat > /etc/systemd/system/ragnar-kiosk.service.d/10-restart-limit.conf <<'DROPIN'
+[Unit]
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+RestartSec=10
+DROPIN
+        systemctl daemon-reload 2>/dev/null || true
+        echo -e "  ${GREEN}✓${NC} Kiosk restart-loop cap applied (drop-in)"
+    fi
+fi
+
 echo -e "${BLUE}Step 6.5: Validating actions.json configuration...${NC}"
 python3 << 'PYTHON_EOF'
 import json

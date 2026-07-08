@@ -164,9 +164,11 @@ Environment=RUVIEW_NONVOTING_NODES=1
 # Multi-node fusion guard: WiFi/ESP-NOW-synced ESP32 nodes drift 10-150 ms
 # (100 ms beacon + WiFi-MAC jitter), which blows past the engine's 60 ms default
 # and makes fusion reject every frame ("Timestamp spread ... exceeds guard
-# interval") -> source flips to esp32:offline. Lift the hard guard to 200 ms
-# (RuView's own #1049 escape hatch) so real-world CSI meshes actually fuse.
-Environment=WDP_GUARD_INTERVAL_US=200000
+# interval") -> source flips to esp32:offline. Field logs show the real-world
+# spread reaching 200-330 ms, so 200 ms still rejected cycles; lift to 350 ms.
+# Raising the ceiling only affects meshes that were exceeding it (they now fuse
+# instead of dropping the cycle); a well-synced mesh fuses the same frames.
+Environment=WDP_GUARD_INTERVAL_US=350000
 ExecStart=$INSTALL_BIN --source $SOURCE --tick-ms $TICK_MS --ui-path $UI_PATH --http-port $HTTP_PORT --ws-port $WS_PORT --udp-port $UDP_PORT --bind-addr 0.0.0.0
 Restart=on-failure
 RestartSec=3

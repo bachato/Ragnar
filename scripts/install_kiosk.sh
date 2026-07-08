@@ -28,6 +28,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "[kiosk-install] starting at $(date -Iseconds)"
 echo "[kiosk-install] repo root: $REPO_ROOT"
+echo "[kiosk-install] board: $(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown) | RAM: $(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)MB"
 
 # Detect if a desktop session is already running on this Pi.
 detect_desktop_mode() {
@@ -137,6 +138,13 @@ if [[ "$MODE" == "service" ]]; then
         echo "[kiosk-install] no X detected — adding minimal X stack"
         PKGS_TO_INSTALL+=(xserver-xorg xinit x11-xserver-utils openbox)
     fi
+    # xserver-xorg-legacy provides the suid Xorg.wrap that lets a non-root user
+    # start X (our needs_root_rights=yes + allowed_users=anybody below). On Pi OS
+    # Bookworm — the default on Pi 5 — X is rootless by default and this package
+    # isn't pulled in, so the kiosk service fails to start X without it.
+    if [[ ! -f /usr/lib/xorg/Xorg.wrap ]] && ! dpkg -s xserver-xorg-legacy >/dev/null 2>&1; then
+        PKGS_TO_INSTALL+=(xserver-xorg-legacy)
+    fi
     if ! command -v xauth >/dev/null 2>&1; then
         PKGS_TO_INSTALL+=(xauth)
     fi
@@ -152,6 +160,23 @@ if [[ "${#PKGS_TO_INSTALL[@]}" -gt 0 ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PKGS_TO_INSTALL[@]}"
 else
     echo "[kiosk-install] all required packages already present"
+fi
+
+# On-screen keyboard so a touchscreen kiosk can type (login, terminal, WiFi
+# passphrases). Installed best-effort — a missing package must never block the
+# kiosk. The wrapper only launches it when it actually detects a touchscreen.
+#   - autostart/Wayland (Pi OS Bookworm desktop) -> squeekboard (focus-following)
+#   - service/X (Pi OS Lite)                      -> matchbox-keyboard (lightweight)
+OSK_PKG=""
+if [[ "$MODE" == "autostart" ]]; then
+    command -v squeekboard >/dev/null 2>&1 || OSK_PKG="squeekboard"
+else
+    command -v matchbox-keyboard >/dev/null 2>&1 || OSK_PKG="matchbox-keyboard"
+fi
+if [[ -n "$OSK_PKG" ]]; then
+    echo "[kiosk-install] installing on-screen keyboard: $OSK_PKG (best-effort, for touchscreens)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$OSK_PKG" \
+        || echo "[kiosk-install] WARN: could not install $OSK_PKG — touch keyboard unavailable"
 fi
 
 # Re-detect browser after install
@@ -249,6 +274,10 @@ cat > "$SERVICE_FILE" <<EOF
 Description=Ragnar on-screen kiosk (Chromium fullscreen)
 After=network-online.target ragnar.service
 Wants=network-online.target
+# Cap the restart loop: if it fails 5 times in 2 minutes, stop and stay stopped
+# instead of hammering (a broken kiosk should surface, not spin 89 times).
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -264,7 +293,8 @@ Environment=RAGNAR_BROWSER=$BROWSER_BIN
 ExecStartPre=+/bin/sh -c 'rm -f /tmp/.X0-lock; rm -rf /tmp/.X11-unix/X0'
 ExecStart=$WRAPPER_DST
 Restart=on-failure
-RestartSec=5
+# 10s (not 5) so a dying Xorg releases the VT/DRM master before the next start.
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
