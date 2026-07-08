@@ -28,6 +28,7 @@ alert.
 | [WHOIS](#whois) | Diagnostics | `POST /api/net/whois` |
 | [DNS Doctor (poisoning check)](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
 | [ARP Poisoning](#arp-poisoning) | Diagnostics | `GET /api/net/arp-check`, `/arp-baseline` |
+| [MAC Watch](#mac-watch) | Diagnostics | `GET /api/net/mac-watch`, `POST /api/net/mac-watch-reset` |
 | [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
 | [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
 | [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
@@ -213,6 +214,59 @@ is the *active* complement to the passive duplicate-IP check in
 
 - Endpoints: `GET /api/net/arp-check`,
   `GET|POST /api/net/arp-baseline` `{action:reset}` · uses `ip neigh` (iproute2)
+
+### MAC Watch
+**Detection-only** MAC-spoofing + randomization monitor — it *never spoofs or
+randomizes anything itself*. Passive: it reads the kernel neighbour table
+(`ip neigh`) and, optionally, runs an `arp-scan` sweep to widen coverage. Three
+jobs, rolled into one **clean / randomization / suspicious / spoofed** verdict:
+
+1. **Spoofing / cloning** (current *and* past):
+   - **Disguised vendor** — a registered vendor OUI wearing the
+     locally-administered (LAA) bit. A real OUI can't legitimately carry that
+     bit, so it's the classic MAC-spoof signature → **spoofed**. Detected by
+     clearing the LAA bit and matching the underlying OUI against the vendor DB.
+   - **Clone** — one MAC bound to several IPs at once (the gateway is excluded).
+   - **Past spoofing** — an IP whose MAC *changed identity* over time. History
+     is persisted (`data/mac_watch.json`), so identity flips survive restarts;
+     a randomized↔randomized flip is treated as benign privacy rotation, not a
+     spoof.
+2. **Randomization** — privacy (LAA, vendor-less) MACs are reported as an
+   **aggregate inventory** (count · short-lived/ephemeral · virtual/VM), not one
+   finding per MAC, so a Wi-Fi segment full of iPhones doesn't bury a real
+   spoof. Docker / QEMU / VirtualBox / Parallels ranges are bucketed separately.
+3. **Tracking** — an IP that cycles through **≥2 randomized MACs** over time is
+   one device rotating to hide; its addresses are grouped into a followable
+   track so it can be traced across the MACs it hides behind.
+
+Every MAC is classified as **Vendor** (universal/burned-in), **Spoofed**
+(vendor OUI + LAA bit), **Randomized** (privacy), or **Virtual/VM**. Vendor
+names come from the `arp-scan` / `nmap` OUI database
+(`/usr/share/arp-scan/ieee-oui.txt`, ~35k prefixes) with a built-in seed
+fallback; the table is filtered to universal prefixes only so an LAA range in a
+full manuf file can't be mistaken for a real vendor. This host's own NIC MACs
+are always excluded.
+
+- **Interface selector** — *Auto (default route)* or a specific NIC
+  (WiFi / LAN labelled). It targets the `arp-scan` sweep at that segment; the
+  neighbour-table read is kernel-global. The result shows the exact **source**
+  (`arp-scan sweep on wlan0` vs `neighbour table (all interfaces)`).
+- **Scan** runs the sweep; **Quick** reads the neighbour table only (no traffic
+  generated, works unprivileged); **Reset history** clears the store;
+  **Export CSV** downloads every observed MAC (MAC · type · vendor · IPs · flag
+  · note), the scanned interface in the filename.
+- Results list all findings — spoofed, cloned, tracked devices, past MAC
+  changes, the randomization inventory — plus a **full table of every MAC
+  observed**, worst class first.
+
+Cross-MAC tracking here is **IP-anchored and capture-free** — honest but
+limited. True device tracking across a MAC *and* IP change needs 802.11
+probe-request fingerprinting, which is monitor-mode only; MAC Watch labels its
+tracking as the neighbour-table approximation.
+
+- Endpoints: `GET /api/net/mac-watch` `?scan=0|1&interface=<if>`,
+  `POST /api/net/mac-watch-reset` · store: `data/mac_watch.json` · uses
+  `ip neigh` (iproute2) + optional `arp-scan`; OUI DB from `arp-scan`/`nmap`
 
 ### 🛡️ Network Integrity Monitor
 The one **passive, alerting** tool in the suite (everything else is on-demand).
@@ -582,8 +636,8 @@ alone would miss".
   lookups) are always explicit, button-triggered actions. The single background
   poller is the opt-in [Network Integrity Monitor](#-network-integrity-monitor),
   which is off unless you enable it.
-- **CSV export** is available for the Switch Discovery, ARP Scan, Interfaces,
-  Network Identity and ISP / WAN tables.
+- **CSV export** is available for the Switch Discovery, ARP Scan, MAC Watch,
+  Interfaces, Network Identity and ISP / WAN tables.
 - **Offline-capable.** Everything except the internet-facing tools (Speed Test,
   ISP/WAN detection, DoH/DoT reachability) works with no internet at all —
   ping/MTR to local hosts, DNS against local resolvers, LLDP/PoE, ARP scan,
