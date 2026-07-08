@@ -1272,6 +1272,7 @@
                             <button onclick="runMacWatch(true)" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan (arp-scan sweep)</button>
                             <button onclick="runMacWatch(false)" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Read the kernel neighbour table only — no traffic generated">Quick (neighbour table)</button>
                             <button onclick="macWatchReset()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Clear the MAC-watch history (first/last-seen, per-IP history, change events)">Reset history</button>
+                            <button onclick="exportMacWatchCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Download the observed MACs as CSV">Export CSV</button>
                         </div>
                         <div id="macwatch-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                     </div>
@@ -5653,7 +5654,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260708-macwatch-list"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260708-macwatch-csv"></script>
 
 </body>
 </html>
