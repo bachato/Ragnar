@@ -188,7 +188,9 @@ page (tap) or restart the service (hold).
 
 ## 🩺 Diagnostics
 
-Reachability, path and bandwidth testing to any target.
+Reachability, path and bandwidth testing to any target — plus application-layer
+service-security checks (**NTP** time integrity, **SNMP** cleartext exposure, and
+**TLS/certificate** hygiene).
 
 ### Ping
 ICMP echo to a host or IP. Reports the raw output plus a parsed summary
@@ -413,6 +415,172 @@ TWAMP/OWAMP SLA testing is a natural next step but needs a cooperating reflector
 on the far end.)
 
 - Endpoint: `POST /api/net/ptp` `{interface, seconds}` · binary: `tcpdump`
+
+### NTP Watch
+NTP (**UDP/123**) is the network's **clock of record**. It touches every layer, but
+the attack surface is **Layer-7**: a rogue NTP server that answers clients — or
+**broadcasts** — with the **wrong time** silently poisons every downstream
+timestamp. Wrong time breaks **TLS / Kerberos validity windows**, invalidates
+**MFA/TOTP** codes, corrupts **audit logs**, and — in a precision-critical shop
+(medical lab, finance, industrial control) — falsifies **lab-result and
+chain-of-custody records**, where a few seconds of skew is a real incident. Yet
+almost nobody watches 123. This scanner is **passive and detection-only**: it never
+sends an NTP query. One short `tcpdump` window over `udp port 123` (captured with a
+per-packet Unix timestamp via `-tt`) is parsed and classified:
+
+- **Time injection** — a source whose served **transmit timestamp** disagrees with
+  the **segment consensus** (the median of all sources) — or, when only one source
+  is seen, with the **local clock** — beyond a threshold (default **2 s**; honest
+  sources agree to well under a second passively). This is the core attack: someone
+  is serving a skewed clock. If *every* source agrees but all disagree with the
+  local clock, that's flagged too (the host clock is wrong, or all sources shifted).
+- **Rogue server** — an NTP server answering on the segment that **isn't in the
+  learned baseline**. Clients may silently prefer it.
+- **Kiss-o'-Death** — a **stratum-0** reply (RFC 5905 KoD, e.g. `RATE` / `DENY`). A
+  rogue uses KoD to make clients **back off legitimate time sources** — a time-sync
+  DoS that softens them up for a rogue server.
+- **Stratum spoof** — a source claiming **Stratum 1** (primary / GPS reference) it
+  shouldn't, or a known server **lowering its stratum** to win client preference.
+- **Broadcast** — a **mode-Broadcast** time source: hosts in broadcast client mode
+  accept it blindly, a classic injection vector on modern unicast networks.
+- **Recon** — NTP **mode 6/7** (`ntpq` control / `monlist`) traffic: reconnaissance
+  or amplification abuse.
+- **Anomaly** — an implausible **root dispersion**, a **leap-alarm** (unsynchronized)
+  source, or a **reference-ID loop** (refid equals the source's own address).
+
+The **first scan learns** the trusted time source(s) + their stratum into
+`data/ntp_watch.json`; after a legitimate NTP change, click **Trust current** to
+re-learn. Every result carries a **mitigation advisory**: pin clients to known
+servers (prefer authenticated **NTS** or symmetric keys), restrict UDP 123 to
+expected hosts, and disable `monitor` (mode 6/7) on servers.
+
+> Passive over a capture window, NTP Watch catches **gross time injection, rogue and
+> broadcast sources, KoD, and stratum/mode abuse** — not sub-millisecond clock
+> *discipline* accuracy (that needs an active, round-trip measurement). It answers
+> "**is something on this segment serving the wrong time, or trying to?**"
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py ntp-watch [--iface eth0] [--seconds 15] [--json]
+python3 network_diagnostics.py ntp-selftest    # self-test the detectors, no root
+```
+
+`ntp-selftest` drives the real parser + classifier with synthetic captures (clean /
+time-injection / rogue-server / kod / stratum-spoof / broadcast / recon / anomaly /
+parse), and — when [Scapy](https://scapy.net) is installed — crafts a real NTP
+server reply into a pcap and parses it back through `tcpdump`, exercising the
+capture→parse path end to end.
+
+- Endpoint: `GET /api/net/ntp-watch` `{interface, seconds}`,
+  `POST /api/net/ntp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### SNMP Watch
+SNMP **v1 and v2c** authenticate with a plaintext **community string** — effectively
+a device password carried in the clear on *every* request. Anyone passively sniffing
+the segment harvests it: the **read** community (very often the default `public`)
+exposes the full device config / MIB, and a **write** community — revealed the moment
+a `SetRequest` crosses the wire — lets an attacker who captured it **reconfigure the
+device**: change routes, ACLs, SNMP itself, or bounce interfaces. **v3** fixes this
+with the User Security Model (authentication + privacy/encryption). This scanner is
+**passive and detection-only**: one short `tcpdump` window over UDP **161/162**,
+parsed and classified. It never sends an SNMP request. What it flags:
+
+- **Write-exposed** — a `SetRequest` in v1/v2c: a **write community is on the wire**,
+  i.e. sniff it and you own the device. The most severe finding.
+- **Cleartext** — any v1/v2c traffic: the community string is exposed. Worse when
+  it's a **well-known default** (`public`, `private`, `community`, `cisco`, …) —
+  trivially guessable even without a sniffer. The community strings actually seen are
+  listed so you know exactly what leaked.
+- **Amplification** — a `GetBulk` with a large **max-repetitions**: the SNMP
+  reflection / amplification DDoS vector (a small request eliciting a huge response).
+- **Enumeration** — one host issuing many `GetNext` / `GetBulk` requests: walking the
+  MIB (SNMP reconnaissance).
+- **Clean** — only **SNMPv3** (authenticated/encrypted), or no SNMP at all.
+
+The parser reads tcpdump's SNMP decode, including its convention of **omitting
+`C="…"` for the default `public` community** (so a v1/v2c message with no community
+shown is correctly treated as `public`). The first scan learns the segment's SNMP
+**agents + community strings** into `data/snmp_watch.json` so later scans can
+highlight **new** exposure (a new insecure agent or a new community appearing);
+**Trust current** re-learns. The verdict always reflects the cleartext reality —
+v1/v2c is insecure regardless of baseline. Every result carries a **mitigation
+advisory**: migrate to **SNMPv3 (authPriv, SHA + AES)**; if v1/v2c must remain,
+confine SNMP to a management VLAN with ACLs, use unique non-default read-only
+community strings, and disable SNMP on devices that don't need it.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py snmp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py snmp-selftest    # self-test the detectors, no root
+```
+
+`snmp-selftest` drives the real parser + classifier with synthetic captures (clean /
+cleartext / write-exposed / amplification / enumeration / parse), and — when
+[Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set messages into
+a pcap and parses them back through `tcpdump`, confirming the `public`-hidden
+inference and write-community detection end to end.
+
+- Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
+  `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### TLS Watch
+Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
+hypervisors, printers, IoT — with certificates **nobody audits**: long expired,
+self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive
+scanners in this guide, a certificate checker is inherently **active** — it must
+complete a TLS handshake to read the cert, and **TLS 1.3 encrypts the Certificate
+message**, so passive sniffing can't read modern certs at all. It therefore lives in
+the **Diagnostics** tab with the other active tools (ping / traceroute / speed test),
+and runs in two phases:
+
+- **Passive discovery** (optional, tick *Discover*) — one short `tcpdump` window over
+  TLS **ClientHellos** to find the TLS servers active on the segment (server
+  **IP:port + SNI**), so you don't have to type them. Best-effort; the SNI is still in
+  the clear in the ClientHello even under TLS 1.3. Needs Scapy's TLS layer for SNI,
+  else falls back to server IP:port.
+- **Active grading** — connect to each target (typed as `host` / `host:port`, and/or
+  discovered), fetch the presented certificate **even when it fails validation** (an
+  unverified fallback fetch), and grade it. Chain trust is checked against the system
+  CA store; hostname matching (wildcard-aware, SAN then CN) is done independently so
+  *why* a cert is bad is unambiguous.
+
+Per-target verdicts, worst first: **expired** · **not-yet-valid** · **self-signed** ·
+**untrusted** (chain doesn't build to a trusted CA — private CA or missing
+intermediate) · **hostname-mismatch** · **weak-crypto** (SHA-1/MD5 signature,
+RSA < 2048, or a weak/anon/NULL/RC4/DES cipher) · **deprecated-tls** (SSLv3 / TLS 1.0 /
+TLS 1.1 negotiated) · **expiring** (valid but < 21 days left) · **valid**. Each result
+carries the subject / issuer / SAN, validity dates + days-remaining, key type + size,
+signature algorithm, and the negotiated protocol + cipher. A learned **fingerprint
+baseline** (`data/tls_watch.json`, per `host:port`) flags a certificate that
+**changed** between scans — a rotation, or a possible **MITM** — and *Trust current*
+re-learns. Targets are always explicit (typed, or discovered on your own segment), and
+runs are capped — this is device-hygiene auditing of your own network, not a scanner.
+
+Uses Python's `ssl` + the `cryptography` library (no external binary for grading;
+`tcpdump` is only needed for the optional discovery phase). Every result carries a
+**mitigation advisory**: re-issue from a trusted internal CA (or ACME/Let's Encrypt
+for internet-facing services), put every hostname/IP in the SAN, use RSA ≥ 2048 or
+ECDSA P-256 with SHA-256+, disable TLS 1.0/1.1, and automate renewal.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py tls-watch router.local 192.168.1.1:443 nas:5001
+python3 network_diagnostics.py tls-watch --discover --iface eth0    # find + grade
+python3 network_diagnostics.py tls-selftest    # self-test the grader, no root
+```
+
+`tls-selftest` drives the real classifier with synthetic certs built by
+`cryptography` (valid / expired / not-yet-valid / self-signed / untrusted /
+hostname-mismatch / weak-crypto / deprecated-tls / expiring / wildcard-match), then
+runs an **end-to-end** leg that starts a local TLS server with a self-signed cert and
+grades it through the real handshake path — no root, no network.
+
+- Endpoint: `POST /api/net/tls-watch` `{targets, discover, interface, seconds}`,
+  `POST /api/net/tls-baseline` `{action: reset}` · Python: `cryptography` ·
+  binary: `tcpdump` (discovery only)
 
 ## 🔌 Switch & L2/L3
 
@@ -657,65 +825,6 @@ exercising the capture→parse path end to end.
 - Endpoint: `GET /api/net/ipv6-watch` `{interface, seconds}`,
   `POST /api/net/ipv6-baseline` `{action: reset}` · binary: `tcpdump`
 
-### NTP Watch
-NTP (**UDP/123**) is the network's **clock of record**. It touches every layer, but
-the attack surface is **Layer-7**: a rogue NTP server that answers clients — or
-**broadcasts** — with the **wrong time** silently poisons every downstream
-timestamp. Wrong time breaks **TLS / Kerberos validity windows**, invalidates
-**MFA/TOTP** codes, corrupts **audit logs**, and — in a precision-critical shop
-(medical lab, finance, industrial control) — falsifies **lab-result and
-chain-of-custody records**, where a few seconds of skew is a real incident. Yet
-almost nobody watches 123. This scanner is **passive and detection-only**: it never
-sends an NTP query. One short `tcpdump` window over `udp port 123` (captured with a
-per-packet Unix timestamp via `-tt`) is parsed and classified:
-
-- **Time injection** — a source whose served **transmit timestamp** disagrees with
-  the **segment consensus** (the median of all sources) — or, when only one source
-  is seen, with the **local clock** — beyond a threshold (default **2 s**; honest
-  sources agree to well under a second passively). This is the core attack: someone
-  is serving a skewed clock. If *every* source agrees but all disagree with the
-  local clock, that's flagged too (the host clock is wrong, or all sources shifted).
-- **Rogue server** — an NTP server answering on the segment that **isn't in the
-  learned baseline**. Clients may silently prefer it.
-- **Kiss-o'-Death** — a **stratum-0** reply (RFC 5905 KoD, e.g. `RATE` / `DENY`). A
-  rogue uses KoD to make clients **back off legitimate time sources** — a time-sync
-  DoS that softens them up for a rogue server.
-- **Stratum spoof** — a source claiming **Stratum 1** (primary / GPS reference) it
-  shouldn't, or a known server **lowering its stratum** to win client preference.
-- **Broadcast** — a **mode-Broadcast** time source: hosts in broadcast client mode
-  accept it blindly, a classic injection vector on modern unicast networks.
-- **Recon** — NTP **mode 6/7** (`ntpq` control / `monlist`) traffic: reconnaissance
-  or amplification abuse.
-- **Anomaly** — an implausible **root dispersion**, a **leap-alarm** (unsynchronized)
-  source, or a **reference-ID loop** (refid equals the source's own address).
-
-The **first scan learns** the trusted time source(s) + their stratum into
-`data/ntp_watch.json`; after a legitimate NTP change, click **Trust current** to
-re-learn. Every result carries a **mitigation advisory**: pin clients to known
-servers (prefer authenticated **NTS** or symmetric keys), restrict UDP 123 to
-expected hosts, and disable `monitor` (mode 6/7) on servers.
-
-> Passive over a capture window, NTP Watch catches **gross time injection, rogue and
-> broadcast sources, KoD, and stratum/mode abuse** — not sub-millisecond clock
-> *discipline* accuracy (that needs an active, round-trip measurement). It answers
-> "**is something on this segment serving the wrong time, or trying to?**"
-
-Small **CLI** (no web app needed):
-
-```
-python3 network_diagnostics.py ntp-watch [--iface eth0] [--seconds 15] [--json]
-python3 network_diagnostics.py ntp-selftest    # self-test the detectors, no root
-```
-
-`ntp-selftest` drives the real parser + classifier with synthetic captures (clean /
-time-injection / rogue-server / kod / stratum-spoof / broadcast / recon / anomaly /
-parse), and — when [Scapy](https://scapy.net) is installed — crafts a real NTP
-server reply into a pcap and parses it back through `tcpdump`, exercising the
-capture→parse path end to end.
-
-- Endpoint: `GET /api/net/ntp-watch` `{interface, seconds}`,
-  `POST /api/net/ntp-baseline` `{action: reset}` · binary: `tcpdump`
-
 ### ICMP Watch
 The **ICMP Redirect** (type 5) is the classic **Layer-3 man-in-the-middle**. Any
 host on the segment can forge a Redirect that appears to come from the real gateway
@@ -765,113 +874,6 @@ end.
 
 - Endpoint: `GET /api/net/icmp-watch` `{interface, seconds}`,
   `POST /api/net/icmp-baseline` `{action: reset}` · binary: `tcpdump`
-
-### SNMP Watch
-SNMP **v1 and v2c** authenticate with a plaintext **community string** — effectively
-a device password carried in the clear on *every* request. Anyone passively sniffing
-the segment harvests it: the **read** community (very often the default `public`)
-exposes the full device config / MIB, and a **write** community — revealed the moment
-a `SetRequest` crosses the wire — lets an attacker who captured it **reconfigure the
-device**: change routes, ACLs, SNMP itself, or bounce interfaces. **v3** fixes this
-with the User Security Model (authentication + privacy/encryption). This scanner is
-**passive and detection-only**: one short `tcpdump` window over UDP **161/162**,
-parsed and classified. It never sends an SNMP request. What it flags:
-
-- **Write-exposed** — a `SetRequest` in v1/v2c: a **write community is on the wire**,
-  i.e. sniff it and you own the device. The most severe finding.
-- **Cleartext** — any v1/v2c traffic: the community string is exposed. Worse when
-  it's a **well-known default** (`public`, `private`, `community`, `cisco`, …) —
-  trivially guessable even without a sniffer. The community strings actually seen are
-  listed so you know exactly what leaked.
-- **Amplification** — a `GetBulk` with a large **max-repetitions**: the SNMP
-  reflection / amplification DDoS vector (a small request eliciting a huge response).
-- **Enumeration** — one host issuing many `GetNext` / `GetBulk` requests: walking the
-  MIB (SNMP reconnaissance).
-- **Clean** — only **SNMPv3** (authenticated/encrypted), or no SNMP at all.
-
-The parser reads tcpdump's SNMP decode, including its convention of **omitting
-`C="…"` for the default `public` community** (so a v1/v2c message with no community
-shown is correctly treated as `public`). The first scan learns the segment's SNMP
-**agents + community strings** into `data/snmp_watch.json` so later scans can
-highlight **new** exposure (a new insecure agent or a new community appearing);
-**Trust current** re-learns. The verdict always reflects the cleartext reality —
-v1/v2c is insecure regardless of baseline. Every result carries a **mitigation
-advisory**: migrate to **SNMPv3 (authPriv, SHA + AES)**; if v1/v2c must remain,
-confine SNMP to a management VLAN with ACLs, use unique non-default read-only
-community strings, and disable SNMP on devices that don't need it.
-
-Small **CLI** (no web app needed):
-
-```
-python3 network_diagnostics.py snmp-watch [--iface eth0] [--seconds 12] [--json]
-python3 network_diagnostics.py snmp-selftest    # self-test the detectors, no root
-```
-
-`snmp-selftest` drives the real parser + classifier with synthetic captures (clean /
-cleartext / write-exposed / amplification / enumeration / parse), and — when
-[Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set messages into
-a pcap and parses them back through `tcpdump`, confirming the `public`-hidden
-inference and write-community detection end to end.
-
-- Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
-  `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
-
-### TLS Watch
-Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
-hypervisors, printers, IoT — with certificates **nobody audits**: long expired,
-self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive
-scanners in this guide, a certificate checker is inherently **active** — it must
-complete a TLS handshake to read the cert, and **TLS 1.3 encrypts the Certificate
-message**, so passive sniffing can't read modern certs at all. It therefore lives in
-the **Diagnostics** tab with the other active tools (ping / traceroute / speed test),
-and runs in two phases:
-
-- **Passive discovery** (optional, tick *Discover*) — one short `tcpdump` window over
-  TLS **ClientHellos** to find the TLS servers active on the segment (server
-  **IP:port + SNI**), so you don't have to type them. Best-effort; the SNI is still in
-  the clear in the ClientHello even under TLS 1.3. Needs Scapy's TLS layer for SNI,
-  else falls back to server IP:port.
-- **Active grading** — connect to each target (typed as `host` / `host:port`, and/or
-  discovered), fetch the presented certificate **even when it fails validation** (an
-  unverified fallback fetch), and grade it. Chain trust is checked against the system
-  CA store; hostname matching (wildcard-aware, SAN then CN) is done independently so
-  *why* a cert is bad is unambiguous.
-
-Per-target verdicts, worst first: **expired** · **not-yet-valid** · **self-signed** ·
-**untrusted** (chain doesn't build to a trusted CA — private CA or missing
-intermediate) · **hostname-mismatch** · **weak-crypto** (SHA-1/MD5 signature,
-RSA < 2048, or a weak/anon/NULL/RC4/DES cipher) · **deprecated-tls** (SSLv3 / TLS 1.0 /
-TLS 1.1 negotiated) · **expiring** (valid but < 21 days left) · **valid**. Each result
-carries the subject / issuer / SAN, validity dates + days-remaining, key type + size,
-signature algorithm, and the negotiated protocol + cipher. A learned **fingerprint
-baseline** (`data/tls_watch.json`, per `host:port`) flags a certificate that
-**changed** between scans — a rotation, or a possible **MITM** — and *Trust current*
-re-learns. Targets are always explicit (typed, or discovered on your own segment), and
-runs are capped — this is device-hygiene auditing of your own network, not a scanner.
-
-Uses Python's `ssl` + the `cryptography` library (no external binary for grading;
-`tcpdump` is only needed for the optional discovery phase). Every result carries a
-**mitigation advisory**: re-issue from a trusted internal CA (or ACME/Let's Encrypt
-for internet-facing services), put every hostname/IP in the SAN, use RSA ≥ 2048 or
-ECDSA P-256 with SHA-256+, disable TLS 1.0/1.1, and automate renewal.
-
-Small **CLI** (no web app needed):
-
-```
-python3 network_diagnostics.py tls-watch router.local 192.168.1.1:443 nas:5001
-python3 network_diagnostics.py tls-watch --discover --iface eth0    # find + grade
-python3 network_diagnostics.py tls-selftest    # self-test the grader, no root
-```
-
-`tls-selftest` drives the real classifier with synthetic certs built by
-`cryptography` (valid / expired / not-yet-valid / self-signed / untrusted /
-hostname-mismatch / weak-crypto / deprecated-tls / expiring / wildcard-match), then
-runs an **end-to-end** leg that starts a local TLS server with a self-signed cert and
-grades it through the real handshake path — no root, no network.
-
-- Endpoint: `POST /api/net/tls-watch` `{targets, discover, interface, seconds}`,
-  `POST /api/net/tls-baseline` `{action: reset}` · Python: `cryptography` ·
-  binary: `tcpdump` (discovery only)
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
