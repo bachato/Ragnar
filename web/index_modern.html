@@ -1339,6 +1339,36 @@
                         </div>
                         <div id="ptp-results" class="hidden mt-3 text-sm"></div>
                     </div>
+                    <!-- NTP Watch (rogue time source / clock injection) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">NTP Watch <span class="text-xs font-normal text-gray-500">(rogue time source · clock injection)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">NTP (<span class="font-mono">UDP/123</span>) is the network's <strong>clock of record</strong>. A rogue NTP server that answers clients — or <strong>broadcasts</strong> — with the <strong>wrong time</strong> silently poisons every downstream timestamp: audit logs, <strong>TLS / Kerberos validity windows</strong>, MFA/TOTP codes, and lab-result / chain-of-custody records. On a precision-critical segment (medical, finance, industrial) a few seconds of skew is a real incident — yet nobody watches 123. <strong>Detection-only</strong> — it never sends an NTP query.</p>
+                        <p class="text-sm text-gray-400 mb-3">Passively captures NTP and flags <strong>time-injection</strong> (a source whose served time disagrees with the segment consensus / local clock), a <strong>rogue server</strong> (answering but not in the baseline), a <strong>Kiss-o'-Death</strong> (stratum-0 sync-DoS), <strong>stratum spoofing</strong> (a forged Stratum-1/GPS claim), a rogue <strong>broadcast</strong> time source, mode 6/7 <strong>monlist recon/amplification</strong>, and anomalies (implausible root dispersion, leap-alarm, refid loop). First scan learns the trusted time source(s) (<span class="font-mono">data/ntp_watch.json</span>); "Trust current" re-learns.</p>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <select id="ntp-iface" title="Interface for the NTP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Auto (default route)</option>
+                            </select>
+                            <input id="ntp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runNtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan NTP</button>
+                            <button onclick="ntpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current NTP time source(s) as the trusted baseline — use after a legitimate NTP change">Trust current</button>
+                        </div>
+                        <div id="ntp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- SNMP Watch (v1/v2c cleartext community exposure) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">SNMP Watch <span class="text-xs font-normal text-gray-500">(v1/v2c cleartext community exposure)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">SNMP <strong>v1 and v2c authenticate with a plaintext "community string"</strong> — effectively a device password sent in the clear on <em>every</em> request. Anyone sniffing the segment harvests it: the read community (often the default <span class="font-mono">public</span>) exposes the full device config, and a <strong>write</strong> community — seen on a <span class="font-mono">SetRequest</span> — lets whoever captured it <strong>reconfigure the device</strong> (routes, ACLs, interfaces). <strong>v3</strong> (USM auth + privacy) fixes this. <strong>Detection-only</strong> — it never sends an SNMP request.</p>
+                        <p class="text-sm text-gray-400 mb-3">Passively captures SNMP (UDP 161/162) and flags <strong>write-exposed</strong> (a cleartext SetRequest), <strong>cleartext</strong> v1/v2c community exposure (worse for default strings like <span class="font-mono">public</span>/<span class="font-mono">private</span>), SNMP <strong>amplification</strong> (GetBulk with huge max-repetitions — a reflection-DDoS vector), and <strong>enumeration</strong> (a host walking the MIB). Only <strong>v3</strong> reads clean. First scan learns the segment's agents + community strings (<span class="font-mono">data/snmp_watch.json</span>) so later scans highlight <em>new</em> exposure; "Trust current" re-learns.</p>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <select id="snmp-iface" title="Interface for the SNMP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Auto (default route)</option>
+                            </select>
+                            <input id="snmp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runSnmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan SNMP</button>
+                            <button onclick="snmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current SNMP agents / community strings as the baseline — use after a legitimate SNMP change">Trust current</button>
+                        </div>
+                        <div id="snmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
                     <!-- TLS Watch (certificate & TLS hygiene) -->
                     <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                         <h3 class="text-lg font-semibold mb-1">TLS Watch <span class="text-xs font-normal text-gray-500">(certificate &amp; TLS hygiene)</span></h3>
@@ -1450,21 +1480,6 @@
                     </div>
                     <div id="ipv6-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
-                <!-- NTP Watch -->
-                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
-                    <h3 class="text-lg font-semibold mb-1">NTP Watch <span class="text-xs font-normal text-gray-500">(rogue time source · clock injection)</span></h3>
-                    <p class="text-xs text-amber-300/90 mb-2">NTP (<span class="font-mono">UDP/123</span>) is the network's <strong>clock of record</strong>. A rogue NTP server that answers clients — or <strong>broadcasts</strong> — with the <strong>wrong time</strong> silently poisons every downstream timestamp: audit logs, <strong>TLS / Kerberos validity windows</strong>, MFA/TOTP codes, and lab-result / chain-of-custody records. On a precision-critical segment (medical, finance, industrial) a few seconds of skew is a real incident — yet nobody watches 123. <strong>Detection-only</strong> — it never sends an NTP query.</p>
-                    <p class="text-sm text-gray-400 mb-3">Passively captures NTP and flags <strong>time-injection</strong> (a source whose served time disagrees with the segment consensus / local clock), a <strong>rogue server</strong> (answering but not in the baseline), a <strong>Kiss-o'-Death</strong> (stratum-0 sync-DoS), <strong>stratum spoofing</strong> (a forged Stratum-1/GPS claim), a rogue <strong>broadcast</strong> time source, mode 6/7 <strong>monlist recon/amplification</strong>, and anomalies (implausible root dispersion, leap-alarm, refid loop). First scan learns the trusted time source(s) (<span class="font-mono">data/ntp_watch.json</span>); "Trust current" re-learns.</p>
-                    <div class="flex flex-wrap items-center gap-2">
-                        <select id="ntp-iface" title="Interface for the NTP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
-                        </select>
-                        <input id="ntp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                        <button onclick="runNtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan NTP</button>
-                        <button onclick="ntpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current NTP time source(s) as the trusted baseline — use after a legitimate NTP change">Trust current</button>
-                    </div>
-                    <div id="ntp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
-                </div>
                 <!-- ICMP Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">ICMP Watch <span class="text-xs font-normal text-gray-500">(ICMP redirect · L3 route injection)</span></h3>
@@ -1479,21 +1494,6 @@
                         <button onclick="icmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Re-seed the trusted gateway from the host's current default gateway — use after a legitimate router change">Trust current</button>
                     </div>
                     <div id="icmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
-                </div>
-                <!-- SNMP Watch -->
-                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
-                    <h3 class="text-lg font-semibold mb-1">SNMP Watch <span class="text-xs font-normal text-gray-500">(v1/v2c cleartext community exposure)</span></h3>
-                    <p class="text-xs text-amber-300/90 mb-2">SNMP <strong>v1 and v2c authenticate with a plaintext "community string"</strong> — effectively a device password sent in the clear on <em>every</em> request. Anyone sniffing the segment harvests it: the read community (often the default <span class="font-mono">public</span>) exposes the full device config, and a <strong>write</strong> community — seen on a <span class="font-mono">SetRequest</span> — lets whoever captured it <strong>reconfigure the device</strong> (routes, ACLs, interfaces). <strong>v3</strong> (USM auth + privacy) fixes this. <strong>Detection-only</strong> — it never sends an SNMP request.</p>
-                    <p class="text-sm text-gray-400 mb-3">Passively captures SNMP (UDP 161/162) and flags <strong>write-exposed</strong> (a cleartext SetRequest), <strong>cleartext</strong> v1/v2c community exposure (worse for default strings like <span class="font-mono">public</span>/<span class="font-mono">private</span>), SNMP <strong>amplification</strong> (GetBulk with huge max-repetitions — a reflection-DDoS vector), and <strong>enumeration</strong> (a host walking the MIB). Only <strong>v3</strong> reads clean. First scan learns the segment's agents + community strings (<span class="font-mono">data/snmp_watch.json</span>) so later scans highlight <em>new</em> exposure; "Trust current" re-learns.</p>
-                    <div class="flex flex-wrap items-center gap-2">
-                        <select id="snmp-iface" title="Interface for the SNMP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
-                        </select>
-                        <input id="snmp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                        <button onclick="runSnmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan SNMP</button>
-                        <button onclick="snmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current SNMP agents / community strings as the baseline — use after a legitimate SNMP change">Trust current</button>
-                    </div>
-                    <div id="snmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <!-- IGMP Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
@@ -5884,7 +5884,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-tlsdiag"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-ntpsnmpdiag"></script>
 
 </body>
 </html>

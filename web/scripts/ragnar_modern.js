@@ -1219,9 +1219,7 @@ function showNetworkSubtab(name) {
         _dhcpFillIfaces();
         _igmpFillIfaces();
         _ipv6FillIfaces();
-        _ntpFillIfaces();
         _icmpFillIfaces();
-        _snmpFillIfaces();
         _ospfFillIfaces();
         _bgpFillIfaces();
         dhcpSnoopStatus();
@@ -1233,6 +1231,8 @@ function showNetworkSubtab(name) {
         syncNetDiagDisplayFromServer();
         syncNetIntegrityFromServer();
         _macWatchFillIfaces();
+        _ntpFillIfaces();
+        _snmpFillIfaces();
         _tlsFillIfaces();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
