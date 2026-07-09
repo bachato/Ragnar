@@ -85,6 +85,17 @@ def _have(binname):
     return shutil.which(binname) is not None
 
 
+def _have_scapy():
+    """True if the Scapy Python module is importable (not just the CLI). Scapy is
+    optional — only the scanners' end-to-end self-test leg uses it — so this is a
+    lightweight spec check that doesn't pay Scapy's slow import."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec('scapy') is not None
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------
 # Diagnostics: ping / traceroute / mtr / whois / speedtest
 # --------------------------------------------------------------------------
@@ -4600,6 +4611,24 @@ def _bgp_selftest():
     return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
 
 
+def do_routing_selftest():
+    """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
+    plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
+    the web 'validate detectors' panel. No root, no live traffic, no persistence."""
+    suites = {'igmp': _igmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest()}
+    return {
+        'success': all(s['success'] for s in suites.values()),
+        'scapy_available': _have_scapy(),
+        'suites': {k: {
+            'success': v['success'],
+            'passed': sum(1 for s in v['scenarios'] if s['pass']),
+            'total': len(v['scenarios']),
+            'scenarios': v['scenarios'],
+            'scapy': v['scapy'],
+        } for k, v in suites.items()},
+    }
+
+
 # --------------------------------------------------------------------------
 # PCAP Analyzer: triage an uploaded capture with tshark/capinfos
 # --------------------------------------------------------------------------
@@ -4976,9 +5005,40 @@ def _configure_lldpd():
     _run(['systemctl', 'restart', 'lldpd'], timeout=15)
 
 
+def _install_scapy():
+    """Install the Scapy Python module (used by the scanners' end-to-end self-test
+    leg). Prefers the Debian package python3-scapy so it lands in the system
+    interpreter the service runs under; falls back to pip (PEP-668 override on
+    Pi OS). Idempotent."""
+    if _have_scapy():
+        return {'success': True, 'already_installed': True, 'tool': 'scapy',
+                'message': 'scapy is already installed.'}
+    env = dict(os.environ)
+    env['DEBIAN_FRONTEND'] = 'noninteractive'
+    res = {'err': '', 'out': ''}
+    if _have('apt-get'):
+        res = _run(['apt-get', 'install', '-y', 'python3-scapy'], timeout=300, env=env)
+        if not _have_scapy():
+            _run(['apt-get', 'update', '-y'], timeout=180, env=env)
+            res = _run(['apt-get', 'install', '-y', 'python3-scapy'], timeout=300, env=env)
+    if not _have_scapy():
+        import sys
+        py = sys.executable or 'python3'
+        res = _run([py, '-m', 'pip', 'install', '--break-system-packages', 'scapy'],
+                   timeout=300, env=env)
+    if not _have_scapy():
+        tail = (res.get('err') or res.get('out') or '').strip()[-400:]
+        return {'success': False, 'tool': 'scapy',
+                'error': 'Could not install scapy (tried apt python3-scapy and pip). '
+                         + (f'Detail: {tail}' if tail else '')}
+    return {'success': True, 'tool': 'scapy', 'message': 'Installed scapy.'}
+
+
 def do_install_tool(tool):
     """Install a missing network tool on demand via apt. Whitelisted packages
     only. The Ragnar service runs as root, so apt is invoked directly."""
+    if tool == 'scapy':
+        return _install_scapy()
     entry = _NET_TOOL_PKGS.get(tool)
     if entry is None:
         return {'success': False, 'error': f'Unknown or non-installable tool: {tool}'}
@@ -5224,6 +5284,11 @@ def register_network_diagnostics(app, logger=None):
             action = 'reset' if (data.get('action') == 'reset') else 'get'
         _log(f"net/bgp-baseline {action}")
         return jsonify(do_bgp_baseline(action))
+
+    @app.route('/api/net/routing-selftest', methods=['GET'])
+    def net_routing_selftest():
+        _log("net/routing-selftest")
+        return jsonify(do_routing_selftest())
 
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():

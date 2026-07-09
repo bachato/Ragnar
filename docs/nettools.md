@@ -73,6 +73,22 @@ Installable packages are whitelisted (`iputils-ping`, `traceroute`, `mtr-tiny`,
 `iperf3`, `tcpdump`), so the tool name is never interpolated into a shell
 command.
 
+**Scapy** (for the routing-scanner end-to-end self-test) is installable the same
+way — the **Detector Self-Test** panel in Switch & L2/L3 has an **Install Scapy**
+button that installs `python3-scapy` (falling back to `pip`). It's optional: the
+IGMP / OSPF / BGP scanners work fully without it; Scapy only adds the end-to-end
+leg that crafts real packets → pcap → `tcpdump` → parse to exercise the whole
+capture path.
+
+### Detector Self-Test (Switch & L2/L3)
+A one-click **Run self-test** that validates the IGMP, OSPF and BGP detectors by
+running each classifier against crafted attack captures (no root, no live
+traffic) and reports per-scanner pass/fail. With Scapy installed it also runs the
+end-to-end packet-crafting leg for each scanner. This is how you confirm the
+routing-security detectors are working on a given box without waiting for a real
+attack — endpoint `GET /api/net/routing-selftest`. The same checks run headless
+via `python3 network_diagnostics.py {igmp,ospf,bgp}-selftest`.
+
 ---
 
 ## 🖥️ E-Paper Network Diagnostic Mode

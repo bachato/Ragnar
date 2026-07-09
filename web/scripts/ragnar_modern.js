@@ -2835,6 +2835,64 @@ async function bgpTrustBaseline() {
     }
 }
 
+// ---- Routing-scanner detector self-test (+ optional Scapy) ------------------
+function _scapyLegLabel(sc) {
+    if (!sc) return '';
+    if (sc.ran) return sc.pass ? '<span class="text-green-400">scapy e2e ✓</span>' : '<span class="text-red-300">scapy e2e ✗</span>';
+    return '<span class="text-gray-500">scapy e2e skipped</span>';
+}
+async function runRoutingSelftest() {
+    const out = document.getElementById('routing-selftest-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, 'Running…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running IGMP / OSPF / BGP detector self-tests…</p>';
+    try {
+        const d = await fetchAPI('/api/net/routing-selftest');
+        if (!d || d.success === undefined) {
+            out.innerHTML = '<p class="text-sm text-red-400">Self-test failed to run.</p>';
+            return;
+        }
+        // Scapy status + install button
+        const status = document.getElementById('scapy-status');
+        const instBtn = document.getElementById('scapy-install-btn');
+        if (status) status.innerHTML = d.scapy_available
+            ? 'Scapy: <span class="text-green-400">installed</span> — end-to-end leg active'
+            : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
+        if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
+
+        const names = { igmp: 'IGMP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch' };
+        const overall = d.success
+            ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
+            : '<div class="mb-2 px-3 py-2 rounded border bg-red-950/60 border-red-800 text-red-300 text-sm">🛑 A detector self-test FAILED — see below</div>';
+        let html = overall +
+            '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+            '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
+            '</thead><tbody>';
+        ['igmp', 'ospf', 'bgp'].forEach(k => {
+            const s = d.suites[k]; if (!s) return;
+            const okAll = s.success;
+            html += `<tr class="border-t border-slate-800">
+                <td class="px-2 py-1">${names[k]}</td>
+                <td class="px-2 py-1 font-mono ${okAll ? 'text-gray-300' : 'text-red-300'}">${s.passed}/${s.total}</td>
+                <td class="px-2 py-1">${_scapyLegLabel(s.scapy)}</td>
+                <td class="px-2 py-1">${okAll ? '<span class="text-green-400">PASS</span>' : '<span class="text-red-300">FAIL</span>'}</td>
+            </tr>`;
+            // list any failing scenarios
+            (s.scenarios || []).filter(x => !x.pass).forEach(x => {
+                html += `<tr class="border-t border-slate-900"><td class="px-2 py-1 text-red-300 text-xs" colspan="4">↳ ${escapeHtml(x.name)}: expected ${escapeHtml(String(x.expect))}, got ${escapeHtml(String(x.got))}</td></tr>`;
+            });
+        });
+        html += '</tbody></table>';
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
 // ---- DHCP Snooping (inline bridge) -----------------------------------------
 function _snoopFillSelect(sel, nics, current) {
     if (!sel) return;
