@@ -1218,6 +1218,7 @@ function showNetworkSubtab(name) {
         loadLldp();
         _dhcpFillIfaces();
         _igmpFillIfaces();
+        _ospfFillIfaces();
         dhcpSnoopStatus();
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
@@ -2624,6 +2625,112 @@ async function igmpTrustBaseline() {
         await runIgmpWatch();
     } catch (e) {
         addConsoleMessage('Failed to reset IGMP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- OSPF Security Scanner (passive) ---------------------------------------
+const _OSPF_VERDICT_STYLE = {
+    clean:     ['bg-green-950/40 border-green-900 text-green-400', '✓ No OSPF anomalies detected'],
+    weak_auth: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak / no OSPF authentication — exposed to LSA injection'],
+    anomaly:   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ OSPF anomaly — rogue router / Router-ID conflict / mismatch'],
+    injection: ['bg-red-950/60 border-red-800 text-red-300', '🛑 OSPF LSA injection / route poisoning detected'],
+    storm:     ['bg-red-950/60 border-red-800 text-red-300', '🛑 OSPF flooding storm detected'],
+    unknown:   ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+const _OSPF_AUTH_NAME = { 0: 'none (0)', 1: 'plaintext (1)', 2: 'cryptographic (2)' };
+function _ospfFillIfaces() {
+    const sel = document.getElementById('ospf-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runOspfWatch() {
+    const out = document.getElementById('ospf-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('ospf-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('ospf-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing OSPF on the segment…</p>';
+    try {
+        _ospfFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/ospf-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runOspfWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _OSPF_VERDICT_STYLE[d.verdict] || _OSPF_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packets} OSPF pkts (${d.hellos} hello, ${d.ls_updates} LSU @ ${d.lsu_per_s}/s)${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if (d.note) html += `<p class="text-xs text-gray-500 mb-2">${escapeHtml(d.note)}</p>`;
+        const auth = (d.auth_types || []).map(a => _OSPF_AUTH_NAME[a] || a);
+        if (auth.length) {
+            const bad = (d.auth_types || []).some(a => a < 2);
+            html += `<p class="text-xs mb-1 ${bad ? 'text-amber-300' : 'text-gray-400'}">Authentication: ${escapeHtml(auth.join(', '))}${bad ? ' — no cryptographic auth' : ''}</p>`;
+        }
+        // Advisories (CVE / OSV)
+        (d.advisories || []).forEach(a => {
+            const sev = a.severity === 'high' ? 'text-red-300 border-red-800 bg-red-950/40' : 'text-amber-300 border-amber-800 bg-amber-950/30';
+            const refs = (a.refs || []).map(r => r.startsWith('http')
+                ? `<a href="${escapeHtml(r)}" target="_blank" rel="noopener" class="underline text-cyan-400">OSV</a>`
+                : `<span class="font-mono">${escapeHtml(r)}</span>`).join(', ');
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs ${sev}"><strong>${escapeHtml(a.title)}</strong><br>${escapeHtml(a.detail)}${refs ? '<br><span class="text-gray-400">Refs:</span> ' + refs : ''}</div>`;
+        });
+        // Routers table
+        const routers = d.routers || [], tr = d.trusted_routers || [];
+        if (routers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">OSPF routers seen (' + routers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Router-ID</th><th class="px-2 py-1">Source(s)</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                routers.map(r => {
+                    const badge = r.new ? '<span class="text-amber-300">? new</span>' : (tr.indexOf(r.router_id) >= 0 ? '<span class="text-green-400">✓ known</span>' : '<span class="text-gray-500">—</span>');
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${r.new ? 'text-amber-300' : ''}">${escapeHtml(r.router_id)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((r.sources || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        const lc = d.lsa_counts || {};
+        const lcKeys = Object.keys(lc);
+        if (lcKeys.length) {
+            html += '<p class="text-xs text-gray-500 mt-2">LSAs: ' + lcKeys.map(k => `${escapeHtml(k)}×${lc[k]}`).join(', ') + '</p>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function ospfTrustBaseline() {
+    try {
+        await postAPI('/api/net/ospf-baseline', { action: 'reset' });
+        addConsoleMessage('OSPF baseline reset — re-learning current routers & originators', 'info');
+        await runOspfWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset OSPF baseline: ' + e.message, 'error');
     }
 }
 

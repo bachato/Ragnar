@@ -3480,6 +3480,548 @@ def _igmp_selftest():
 
 
 # --------------------------------------------------------------------------
+# OSPF Watch: passive OSPF security scanner (detection-only)
+# --------------------------------------------------------------------------
+# OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
+# It is the classic target for route poisoning: without cryptographic auth, any
+# host on the segment can inject/spoof LSAs and silently redirect traffic
+# (persistent OSPF poisoning, disguised-LSA and fight-back-bypass attacks —
+# Nakibly et al.). This scanner is PASSIVE: one short tcpdump window, parsed and
+# classified. It never forms an adjacency, never floods an LSA, never touches the
+# LSDB — inspired by OSPFwatcher (topology-change monitoring) and FRR-MAD
+# (expected-vs-observed LSDB anomaly detection), approximated here from the wire
+# with a learned baseline. What it looks for:
+#   * weak_auth — Auth Type 0 (none) / 1 (plaintext). The enabler for every
+#     injection attack, and the one thing we can always see. Surfaces advisories.
+#   * anomaly   — a new/rogue OSPF router (adjacency spoofing), a duplicate
+#     Router-ID (RID conflict/spoof), DR takeover, or Hello parameter mismatch.
+#   * injection — an LSA whose Advertising Router isn't a known router (spoofed
+#     LSA), a MaxSequence (0x7fffffff) or MaxAge fight-provoking LSA, rapid
+#     re-origination of one LSA (fight-back = active injection in progress), or a
+#     new AS-External (Type-5) originator (route injection / default hijack).
+#   * storm     — an LS-Update flood (control-plane DoS).
+# Version-specific CVEs (FRR/Quagga ospfd crashes via malformed/opaque LSAs) are
+# NOT visible on the wire, so instead of guessing a version we detect the
+# exposure conditions and point at OSV for a version lookup (honest by design).
+
+_OSPF_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'ospf_watch.json')
+_ospf_watch_lock = threading.Lock()
+
+_OSPF_MAXAGE = 3600            # LSA MaxAge — used by the premature-aging attack
+_OSPF_MAXSEQ = 0x7fffffff      # LSA MaxSequence — used by the seq-wrap attack
+# LS-Update rate/sec at or above which the window is a flood (LSU is low-rate).
+_OSPF_LSU_STORM_RATE = 20.0
+# Distinct increasing sequence numbers for one (lsa-id, adv-router) in the window
+# at or above which it's rapid re-origination — the fight-back signature.
+_OSPF_FIGHTBACK_SEQS = 4
+_OSPF_EVENTS_CAP = 200
+
+# Curated OSPF vulnerability references, surfaced by observed condition. Version-
+# specific CVEs can't be fingerprinted passively, so these tie to what IS visible
+# (auth posture, opaque/malformed LSAs) and point at OSV for the version lookup.
+_OSPF_OSV_URL = 'https://osv.dev/list?ecosystem=&q=frr%20ospfd'
+_OSPF_ADVISORIES = {
+    'no_auth': {
+        'severity': 'high',
+        'title': 'OSPF without cryptographic authentication',
+        'detail': ('Auth Type 0 (none) or 1 (plaintext) lets any host on the '
+                   'segment inject or spoof LSAs — the enabler for persistent '
+                   'route poisoning, disguised-LSA and fight-back-bypass attacks '
+                   '(Nakibly et al.). Enable RFC 5709 HMAC-SHA cryptographic auth '
+                   '(OSPFv2) or IPsec AH/ESP (OSPFv3).'),
+        'refs': ['RFC 5709'],
+    },
+    'opaque_lsa': {
+        'severity': 'medium',
+        'title': 'Opaque/TE LSAs present — patch ospfd for malformed-LSA crashes',
+        'detail': ('Opaque (Type 9/10/11) / TE LSAs are on the segment. Several '
+                   'FRRouting ospfd DoS crashes are triggered by malformed opaque '
+                   'LSAs (e.g. CVE-2024-27913, CVE-2025-61107, CVE-2025-61105). '
+                   'The software version is not visible on the wire — check OSV '
+                   'for your ospfd build and patch. Cisco ASA/FTD have had '
+                   'equivalent OSPF-LSA DoS advisories.'),
+        'refs': ['CVE-2024-27913', 'CVE-2025-61107', 'CVE-2025-61105', _OSPF_OSV_URL],
+    },
+}
+
+_OSPF_LSA_TYPES = [
+    (re.compile(r'\bRouter\s+LSA\b', re.I), 'router'),
+    (re.compile(r'\bNetwork\s+LSA\b', re.I), 'network'),
+    (re.compile(r'\bASBR[- ]Summary\s+LSA\b', re.I), 'asbr-summary'),
+    (re.compile(r'\bSummary\s+LSA\b', re.I), 'summary'),
+    (re.compile(r'\b(?:AS[- ]?)?External\s+LSA\b', re.I), 'external'),
+    (re.compile(r'\bNSSA\s+LSA\b', re.I), 'nssa'),
+    (re.compile(r'\b(?:Opaque|Grace|TE)\s+LSA\b', re.I), 'opaque'),
+]
+_OSPF_IPRE = r'(\d{1,3}(?:\.\d{1,3}){3})'
+_OSPF_HDR_RE = re.compile(r'(?:IP6?\s+)?' + _OSPF_IPRE + r'(?:\.\d+)?\s+>\s+\S+:\s+OSPFv(\d),\s*([^,]+)')
+
+
+def _ospf_pkt_type(kw):
+    k = kw.strip().lower()
+    if k.startswith('hello'):
+        return 'hello'
+    if k.startswith('ls-update') or k.startswith('ls update'):
+        return 'lsupdate'
+    if k.startswith('ls-ack') or k.startswith('ls ack'):
+        return 'lsack'
+    if k.startswith('database') or k == 'dd':
+        return 'dd'
+    if k.startswith('ls-request') or k.startswith('ls request'):
+        return 'lsrequest'
+    return k.split()[0] if k else 'other'
+
+
+def _parse_ospf_capture(output):
+    """Parse `tcpdump -nn -v 'proto ospf'` text into a list of packet dicts:
+    {src, version, type, router_id, area, auth, hello{...}, lsas[...]}. Tolerant
+    of tcpdump version differences — it keys off the OSPFv2/OSPFv3 header line and
+    pulls whatever fields it can from the indented body of each packet."""
+    packets = []
+    cur = None
+
+    def flush():
+        if cur is not None:
+            packets.append(cur)
+
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        h = _OSPF_HDR_RE.search(line)
+        if h:
+            flush()
+            cur = {'src': h.group(1), 'version': int(h.group(2)),
+                   'type': _ospf_pkt_type(h.group(3)), 'router_id': None,
+                   'area': None, 'auth': None,
+                   'hello': None, 'adv_router': None, 'lsas': []}
+            continue
+        if cur is None:
+            continue
+        rid = re.search(r'Router-ID\s+' + _OSPF_IPRE, line)
+        if rid:
+            cur['router_id'] = rid.group(1)
+        if cur['area'] is None:
+            if re.search(r'Backbone Area', line):
+                cur['area'] = '0.0.0.0'
+            else:
+                am = re.search(r'\bArea\s+' + _OSPF_IPRE, line)
+                if am:
+                    cur['area'] = am.group(1)
+        au = re.search(r'Authentication Type:\s*\w+\s*\((\d)\)', line)
+        if au:
+            cur['auth'] = int(au.group(1))
+        av = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
+        if av and cur['adv_router'] is None:
+            cur['adv_router'] = av.group(1)
+        if cur['type'] == 'hello':
+            hp = cur['hello'] or {'hello_timer': None, 'dead_timer': None,
+                                  'mask': None, 'dr': None, 'neighbors': []}
+            ht = re.search(r'Hello Timer\s+(\d+)s', line)
+            if ht:
+                hp['hello_timer'] = int(ht.group(1))
+            dt = re.search(r'Dead Timer\s+(\d+)s', line)
+            if dt:
+                hp['dead_timer'] = int(dt.group(1))
+            mk = re.search(r'Mask\s+' + _OSPF_IPRE, line)
+            if mk:
+                hp['mask'] = mk.group(1)
+            dr = re.search(r'Designated Router(?:\s+\(ID\))?\s+' + _OSPF_IPRE, line)
+            if dr:
+                hp['dr'] = dr.group(1)
+            nb = re.search(r'Neighbor\s+' + _OSPF_IPRE, line)
+            if nb:
+                hp['neighbors'].append(nb.group(1))
+            cur['hello'] = hp
+        # LSA record line (LS-Update / DD carry these)
+        for rx, lsa_type in _OSPF_LSA_TYPES:
+            if rx.search(line):
+                lid = re.search(r'LSA-ID:?\s+' + _OSPF_IPRE, line)
+                adv = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
+                sq = re.search(r'seq\s+(0x[0-9a-fA-F]+)', line)
+                ag = re.search(r'age\s+(\d+)', line)
+                cur['lsas'].append({
+                    'lsa_type': lsa_type,
+                    'lsa_id': lid.group(1) if lid else None,
+                    'adv_router': (adv.group(1) if adv else cur.get('adv_router')),
+                    'seq': int(sq.group(1), 16) if sq else None,
+                    'age': int(ag.group(1)) if ag else None,
+                })
+                break
+    flush()
+    return packets
+
+
+def _ospf_watch_load():
+    try:
+        with open(_OSPF_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ospf_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_OSPF_WATCH_PATH), exist_ok=True)
+        tmp = _OSPF_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _OSPF_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ospf_baseline(action='get'):
+    """Manage the learned OSPF baseline (trusted routers + Type-5 originators).
+    action='reset' clears it so the current segment is re-learned next scan."""
+    with _ospf_watch_lock:
+        if action == 'reset':
+            _ospf_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ospf_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted(b.get('routers') or []),
+            'asbrs': sorted(b.get('asbrs') or []),
+        }}
+
+
+def _ospf_analyze(packets, seconds, baseline, learn=True):
+    """Pure classifier over parsed OSPF packets. Returns the result payload
+    (minus interface). Split from capture so the self-test can drive it with
+    synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    hellos = [p for p in packets if p['type'] == 'hello']
+    lsupdates = [p for p in packets if p['type'] == 'lsupdate']
+    total = len(packets)
+
+    # routers seen (via Hello Router-ID), and the src IP(s) each was seen from
+    rid_srcs = {}
+    for p in hellos:
+        if p.get('router_id'):
+            rid_srcs.setdefault(p['router_id'], set()).add(p.get('src'))
+    routers_seen = set(rid_srcs.keys())
+
+    # auth posture
+    auth_types = sorted({p['auth'] for p in packets if p.get('auth') is not None})
+
+    # all LSAs, flattened
+    lsas = []
+    for p in lsupdates:
+        for l in p['lsas']:
+            l = dict(l)
+            l['pkt_src'] = p.get('src')
+            l['pkt_router_id'] = p.get('router_id')
+            lsas.append(l)
+    adv_routers = {l['adv_router'] for l in lsas if l.get('adv_router')}
+    asbrs_seen = {l['adv_router'] for l in lsas
+                  if l.get('lsa_type') == 'external' and l.get('adv_router')}
+    has_opaque = any(l.get('lsa_type') == 'opaque' for l in lsas)
+
+    trusted_routers = set(baseline.get('routers') or [])
+    trusted_asbrs = set(baseline.get('asbrs') or [])
+    known_advs = set(baseline.get('advs') or []) | trusted_routers
+    learned = False
+    have_baseline = bool(trusted_routers or known_advs or baseline.get('asbrs') is not None)
+    if learn and not have_baseline and (routers_seen or adv_routers):
+        baseline['routers'] = sorted(routers_seen)
+        baseline['advs'] = sorted(adv_routers | routers_seen)
+        baseline['asbrs'] = sorted(asbrs_seen)
+        learned = True
+        trusted_routers = set(routers_seen)
+        known_advs = adv_routers | routers_seen
+        trusted_asbrs = set(asbrs_seen)
+        have_baseline = True
+
+    findings = []      # (level, category, text)
+    categories = set()
+    advisories = []
+
+    # weak / no authentication
+    if 0 in auth_types:
+        categories.add('weak_auth')
+        advisories.append(dict(_OSPF_ADVISORIES['no_auth'], key='no_auth'))
+        findings.append(('warn', 'weak_auth',
+                         'OSPF packets use Authentication Type 0 (none) — any host '
+                         'can inject LSAs; enable cryptographic auth'))
+    if 1 in auth_types:
+        categories.add('weak_auth')
+        if not any(a.get('key') == 'no_auth' for a in advisories):
+            advisories.append(dict(_OSPF_ADVISORIES['no_auth'], key='no_auth'))
+        findings.append(('warn', 'weak_auth',
+                         'OSPF uses Authentication Type 1 (plaintext) — trivially '
+                         'forged; move to cryptographic (HMAC) auth'))
+
+    # storm
+    lsu_rate = round(len(lsupdates) / seconds, 1)
+    if lsu_rate >= _OSPF_LSU_STORM_RATE:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'{len(lsupdates)} LS-Updates in {seconds}s ({lsu_rate}/s) '
+                         '— OSPF flooding / control-plane DoS'))
+
+    # rogue / new router (adjacency spoofing)
+    if have_baseline:
+        for rid in sorted(routers_seen - trusted_routers):
+            categories.add('anomaly')
+            findings.append(('warn', 'anomaly',
+                             f'new OSPF router {rid} (from {", ".join(sorted(s for s in rid_srcs[rid] if s))}) '
+                             '— not in the learned baseline (possible rogue adjacency)'))
+    # duplicate Router-ID (conflict / spoof)
+    for rid, srcs in rid_srcs.items():
+        real = {s for s in srcs if s}
+        if len(real) > 1:
+            categories.add('anomaly')
+            findings.append(('crit', 'anomaly',
+                             f'Router-ID {rid} claimed by multiple sources '
+                             f'({", ".join(sorted(real))}) — Router-ID conflict or spoof'))
+    # Hello parameter mismatch on the segment
+    hp_params = {(p['hello'].get('hello_timer'), p['hello'].get('dead_timer'), p.get('area'))
+                 for p in hellos if p.get('hello')}
+    hp_params = {x for x in hp_params if x != (None, None, None)}
+    if len(hp_params) > 1:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         'mismatched Hello parameters (hello/dead timer or area) on '
+                         'the segment — misconfig or an attacker probing for adjacency'))
+
+    # injection — spoofed advertising router
+    if have_baseline:
+        spoofed = sorted({a for a in adv_routers if a not in known_advs and a not in routers_seen})
+        for a in spoofed:
+            categories.add('injection')
+            findings.append(('crit', 'injection',
+                             f'LSA advertised by {a}, which never announced itself via '
+                             'Hello and is not in the baseline — spoofed/injected LSA'))
+        # new AS-External (Type-5) originator — route injection / default hijack
+        for a in sorted(asbrs_seen - trusted_asbrs):
+            categories.add('injection')
+            findings.append(('crit', 'injection',
+                             f'new AS-External (Type-5) LSAs from {a} — not a known '
+                             'ASBR; possible route injection / default-route hijack'))
+
+    # MaxSequence / MaxAge attack signatures
+    if any(l.get('seq') == _OSPF_MAXSEQ for l in lsas):
+        categories.add('injection')
+        findings.append(('crit', 'injection',
+                         'LSA with MaxSequence (0x7fffffff) — sequence-wrap attack to '
+                         'force LSDB reset'))
+    # MaxAge for an LSA-ID that is ALSO seen fresh in the window = premature-aging
+    fresh_ids = {l['lsa_id'] for l in lsas if l.get('age') is not None and l['age'] < _OSPF_MAXAGE}
+    maxage_hot = sorted({l['lsa_id'] for l in lsas
+                         if l.get('age') is not None and l['age'] >= _OSPF_MAXAGE
+                         and l['lsa_id'] in fresh_ids and l['lsa_id']})
+    for lid in maxage_hot:
+        categories.add('injection')
+        findings.append(('warn', 'injection',
+                         f'LSA {lid} flooded at MaxAge while also fresh — premature-'
+                         'aging (MaxAge) attack to flush it from the LSDB'))
+
+    # fight-back — rapid re-origination of one (lsa-id, adv-router)
+    seq_by_lsa = {}
+    for l in lsas:
+        if l.get('lsa_id') and l.get('adv_router') and l.get('seq') is not None:
+            seq_by_lsa.setdefault((l['lsa_id'], l['adv_router']), set()).add(l['seq'])
+    for (lid, adv), seqs in seq_by_lsa.items():
+        if len(seqs) >= _OSPF_FIGHTBACK_SEQS:
+            categories.add('injection')
+            findings.append(('crit', 'injection',
+                             f'LSA {lid} from {adv} re-originated {len(seqs)} times with '
+                             'rising sequence — fight-back: the owner is countering an '
+                             'active LSA injection'))
+
+    if has_opaque:
+        advisories.append(dict(_OSPF_ADVISORIES['opaque_lsa'], key='opaque_lsa'))
+
+    # version anomaly
+    versions = sorted({p['version'] for p in packets})
+    if len(versions) > 1:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'mixed OSPF versions {versions} on the segment'))
+
+    order = ['storm', 'injection', 'anomaly', 'weak_auth']
+    verdict = next((c for c in order if c in categories), 'clean')
+    if not findings:
+        findings.append(('ok', 'clean', 'No OSPF anomalies in the capture window.'))
+
+    routers_out = []
+    for rid in sorted(routers_seen):
+        routers_out.append({'router_id': rid,
+                            'sources': sorted(s for s in rid_srcs[rid] if s),
+                            'new': bool(have_baseline and rid not in trusted_routers)})
+    lsa_summary = {}
+    for l in lsas:
+        lsa_summary[l['lsa_type']] = lsa_summary.get(l['lsa_type'], 0) + 1
+
+    return {
+        'success': True, 'verdict': verdict, 'seconds': seconds,
+        'packets': total, 'hellos': len(hellos), 'ls_updates': len(lsupdates),
+        'lsu_per_s': lsu_rate, 'learned': learned,
+        'auth_types': auth_types, 'versions': versions,
+        'routers': routers_out, 'trusted_routers': sorted(trusted_routers),
+        'lsa_counts': lsa_summary,
+        'advisories': [{'key': a.get('key'), 'severity': a['severity'],
+                        'title': a['title'], 'detail': a['detail'],
+                        'refs': a.get('refs', [])} for a in advisories],
+        'findings': [{'level': l, 'category': c, 'text': t} for l, c, t in findings],
+        'reasons': [t for _l, _c, t in findings if _l != 'ok'],
+    }
+
+
+def _ospf_capture(interface, seconds):
+    """Run one passive tcpdump OSPF window and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', 'proto', 'ospf'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ospf_watch(interface=None, seconds=15, learn=True, quick=False):
+    """Passive OSPF security scanner (detection-only). Captures OSPF for a few
+    seconds and classifies the segment: weak_auth / anomaly / injection / storm /
+    clean, with CVE/OSV advisories for observed exposure conditions. Learns the
+    routers + Type-5 originators on first run; never forms an adjacency."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _ospf_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    packets = _parse_ospf_capture(text)
+
+    with _ospf_watch_lock:
+        baseline = _ospf_watch_load()
+        result = _ospf_analyze(packets, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _ospf_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ospf_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_OSPF_EVENTS_CAP:]
+            _ospf_watch_save(b)
+
+    if not packets:
+        result['note'] = ('No OSPF seen — this segment may not run OSPF, or the Pi '
+                          'is not on the OSPF broadcast domain (put it on a SPAN/'
+                          'mirror or the routed VLAN to observe).')
+    result['interface'] = iface
+    return result
+
+
+def _ospf_selftest():
+    """Self-test the OSPF detectors with synthetic tcpdump captures (no root, no
+    live traffic), plus an optional Scapy end-to-end leg (scapy.contrib.ospf ->
+    pcap -> tcpdump -> parse). Mirrors the IGMP/MAC Watch self-tests."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        pkts = _parse_ospf_capture(text)
+        res = _ospf_analyze(pkts, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'packets': len(pkts), 'pass': ok})
+        return res
+
+    base = {'routers': ['10.0.0.1', '10.0.0.2'],
+            'advs': ['10.0.0.1', '10.0.0.2'], 'asbrs': ['10.0.0.1']}
+
+    clean = "\n".join([
+        "10.0.0.1 > 224.0.0.5: OSPFv2, Hello, length 48",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tHello Timer 10s, Dead Timer 40s, Mask 255.255.255.0",
+        "10.0.0.2 > 224.0.0.5: OSPFv2, LS-Update, length 64",
+        "\tRouter-ID 10.0.0.2, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tRouter LSA (1), LSA-ID: 10.0.0.2, Advertising Router: 10.0.0.2, seq 0x80000005, age 12",
+    ])
+    run('clean', clean, 15, base, 'clean')
+
+    weak = "\n".join([
+        "10.0.0.1 > 224.0.0.5: OSPFv2, Hello, length 48",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: none (0)",
+        "\tHello Timer 10s, Dead Timer 40s, Mask 255.255.255.0",
+    ])
+    run('weak_auth', weak, 15, base, 'weak_auth')
+
+    rogue = "\n".join([
+        "10.0.0.9 > 224.0.0.5: OSPFv2, Hello, length 48",
+        "\tRouter-ID 10.0.0.9, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tHello Timer 10s, Dead Timer 40s, Mask 255.255.255.0",
+    ])
+    run('anomaly', rogue, 15, base, 'anomaly')
+
+    inject = "\n".join([
+        "10.0.0.66 > 224.0.0.5: OSPFv2, LS-Update, length 64",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tRouter LSA (1), LSA-ID: 10.0.0.66, Advertising Router: 10.0.0.66, seq 0x80000002, age 1",
+    ])
+    run('injection', inject, 15, base, 'injection')
+
+    maxseq = "\n".join([
+        "10.0.0.1 > 224.0.0.5: OSPFv2, LS-Update, length 64",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tRouter LSA (1), LSA-ID: 10.0.0.1, Advertising Router: 10.0.0.1, seq 0x7fffffff, age 1",
+    ])
+    run('injection-maxseq', maxseq, 15, base, 'injection')
+
+    # parser check: a full LS-Update parses out the LSA fields.
+    p = _parse_ospf_capture(clean)
+    lsu = [x for x in p if x['type'] == 'lsupdate']
+    parse_ok = bool(lsu and lsu[0]['lsas'] and
+                    lsu[0]['lsas'][0]['adv_router'] == '10.0.0.2' and
+                    lsu[0]['lsas'][0]['seq'] == 0x80000005)
+    scenarios.append({'name': 'lsa-parse', 'expect': 'adv=10.0.0.2 seq=0x80000005',
+                      'got': str(lsu[0]['lsas'][0] if lsu and lsu[0]['lsas'] else None),
+                      'pass': parse_ok})
+
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import IP, Ether, wrpcap  # noqa
+        try:
+            from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello
+        except Exception:
+            OSPF_Hdr = None
+        if OSPF_Hdr is not None and _have('tcpdump'):
+            pkt = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
+                   OSPF_Hdr(version=2, type=1, src='10.0.0.5', area='0.0.0.0',
+                            authtype=0) / OSPF_Hello(mask='255.255.255.0'))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'proto', 'ospf'],
+                       timeout=10)
+            parsed = _parse_ospf_capture(res['out'])
+            got_auth = next((x.get('auth') for x in parsed if x.get('auth') is not None), None)
+            scapy_result = {'ran': True, 'parsed_packets': len(parsed),
+                            'auth': got_auth, 'pass': len(parsed) >= 1,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # PCAP Analyzer: triage an uploaded capture with tshark/capinfos
 # --------------------------------------------------------------------------
 
@@ -4068,6 +4610,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/igmp-baseline {action}")
         return jsonify(do_igmp_baseline(action))
 
+    @app.route('/api/net/ospf-watch', methods=['GET'])
+    def net_ospf_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        _log(f"net/ospf-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ospf_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ospf-baseline', methods=['GET', 'POST'])
+    def net_ospf_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ospf-baseline {action}")
+        return jsonify(do_ospf_baseline(action))
+
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():
         _log("net/identity")
@@ -4197,6 +4757,15 @@ def _cli(argv=None):
     st = sub.add_parser('igmp-selftest', help='self-test the IGMP detectors (no root)')
     st.add_argument('--json', action='store_true', help='emit JSON')
 
+    o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
+    o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    o.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    o.add_argument('--json', action='store_true', help='emit JSON')
+
+    ost = sub.add_parser('ospf-selftest', help='self-test the OSPF detectors (no root)')
+    ost.add_argument('--json', action='store_true', help='emit JSON')
+
     args = p.parse_args(argv)
     if args.cmd == 'igmp-watch':
         r = do_igmp_watch(interface=args.iface, seconds=args.seconds,
@@ -4237,6 +4806,49 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"IGMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ospf-watch':
+        r = do_ospf_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"OSPF Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packets']} pkts, {r['hellos']} hello, {r['ls_updates']} LSU)")
+            if r.get('note'):
+                print(f"  note: {r['note']}")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            if r.get('auth_types'):
+                print(f"  auth types seen: {r['auth_types']}")
+            for rt in r.get('routers', []):
+                print(f"  router {rt['router_id']}{' *NEW*' if rt.get('new') else ''}"
+                      f" <- {', '.join(rt['sources'])}")
+            for a in r.get('advisories', []):
+                print(f"  [advisory:{a['severity']}] {a['title']}"
+                      f"{' (' + ', '.join(a['refs']) + ')' if a.get('refs') else ''}")
+            for f in r.get('findings', []):
+                print(f"  [{f['level']}] {f['text']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ospf-selftest':
+        r = _ospf_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"parsed={sc.get('parsed_packets')} auth={sc.get('auth')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"OSPF self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     p.print_help()

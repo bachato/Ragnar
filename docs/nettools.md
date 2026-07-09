@@ -43,6 +43,7 @@ alert.
 | [ARP Scan](#arp-scan) | Switch & L2 | `GET /api/net/arp-scan` |
 | [L2 Link Health](#l2-link-health) | Switch & L2 | `POST /api/net/l2-health` |
 | [IGMP Watch](#igmp-watch) | Switch & L2 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
+| [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [Locate Port](#locate-port) | Switch & L2 | `POST /api/net/locate-port` |
 | [PCAP Analyzer](#pcap-analyzer) | Switch & L2 | `POST /api/net/pcap` |
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
@@ -571,6 +572,57 @@ capture→parse path end to end.
 
 - Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
   `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### OSPF Security Scanner
+A **passive** routing-security scanner for OSPF (the interior routing control
+plane, IP proto 89 / multicast 224.0.0.5–6). **Detection-only** — it never forms
+an adjacency, floods an LSA, or touches the LSDB; it just captures one short
+window and classifies it. OSPF is the classic route-poisoning target: without
+cryptographic auth, any host on the segment can inject LSAs and silently redirect
+traffic. What it flags:
+
+- **Weak / no authentication** — Auth Type 0 (none) or 1 (plaintext). This is the
+  enabler for every injection attack and the one thing always visible on the wire;
+  it surfaces a CVE/OSV advisory.
+- **Anomaly** — a new/rogue OSPF router (adjacency spoofing), a **duplicate
+  Router-ID** (conflict/spoof), Hello parameter mismatch, or mixed OSPF versions.
+- **Injection** — an LSA whose **Advertising Router** never announced itself (a
+  spoofed/injected LSA), a **MaxSequence** (0x7fffffff) or **MaxAge** fight-provoking
+  LSA, **fight-back** (one LSA re-originated rapidly = the owner countering an
+  active injection), or a **new AS-External (Type-5)** originator (route injection /
+  default-route hijack).
+- **Storm** — an LS-Update flood (control-plane DoS).
+
+Design is inspired by **[OSPFwatcher](https://github.com/Vadims06/ospfwatcher)**
+(topology-change monitoring) and **FRR-MAD** (expected-vs-observed LSDB anomaly
+detection), approximated passively from the wire with a learned baseline — the
+first scan learns the routers and Type-5 originators (`data/ospf_watch.json`),
+**Trust current** re-learns after a legitimate change. Follows the passive-floor
+doctrine so a healthy segment reads clean. Put the Pi on the **routed VLAN or a
+SPAN/mirror** to observe OSPF.
+
+**On vulnerabilities vs [OSV](https://osv.dev):** OSPF carries no software version
+on the wire, so a version→CVE lookup isn't possible passively — the scanner
+detects the *exposure conditions* instead (weak auth; opaque/TE LSAs, which are
+the trigger for FRRouting ospfd DoS crashes such as CVE-2024-27913 /
+CVE-2025-61107 / CVE-2025-61105, and equivalent Cisco ASA/FTD OSPF-LSA advisories)
+and points at OSV for the version lookup. It **detects, never exploits**, and is
+harmless to the network.
+
+Small **CLI** (no web app / no root for the self-test):
+
+```
+python3 network_diagnostics.py ospf-watch [--iface eth0] [--seconds 15] [--json]
+python3 network_diagnostics.py ospf-selftest
+```
+
+`ospf-selftest` drives the parser + classifier with synthetic captures (clean /
+weak-auth / rogue-router / spoofed-LSA / MaxSequence / LSA-field parse) and, when
+[Scapy](https://scapy.net) (`scapy.contrib.ospf`) is present, crafts a real OSPF
+packet into a pcap and parses it back through `tcpdump` end to end.
+
+- Endpoint: `GET /api/net/ospf-watch` `{interface, seconds}`,
+  `POST /api/net/ospf-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### Locate Port
 Physically find **which switch port** the device is plugged into — the software
