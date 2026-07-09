@@ -800,6 +800,35 @@ class Display:
         self._page_cache[key] = (now, data)
         return data
 
+    def _font_at(self, font_name, size):
+        """Return a truetype font at `size`, cached across frames."""
+        if not hasattr(self, '_font_size_cache'):
+            self._font_size_cache = {}
+        size = max(6, int(size))
+        key = (font_name, size)
+        f = self._font_size_cache.get(key)
+        if f is None:
+            try:
+                from PIL import ImageFont
+                f = ImageFont.truetype(os.path.join(self.shared_data.fontdir, font_name), size)
+            except Exception:
+                f = self.shared_data.font_arial9
+            self._font_size_cache[key] = f
+        return f
+
+    def _fit_font(self, font_name, base_font, text, max_w):
+        """Pick the largest `font_name` size ≤ base that renders `text` within
+        `max_w` px. Used so page titles shrink instead of clipping on the 128px
+        LCD; on roomy e-paper the base font already fits, so this is a no-op."""
+        if not text or base_font is None or base_font.getlength(text) <= max_w:
+            return base_font
+        base_size = getattr(base_font, 'size', 13)
+        for size in range(base_size - 1, 6, -1):
+            f = self._font_at(font_name, size)
+            if f.getlength(text) <= max_w:
+                return f
+        return self._font_at(font_name, 7)
+
     def _draw_page_frame(self, draw, title, hint="K1:Home K2:Flip K3:Next K4:Rst"):
         """Draw standard page frame: border, title, divider, footer."""
         w = getattr(self, 'render_w', self.shared_data.width)
@@ -807,7 +836,10 @@ class Display:
         sx = getattr(self, 'render_sx', self.scale_factor_x)
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         font = self.shared_data.font_arial9
-        font_title = self.shared_data.font_viking
+        # Shrink the title to fit the panel width so long names ("NET DNS
+        # DOCTOR") aren't clipped mid-word on the narrow LCD.
+        font_title = self._fit_font('Viking.TTF', self.shared_data.font_viking,
+                                    title, w - int(8 * sx))
         draw.rectangle((1, 1, w - 1, h - 1), outline=0)
         draw.text((int(4 * sx), int(4 * sy)), title, font=font_title, fill=0)
         draw.line((1, int(22 * sy), w - 1, int(22 * sy)), fill=0)
@@ -1143,6 +1175,107 @@ class Display:
                 os.fsync(img_file.fileno())
         except Exception:
             pass
+
+    def _render_main_compact(self, image, draw, W, H):
+        """Compact PAGE_MAIN layout for a small square panel (e.g. the 128x128
+        LCD HAT). The default dashboard is authored for a ~122x250 canvas, so on
+        a 128-tall panel its absolute coordinates fall off-screen and the speech
+        text collides with the 78px character sprite. This lays the same
+        elements out to fit: header, two icon+count stat rows, the mood lines,
+        the speech line beside a shrunk character, all inside 128x128."""
+        sd = self.shared_data
+        font = sd.font_arial9
+        # --- frame + header ---
+        draw.rectangle((0, 0, W - 1, H - 1), outline=0)
+        title_font = self._fit_font('Viking.TTF', sd.font_viking, "RAGNAR", W - 40)
+        tw = title_font.getlength("RAGNAR")
+        draw.text(((W - tw) / 2, 1), "RAGNAR", font=title_font, fill=0)
+        # WiFi / AP indicator, top-left
+        try:
+            if getattr(sd, 'ap_mode_active', False):
+                ap_text = "AP"
+                if getattr(sd, 'ap_client_count', 0) > 0:
+                    ap_text = f"AP:{sd.ap_client_count}"
+                draw.text((3, 3), ap_text, font=font, fill=0)
+            elif getattr(sd, 'wifi_connected', False):
+                self.render_wifi_wave_indicator(image, draw)
+        except Exception:
+            pass
+        # Battery %, top-right (PiSugar)
+        try:
+            _ri = getattr(sd, 'ragnar_instance', None)
+            _ps = getattr(_ri, 'pisugar_listener', None) if _ri else None
+            if _ps and _ps.available:
+                bl = _ps.get_battery_level()
+                if bl is not None:
+                    bt = f"{int(round(bl))}%{'+' if _ps.is_charging() else ''}"
+                    draw.text((W - font.getlength(bt) - 2, 3), bt, font=font, fill=0)
+        except Exception:
+            pass
+        draw.line((1, 15, W - 1, 15), fill=0)
+
+        # --- two icon+count stat rows ---
+        def _row(y, items):
+            slot = W // len(items)
+            for i, (icon, val) in enumerate(items):
+                x = i * slot + 2
+                if icon is not None:
+                    try:
+                        image.paste(icon, (x, y))
+                        tx = x + icon.width + 1
+                    except Exception:
+                        tx = x
+                else:
+                    tx = x
+                draw.text((tx, y + 4), str(val), font=font, fill=0)
+
+        _row(18, [(getattr(sd, 'target', None), sd.targetnbr),
+                  (getattr(sd, 'port', None),   sd.portnbr),
+                  (getattr(sd, 'vuln', None),   sd.vulnnbr),
+                  (getattr(sd, 'cred', None),   sd.crednbr)])
+        _row(38, [(getattr(sd, 'zombie', None),  sd.zombiesnbr),
+                  (getattr(sd, 'data', None),    sd.datanbr),
+                  (getattr(sd, 'money', None),   sd.coinnbr),
+                  (getattr(sd, 'attacks', None), sd.attacksnbr)])
+        draw.line((1, 57, W - 1, 57), fill=0)
+
+        # --- mood / status lines ---
+        try:
+            sd.update_ragnarstatus()
+        except Exception:
+            pass
+        draw.text((3, 59), str(getattr(sd, 'ragnarstatustext', '') or '')[:24], font=font, fill=0)
+        draw.text((3, 69), str(getattr(sd, 'ragnarstatustext2', '') or '')[:24], font=font, fill=0)
+
+        # --- character sprite, shrunk into the bottom-right corner ---
+        vk_w = 0
+        vk = getattr(sd, 'imagegen', None)
+        if vk is not None:
+            try:
+                target_h = 46
+                if vk.height > target_h:
+                    ratio = target_h / vk.height
+                    vk = vk.resize((max(1, int(vk.width * ratio)), target_h), Image.NEAREST)
+                vk_w = vk.width
+                image.paste(vk, (W - vk_w - 1, H - vk.height - 1))
+            except Exception:
+                vk_w = 0
+
+        # --- speech, wrapped into the space left of the sprite ---
+        says = str(getattr(sd, 'ragnarsays', '') or '')
+        if says:
+            avail_w = W - vk_w - 6
+            try:
+                lines = sd.wrap_text(says, sd.font_arialbold, avail_w)
+            except Exception:
+                lines = [says]
+            y = 82
+            for line in lines:
+                if y > H - 12:
+                    break
+                draw.text((3, y), line, font=sd.font_arialbold, fill=0)
+                bb = sd.font_arialbold.getbbox(line)
+                y += (bb[3] - bb[1]) + 2
 
     def _fetch_network_data(self):
         """Fetch real host data from database."""
@@ -3091,6 +3224,25 @@ class Display:
                 # For 90°/270° we render in portrait so W < H.
                 W = render_w
                 H = render_h
+                # Small square panels (e.g. the 128x128 LCD HAT) can't fit the
+                # tall e-paper dashboard — its absolute coords fall off-screen and
+                # the speech text collides with the character sprite. Render a
+                # dedicated compact layout instead and commit it directly.
+                if render_w < 150 and 100 <= render_h < 170:
+                    try:
+                        self._render_main_compact(image, draw, W, H)
+                    except Exception as e:
+                        logger.debug(f"compact main render error: {e}")
+                    epd_img = _apply_epd_rotation(image, self.screen_reversed)
+                    self.epd_helper.display_partial(epd_img)
+                    self.epd_helper.display_partial(epd_img)
+                    web_img = _apply_web_rotation(image, self.web_screen_reversed)
+                    with open(os.path.join(self.shared_data.webdir, "screen.png"), 'wb') as img_file:
+                        web_img.save(img_file)
+                        img_file.flush()
+                        os.fsync(img_file.fileno())
+                    self._sleep_interruptible(PAGE_MAIN)
+                    continue
                 ref_w = self.shared_data.config.get('ref_width', 122)
                 ref_h = self.shared_data.config.get('ref_height', 250)
                 if self.screen_reversed in (90, 270):
