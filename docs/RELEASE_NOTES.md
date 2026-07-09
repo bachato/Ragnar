@@ -1,6 +1,95 @@
-# Ragnar Release Notes - Multi-Platform & Advanced Tools Support
+# Ragnar Release Notes
 
-## 🎯 Overview
+---
+
+## Unreleased — `releases` branch
+
+### New Features
+
+#### Interactive Network Map
+- D3.js force-directed topology map with risk-colored nodes (critical/high/medium/low/info)
+- Click any node to open a slide-in host detail panel showing ports, credentials, attack history, and vulnerability summary
+- Zoom, pan, and drag support
+- AI-assisted device classification via GPT-5 Nano toggle (optional, requires API key)
+- Node labels prefer resolved hostname over raw IP
+- Legend auto-generated from live data
+
+#### Multi-Subnet Discovery
+- Add extra subnets directly from the Network Map tab to discover devices behind other routers/APs
+- Subnet scan log shows per-cycle progress
+- Subnets persisted via `/api/config/scan-subnets` API
+
+#### Unified Credentials Table
+- Dedicated **Credentials** tab aggregating all discovered credentials across all services and networks
+- Sortable columns (host, service, username, password, date)
+- Full-text search/filter
+- One-click CSV export
+
+#### Per-Network File Browser
+- Data stolen files and cracked passwords organised by SSID/network
+- Network and SSID sorting/filtering in attack logs and file browser
+
+#### Inline File Preview
+- Preview text, CSV, and image files directly in the browser without downloading
+- Scrollable modal with Escape and backdrop-click to close
+
+#### HTML Scan Report Export
+- One-click export of a full standalone HTML report containing hosts, credentials, and attack log
+- Self-contained — no external dependencies, works offline
+
+#### Pushover Push Notifications
+- New `pushover_service.py` — sends real-time push notifications via the Pushover API
+- Alerts for: new device discovered, device back online, new credentials found, new vulnerabilities
+- Deduplication to avoid repeat alerts for known devices/events
+- Configure API user key and app token in the web UI (Settings tab)
+- Test notification button
+
+#### Device Classifier
+- New `device_classifier.py` — zero-dependency MAC OUI + open-port heuristic classification
+- Sub-millisecond per-host classification, suitable for Pi Zero W2
+- Categories: router, access-point, server, workstation, mobile, IoT, printer, camera, NAS, gaming, media, VoIP
+- Optional AI enhancement for low-confidence devices
+
+#### Environment Variable Manager
+- New `env_manager.py` — manages API tokens (OpenAI key) in `.env` file with a clean Python API
+
+### Improvements
+
+- **Faster startup** — reduced boot time
+- **E-paper display** — updated layout and rendering
+- **Toggle switches** — corrected green background when enabled (was missing Tailwind class at runtime)
+- **Search icon placement** — moved to right side in credentials and attack log search inputs, using inline styles to avoid Tailwind purge issues
+- **Network storage** — per-network organisation for scan results and vulnerabilities
+- **AI export button** — relocated for better UI flow
+- **Scan progress** — more accurate progress counters via per-network result scoping
+
+### Bug Fixes
+
+- File preview modal: correct max height, `overflow-y-auto` on content, Escape and backdrop close
+- Network map node labels now prefer hostname over IP
+- Search icon visibility fixed with inline styles (bypasses compiled Tailwind)
+- Attack log and file browser SSID/network sort and filter corrected
+
+### New API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET/POST/DELETE | `/api/config/scan-subnets` | Manage extra scan subnets |
+| GET | `/api/config/scan-subnets/log` | Per-cycle subnet scan log |
+| GET | `/api/network/topology` | Network topology data for D3 map |
+| GET | `/api/host/<ip>` | Host detail (ports, creds, vulns, history) |
+| GET | `/api/report/export` | Export full HTML scan report |
+| GET | `/api/files/preview` | Inline file preview (text/CSV/image) |
+| GET | `/api/pushover/keys` | Retrieve Pushover config |
+| POST | `/api/pushover/keys` | Save Pushover API keys |
+| DELETE | `/api/pushover/keys` | Remove Pushover API keys |
+| POST | `/api/pushover/test` | Send a test push notification |
+
+---
+
+## v2.0.0 — Multi-Platform & Advanced Tools Support
+
+## Overview
 
 This release brings comprehensive multi-platform support and intelligent automatic installation of advanced security tools based on hardware capabilities.
 
@@ -98,7 +187,7 @@ Hardware Requirements Check:
 
 ### Installation Behavior Clarity
 - **Fresh Installations**: Fully automatic, no prompts for advanced tools on qualifying hardware
-- **Existing Installations**: Manual upgrade via `./scripts/install_advanced_tools.sh`
+- **Existing Installations**: Manual upgrade via `./install_advanced_tools.sh`
 - **Resource-Constrained**: Clear messages explaining why tools are skipped
 
 ## 🚀 Usage Examples
@@ -114,7 +203,7 @@ sudo chmod +x install_ragnar.sh && sudo ./install_ragnar.sh
 ### Existing Installation Upgrade
 ```bash
 cd /home/ragnar/Ragnar
-sudo ./scripts/install_advanced_tools.sh
+sudo ./install_advanced_tools.sh
 sudo systemctl restart ragnar
 ```
 
@@ -160,7 +249,7 @@ None. All changes are backward compatible.
 ```bash
 cd /home/ragnar/Ragnar
 git pull  # Get latest code
-sudo ./scripts/install_advanced_tools.sh
+sudo ./install_advanced_tools.sh
 sudo systemctl restart ragnar
 ```
 
@@ -212,7 +301,7 @@ We welcome contributions! Areas of interest:
 
 - **Issues**: [GitHub Issues](https://github.com/PierreGode/Ragnar/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/PierreGode/Ragnar/discussions)
-- **Documentation**: [README.md](../README.md) | [INSTALL.md](INSTALL.md)
+- **Documentation**: [README.md](README.md) | [INSTALL.md](INSTALL.md)
 
 ## 🙏 Acknowledgments
 
