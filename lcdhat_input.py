@@ -21,10 +21,10 @@
 # Default layer (not wardriving, not net-diag):
 #   Joy Up/Left   : previous display page   (as seen on the text)
 #   Joy Down/Right: next display page       (as seen on the text)
-#   Joy Press     : restart Ragnar service
+#   Joy Press     : start/stop page autoscroll (auto-cycle every 5s)
 #   KEY1          : toggle On-Screen Network Diagnostic Mode
 #   KEY2          : rotate the screen (0→90→180→270)
-#   KEY3          : next display page
+#   KEY3 short/long: next display page / restart Ragnar service
 #
 # Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad.
 # The joystick navigates + pings, the keys fire tests (a long key-press fires
@@ -39,10 +39,16 @@
 #   KEY3 short/long: speedtest / DNS Doctor poison-hijack check
 
 import logging
+import threading
+import time
 
 from epd_button import EPDButtonListener, PAGE_COUNT, NETDIAG_HOLD_TIME
 
 logger = logging.getLogger(__name__)
+
+# Seconds each normal Ragnar page is shown when page autoscroll is enabled
+# (joystick-center toggles it). Matches the net-diag auto-cycle cadence.
+AUTOSCROLL_INTERVAL = 5.0
 
 # Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP). Mirrors
 # display.NETDIAG_PAGE_COUNT; kept local so this module needn't import display.py.
@@ -72,10 +78,9 @@ _INPUTS = (
     (JOY_PRESS_PIN, 'press'),
 )
 
-# Inputs that resolve short-vs-long on release/hold while in net-diag mode
-# (their long press fires the advanced-test variant). KEY1 is not here — it's a
-# global mode toggle that acts on press in every layer.
-_LONG_PRESS_INPUTS = {'key2', 'key3'}
+# KEY1 is never here — it's a global mode toggle that acts on press in every
+# layer. Which other inputs resolve short-vs-long on release/hold depends on the
+# mode; see _defers().
 
 # Joystick directions in clockwise order — used to rotate a raw pin direction
 # into the frame the user reads on the panel.
@@ -88,6 +93,8 @@ class LCDHATInputListener(EPDButtonListener):
     def __init__(self, shared_data):
         super().__init__(shared_data)
         self._held_inputs = set()
+        self.autoscroll = False           # joystick-center toggles page autoscroll
+        self._autoscroll_started = False
 
     def start(self):
         """Claim the HAT's buttons + joystick via gpiozero."""
@@ -106,6 +113,7 @@ class LCDHATInputListener(EPDButtonListener):
                 self._buttons.append(btn)
 
             self.available = True
+            self._start_autoscroll_thread()
             logger.info("LCD HAT input listener started (keys 21,20,16 + "
                         "joystick 6,19,5,26,13)")
         except ImportError:
@@ -113,10 +121,43 @@ class LCDHATInputListener(EPDButtonListener):
         except Exception as e:
             logger.warning(f"Could not start LCD HAT input listener: {e}")
 
+    def _start_autoscroll_thread(self):
+        """Background ticker that advances the page while autoscroll is on. The
+        render loop's _sleep_interruptible wakes on the current_page change, so
+        no display-side timer is needed. Paused during net-diag (it has its own
+        cycle) and wardriving (so it never yanks you off the wardriving view)."""
+        if self._autoscroll_started:
+            return
+        self._autoscroll_started = True
+
+        def _loop():
+            while True:
+                time.sleep(AUTOSCROLL_INTERVAL)
+                try:
+                    if not self.autoscroll:
+                        continue
+                    if self._netdiag_active():
+                        continue
+                    if self._is_wardriving_active():
+                        continue
+                    self.current_page = (self.current_page + 1) % PAGE_COUNT
+                except Exception as e:
+                    logger.debug(f"autoscroll tick error: {e}")
+
+        threading.Thread(target=_loop, name='lcd-autoscroll', daemon=True).start()
+
     # --- Gesture dispatch -------------------------------------------------
     # Joystick inputs fire on press. Keys fire on release (short) or hold
     # (long) while in net-diag mode so a long press never also triggers the
     # short action; elsewhere the keys act on press like the 2.7" HAT.
+
+    def _defers(self, name):
+        """Inputs that resolve short-vs-long on release/hold (the rest act on
+        press). In net-diag both KEY2 and KEY3 carry a short/long test pair; in
+        the default layer only KEY3 does (short = next page, long = restart)."""
+        if self._netdiag_active():
+            return name in ('key2', 'key3')
+        return name == 'key3'
 
     def _on_input_press(self, name):
         self._held_inputs.discard(name)
@@ -125,18 +166,18 @@ class LCDHATInputListener(EPDButtonListener):
             # in every layer. Its release/hold are ignored (not deferred).
             self._set_netdiag(not self._netdiag_active())
             return
-        if name in _LONG_PRESS_INPUTS and self._netdiag_active():
-            return  # a key in net-diag mode is decided on release/hold
+        if self._defers(name):
+            return  # decided on release (short) / hold (long)
         self._dispatch(name, 'short')
 
     def _on_input_held(self, name):
-        if name not in _LONG_PRESS_INPUTS or not self._netdiag_active():
+        if not self._defers(name):
             return
         self._held_inputs.add(name)
         self._dispatch(name, 'long')
 
     def _on_input_release(self, name):
-        if name not in _LONG_PRESS_INPUTS or not self._netdiag_active():
+        if not self._defers(name):
             return
         if name in self._held_inputs:
             self._held_inputs.discard(name)
@@ -147,7 +188,7 @@ class LCDHATInputListener(EPDButtonListener):
         if self._netdiag_active():
             self._netdiag_input(name, gesture)
         else:
-            self._default_input(name)
+            self._default_input(name, gesture)
 
     # --- Orientation ------------------------------------------------------
     def _visual_dir(self, name):
@@ -170,21 +211,35 @@ class LCDHATInputListener(EPDButtonListener):
 
     # --- Default layer (page navigation + key actions) --------------------
 
-    def _default_input(self, name):
+    def _default_input(self, name, gesture='short'):
         name = self._visual_dir(name)
         if name in ('up', 'left'):
             self._change_page(-1)
-        elif name in ('down', 'right', 'key3'):
+        elif name in ('down', 'right'):
             self._change_page(+1)
+        elif name == 'key3':
+            if gesture == 'long':
+                self._on_key4()        # KEY3 hold: restart service
+            else:
+                self._change_page(+1)  # KEY3 tap: next page
         elif name == 'press':
-            self._on_key4()   # restart service
+            self._toggle_autoscroll()  # joystick center: start/stop autoscroll
         elif name == 'key2':
-            self._on_key2()   # rotate screen
+            self._on_key2()            # rotate screen
         # KEY1 is handled on press in _on_input_press (mode toggle).
 
     def _change_page(self, step):
+        # Any manual navigation cancels autoscroll so it doesn't fight the user.
+        if self.autoscroll and step:
+            self.autoscroll = False
+            logger.info("LCD: page autoscroll OFF (manual navigation)")
         self.current_page = (self.current_page + step) % PAGE_COUNT
         logger.info(f"LCD HAT: page -> {self.current_page}")
+
+    def _toggle_autoscroll(self):
+        """Joystick center: start/stop auto-cycling the normal Ragnar pages."""
+        self.autoscroll = not self.autoscroll
+        logger.info(f"LCD: page autoscroll {'ON' if self.autoscroll else 'OFF'}")
 
     def _set_netdiag(self, on):
         """Flip Network Diagnostic Mode on/off (KEY1), persist it, wake panel."""

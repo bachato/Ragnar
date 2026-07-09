@@ -169,9 +169,10 @@ remaps each push into the on-screen frame (and re-aligns automatically when
 **KEY2** rotates the display) — up/down page, left/right ping, whichever way the
 panel is turned.
 
-Outside net-diag mode the joystick pages through the normal Ragnar screens,
-**KEY1** toggles this diagnostic mode, **KEY2** rotates the screen, and a joystick
-press restarts the service.
+Outside net-diag mode the joystick pages through the normal Ragnar screens and a
+**joystick press starts/stops page autoscroll** (auto-cycle every 5 s); **KEY1**
+toggles this diagnostic mode, **KEY2** rotates the screen, and **KEY3** is next
+page (tap) or restart the service (hold).
 
 > Applies to the e-Paper / LCD display. Headless installs (no display) accept
 > the toggle but have nothing to render it on.
