@@ -38,7 +38,7 @@ alert.
 | [Speed Test](#speed-test) | Diagnostics | `POST /api/net/speedtest` |
 | [Live Flow Telemetry](#live-flow-telemetry) | Diagnostics | `GET /api/net/flows` |
 | [PTP Timing Detection](#ptp-timing-detection) | Diagnostics | `POST /api/net/ptp` |
-| [E-Paper Network Diagnostic Mode](#-e-paper-network-diagnostic-mode) | Diagnostics (toggle) | config `network_diagnostic_mode` |
+| [On-Screen Network Diagnostic Mode](#-on-screen-network-diagnostic-mode) | Diagnostics (toggle) | config `network_diagnostic_mode` |
 | [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2/L3 | `GET /api/net/lldp` |
 | [ARP Scan](#arp-scan) | Switch & L2/L3 | `GET /api/net/arp-scan` |
 | [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
@@ -94,10 +94,11 @@ module's `selftest()`.
 
 ---
 
-## 🖥️ E-Paper Network Diagnostic Mode
+## 🖥️ On-Screen Network Diagnostic Mode
 
-A toggle at the top of the Diagnostics sub-tab turns the **e-Paper display**
-into a standalone, Ethernet-focused field tool — so you can plug the device
+A toggle at the top of the Diagnostics sub-tab turns the **on-board display**
+(e-Paper HAT or the 1.44" LCD HAT) into a standalone, Ethernet-focused field
+tool — so you can plug the device
 into a switch and read the essentials off the screen with **no laptop and no
 internet**. Everything shown is gathered locally (`ip` / `ethtool` /
 `lldpctl` / `resolv.conf`), so it works on an isolated or dead network.
@@ -147,27 +148,29 @@ waiting out the 5 s cycle.
 #### Field-test pad (1.44" LCD HAT + joystick)
 
 The Waveshare **1.44" LCD HAT** (ST7735S, 128×128) carries **3 keys plus a
-5-way joystick**, so navigation and tests get separate controls — no long-press
-needed for the common ones. Select it in **Display settings** as *"1.44" ST7735S
-LCD HAT + joystick"*. While Network Diagnostic mode is on:
+5-way joystick**. On this HAT **KEY1 is the mode switch** — it toggles On-Screen
+Network Diagnostic Mode on/off directly (no web UI needed), so the two gateway/
+internet pings live on the joystick instead. Select the HAT in **Display
+settings** as *"1.44" ST7735S LCD HAT + joystick"*. While the mode is on:
 
 | Input | Action |
 |-------|--------|
-| **Joystick ← / ↑** | Previous diagnostic page |
-| **Joystick → / ↓** | Next diagnostic page |
+| **KEY1** | **Toggle the mode off** — back to the normal screens |
+| **Joystick ↑ / ↓** | Previous / next diagnostic page |
+| **Joystick ←** | **Ping the gateway** (LAN) |
+| **Joystick →** | **Ping the internet** (`8.8.8.8`, WAN) |
 | **Joystick press** | Dismiss a shown result, else **pause / resume** the auto-cycle |
-| **KEY1** short / long | **Ping the gateway** (LAN) / **Ping the internet** (`8.8.8.8`, WAN) |
 | **KEY2** short / long | **Locate port** — blink the switch link LED / **L2 health** capture (~12 s) |
 | **KEY3** short / long | **Speed test** / **DNS Doctor** — poisoning/hijack verdict |
 
 The joystick arrows above are **as you read them on the screen**: the HAT's
 joystick is physically mounted 90° clockwise of the panel's text, so the listener
 remaps each push into the on-screen frame (and re-aligns automatically when
-**KEY2** rotates the display) — up/left is always "back" and down/right always
-"forward" relative to the text, whichever way the panel is turned.
+**KEY2** rotates the display) — up/down page, left/right ping, whichever way the
+panel is turned.
 
 Outside net-diag mode the joystick pages through the normal Ragnar screens,
-**KEY1** swaps to/from Pwnagotchi, **KEY2** rotates the screen, and a joystick
+**KEY1** toggles this diagnostic mode, **KEY2** rotates the screen, and a joystick
 press restarts the service.
 
 > Applies to the e-Paper / LCD display. Headless installs (no display) accept
@@ -496,7 +499,7 @@ capture stats, and the gateway's ARP verdict. An **interface selector**
 (Auto / WiFi / LAN) targets the scan at a chosen segment. It feeds the
 [Network Integrity Monitor](#-network-integrity-monitor) (rogue-server check
 only, so the background cycle stays fast) and adds a **DHCP page** to the
-[e-Paper Network Diagnostic Mode](#-e-paper-network-diagnostic-mode).
+[On-Screen Network Diagnostic Mode](#-on-screen-network-diagnostic-mode).
 
 - Endpoints: `GET /api/net/dhcp-guardian` `?interface=<if>&seconds=<n>&quick=0|1`,
   `GET|POST /api/net/dhcp-baseline` `{action:reset}` · store:

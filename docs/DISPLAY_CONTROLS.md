@@ -6,7 +6,7 @@ Ragnar's HATs carry hardware controls that change what they do depending on the
 - **Default** — the normal Ragnar dashboard (the everyday screens).
 - **Wardriving** — while the wardriving engine is running.
 - **Network Diagnostic** — while `network_diagnostic_mode` is on (a standalone
-  field tester; documented in full in the [Network Tools Guide](nettools.md#-e-paper-network-diagnostic-mode)).
+  field tester; documented in full in the [Network Tools Guide](nettools.md#-on-screen-network-diagnostic-mode)).
 
 Two HATs have controls:
 
@@ -64,15 +64,19 @@ GPIO pins (BCM), fixed by the HAT: `KEY1=21`, `KEY2=20`, `KEY3=16`; joystick
 | **Joystick ↑ / ←** | Previous display page |
 | **Joystick ↓ / →** | Next display page |
 | **Joystick press** | Restart the Ragnar service |
-| **KEY1** | Swap to/from **Pwnagotchi** |
+| **KEY1** | **Toggle On‑Screen Network Diagnostic Mode** |
 | **KEY2** | **Rotate** the screen (0° → 90° → 180° → 270°) |
 | **KEY3** | **Next page** |
 
+> The e‑paper HAT uses KEY1 for the Pwnagotchi swap; on the LCD HAT KEY1 is the
+> field‑tester switch instead — it flips Network Diagnostic Mode on and off.
+
 ### Network Diagnostic mode
 
-The joystick navigates and the keys fire tests (each key has a short/long
-press) — see the full [field‑test pad](nettools.md#field-test-pad-144-lcd-hat--joystick)
-table.
+**KEY1** toggles the mode back off. The joystick navigates (↑/↓ page) and runs
+the two pings (← gateway, → internet); **KEY2**/**KEY3** fire the other tests
+(short/long) — see the full
+[field‑test pad](nettools.md#field-test-pad-144-lcd-hat--joystick) table.
 
 ---
 

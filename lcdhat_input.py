@@ -13,21 +13,28 @@
 # listener remaps every joystick direction into this visual frame (see
 # _visual_dir) and keeps it correct as KEY2 rotates the screen.
 #
+# KEY1 is the field-tester switch on the LCD HAT: it flips On-Screen Network
+# Diagnostic Mode on/off (the e-paper HAT uses KEY1 for the Pwnagotchi swap).
+# Because KEY1 owns the toggle in net-diag, the two gateway/internet ping tests
+# live on the joystick left/right there instead.
+#
 # Default layer (not wardriving, not net-diag):
 #   Joy Up/Left   : previous display page   (as seen on the text)
 #   Joy Down/Right: next display page       (as seen on the text)
 #   Joy Press     : restart Ragnar service
-#   KEY1          : swap to/from Pwnagotchi
+#   KEY1          : toggle On-Screen Network Diagnostic Mode
 #   KEY2          : rotate the screen (0→90→180→270)
 #   KEY3          : next display page
 #
 # Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad.
-# The joystick navigates, the keys fire tests (a long key-press fires the
-# "advanced" variant, mirroring the 2.7" HAT's short/long netdiag gestures):
-#   Joy Left/Up   : previous diagnostic page   (as seen on the text)
-#   Joy Right/Down: next diagnostic page       (as seen on the text)
+# The joystick navigates + pings, the keys fire tests (a long key-press fires
+# the "advanced" variant, mirroring the 2.7" HAT's short/long netdiag gestures):
+#   Joy Up        : previous diagnostic page   (as seen on the text)
+#   Joy Down      : next diagnostic page       (as seen on the text)
+#   Joy Left      : ping gateway (LAN)
+#   Joy Right     : ping internet (8.8.8.8, WAN)
 #   Joy Press     : dismiss a shown result, else pause/resume auto-cycle
-#   KEY1 short/long: ping gateway  / ping internet (8.8.8.8)
+#   KEY1          : toggle the mode off (back to the normal screens)
 #   KEY2 short/long: locate switch port / L2 health capture (~12s)
 #   KEY3 short/long: speedtest / DNS Doctor poison-hijack check
 
@@ -65,8 +72,10 @@ _INPUTS = (
     (JOY_PRESS_PIN, 'press'),
 )
 
-# Keys that support a long press in net-diag mode → advanced-test variant.
-_LONG_PRESS_INPUTS = {'key1', 'key2', 'key3'}
+# Inputs that resolve short-vs-long on release/hold while in net-diag mode
+# (their long press fires the advanced-test variant). KEY1 is not here — it's a
+# global mode toggle that acts on press in every layer.
+_LONG_PRESS_INPUTS = {'key2', 'key3'}
 
 # Joystick directions in clockwise order — used to rotate a raw pin direction
 # into the frame the user reads on the panel.
@@ -111,6 +120,11 @@ class LCDHATInputListener(EPDButtonListener):
 
     def _on_input_press(self, name):
         self._held_inputs.discard(name)
+        if name == 'key1':
+            # KEY1 is the global mode switch: flip net-diag on/off on press,
+            # in every layer. Its release/hold are ignored (not deferred).
+            self._set_netdiag(not self._netdiag_active())
+            return
         if name in _LONG_PRESS_INPUTS and self._netdiag_active():
             return  # a key in net-diag mode is decided on release/hold
         self._dispatch(name, 'short')
@@ -164,14 +178,31 @@ class LCDHATInputListener(EPDButtonListener):
             self._change_page(+1)
         elif name == 'press':
             self._on_key4()   # restart service
-        elif name == 'key1':
-            self._on_key1()   # swap Pwnagotchi (or wardriving AP)
         elif name == 'key2':
             self._on_key2()   # rotate screen
+        # KEY1 is handled on press in _on_input_press (mode toggle).
 
     def _change_page(self, step):
         self.current_page = (self.current_page + step) % PAGE_COUNT
         logger.info(f"LCD HAT: page -> {self.current_page}")
+
+    def _set_netdiag(self, on):
+        """Flip Network Diagnostic Mode on/off (KEY1), persist it, wake panel."""
+        try:
+            self.shared_data.config['network_diagnostic_mode'] = bool(on)
+            try:
+                self.shared_data.save_config()
+            except Exception as e:
+                logger.warning(f"Could not persist network_diagnostic_mode: {e}")
+            self.netdiag_seq += 1               # wake the display promptly
+            if on:
+                self.netdiag_page = 0
+                self.netdiag_result = None
+                self.netdiag_frozen = False
+            logger.info(f"LCD KEY1: Network Diagnostic Mode "
+                        f"{'ON' if on else 'OFF'}")
+        except Exception as e:
+            logger.error(f"LCD net-diag toggle failed: {e}")
 
     # --- Network Diagnostic layer ----------------------------------------
 
@@ -180,11 +211,19 @@ class LCDHATInputListener(EPDButtonListener):
         self.netdiag_seq += 1   # wake the display promptly
 
         name = self._visual_dir(name)
-        if name in ('left', 'up'):
+        # Up/Down page through the diagnostics; Left/Right run the two pings
+        # (KEY1 now owns the mode toggle, so the pings moved off it).
+        if name == 'up':
             self._netdiag_step_page(-1)
             return
-        if name in ('right', 'down'):
+        if name == 'down':
             self._netdiag_step_page(+1)
+            return
+        if name == 'left':
+            self._run_netdiag_test('ping_gw')
+            return
+        if name == 'right':
+            self._run_netdiag_test('ping_wan')
             return
         if name == 'press':
             # Dismiss a shown result first, else toggle the auto-cycle.
@@ -197,7 +236,6 @@ class LCDHATInputListener(EPDButtonListener):
             return
 
         kind = {
-            ('key1', 'short'): 'ping_gw', ('key1', 'long'): 'ping_wan',
             ('key2', 'short'): 'port',    ('key2', 'long'): 'l2',
             ('key3', 'short'): 'speedtest', ('key3', 'long'): 'dns',
         }.get((name, gesture))
