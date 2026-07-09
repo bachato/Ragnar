@@ -1191,13 +1191,17 @@ class Display:
         # middle strip only (never colliding with either) and the divider sits
         # below all three.
         draw.rectangle((0, 0, W - 1, H - 1), outline=0)
-        # Left connection glyph, confined to x<16 / y<14 so it clears the title.
+        # Left connection glyph + IP octet, confined to the top-left so they
+        # clear the title. `left_used` grows to whatever they occupy so the
+        # title padding can step around them.
+        left_used = 2
         try:
             if getattr(sd, 'ap_mode_active', False):
                 ap_text = "AP"
                 if getattr(sd, 'ap_client_count', 0) > 0:
                     ap_text = f"AP:{sd.ap_client_count}"
                 draw.text((2, 3), ap_text, font=font, fill=0)
+                left_used = 2 + int(font.getlength(ap_text))
             elif getattr(sd, 'wifi_connected', False):
                 try:
                     q = getattr(sd, 'wifi_signal_quality', None)
@@ -1210,6 +1214,14 @@ class Display:
                 for i in range(waves):
                     r = 3 + i * 3
                     draw.arc((cx - r, cy - r, cx + r, cy + r), start=225, end=315, fill=0, width=1)
+                left_used = 14
+                try:
+                    ip_octet = self.get_wifi_ip_last_octet()
+                except Exception:
+                    ip_octet = None
+                if ip_octet:
+                    draw.text((15, 4), ip_octet, font=font, fill=0)
+                    left_used = 15 + int(font.getlength(ip_octet))
         except Exception:
             pass
         # Battery %, top-right (PiSugar)
@@ -1225,8 +1237,8 @@ class Display:
                     draw.text((W - bat_w + 1, 3), bt, font=font, fill=0)
         except Exception:
             pass
-        # Centre the title in the strip between the glyph and the battery.
-        left_pad = 18
+        # Centre the title in the strip between the glyph/IP and the battery.
+        left_pad = max(18, left_used + 2)
         right_pad = max(18, bat_w)
         avail = W - left_pad - right_pad
         title_font = self._fit_font('Viking.TTF', sd.font_viking, "RAGNAR", avail)
