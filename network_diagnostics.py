@@ -4958,6 +4958,466 @@ def _icmp_selftest():
 
 
 # --------------------------------------------------------------------------
+# SNMP Watch: passive cleartext-SNMP (v1/v2c) exposure scanner (detection-only)
+# --------------------------------------------------------------------------
+# SNMP v1 and v2c authenticate with a plaintext "community string" — effectively a
+# device password carried in the clear on every request. Anyone passively sniffing
+# the segment harvests it: the read community (often the default "public") exposes
+# the full device config/MIB, and a write community (seen on a SetRequest) lets an
+# attacker who captured it *reconfigure* the device — change routes, ACLs, SNMP
+# itself, or bounce interfaces. v3 fixes this with the User Security Model
+# (authentication + privacy/encryption). This scanner is PASSIVE: one short tcpdump
+# window over UDP 161/162, parsed and classified. It never sends an SNMP request.
+# What it flags:
+#   * write-exposed — a SetRequest in v1/v2c: a *write* community is on the wire,
+#     i.e. sniff it and you own the device.
+#   * cleartext     — any v1/v2c traffic: the community string is exposed (worse
+#     when it's a well-known default like "public"/"private").
+#   * amplification — a GetBulk with a large max-repetitions: the SNMP reflection/
+#     amplification DDoS vector.
+#   * enumeration   — one host walking the MIB (many GetNext/GetBulk): SNMP recon.
+#   * clean         — only SNMPv3 (or no SNMP) seen.
+# A first scan learns the segment's SNMP agents + community strings into
+# data/snmp_watch.json so later scans can highlight *new* exposure; the verdict
+# always reflects the cleartext reality (v1/v2c is insecure regardless of baseline).
+_SNMP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'snmp_watch.json')
+_snmp_watch_lock = threading.Lock()
+
+# A GetBulk requesting at least this many repetitions is an amplification/DoS-grade
+# request (a normal snmpbulkwalk uses ~10).
+_SNMP_BULK_AMP = 50
+# One source issuing at least this many GetNext/GetBulk in the window is walking the
+# MIB (enumeration / recon).
+_SNMP_WALK_COUNT = 20
+_SNMP_EVENTS_CAP = 200
+
+# Well-known / default community strings — trivially guessable even without a
+# sniffer, and the first thing every scanner tries.
+_SNMP_DEFAULT_COMMUNITIES = frozenset((
+    'public', 'private', 'community', 'cisco', 'manager', 'admin', 'snmp',
+    'default', 'write', 'read', 'monitor', 'netman', 'ilo', 'secret', 'password',
+    'security', 'router', 'switch', 'test', 'guest', 'tivoli', 'openview', '0', ''))
+
+_SNMP_LINE_RE = re.compile(
+    r'^\s*(\d+\.\d+\.\d+\.\d+)\.(\d+)\s*>\s*(\d+\.\d+\.\d+\.\d+)\.(\d+):\s*'
+    r'\{\s*SNMP(v1|v2c|v3)\b(.*)$')
+_SNMP_COMMUNITY_RE = re.compile(r'C="([^"]*)"')
+_SNMP_PDU_RE = re.compile(
+    r'\b(GetNextRequest|GetResponse|GetBulk|GetRequest|SetRequest|InformRequest|'
+    r'V2Trap|Trap|Response)\b')
+_SNMP_MAXREP_RE = re.compile(r'\bM=(\d+)')
+
+
+def _parse_snmp_capture(output):
+    """Parse `tcpdump -nn -t -v 'udp port 161 or 162'` text into SNMP events.
+
+    tcpdump prints each SNMP message on one line as `<src>.<p> > <dst>.<p>:
+    { SNMPvN [C="community"] { PDU(..) ... } }`. It *omits* `C="..."` when the
+    community is the default "public", so a v1/v2c line with no community is treated
+    as "public". v3 uses the USM (no cleartext community). Each event:
+      {src, sport, dst, dport, version, community, pdu, max_rep}
+    """
+    events = []
+    for raw in output.splitlines():
+        m = _SNMP_LINE_RE.match(raw)
+        if not m:
+            continue
+        src, sport, dst, dport = (m.group(1), int(m.group(2)),
+                                  m.group(3), int(m.group(4)))
+        version = m.group(5)   # 'v1' | 'v2c' | 'v3'
+        rest = m.group(6)
+        cm = _SNMP_COMMUNITY_RE.search(rest)
+        if cm:
+            community = cm.group(1)
+        elif version in ('v1', 'v2c'):
+            community = 'public'   # tcpdump hides the default community
+        else:
+            community = None       # v3 — USM, no cleartext community
+        pm = _SNMP_PDU_RE.search(rest)
+        pdu = pm.group(1) if pm else None
+        rp = _SNMP_MAXREP_RE.search(rest)
+        max_rep = int(rp.group(1)) if rp else None
+        events.append({'src': src, 'sport': sport, 'dst': dst, 'dport': dport,
+                       'version': version, 'community': community, 'pdu': pdu,
+                       'max_rep': max_rep})
+    return events
+
+
+def _snmp_watch_load():
+    try:
+        with open(_SNMP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _snmp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_SNMP_WATCH_PATH), exist_ok=True)
+        tmp = _SNMP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _SNMP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_snmp_baseline(action='get'):
+    """Manage the learned SNMP baseline (known agents + community strings). Used to
+    highlight *new* exposure on later scans. action='reset' re-learns the segment's
+    current SNMP inventory on the next scan."""
+    with _snmp_watch_lock:
+        if action == 'reset':
+            _snmp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _snmp_watch_load()
+        return {'success': True, 'baseline': {
+            'agents': sorted((b.get('agents') or {}).keys()),
+            'communities': sorted(b.get('communities') or []),
+        }}
+
+
+def _snmp_endpoints(e):
+    """Return (agent_ip, manager_ip) for an SNMP event by port role: the agent is
+    the SNMP-service side (161), or the device sending a trap (to 162)."""
+    if e['dport'] == 161:
+        return e['dst'], e['src']       # query -> agent
+    if e['sport'] == 161:
+        return e['src'], e['dst']       # response from agent
+    if e['dport'] == 162:
+        return e['src'], e['dst']       # trap/inform from device -> manager
+    if e['sport'] == 162:
+        return e['dst'], e['src']       # inform response
+    return e['dst'], e['src']
+
+
+def _snmp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed SNMP events. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with synthetic
+    packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    agents = {}          # agent ip -> aggregate
+    managers = set()
+    communities = {}     # community -> aggregate (v1/v2c only)
+    walk_by_src = {}     # source -> count of GetNext/GetBulk
+    bulk_max = 0
+    insecure = False     # any v1/v2c seen
+    write_seen = []      # (community, agent, manager)
+
+    for e in events:
+        agent_ip, mgr_ip = _snmp_endpoints(e)
+        a = agents.setdefault(agent_ip, {
+            'ip': agent_ip, 'versions': set(), 'communities': set(),
+            'pdus': set(), 'writes': False})
+        a['versions'].add(e['version'])
+        if e['pdu']:
+            a['pdus'].add(e['pdu'])
+        managers.add(mgr_ip)
+
+        if e['version'] in ('v1', 'v2c'):
+            insecure = True
+            comm = e['community'] if e['community'] is not None else 'public'
+            a['communities'].add(comm)
+            c = communities.setdefault(comm, {
+                'community': comm, 'versions': set(), 'count': 0, 'writes': False})
+            c['versions'].add(e['version'])
+            c['count'] += 1
+            if e['pdu'] == 'SetRequest':
+                a['writes'] = True
+                c['writes'] = True
+                write_seen.append((comm, agent_ip, mgr_ip))
+
+        if e['pdu'] in ('GetNextRequest', 'GetBulk'):
+            walk_by_src[e['src']] = walk_by_src.get(e['src'], 0) + 1
+        if e['pdu'] == 'GetBulk' and e['max_rep']:
+            bulk_max = max(bulk_max, e['max_rep'])
+
+    known_agents = dict(baseline.get('agents') or {})
+    known_comms = set(baseline.get('communities') or [])
+    had_baseline = bool(known_agents or known_comms)
+
+    learned = False
+    if learn and not had_baseline and (agents or communities):
+        baseline['agents'] = {ip: {'versions': sorted(a['versions']),
+                                   'communities': sorted(a['communities'])}
+                              for ip, a in agents.items()}
+        baseline['communities'] = sorted(communities.keys())
+        learned = True
+        known_agents = dict(baseline['agents'])
+        known_comms = set(baseline['communities'])
+
+    PRIORITY = ['write-exposed', 'cleartext', 'amplification', 'enumeration',
+                'anomaly', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    default_comms = sorted(c for c in communities
+                           if c.lower() in _SNMP_DEFAULT_COMMUNITIES)
+    custom_comms = sorted(c for c in communities
+                          if c.lower() not in _SNMP_DEFAULT_COMMUNITIES)
+
+    # --- write-exposed: a SetRequest in cleartext = write community on the wire ---
+    if write_seen:
+        bump('write-exposed')
+        for comm, agent_ip, mgr_ip in write_seen[:6]:
+            reasons.append(
+                f"SNMP SetRequest (write) in cleartext from {mgr_ip} to agent "
+                f"{agent_ip} with community \"{comm}\" — capturing that community "
+                f"grants write access to reconfigure the device (takeover)")
+
+    # --- cleartext: any v1/v2c community exposure ---
+    if insecure:
+        bump('cleartext')
+        vers = sorted({v for a in agents.values() for v in a['versions']
+                       if v in ('v1', 'v2c')})
+        reasons.append(
+            f"SNMP {'/'.join(vers)} in use — the community string is sent in "
+            f"cleartext; anyone sniffing this segment captures it and gains that "
+            f"level of device access. Migrate to SNMPv3 (authPriv).")
+        if default_comms:
+            reasons.append(
+                f"Default/well-known community string(s) exposed: "
+                f"{', '.join(chr(34) + c + chr(34) for c in default_comms)} — "
+                f"trivially guessable even without a sniffer")
+        if custom_comms:
+            reasons.append(
+                f"Custom community string(s) exposed in cleartext: "
+                f"{', '.join(chr(34) + c + chr(34) for c in custom_comms)}")
+        new_comms = [c for c in communities if c not in known_comms]
+        if had_baseline and new_comms and not learned:
+            reasons.append(
+                f"NEW community string(s) since baseline: "
+                f"{', '.join(chr(34) + c + chr(34) for c in sorted(new_comms))}")
+
+    # --- amplification: GetBulk with large max-repetitions ---
+    if bulk_max >= _SNMP_BULK_AMP:
+        bump('amplification')
+        reasons.append(
+            f"SNMP GetBulk with max-repetitions {bulk_max} — the SNMP reflection/"
+            f"amplification DDoS vector; restrict/rate-limit SNMP and disable it on "
+            f"internet-facing interfaces")
+
+    # --- enumeration: a host walking the MIB ---
+    walkers = sorted((s for s, n in walk_by_src.items() if n >= _SNMP_WALK_COUNT),
+                     key=lambda s: -walk_by_src[s])
+    if walkers:
+        bump('enumeration')
+        for s in walkers[:4]:
+            reasons.append(
+                f"{s} issued {walk_by_src[s]} GetNext/GetBulk requests — walking the "
+                f"MIB (SNMP enumeration / reconnaissance)")
+
+    advisories = []
+    if agents or communities:
+        advisories.append(
+            "Migrate to SNMPv3 with authPriv (SHA + AES). If v1/v2c must remain, "
+            "confine SNMP to a management VLAN with ACLs, use unique non-default "
+            "read-only community strings, and never carry it over shared/user "
+            "segments. Disable SNMP on devices that don't need it.")
+
+    def _pub_agent(a):
+        return {'ip': a['ip'], 'versions': sorted(a['versions']),
+                'communities': sorted(a['communities']), 'writes': a['writes'],
+                'pdus': sorted(a['pdus']),
+                'secure': a['versions'] == {'v3'},
+                'baseline': a['ip'] in known_agents}
+
+    def _pub_comm(c):
+        return {'community': c['community'], 'versions': sorted(c['versions']),
+                'count': c['count'], 'writes': c['writes'],
+                'default': c['community'].lower() in _SNMP_DEFAULT_COMMUNITIES,
+                'baseline': c['community'] in known_comms}
+
+    if reasons:
+        summary = reasons
+    elif not events:
+        summary = ['No SNMP traffic seen — segment quiet on UDP 161/162']
+    else:
+        summary = ['Only SNMPv3 seen — SNMP traffic is authenticated/encrypted (secure)']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'snmp_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'insecure': insecure,
+        'agents': [_pub_agent(agents[a]) for a in sorted(agents)],
+        'communities': [_pub_comm(communities[c]) for c in sorted(communities)],
+        'managers': sorted(managers),
+        'advisories': advisories,
+    }
+
+
+def _snmp_capture(interface, seconds):
+    """Run one passive tcpdump window over SNMP (UDP 161/162), return (raw, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000',
+                'udp and (port 161 or port 162)'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_snmp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive SNMP exposure scanner (detection-only). Captures SNMP for a few
+    seconds and classifies the segment: write-exposed / cleartext / amplification /
+    enumeration / clean. Learns the segment's SNMP agents + community strings on
+    first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _snmp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_snmp_capture(text)
+
+    with _snmp_watch_lock:
+        baseline = _snmp_watch_load()
+        result = _snmp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _snmp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _snmp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_SNMP_EVENTS_CAP:]
+            _snmp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _snmp_selftest():
+    """Self-test the SNMP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -t -v` text through the real parser +
+    classifier, and — if Scapy is available — builds real SNMP v2c messages into a
+    pcap and parses them back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def line(src, dst, sport, dport, ver, pdu, community=None, maxrep=None):
+        cs = f' C="{community}"' if community is not None else ''
+        body = f'{pdu}(25) R=0'
+        if maxrep is not None:
+            body = f'GetBulk(22) R=0  N=0 M={maxrep}'
+        return (f"    {src}.{sport} > {dst}.{dport}:  {{ SNMP{ver}{cs} "
+                f"{{ {body}  .1.3.6.1.2.1.1.5.0 }} }}")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_snmp_capture(text)
+        res = _snmp_analyze(events, seconds, dict(baseline or {}),
+                            learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'agents': {'192.168.1.1': {'versions': ['v2c'],
+                                       'communities': ['public']}},
+            'communities': ['public']}
+
+    # 1. clean: only SNMPv3 (authenticated/encrypted).
+    run('clean', line('192.168.1.50', '192.168.1.1', 42000, 161, 'v3',
+                      'GetRequest'), 12, base, 'clean')
+
+    # 2. cleartext: a v2c GetRequest with the hidden default "public" community.
+    run('cleartext', line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c',
+                          'GetRequest'), 12, base, 'cleartext')
+
+    # 3. write-exposed: a v2c SetRequest exposes a write community.
+    run('write-exposed', line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c',
+                              'SetRequest', community='private'), 12, base,
+        'write-exposed')
+
+    # 4. amplification: a GetBulk with a large max-repetitions (v3, so not cleartext).
+    run('amplification', line('10.0.0.9', '192.168.1.1', 42000, 161, 'v3',
+                              'GetBulk', maxrep=200), 12, base, 'amplification')
+
+    # 5. enumeration: one host walking the MIB (v3 GetNext flood).
+    walk = "\n".join(line('10.0.0.9', '192.168.1.1', 42000 + i, 161, 'v3',
+                          'GetNextRequest') for i in range(25))
+    run('enumeration', walk, 12, base, 'enumeration')
+
+    # 6. parse: hidden-public + explicit community + v3 (no community).
+    pev = _parse_snmp_capture(
+        line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c', 'GetRequest') + "\n" +
+        line('192.168.1.50', '192.168.1.1', 42001, 161, 'v2c', 'GetRequest',
+             community='secret') + "\n" +
+        line('192.168.1.50', '192.168.1.1', 42002, 161, 'v3', 'GetRequest'))
+    p_ok = (len(pev) == 3 and pev[0]['community'] == 'public'
+            and pev[1]['community'] == 'secret' and pev[2]['community'] is None
+            and pev[2]['version'] == 'v3')
+    scenarios.append({'name': 'snmp-parse', 'expect': 'public/secret/v3-none',
+                      'got': str([e['community'] for e in pev]), 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft real SNMP v2c -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, UDP, wrpcap
+        from scapy.layers.snmp import SNMP, SNMPget, SNMPset, SNMPvarbind
+        from scapy.asn1.asn1 import ASN1_OID, ASN1_STRING
+        if _have('tcpdump'):
+            oid = ASN1_OID('1.3.6.1.2.1.1.5.0')
+            pkts = [
+                Ether() / IP(src='192.168.1.50', dst='192.168.1.1')
+                / UDP(sport=42000, dport=161)
+                / SNMP(version=1, community='public',
+                       PDU=SNMPget(varbindlist=[SNMPvarbind(oid=oid)])),
+                Ether() / IP(src='192.168.1.50', dst='192.168.1.1')
+                / UDP(sport=42001, dport=161)
+                / SNMP(version=1, community='rwsecret',
+                       PDU=SNMPset(varbindlist=[SNMPvarbind(
+                           oid=oid, value=ASN1_STRING('x'))])),
+            ]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_snmp_capture(res['out'])
+            comms = {e['community'] for e in evs}
+            wrote = any(e['pdu'] == 'SetRequest' for e in evs)
+            ok = ('public' in comms and 'rwsecret' in comms and wrote)
+            scapy_result = {'ran': True, 'events': len(evs),
+                            'communities': sorted(c for c in comms if c),
+                            'write': wrote, 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # OSPF Watch: passive OSPF security scanner (detection-only)
 # --------------------------------------------------------------------------
 # OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
@@ -6219,7 +6679,7 @@ def do_routing_selftest():
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
-              'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+              'snmp': _snmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
@@ -7043,6 +7503,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/icmp-baseline {action}")
         return jsonify(do_icmp_baseline(action))
 
+    @app.route('/api/net/snmp-watch', methods=['GET'])
+    def net_snmp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/snmp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_snmp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/snmp-baseline', methods=['GET', 'POST'])
+    def net_snmp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/snmp-baseline {action}")
+        return jsonify(do_snmp_baseline(action))
+
     @app.route('/api/net/ospf-watch', methods=['GET'])
     def net_ospf_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -7282,6 +7760,15 @@ def _cli(argv=None):
     icst = sub.add_parser('icmp-selftest', help='self-test the ICMP detectors (no root)')
     icst.add_argument('--json', action='store_true', help='emit JSON')
 
+    sn = sub.add_parser('snmp-watch', help='passive SNMP (v1/v2c cleartext) scan')
+    sn.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    sn.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    sn.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    sn.add_argument('--json', action='store_true', help='emit JSON')
+
+    snst = sub.add_parser('snmp-selftest', help='self-test the SNMP detectors (no root)')
+    snst.add_argument('--json', action='store_true', help='emit JSON')
+
     o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
     o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
@@ -7466,6 +7953,50 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"ICMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'snmp-watch':
+        r = do_snmp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"SNMP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['snmp_count']} msgs @ {r['rate']}/s, "
+                  f"{'insecure v1/v2c' if r['insecure'] else 'v3-only'})")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for a in r.get('agents', []):
+                tag = ' *NEW*' if not a['baseline'] else ''
+                sec = ' SECURE' if a['secure'] else ''
+                wr = ' WRITE' if a['writes'] else ''
+                comm = (' comm=' + ','.join(a['communities'])) if a['communities'] else ''
+                print(f"  agent {a['ip']} {'/'.join(a['versions'])}{sec}{wr}{comm}{tag}")
+            for c in r.get('communities', []):
+                flags = (' DEFAULT' if c['default'] else '') + (' WRITE' if c['writes'] else '')
+                print(f"  community \"{c['community']}\" ({'/'.join(c['versions'])}, "
+                      f"x{c['count']}){flags}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'snmp-selftest':
+        r = _snmp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"communities={sc.get('communities')} write={sc.get('write')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"SNMP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ospf-watch':

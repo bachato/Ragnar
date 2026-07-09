@@ -46,6 +46,7 @@ alert.
 | [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
 | [NTP Watch](#ntp-watch) | Switch & L2/L3 | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
+| [SNMP Watch](#snmp-watch) | Switch & L2/L3 | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -86,14 +87,14 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NTP**,
-**ICMP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**ICMP**, **SNMP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no live traffic) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
 scanners. This is how you confirm the routing-security detectors are working on a
 given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
 The same checks run headless via
-`python3 network_diagnostics.py {igmp,ipv6,ntp,icmp,ospf,bgp}-selftest` and each module's
+`python3 network_diagnostics.py {igmp,ipv6,ntp,icmp,snmp,ospf,bgp}-selftest` and each module's
 `selftest()`.
 
 ---
@@ -762,6 +763,56 @@ end.
 
 - Endpoint: `GET /api/net/icmp-watch` `{interface, seconds}`,
   `POST /api/net/icmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### SNMP Watch
+SNMP **v1 and v2c** authenticate with a plaintext **community string** — effectively
+a device password carried in the clear on *every* request. Anyone passively sniffing
+the segment harvests it: the **read** community (very often the default `public`)
+exposes the full device config / MIB, and a **write** community — revealed the moment
+a `SetRequest` crosses the wire — lets an attacker who captured it **reconfigure the
+device**: change routes, ACLs, SNMP itself, or bounce interfaces. **v3** fixes this
+with the User Security Model (authentication + privacy/encryption). This scanner is
+**passive and detection-only**: one short `tcpdump` window over UDP **161/162**,
+parsed and classified. It never sends an SNMP request. What it flags:
+
+- **Write-exposed** — a `SetRequest` in v1/v2c: a **write community is on the wire**,
+  i.e. sniff it and you own the device. The most severe finding.
+- **Cleartext** — any v1/v2c traffic: the community string is exposed. Worse when
+  it's a **well-known default** (`public`, `private`, `community`, `cisco`, …) —
+  trivially guessable even without a sniffer. The community strings actually seen are
+  listed so you know exactly what leaked.
+- **Amplification** — a `GetBulk` with a large **max-repetitions**: the SNMP
+  reflection / amplification DDoS vector (a small request eliciting a huge response).
+- **Enumeration** — one host issuing many `GetNext` / `GetBulk` requests: walking the
+  MIB (SNMP reconnaissance).
+- **Clean** — only **SNMPv3** (authenticated/encrypted), or no SNMP at all.
+
+The parser reads tcpdump's SNMP decode, including its convention of **omitting
+`C="…"` for the default `public` community** (so a v1/v2c message with no community
+shown is correctly treated as `public`). The first scan learns the segment's SNMP
+**agents + community strings** into `data/snmp_watch.json` so later scans can
+highlight **new** exposure (a new insecure agent or a new community appearing);
+**Trust current** re-learns. The verdict always reflects the cleartext reality —
+v1/v2c is insecure regardless of baseline. Every result carries a **mitigation
+advisory**: migrate to **SNMPv3 (authPriv, SHA + AES)**; if v1/v2c must remain,
+confine SNMP to a management VLAN with ACLs, use unique non-default read-only
+community strings, and disable SNMP on devices that don't need it.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py snmp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py snmp-selftest    # self-test the detectors, no root
+```
+
+`snmp-selftest` drives the real parser + classifier with synthetic captures (clean /
+cleartext / write-exposed / amplification / enumeration / parse), and — when
+[Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set messages into
+a pcap and parses them back through `tcpdump`, confirming the `public`-hidden
+inference and write-community detection end to end.
+
+- Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
+  `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
