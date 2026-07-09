@@ -43,6 +43,7 @@ alert.
 | [ARP Scan](#arp-scan) | Switch & L2/L3 | `GET /api/net/arp-scan` |
 | [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
+| [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -82,15 +83,16 @@ leg that crafts real packets → pcap → `tcpdump` → parse to exercise the wh
 capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
-A one-click **Run self-test** that validates the IGMP, OSPF and BGP detectors —
-plus the **BGP speaker** (codec/framer/FSM/RIB) and **path-asymmetry / OWD**
-engine — by running each classifier against crafted attack captures (no root, no
-live traffic) and reports per-suite pass/fail. With Scapy installed it also runs
-the end-to-end packet-crafting leg for the capture-based scanners. This is how you
-confirm the routing-security detectors are working on a given box without waiting
-for a real attack — endpoint `GET /api/net/routing-selftest`. The same checks run
-headless via `python3 network_diagnostics.py {igmp,ospf,bgp}-selftest` and each
-module's `selftest()`.
+A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, OSPF and
+BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**path-asymmetry / OWD** engine — by running each classifier against crafted attack
+captures (no root, no live traffic) and reports per-suite pass/fail. With Scapy
+installed it also runs the end-to-end packet-crafting leg for the capture-based
+scanners. This is how you confirm the routing-security detectors are working on a
+given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
+The same checks run headless via
+`python3 network_diagnostics.py {igmp,ipv6,ospf,bgp}-selftest` and each module's
+`selftest()`.
 
 ---
 
@@ -602,6 +604,53 @@ capture→parse path end to end.
 
 - Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
   `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### IPv6 First-Hop Watch
+The **most-overlooked LAN attack today**, and a genuine gap in most toolkits. Every
+modern OS ships with **IPv6 enabled and _preferred_** over IPv4 — even on networks
+where "nobody deploys IPv6" and nobody's watching it. So an attacker who broadcasts
+a rogue **Router Advertisement** (ICMPv6 type 134) or stands up a rogue **DHCPv6**
+server silently becomes the segment's **default gateway and/or DNS** — the classic
+**SLAAC attack** and **mitm6** — while a tech staring at IPv4 / ARP / DHCP sees
+nothing wrong. This scanner is **passive and detection-only**: it never sends an RA,
+never answers a solicit, never touches routing. One short `tcpdump` window over
+ICMPv6 RA/RS/Redirect + DHCPv6 (udp 546/547) is parsed and classified:
+
+- **Rogue RA** — a Router Advertisement from a router **not in the learned baseline**
+  (a new default gateway), a **second, conflicting** router, an RA that **injects a
+  DNS server** (RDNSS option) or a new prefix, an RA with **`pref high`** (an
+  attacker biasing host router-selection), or **router-lifetime 0** (an RA that
+  *deprecates* the real router — the RA "kill" / DoS trick).
+- **Rogue DHCPv6** — a DHCPv6 **ADVERTISE / REPLY / RECONFIGURE** from a server not
+  in the baseline. This is **mitm6's signature**: it answers DHCPv6 solicits handing
+  out the attacker as **DNS** (no gateway — it pairs with WPAD) to relay and
+  NTLM-capture.
+- **Storm** — a Router Advertisement **flood** (e.g. THC `fake_router6`), by rate.
+- **Anomaly** — first-hop IPv6 seen where the baseline expected none, or a
+  managed/other-flag change that alters how hosts get addresses.
+
+The **first scan learns** the trusted router(s) + DHCPv6 server(s) into
+`data/ipv6_watch.json`; after a legitimate IPv6 change, click **Trust current** to
+re-learn. Because RAs are intrinsically rare, a healthy segment reads clean. Every
+result carries a **mitigation advisory**: enable switch **RA-Guard** (RFC 6105) and
+DHCPv6 snooping on access ports; if IPv6 is genuinely unused, filter ICMPv6 RA /
+DHCPv6 or disable IPv6 on hosts to remove the vector entirely.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py ipv6-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py ipv6-selftest    # self-test the detectors, no root
+```
+
+`ipv6-selftest` drives the real parser + classifier with synthetic captures
+(clean / rogue-ra / rogue-dhcpv6 / storm / anomaly / multi-line RA parse), and —
+when [Scapy](https://scapy.net) is installed — crafts a real Router Advertisement
+(with prefix + RDNSS options) into a pcap and parses it back through `tcpdump`,
+exercising the capture→parse path end to end.
+
+- Endpoint: `GET /api/net/ipv6-watch` `{interface, seconds}`,
+  `POST /api/net/ipv6-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control

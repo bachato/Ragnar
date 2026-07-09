@@ -3494,6 +3494,471 @@ def _igmp_selftest():
 
 
 # --------------------------------------------------------------------------
+# IPv6 First-Hop Watch: rogue Router Advertisement / DHCPv6 scanner (passive)
+# --------------------------------------------------------------------------
+# The most-overlooked LAN attack today. Every modern OS ships with IPv6 on and
+# *prefers* it, even on "IPv4-only" networks nobody manages. So a rogue Router
+# Advertisement (ICMPv6 type 134) or a rogue DHCPv6 server silently becomes the
+# default gateway and/or DNS for the whole segment — the SLAAC / mitm6 attack —
+# and a tech watching only IPv4/ARP/DHCP never sees it. This scanner is PASSIVE:
+# one short tcpdump window over RA/RS/Redirect + DHCPv6, parsed and classified.
+# It never sends an RA, never answers a solicit, never touches routing. What it
+# flags:
+#   * rogue-ra      — a Router Advertisement from a router not in the learned
+#     baseline (new default gateway), a *second* conflicting router, an RA that
+#     injects a DNS server (RDNSS option) or prefix you didn't have, an RA with
+#     'pref high' (attacker biasing host selection), or router-lifetime 0 (an RA
+#     that deprecates the real router — the RA "kill" / DoS trick).
+#   * rogue-dhcpv6  — a DHCPv6 ADVERTISE/REPLY/RECONFIGURE from a server not in
+#     the baseline. mitm6's signature: it answers DHCPv6 solicits handing out the
+#     attacker as DNS (no gateway, pairs with WPAD) to relay/NTLM-capture.
+#   * storm         — an RA flood (THC fake_router6 / RA-flood DoS) by rate.
+#   * anomaly       — first-hop IPv6 seen where the baseline expected none, or a
+#     managed/other-flag flip that changes host addressing behaviour.
+# First run learns the trusted router(s) + DHCPv6 server(s) into
+# data/ipv6_watch.json; "Trust current" re-learns after a legitimate change.
+# Mitigation advisory points at switch RA-Guard (RFC 6105) / DHCPv6 snooping.
+
+_IPV6_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'ipv6_watch.json')
+_ipv6_watch_lock = threading.Lock()
+
+# Router Advertisements are intrinsically rare (every ~200s per router). A
+# sustained rate at/above this is a flood (fake_router6 / RA storm DoS).
+_IPV6_RA_FLOOD_RATE = 5.0
+# Keep at most this many anomaly events in the store (newest wins).
+_IPV6_EVENTS_CAP = 200
+
+# DHCPv6 message types sent by *servers* (a client should never see these from a
+# peer that isn't a real DHCPv6 server) — the rogue-server tell.
+_IPV6_DHCP6_SERVER_MSGS = ('advertise', 'reply', 'reconfigure', 'relay-reply')
+
+_IPV6_ADDR_RE = r'([0-9A-Fa-f:]+(?:%\w+)?)'
+
+
+def _parse_ipv6_capture(output):
+    """Parse `tcpdump -nn -t -v` text (RA/RS/Redirect + DHCPv6) into events.
+
+    tcpdump prints one packet as a non-indented header line followed by indented
+    option lines, so we group by packet block first, then read each block. Each
+    event is a dict with a 'kind':
+      ra    : {src, dst, lifetime, pref, managed, other, prefixes[], rdnss[],
+               mac, mtu}
+      rs    : {src}                      (router solicitation — normal from hosts)
+      redirect: {src}
+      dhcp6 : {src, msgtype, dns[], is_server}
+    """
+    events = []
+    # --- group lines into per-packet blocks ---
+    blocks, cur = [], []
+    hdr_re = re.compile(r'^\S.*\s>\s\S')
+    for raw in output.splitlines():
+        if not raw.strip():
+            continue
+        if not raw[0].isspace() and hdr_re.match(raw):
+            if cur:
+                blocks.append(cur)
+            cur = [raw]
+        elif cur:
+            cur.append(raw)
+    if cur:
+        blocks.append(cur)
+
+    src_re = re.compile(r'^' + _IPV6_ADDR_RE + r'\s*>\s*' + _IPV6_ADDR_RE)
+    for block in blocks:
+        text = '\n'.join(block)
+        low = text.lower()
+        m = src_re.match(block[0].strip())
+        src = m.group(1) if m else None
+        dst = m.group(2) if m else None
+
+        if 'router advertisement' in low:
+            ev = {'kind': 'ra', 'src': src, 'dst': dst,
+                  'lifetime': None, 'pref': 'medium', 'managed': False,
+                  'other': False, 'prefixes': [], 'rdnss': [], 'mac': None,
+                  'mtu': None}
+            lt = re.search(r'router lifetime\s+(\d+)s', low)
+            if lt:
+                ev['lifetime'] = int(lt.group(1))
+            pf = re.search(r'pref\s+(low|medium|high)', low)
+            if pf:
+                ev['pref'] = pf.group(1)
+            # RA-level flags line (managed/other) — the one with 'router lifetime'
+            for line in block:
+                ll = line.lower()
+                if 'router lifetime' in ll or 'hop limit' in ll:
+                    fl = re.search(r'flags\s+\[([^\]]*)\]', ll)
+                    if fl:
+                        flags = fl.group(1)
+                        ev['managed'] = 'managed' in flags
+                        ev['other'] = 'other' in flags
+                    break
+            ev['prefixes'] = re.findall(r'prefix info option.*?:\s*'
+                                        r'([0-9A-Fa-f:]+/\d+)', low)
+            for line in block:
+                if 'rdnss' in line.lower():
+                    ev['rdnss'].extend(re.findall(r'addr:\s*([0-9A-Fa-f:]+)',
+                                                  line.lower()))
+            mac = re.search(r'source link-address option.*?:\s*'
+                            r'([0-9a-f]{2}(?::[0-9a-f]{2}){5})', low)
+            if mac:
+                ev['mac'] = mac.group(1)
+            mtu = re.search(r'mtu option.*?:\s*(\d+)', low)
+            if mtu:
+                ev['mtu'] = int(mtu.group(1))
+            events.append(ev)
+        elif 'router solicitation' in low:
+            events.append({'kind': 'rs', 'src': src})
+        elif 'redirect' in low:
+            events.append({'kind': 'redirect', 'src': src})
+        elif 'dhcp6' in low:
+            mt = re.search(r'dhcp6\s+([a-z-]+)', low)
+            msgtype = mt.group(1) if mt else 'unknown'
+            dns = re.findall(r'dns[- ]server[^0-9A-Fa-f]*'
+                             r'([0-9A-Fa-f:]+)', low)
+            events.append({'kind': 'dhcp6', 'src': src, 'msgtype': msgtype,
+                           'dns': dns,
+                           'is_server': msgtype in _IPV6_DHCP6_SERVER_MSGS})
+    return events
+
+
+def _ipv6_watch_load():
+    try:
+        with open(_IPV6_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ipv6_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_IPV6_WATCH_PATH), exist_ok=True)
+        tmp = _IPV6_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _IPV6_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ipv6_baseline(action='get'):
+    """Manage the learned IPv6 first-hop baseline (trusted RA router(s) + their
+    RDNSS/prefixes, trusted DHCPv6 server(s)). action='reset' re-learns the
+    current segment on the next scan (use after a legitimate IPv6 change)."""
+    with _ipv6_watch_lock:
+        if action == 'reset':
+            _ipv6_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ipv6_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted((b.get('routers') or {}).keys()),
+            'dhcp6_servers': sorted(b.get('dhcp6_servers') or []),
+        }}
+
+
+def _ipv6_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed IPv6 first-hop events. Returns the result
+    payload (minus interface). Separated from capture so the self-test can drive
+    it with synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    ra_events = [e for e in events if e['kind'] == 'ra']
+    dhcp6_srv = [e for e in events if e['kind'] == 'dhcp6' and e.get('is_server')]
+    ra_count = len(ra_events)
+    ra_rate = round(ra_count / seconds, 2)
+
+    known_routers = dict(baseline.get('routers') or {})
+    known_servers = set(baseline.get('dhcp6_servers') or [])
+    had_baseline = bool(known_routers or known_servers)
+
+    # Aggregate observed routers (by link-local source).
+    routers = {}
+    for e in ra_events:
+        r = routers.setdefault(e['src'], {
+            'src': e['src'], 'lifetime': e['lifetime'], 'pref': e['pref'],
+            'managed': e['managed'], 'other': e['other'],
+            'prefixes': set(), 'rdnss': set(), 'mac': e.get('mac'), 'count': 0})
+        r['count'] += 1
+        r['prefixes'].update(e['prefixes'])
+        r['rdnss'].update(e['rdnss'])
+        if e['pref'] == 'high':
+            r['pref'] = 'high'
+        if e['lifetime'] is not None:
+            r['lifetime'] = e['lifetime']
+
+    servers = {}
+    for e in dhcp6_srv:
+        s = servers.setdefault(e['src'], {'src': e['src'], 'msgtypes': set(),
+                                          'dns': set()})
+        s['msgtypes'].add(e['msgtype'])
+        s['dns'].update(e['dns'])
+
+    # Learn-on-first-run: adopt whatever's on the wire as the trusted baseline.
+    learned = False
+    if learn and not had_baseline and (routers or servers):
+        baseline['routers'] = {src: {'prefixes': sorted(r['prefixes']),
+                                     'rdnss': sorted(r['rdnss'])}
+                               for src, r in routers.items()}
+        baseline['dhcp6_servers'] = sorted(servers.keys())
+        learned = True
+        known_routers = dict(baseline['routers'])
+        known_servers = set(baseline['dhcp6_servers'])
+
+    reasons = []
+    verdict = 'clean'
+
+    # --- storm: RA flood ---
+    if ra_rate >= _IPV6_RA_FLOOD_RATE and ra_count >= _IPV6_RA_FLOOD_RATE * seconds:
+        verdict = 'storm'
+        reasons.append(f"Router Advertisement flood: {ra_count} RAs in {seconds}s "
+                       f"({ra_rate}/s) — RA-flood DoS (e.g. fake_router6)")
+
+    rogue_routers = [src for src in routers if src not in known_routers]
+    rogue_servers = [src for src in servers if src not in known_servers]
+
+    # --- rogue RA (highest single-host severity) ---
+    if verdict == 'clean' and rogue_routers:
+        verdict = 'rogue-ra'
+        for src in rogue_routers:
+            r = routers[src]
+            extra = []
+            if r['rdnss']:
+                extra.append(f"DNS {', '.join(sorted(r['rdnss']))}")
+            if r['prefixes']:
+                extra.append(f"prefix {', '.join(sorted(r['prefixes']))}")
+            if r['pref'] == 'high':
+                extra.append("pref HIGH")
+            tail = (' — ' + '; '.join(extra)) if extra else ''
+            reasons.append(f"Rogue Router Advertisement from {src}"
+                           f"{' (MAC ' + r['mac'] + ')' if r['mac'] else ''}"
+                           f"{tail} — becomes a default gateway/DNS via SLAAC")
+        if not had_baseline:
+            reasons.append("No IPv6 router was known for this segment — first-hop "
+                           "IPv6 appeared where a tech would never look (classic "
+                           "overlooked attack vector)")
+
+    # --- rogue DHCPv6 (mitm6) ---
+    if verdict in ('clean', 'rogue-ra') and rogue_servers:
+        if verdict == 'clean':
+            verdict = 'rogue-dhcpv6'
+        for src in rogue_servers:
+            s = servers[src]
+            dns = f" handing out DNS {', '.join(sorted(s['dns']))}" if s['dns'] else ''
+            reasons.append(f"Rogue DHCPv6 server {src} "
+                           f"({'/'.join(sorted(s['msgtypes']))}){dns} — the mitm6 "
+                           f"DNS-takeover / NTLM-relay signature")
+
+    # --- anomalies (lower severity, don't override a rogue verdict) ---
+    if verdict == 'clean':
+        # >1 distinct router where the baseline knew <=1 = conflicting RAs.
+        if len(routers) > 1 and len(known_routers) <= 1:
+            verdict = 'anomaly'
+            reasons.append(f"{len(routers)} routers advertising on one segment: "
+                           f"{', '.join(sorted(routers))} — RA conflict/spoof")
+        # RA that deprecates a router (lifetime 0) from a known router.
+        for src, r in routers.items():
+            if r['lifetime'] == 0:
+                verdict = 'anomaly' if verdict == 'clean' else verdict
+                reasons.append(f"RA from {src} with router-lifetime 0 — deprecates "
+                               f"the IPv6 default route (RA 'kill' / DoS)")
+        # A known router that started injecting a brand-new RDNSS DNS server.
+        for src, r in routers.items():
+            if src in known_routers:
+                base_dns = set(known_routers[src].get('rdnss') or [])
+                new_dns = set(r['rdnss']) - base_dns
+                if new_dns:
+                    verdict = 'rogue-ra'
+                    reasons.append(f"Known router {src} now advertising new DNS "
+                                   f"{', '.join(sorted(new_dns))} (RDNSS) — DNS "
+                                   f"hijack via RA")
+
+    advisories = []
+    if routers or servers:
+        advisories.append("Enable switch RA-Guard (RFC 6105) and DHCPv6 snooping on "
+                          "access ports; if IPv6 is unused, filter ICMPv6 RA/"
+                          "DHCPv6 or disable IPv6 on hosts to remove the vector.")
+
+    def _pub_router(r):
+        return {'src': r['src'], 'lifetime': r['lifetime'], 'pref': r['pref'],
+                'managed': r['managed'], 'other': r['other'], 'mac': r['mac'],
+                'prefixes': sorted(r['prefixes']), 'rdnss': sorted(r['rdnss']),
+                'count': r['count'], 'baseline': r['src'] in known_routers}
+
+    def _pub_server(s):
+        return {'src': s['src'], 'msgtypes': sorted(s['msgtypes']),
+                'dns': sorted(s['dns']), 'baseline': s['src'] in known_servers}
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': reasons or (['No IPv6 first-hop traffic seen — segment quiet']
+                               if not (routers or servers) else
+                               ['All routers/servers match the trusted baseline']),
+        'learned': learned,
+        'ra_count': ra_count,
+        'dhcp6_count': len([e for e in events if e['kind'] == 'dhcp6']),
+        'rate': ra_rate,
+        'routers': [_pub_router(routers[s]) for s in sorted(routers)],
+        'dhcp6_servers': [_pub_server(servers[s]) for s in sorted(servers)],
+        'advisories': advisories,
+    }
+
+
+def _ipv6_capture(interface, seconds):
+    """Run one passive tcpdump window over IPv6 first-hop traffic (RA/RS/Redirect
+    + DHCPv6) and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    # ICMPv6 RA(134)/RS(133)/Redirect(137) + DHCPv6 (udp 546/547). ip6[40] is the
+    # ICMPv6 type when there are no extension headers, which RAs never carry.
+    bpf = ('(icmp6 and (ip6[40] == 134 or ip6[40] == 133 or ip6[40] == 137)) '
+           'or (udp and (port 547 or port 546))')
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ipv6_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive IPv6 first-hop security scanner (detection-only). Captures RA /
+    DHCPv6 for a few seconds and classifies the segment: storm / rogue-ra /
+    rogue-dhcpv6 / anomaly / clean. Learns the trusted router(s)+server(s) on
+    first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _ipv6_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_ipv6_capture(text)
+
+    with _ipv6_watch_lock:
+        baseline = _ipv6_watch_load()
+        result = _ipv6_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _ipv6_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ipv6_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_IPV6_EVENTS_CAP:]
+            _ipv6_watch_save(b)
+
+    result['interface'] = iface
+    return result
+
+
+def _ipv6_selftest():
+    """Self-test the IPv6 first-hop detectors with synthetic captures (no root, no
+    live traffic). Feeds crafted tcpdump text through the real parser + classifier,
+    and — if Scapy is available — builds a real RA into a pcap and parses it back
+    through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_ipv6_capture(text)
+        res = _ipv6_analyze(events, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    # A realistic multi-line RA block from tcpdump -v.
+    def ra(src, lifetime=1800, pref='medium', prefix='2001:db8:1::/64',
+           rdnss=None, mac='00:11:22:33:44:55'):
+        lines = [f"{src} > ff02::1: ICMP6, router advertisement, length 88",
+                 f"\thop limit 64, Flags [other stateful], pref {pref}, "
+                 f"router lifetime {lifetime}s, reachable time 0ms, retrans timer 0ms",
+                 f"\t  source link-address option (1), length 8 (1): {mac}",
+                 f"\t  prefix info option (3), length 32 (4): {prefix}, "
+                 f"Flags [onlink, auto], valid time 2592000s, pref. time 604800s"]
+        if rdnss:
+            lines.append(f"\t  rdnss option (25), length 24 (3):  lifetime 1800s, "
+                         f"addr: {rdnss}")
+        return "\n".join(lines)
+
+    base_one = {'routers': {'fe80::1': {'prefixes': ['2001:db8:1::/64'],
+                                        'rdnss': ['2001:db8:1::53']}},
+                'dhcp6_servers': []}
+
+    # 1. clean: the known router re-advertising the same prefix/DNS.
+    run('clean', ra('fe80::1', rdnss='2001:db8:1::53'), 12, base_one, 'clean')
+
+    # 2. rogue-ra: an unknown router advertises itself as gateway + DNS.
+    run('rogue-ra', ra('fe80::bad', pref='high', prefix='2001:db8:66::/64',
+                       rdnss='2001:db8:66::53'), 12, base_one, 'rogue-ra')
+
+    # 3. rogue-dhcpv6 (mitm6): an unknown DHCPv6 server hands out DNS.
+    mitm6 = ("fe80::evil > fe80::a: dhcp6 advertise (xid=0x112233 "
+             "(client-ID ...) (server-ID ...) (DNS-server 2001:db8:66::53) "
+             "(IA_NA ...))")
+    run('rogue-dhcpv6', mitm6, 12, base_one, 'rogue-dhcpv6')
+
+    # 4. storm: an RA flood.
+    flood = "\n".join(ra(f"fe80::{i}") for i in range(80))
+    run('storm', flood, 5, base_one, 'storm')
+
+    # 5. anomaly: a known router deprecates the default route (lifetime 0).
+    run('anomaly', ra('fe80::1', lifetime=0, rdnss='2001:db8:1::53'), 12,
+        base_one, 'anomaly')
+
+    # 6. parse: multi-line RA extracts prefix + RDNSS + MAC.
+    pev = _parse_ipv6_capture(ra('fe80::1', rdnss='2001:db8:1::53'))
+    p_ok = (len(pev) == 1 and pev[0]['kind'] == 'ra'
+            and '2001:db8:1::/64' in pev[0]['prefixes']
+            and '2001:db8:1::53' in pev[0]['rdnss']
+            and pev[0]['mac'] == '00:11:22:33:44:55')
+    scenarios.append({'name': 'ra-parse', 'expect': 'prefix+rdnss+mac',
+                      'got': str(pev[0] if pev else None)[:80], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real RA -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, wrpcap
+        from scapy.layers.inet6 import (IPv6, ICMPv6ND_RA, ICMPv6NDOptPrefixInfo,
+                                        ICMPv6NDOptRDNSS)
+        if _have('tcpdump'):
+            ra_pkt = (Ether() / IPv6(src='fe80::dead', dst='ff02::1') /
+                      ICMPv6ND_RA(routerlifetime=1800) /
+                      ICMPv6NDOptPrefixInfo(prefix='2001:db8:99::', prefixlen=64) /
+                      ICMPv6NDOptRDNSS(dns=['2001:db8:99::53']))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [ra_pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_ipv6_capture(res['out'])
+            ra_evs = [e for e in evs if e['kind'] == 'ra']
+            got_pref = ra_evs[0]['prefixes'] if ra_evs else []
+            scapy_result = {'ran': True, 'routers': [e['src'] for e in ra_evs],
+                            'prefixes': got_pref,
+                            'pass': any('2001:db8:99' in p for p in got_pref),
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # OSPF Watch: passive OSPF security scanner (detection-only)
 # --------------------------------------------------------------------------
 # OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
@@ -4753,7 +5218,8 @@ def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
-    suites = {'igmp': _igmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+    suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
+              'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
@@ -5523,6 +5989,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/igmp-baseline {action}")
         return jsonify(do_igmp_baseline(action))
 
+    @app.route('/api/net/ipv6-watch', methods=['GET'])
+    def net_ipv6_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/ipv6-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ipv6_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ipv6-baseline', methods=['GET', 'POST'])
+    def net_ipv6_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ipv6-baseline {action}")
+        return jsonify(do_ipv6_baseline(action))
+
     @app.route('/api/net/ospf-watch', methods=['GET'])
     def net_ospf_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -5735,6 +6219,15 @@ def _cli(argv=None):
     st = sub.add_parser('igmp-selftest', help='self-test the IGMP detectors (no root)')
     st.add_argument('--json', action='store_true', help='emit JSON')
 
+    v6 = sub.add_parser('ipv6-watch', help='passive IPv6 first-hop (RA/DHCPv6) scan')
+    v6.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    v6.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    v6.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    v6.add_argument('--json', action='store_true', help='emit JSON')
+
+    v6st = sub.add_parser('ipv6-selftest', help='self-test the IPv6 first-hop detectors (no root)')
+    v6st.add_argument('--json', action='store_true', help='emit JSON')
+
     o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
     o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
@@ -5794,6 +6287,48 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"IGMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ipv6-watch':
+        r = do_ipv6_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"IPv6 First-Hop Watch [{r['interface']}]: {r['verdict'].upper()}  "
+                  f"({r['ra_count']} RA @ {r['rate']}/s, {r['dhcp6_count']} DHCPv6)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for rt in r.get('routers', []):
+                tag = '' if rt['baseline'] else ' *ROGUE*'
+                dns = f" dns={','.join(rt['rdnss'])}" if rt['rdnss'] else ''
+                print(f"  RA router {rt['src']} pref={rt['pref']} "
+                      f"life={rt['lifetime']}{dns}{tag}")
+            for s in r.get('dhcp6_servers', []):
+                tag = '' if s['baseline'] else ' *ROGUE*'
+                dns = f" dns={','.join(s['dns'])}" if s['dns'] else ''
+                print(f"  DHCPv6 {s['src']} ({'/'.join(s['msgtypes'])}){dns}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ipv6-selftest':
+        r = _ipv6_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"prefixes={sc.get('prefixes')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"IPv6 first-hop self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ospf-watch':
