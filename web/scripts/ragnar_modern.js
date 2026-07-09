@@ -2634,11 +2634,103 @@ async function igmpTrustBaseline() {
     }
 }
 
+// ---- IPv6 RA Guard (host first-hop posture + hardening, active/local) -------
+const _RAGUARD_VERDICT_STYLE = {
+    hardened:        ['bg-green-950/40 border-green-900 text-green-400', '✓ Host hardened — ignores ICMPv6 Redirects and rogue RA preference'],
+    'ipv6-off':      ['bg-slate-800 border-slate-700 text-slate-400', '— IPv6 disabled — no IPv6 first-hop surface'],
+    'ra-open':       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Accepts RAs (SLAAC) — safe only with switch RA-Guard'],
+    'ra-pref-open':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Honours RA Router-Preference — a "pref high" rogue RA can hijack the route'],
+    'redirect-open': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Accepts ICMPv6 Redirects — open to a Layer-3 MITM'],
+    unknown:         ['bg-slate-800 border-slate-700 text-slate-400', '—'],
+};
+function _raguardRender(d, out) {
+    const [cls, label] = _RAGUARD_VERDICT_STYLE[d.verdict] || _RAGUARD_VERDICT_STYLE.unknown;
+    let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+    if (d.applied) {
+        const a = d.applied;
+        html += `<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-300 text-xs">Hardened: set ${a.live.length} sysctl(s)${a.persisted ? ', persisted to <span class="font-mono">' + escapeHtml(a.persisted) + '</span>' : ''}${(a.errors && a.errors.length) ? ' · <span class="text-red-300">' + a.errors.length + ' error(s)</span>' : ''}.</div>`;
+    }
+    const rows = d.interfaces || [];
+    const phys = rows.filter(r => !r.virtual);
+    const virt = rows.filter(r => r.virtual);
+    const fmt = r => {
+        const [c] = _RAGUARD_VERDICT_STYLE[r.verdict] || _RAGUARD_VERDICT_STYLE.unknown;
+        const badge = `<span class="px-1.5 py-0.5 rounded border text-[10px] ${c}">${escapeHtml(r.verdict)}</span>`;
+        const red = v => v === 1 ? 'text-red-300' : 'text-gray-400';
+        return `<tr class="border-t border-slate-800">
+            <td class="px-2 py-1 font-mono ${r.virtual ? 'text-gray-500' : 'text-gray-200'}">${escapeHtml(r.iface)}</td>
+            <td class="px-2 py-1">${badge}</td>
+            <td class="px-2 py-1 font-mono ${red(r.accept_redirects)}">${r.accept_redirects}</td>
+            <td class="px-2 py-1 font-mono ${red(r.accept_ra_rtr_pref)}">${r.accept_ra_rtr_pref}</td>
+            <td class="px-2 py-1 font-mono text-gray-400">${r.accept_ra}</td>
+        </tr>`;
+    };
+    if (rows.length) {
+        html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+            '<tr class="text-left text-gray-500"><th class="px-2 py-1">Interface</th><th class="px-2 py-1">Grade</th><th class="px-2 py-1">accept_redirects</th><th class="px-2 py-1">rtr_pref</th><th class="px-2 py-1">accept_ra</th></tr>' +
+            '</thead><tbody>' + phys.map(fmt).join('');
+        if (virt.length) {
+            html += `<tr class="border-t border-slate-800"><td colspan="5" class="px-2 py-1"><button onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'" class="text-cyan-400 underline text-xs">${virt.length} virtual/container interface(s) ▸</button><span style="display:none"></span></td></tr>`;
+            html += '<tr style="display:none" class="virt-rows"><td colspan="5" class="p-0"><table class="min-w-full text-xs"><tbody>' + virt.map(fmt).join('') + '</tbody></table></td></tr>';
+        }
+        html += '</tbody></table>';
+    }
+    const gws = d.gateways || [];
+    if (gws.length) {
+        html += '<p class="text-xs text-gray-500 mt-2">Accepted IPv6 gateway(s): ' +
+            gws.map(g => `<span class="font-mono text-gray-300">${escapeHtml(g.gw)}</span> dev ${escapeHtml(g.dev)}${g.from_ra ? ' <span class="text-amber-300">(from RA)</span>' : ''}`).join(', ') + '</p>';
+    }
+    if (d.reasons && d.reasons.length) {
+        html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+            d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+    }
+    if (d.needs_hardening && !d.applied) {
+        html += '<p class="text-xs text-amber-300 mt-2">Click <strong>Harden host</strong> to close these (sets accept_redirects=0 and accept_ra_rtr_pref=0; leaves accept_ra alone).</p>';
+    }
+    if (d.advisories && d.advisories.length) {
+        html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+            d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+    }
+    out.innerHTML = html;
+}
+async function runRaGuard() {
+    const out = document.getElementById('raguard-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, 'Reading…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Reading IPv6 first-hop posture…</p>';
+    try {
+        const d = await fetchAPI('/api/net/raguard');
+        if (!d || d.success === false) { out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>'; return; }
+        _raguardRender(d, out);
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally { _ndBusy(btn, false); }
+}
+async function raGuardHarden() {
+    if (!confirm('Harden this host\'s IPv6 first-hop settings?\n\nSets accept_redirects=0 and accept_ra_rtr_pref=0 (live + persisted to /etc/sysctl.d). accept_ra is left untouched, so SLAAC connectivity keeps working.')) return;
+    const out = document.getElementById('raguard-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, 'Hardening…');
+    out.classList.remove('hidden');
+    try {
+        const d = await postAPI('/api/net/raguard', { action: 'harden' });
+        if (!d || d.success === false) { out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>'; return; }
+        addConsoleMessage('IPv6 RA Guard: host hardened (accept_redirects=0, accept_ra_rtr_pref=0)', 'success');
+        _raguardRender(d, out);
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally { _ndBusy(btn, false); }
+}
+
 // ---- IPv6 First-Hop Watch (rogue RA / DHCPv6, passive) ---------------------
 const _IPV6_VERDICT_STYLE = {
     clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No rogue IPv6 first-hop activity detected'],
     anomaly:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ IPv6 first-hop anomaly — conflicting / deprecating RA'],
     'rogue-dhcpv6': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue DHCPv6 server — mitm6 DNS-takeover signature'],
+    'rogue-redirect':['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue ICMPv6 Redirect — Layer-3 IPv6 MITM'],
     'rogue-ra':     ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue Router Advertisement — SLAAC gateway/DNS takeover'],
     storm:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 Router Advertisement flood (RA-flood DoS)'],
     unknown:        ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
@@ -2681,7 +2773,7 @@ async function runIpv6Watch() {
         }
         const [cls, label] = _IPV6_VERDICT_STYLE[d.verdict] || _IPV6_VERDICT_STYLE.unknown;
         let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
-        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.ra_count} RA (${d.rate}/s) · ${d.dhcp6_count} DHCPv6${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.ra_count} RA (${d.rate}/s) · ${d.dhcp6_count} DHCPv6${d.redirect_count ? ' · ' + d.redirect_count + ' redirect' : ''}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
         const routers = d.routers || [];
         if (routers.length) {
             html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">RA routers (' + routers.length + ')</p>' +
@@ -3491,7 +3583,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -3500,7 +3592,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'ntp', 'icmp', 'snmp', 'tls', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">

@@ -44,6 +44,7 @@ alert.
 | [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
 | [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
+| [IPv6 RA Guard](#ipv6-ra-guard) | Diagnostics | `GET /api/net/raguard`, `POST /api/net/raguard` `{action: harden}` |
 | [NTP Watch](#ntp-watch) | Diagnostics | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [SNMP Watch](#snmp-watch) | Diagnostics | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
@@ -87,8 +88,8 @@ leg that crafts real packets → pcap → `tcpdump` → parse to exercise the wh
 capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
-A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NTP**,
-**ICMP**, **SNMP**, **TLS-cert**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -96,7 +97,7 @@ scanners, and TLS Watch grades a real self-signed cert over a local (loopback)
 handshake. This is how you confirm the routing-security detectors are working on a
 given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
 The same checks run headless via
-`python3 network_diagnostics.py {igmp,ipv6,ntp,icmp,snmp,tls,ospf,bgp}-selftest` and each module's
+`python3 network_diagnostics.py {igmp,ipv6,raguard,ntp,icmp,snmp,tls,ospf,bgp}-selftest` and each module's
 `selftest()`.
 
 ---
@@ -415,6 +416,47 @@ TWAMP/OWAMP SLA testing is a natural next step but needs a cooperating reflector
 on the far end.)
 
 - Endpoint: `POST /api/net/ptp` `{interface, seconds}` · binary: `tcpdump`
+
+### IPv6 RA Guard
+The **defence** half of IPv6 first-hop security. Where
+[IPv6 First-Hop Watch](#ipv6-first-hop-watch) (Switch & L2/L3) **detects** a rogue
+RA / DHCPv6 / ICMPv6-Redirect on the wire, RA Guard audits **this host's own IPv6
+settings** so a rogue first-hop can't take effect even if it reaches you — and can
+**harden** them in one click. It is active but sends **no packets**: it reads
+`/proc/sys/net/ipv6/conf/*` and the routing table. It grades every IPv6 interface
+(physical NICs first, container/VPN virtuals collapsed) on:
+
+- **`accept_redirects`** — accepting an **ICMPv6 Redirect** lets any on-link host
+  reroute your traffic (a Layer-3 MITM). A host should never accept them.
+  → verdict **redirect-open**.
+- **`accept_ra_rtr_pref`** — honouring the RA **Router-Preference** field lets a rogue
+  **`pref high`** RA jump ahead of the real router. → verdict **ra-pref-open**.
+- **`accept_ra`** — accepting RAs (SLAAC) at all. Normal, but only safe if the switch
+  enforces RA-Guard. → verdict **ra-open** (advisory).
+- Fully closed → **hardened**; IPv6 off on the interface → **ipv6-off**.
+
+It also shows **which IPv6 default gateway the host has actually accepted** right now
+(and whether it came from an RA). The **Harden** action sets the two safe sysctls —
+`accept_redirects=0` and `accept_ra_rtr_pref=0` — for `all`/`default` and every IPv6
+interface, applies them live, and persists them to
+`/etc/sysctl.d/99-ragnar-raguard.conf` so they survive a reboot. **`accept_ra` is
+deliberately left untouched** — turning it off would drop IPv6 connectivity on a
+legitimate SLAAC network; that trade-off is surfaced as advice (pair with a switch
+RA-Guard) rather than forced.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py raguard              # audit only
+python3 network_diagnostics.py raguard --harden     # apply + persist safe sysctls
+python3 network_diagnostics.py raguard-selftest     # self-test the grader, no root
+```
+
+`raguard-selftest` drives the grader with synthetic posture dicts
+(hardened / redirect-open / ra-pref-open / ra-open / ipv6-off / all-scope override /
+multi-interface roll-up) plus a read-only live leg that grades the real host.
+
+- Endpoint: `GET /api/net/raguard` (check), `POST /api/net/raguard` `{action: harden}`
 
 ### NTP Watch
 NTP (**UDP/123**) is the network's **clock of record**. It touches every layer, but
@@ -798,6 +840,10 @@ ICMPv6 RA/RS/Redirect + DHCPv6 (udp 546/547) is parsed and classified:
   in the baseline. This is **mitm6's signature**: it answers DHCPv6 solicits handing
   out the attacker as **DNS** (no gateway — it pairs with WPAD) to relay and
   NTLM-capture.
+- **Rogue redirect** — an **ICMPv6 Redirect** (type 137) from a source that isn't a
+  known router: the IPv6 twin of the ICMP-redirect MITM, steering your IPv6 traffic
+  through an attacker's next-hop. (Harden the host against these with
+  [IPv6 RA Guard](#ipv6-ra-guard).)
 - **Storm** — a Router Advertisement **flood** (e.g. THC `fake_router6`), by rate.
 - **Anomaly** — first-hop IPv6 seen where the baseline expected none, or a
   managed/other-flag change that alters how hosts get addresses.

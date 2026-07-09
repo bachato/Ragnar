@@ -3773,8 +3773,22 @@ def _ipv6_analyze(events, seconds, baseline, learn=True):
                                    f"{', '.join(sorted(new_dns))} (RDNSS) — DNS "
                                    f"hijack via RA")
 
+    # --- rogue ICMPv6 Redirect (type 137): the IPv6 twin of the ICMP redirect
+    # MITM. A legitimate Redirect only comes from the host's first-hop router, so a
+    # Redirect from any source that isn't a known router steers IPv6 traffic through
+    # an attacker. (Captured all along; now classified.)
+    redirect_srcs = sorted({e['src'] for e in events
+                            if e['kind'] == 'redirect' and e.get('src')})
+    rogue_redirects = [s for s in redirect_srcs if s not in known_routers]
+    if rogue_redirects and verdict in ('clean', 'anomaly'):
+        verdict = 'rogue-redirect'
+    for src in rogue_redirects:
+        reasons.append(f"ICMPv6 Redirect from {src} (not a known router) — steers "
+                       f"IPv6 traffic through a rogue next-hop (Layer-3 MITM). Harden "
+                       f"hosts with net.ipv6.conf.*.accept_redirects=0 (see RA Guard).")
+
     advisories = []
-    if routers or servers:
+    if routers or servers or redirect_srcs:
         advisories.append("Enable switch RA-Guard (RFC 6105) and DHCPv6 snooping on "
                           "access ports; if IPv6 is unused, filter ICMPv6 RA/"
                           "DHCPv6 or disable IPv6 on hosts to remove the vector.")
@@ -3798,6 +3812,7 @@ def _ipv6_analyze(events, seconds, baseline, learn=True):
         'learned': learned,
         'ra_count': ra_count,
         'dhcp6_count': len([e for e in events if e['kind'] == 'dhcp6']),
+        'redirect_count': len([e for e in events if e['kind'] == 'redirect']),
         'rate': ra_rate,
         'routers': [_pub_router(routers[s]) for s in sorted(routers)],
         'dhcp6_servers': [_pub_server(servers[s]) for s in sorted(servers)],
@@ -3915,6 +3930,11 @@ def _ipv6_selftest():
     run('anomaly', ra('fe80::1', lifetime=0, rdnss='2001:db8:1::53'), 12,
         base_one, 'anomaly')
 
+    # 5b. rogue-redirect: an ICMPv6 Redirect from a host that isn't a known router.
+    run('rogue-redirect',
+        "fe80::bad > fe80::a: ICMP6, redirect, length 88", 12, base_one,
+        'rogue-redirect')
+
     # 6. parse: multi-line RA extracts prefix + RDNSS + MAC.
     pev = _parse_ipv6_capture(ra('fe80::1', rdnss='2001:db8:1::53'))
     p_ok = (len(pev) == 1 and pev[0]['kind'] == 'ra'
@@ -3957,6 +3977,277 @@ def _ipv6_selftest():
     passed = all(s['pass'] for s in scenarios) and \
         (not scapy_result.get('ran') or scapy_result.get('pass'))
     return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# IPv6 RA Guard: host first-hop posture check + hardening (active, local)
+# --------------------------------------------------------------------------
+# Where IPv6 First-Hop Watch *detects* a rogue RA / DHCPv6 / ICMPv6-Redirect on the
+# wire, RA Guard is the *defence*: it audits THIS host's own IPv6 knobs and can
+# harden them so a rogue first-hop can't take effect even if it reaches the host.
+# It never sends a packet — it reads /proc/sys/net/ipv6/conf and the routing table.
+# The knobs that matter for first-hop security:
+#   * accept_redirects      — accepting an ICMPv6 Redirect lets any on-link host
+#     reroute your traffic (L3 MITM). A host should never accept them -> harden to 0.
+#   * accept_ra_rtr_pref     — honouring the RA Router-Preference lets a rogue
+#     "pref high" RA jump ahead of the real router -> harden to 0.
+#   * accept_ra              — accepting RAs at all (SLAAC). Left ALONE by harden:
+#     turning it off would drop IPv6 connectivity on legit SLAAC networks; it is
+#     only safe with upstream switch RA-Guard, which we surface as advice.
+# Hardening writes the two safe sysctls live and persists them so they survive a
+# reboot; accept_ra is deliberately untouched.
+_RAGUARD_SYSCTL_FILE = '/etc/sysctl.d/99-ragnar-raguard.conf'
+_RAGUARD_KEYS = ('accept_ra', 'accept_ra_defrtr', 'accept_ra_rtr_pref',
+                 'accept_ra_pinfo', 'accept_redirects', 'autoconf', 'forwarding',
+                 'disable_ipv6', 'use_tempaddr')
+# (key, target) pairs applied by Harden — safe, do not break SLAAC connectivity.
+_RAGUARD_HARDEN = (('accept_redirects', 0), ('accept_ra_rtr_pref', 0))
+_RAGUARD_PRIORITY = ['redirect-open', 'ra-pref-open', 'ra-open', 'hardened',
+                     'ipv6-off']
+# Virtual / container / VPN interfaces — hardened by the same all-scope sysctl, but
+# not the untrusted-facing NICs, so the UI collapses them.
+_RAGUARD_VIRTUAL_RE = re.compile(
+    r'^(veth|br-|docker|virbr|vmnet|vnet|tap|tun|wg\d|zt|tailscale|cni|flannel|'
+    r'cali|kube|nomad|dummy|bond|team|ifb|gre|sit|ip6tnl|erspan)', re.IGNORECASE)
+
+
+def _raguard_read_conf(iface):
+    """Read the relevant net.ipv6.conf.<iface>.* knobs from /proc (None if absent)."""
+    base = f'/proc/sys/net/ipv6/conf/{iface}'
+    out = {}
+    for k in _RAGUARD_KEYS:
+        try:
+            with open(f'{base}/{k}') as f:
+                out[k] = int(f.read().strip())
+        except (OSError, ValueError):
+            out[k] = None
+    return out
+
+
+def _raguard_ifaces():
+    """Real IPv6-capable interfaces (exclude the all/default templates and lo)."""
+    try:
+        names = sorted(os.listdir('/proc/sys/net/ipv6/conf'))
+    except OSError:
+        return []
+    return [n for n in names if n not in ('all', 'default', 'lo')]
+
+
+def _raguard_accepted_gateways():
+    """The IPv6 default route(s) the host has actually installed — the first hop it
+    trusts right now — and whether each came from an RA (proto ra)."""
+    res = _run(['ip', '-6', 'route', 'show', 'default'], timeout=5)
+    gws = []
+    for line in (res.get('out') or '').splitlines():
+        m = re.search(r'default\s+via\s+(\S+)\s+dev\s+(\S+)', line)
+        if m:
+            gws.append({'gw': m.group(1), 'dev': m.group(2),
+                        'from_ra': 'proto ra' in line})
+    return gws
+
+
+def _raguard_analyze(all_conf, ifaces_conf, gateways=None):
+    """Pure classifier over the host's IPv6 first-hop posture. Grades each interface
+    (worst-case: a knob is 'on' if either the interface OR the all-scope has it set),
+    rolls up the worst, and builds the harden plan. Separated for the self-test."""
+    all_conf = all_conf or {}
+    gateways = gateways or []
+
+    def on(c, key):
+        return c.get(key) == 1 or all_conf.get(key) == 1
+
+    per = []
+    for iface in sorted(ifaces_conf):
+        c = ifaces_conf[iface]
+        ipv6_off = c.get('disable_ipv6') == 1
+        redirect_open = on(c, 'accept_redirects')
+        ra_on = c.get('accept_ra') not in (0, None)
+        rtr_pref_on = on(c, 'accept_ra_rtr_pref')
+        if ipv6_off:
+            v, why = 'ipv6-off', 'IPv6 disabled on this interface'
+        elif redirect_open:
+            v, why = ('redirect-open',
+                      'accepts ICMPv6 Redirects (accept_redirects=1) — open to a '
+                      'redirect MITM')
+        elif ra_on and rtr_pref_on:
+            v, why = ('ra-pref-open',
+                      'honours RA Router-Preference (accept_ra_rtr_pref=1) — a rogue '
+                      '"pref high" RA can hijack the default route')
+        elif ra_on:
+            v, why = ('ra-open',
+                      'accepts Router Advertisements (SLAAC) — safe only if the '
+                      'switch enforces RA-Guard')
+        else:
+            v, why = 'hardened', 'ignores RAs and ICMPv6 Redirects'
+        per.append({'iface': iface, 'verdict': v, 'reason': why,
+                    'virtual': bool(_RAGUARD_VIRTUAL_RE.match(iface)),
+                    'accept_ra': c.get('accept_ra'),
+                    'accept_ra_rtr_pref': c.get('accept_ra_rtr_pref'),
+                    'accept_redirects': c.get('accept_redirects'),
+                    'forwarding': c.get('forwarding'),
+                    'disable_ipv6': c.get('disable_ipv6'),
+                    'redirect_open': redirect_open, 'rtr_pref_on': rtr_pref_on})
+
+    # Physical/untrusted-facing NICs first, then virtuals.
+    per.sort(key=lambda p: (p['virtual'], p['iface']))
+    # Overall reflects the worst *physical* interface when there is one (virtuals are
+    # covered by the same all-scope harden but aren't the exposed surface).
+    phys = [p['verdict'] for p in per if not p['virtual']]
+    verdicts = phys or [p['verdict'] for p in per] or ['ipv6-off']
+    overall = min(verdicts, key=_RAGUARD_PRIORITY.index)
+
+    # Does anything need hardening? (redirect or rtr-pref open anywhere, incl. all-scope)
+    needs = any(p['redirect_open'] or p['rtr_pref_on'] for p in per) \
+        or on({}, 'accept_redirects') or on({}, 'accept_ra_rtr_pref')
+
+    reasons = []
+    for p in per:
+        if not p['virtual'] and p['verdict'] not in ('hardened', 'ipv6-off'):
+            reasons.append(f"{p['iface']}: {p['reason']}")
+    virt_exposed = sum(1 for p in per if p['virtual']
+                       and p['verdict'] not in ('hardened', 'ipv6-off'))
+    if virt_exposed:
+        reasons.append(f"…and {virt_exposed} virtual/container interface(s) with the "
+                       f"same exposure (covered by the same all-scope harden)")
+    if not reasons:
+        reasons = ['Host ignores ICMPv6 Redirects and rogue RA preferences — '
+                   'first-hop hardened' if overall != 'ipv6-off'
+                   else 'IPv6 is disabled on all interfaces — no IPv6 first-hop surface']
+
+    remediation = []
+    if needs:
+        for scope in ('all', 'default'):
+            for key, val in _RAGUARD_HARDEN:
+                remediation.append(f'net.ipv6.conf.{scope}.{key} = {val}')
+
+    advisories = []
+    if any(p['verdict'] == 'ra-open' or p['verdict'] == 'ra-pref-open' for p in per):
+        advisories.append('This host accepts Router Advertisements (SLAAC). That is '
+                          'only safe if the access switch enforces RA-Guard (RFC '
+                          '6105); otherwise a rogue RA can still add a gateway/DNS. '
+                          'Pair this with IPv6 First-Hop Watch to catch it on the wire.')
+
+    return {
+        'success': True,
+        'verdict': overall,
+        'reasons': reasons,
+        'interfaces': per,
+        'gateways': gateways,
+        'needs_hardening': needs,
+        'remediation': remediation,
+        'advisories': advisories,
+    }
+
+
+def _raguard_apply():
+    """Harden: set the safe sysctls live for all/default + every IPv6 interface, and
+    persist them. Leaves accept_ra untouched. Returns what changed."""
+    live, errors = [], []
+    scopes = ['all', 'default'] + _raguard_ifaces()
+    for scope in scopes:
+        for key, val in _RAGUARD_HARDEN:
+            name = f'net.ipv6.conf.{scope}.{key}'
+            res = _run(['sysctl', '-w', f'{name}={val}'], timeout=5)
+            if res.get('rc', 0) == 0 and 'error' not in (res.get('err') or '').lower():
+                live.append(name)
+            else:
+                errors.append(f"{name}: {(res.get('err') or 'failed').strip()[:80]}")
+    # Persist (all/default cover interfaces created later; explicit per-if too).
+    body = ["# Ragnar IPv6 RA-Guard hardening — closes the ICMPv6-redirect and rogue",
+            "# RA-preference holes. accept_ra is intentionally left untouched so SLAAC",
+            "# connectivity keeps working. Managed by Ragnar; edit via the RA Guard tool.",
+            ""]
+    for scope in scopes:
+        for key, val in _RAGUARD_HARDEN:
+            body.append(f'net.ipv6.conf.{scope}.{key} = {val}')
+    persisted = None
+    try:
+        with open(_RAGUARD_SYSCTL_FILE, 'w') as f:
+            f.write("\n".join(body) + "\n")
+        persisted = _RAGUARD_SYSCTL_FILE
+    except OSError as e:
+        errors.append(f"persist {_RAGUARD_SYSCTL_FILE}: {e}")
+    return {'live': live, 'persisted': persisted, 'errors': errors}
+
+
+def do_raguard(action='check'):
+    """IPv6 RA Guard: audit (and optionally harden) the host's IPv6 first-hop
+    posture. action='check' reads only; action='harden' applies the safe sysctls
+    (accept_redirects=0, accept_ra_rtr_pref=0) live + persisted, then re-checks."""
+    applied = None
+    if action == 'harden':
+        applied = _raguard_apply()
+    all_conf = _raguard_read_conf('all')
+    ifaces = _raguard_ifaces()
+    ifaces_conf = {i: _raguard_read_conf(i) for i in ifaces}
+    if not ifaces_conf:
+        return {'success': True, 'verdict': 'ipv6-off', 'interfaces': [],
+                'reasons': ['No IPv6-capable interfaces found'], 'gateways': [],
+                'needs_hardening': False, 'remediation': [], 'advisories': [],
+                'applied': applied, 'all': all_conf}
+    result = _raguard_analyze(all_conf, ifaces_conf, _raguard_accepted_gateways())
+    result['all'] = all_conf
+    result['applied'] = applied
+    result['persist_file'] = _RAGUARD_SYSCTL_FILE
+    return result
+
+
+def _raguard_selftest():
+    """Self-test the RA Guard grader with synthetic posture dicts (no root, no host
+    change), plus a read-only live 'check' leg that exercises the /proc path."""
+    scenarios = []
+    allz = {k: 0 for k in _RAGUARD_KEYS}    # all-scope neutral (nothing forced on)
+
+    def conf(**kw):
+        c = {k: 0 for k in _RAGUARD_KEYS}
+        c.update(kw)
+        return c
+
+    def run(name, ifaces_conf, expect, all_conf=None):
+        res = _raguard_analyze(all_conf or allz, ifaces_conf)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'pass': ok})
+        return res
+
+    # hardened: accept_ra off, redirects off.
+    run('hardened', {'eth0': conf(accept_ra=0, accept_redirects=0)}, 'hardened')
+    # redirect-open: accepts ICMPv6 redirects.
+    run('redirect-open', {'eth0': conf(accept_ra=1, accept_redirects=1)},
+        'redirect-open')
+    # ra-pref-open: SLAAC + honours router preference.
+    run('ra-pref-open',
+        {'eth0': conf(accept_ra=1, accept_ra_rtr_pref=1, accept_redirects=0)},
+        'ra-pref-open')
+    # ra-open: SLAAC but ignores router preference + redirects.
+    run('ra-open',
+        {'eth0': conf(accept_ra=1, accept_ra_rtr_pref=0, accept_redirects=0)},
+        'ra-open')
+    # ipv6-off.
+    run('ipv6-off', {'eth0': conf(disable_ipv6=1)}, 'ipv6-off')
+    # all-scope redirect on overrides a clean interface (worst-case OR).
+    run('all-scope-redirect', {'eth0': conf(accept_ra=0, accept_redirects=0)},
+        'redirect-open', all_conf=conf(accept_redirects=1))
+    # worst-of-many rolls up.
+    r = run('rollup',
+            {'eth0': conf(accept_ra=1, accept_redirects=0, accept_ra_rtr_pref=0),
+             'eth1': conf(accept_ra=1, accept_redirects=1)}, 'redirect-open')
+    scenarios.append({'name': 'rollup-needs-harden', 'expect': 'True',
+                      'got': str(r['needs_hardening']), 'pass': r['needs_hardening']})
+
+    # Live read-only leg: the real host posture check must succeed and grade ifaces.
+    e2e = {'ran': False, 'reason': 'skipped'}
+    try:
+        live = do_raguard('check')
+        ok = live.get('success') and 'verdict' in live
+        e2e = {'ran': True, 'verdict': live.get('verdict'),
+               'interfaces': len(live.get('interfaces', [])), 'pass': bool(ok)}
+    except Exception as e:
+        e2e = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not e2e.get('ran')
+                                                    or e2e.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'e2e': e2e}
 
 
 # --------------------------------------------------------------------------
@@ -7324,6 +7615,7 @@ def do_routing_selftest():
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
+              'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
@@ -8114,6 +8406,15 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/ipv6-baseline {action}")
         return jsonify(do_ipv6_baseline(action))
 
+    @app.route('/api/net/raguard', methods=['GET', 'POST'])
+    def net_raguard():
+        action = 'check'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'harden' if (data.get('action') == 'harden') else 'check'
+        _log(f"net/raguard {action}")
+        return jsonify(do_raguard(action))
+
     @app.route('/api/net/ntp-watch', methods=['GET'])
     def net_ntp_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -8412,6 +8713,13 @@ def _cli(argv=None):
     v6st = sub.add_parser('ipv6-selftest', help='self-test the IPv6 first-hop detectors (no root)')
     v6st.add_argument('--json', action='store_true', help='emit JSON')
 
+    rg = sub.add_parser('raguard', help='IPv6 RA Guard: audit (and optionally harden) host first-hop posture')
+    rg.add_argument('--harden', action='store_true', help='apply + persist the safe sysctls')
+    rg.add_argument('--json', action='store_true', help='emit JSON')
+
+    rgst = sub.add_parser('raguard-selftest', help='self-test the RA Guard grader (no root)')
+    rgst.add_argument('--json', action='store_true', help='emit JSON')
+
     nt = sub.add_parser('ntp-watch', help='passive NTP (rogue time-source) scan')
     nt.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     nt.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
@@ -8552,6 +8860,49 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"IPv6 first-hop self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'raguard':
+        r = do_raguard('harden' if args.harden else 'check')
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print(f"IPv6 RA Guard: {r['verdict'].upper()}")
+            for p in r.get('interfaces', []):
+                print(f"  {p['iface']:10} {p['verdict']:14} "
+                      f"accept_ra={p['accept_ra']} rtr_pref={p['accept_ra_rtr_pref']} "
+                      f"accept_redirects={p['accept_redirects']}")
+            for g in r.get('gateways', []):
+                print(f"  accepted gateway: {g['gw']} dev {g['dev']}"
+                      f"{' (from RA)' if g['from_ra'] else ''}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+            ap = r.get('applied')
+            if ap:
+                print(f"  hardened: set {len(ap['live'])} sysctls, persisted "
+                      f"{ap['persisted'] or '(failed)'}")
+                for e in ap['errors']:
+                    print(f"  ! {e}")
+            elif r.get('needs_hardening'):
+                print("  run with --harden to close these (accept_redirects=0, "
+                      "accept_ra_rtr_pref=0; accept_ra left as-is)")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'raguard-selftest':
+        r = _raguard_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            e = r.get('e2e', {})
+            if e.get('ran'):
+                print(f"  [{'PASS' if e.get('pass') else 'FAIL'}] live-check: "
+                      f"verdict={e.get('verdict')} ifaces={e.get('interfaces')}")
+            else:
+                print(f"  [skip] live-check: {e.get('reason')}")
+            print(f"RA Guard self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ntp-watch':

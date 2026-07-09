@@ -1339,6 +1339,17 @@
                         </div>
                         <div id="ptp-results" class="hidden mt-3 text-sm"></div>
                     </div>
+                    <!-- IPv6 RA Guard (host first-hop posture + hardening) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">IPv6 RA Guard <span class="text-xs font-normal text-gray-500">(host first-hop hardening)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">The <strong>defence</strong> half of IPv6 first-hop security. Where <em>IPv6 First-Hop Watch</em> (Switch &amp; L2/L3) <strong>detects</strong> a rogue RA / DHCPv6 / ICMPv6-Redirect on the wire, RA Guard audits <strong>this host's own IPv6 settings</strong> so a rogue first-hop can't take effect even if it reaches you — and can <strong>harden</strong> them in one click. It never sends a packet; it reads <span class="font-mono">/proc/sys/net/ipv6/conf</span> and the routing table.</p>
+                        <p class="text-sm text-gray-400 mb-3">Grades each interface on <span class="font-mono">accept_redirects</span> (accepting an <strong>ICMPv6 Redirect</strong> lets any on-link host reroute your traffic — a Layer-3 MITM), <span class="font-mono">accept_ra_rtr_pref</span> (honouring RA <strong>Router-Preference</strong> lets a rogue "pref high" RA jump ahead of the real router), and <span class="font-mono">accept_ra</span>, and shows which IPv6 <strong>gateway the host has actually accepted</strong>. <strong>Harden</strong> sets the two safe sysctls (<span class="font-mono">accept_redirects=0</span>, <span class="font-mono">accept_ra_rtr_pref=0</span>) live and persists them to <span class="font-mono">/etc/sysctl.d</span>; <span class="font-mono">accept_ra</span> is left untouched so SLAAC connectivity keeps working.</p>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button onclick="runRaGuard()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check posture</button>
+                            <button onclick="raGuardHarden()" class="w-full sm:w-auto bg-amber-700 hover:bg-amber-600 text-white px-4 py-2 rounded text-sm whitespace-nowrap" title="Applies + persists accept_redirects=0 and accept_ra_rtr_pref=0 (leaves accept_ra alone)">Harden host</button>
+                        </div>
+                        <div id="raguard-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
                     <!-- NTP Watch (rogue time source / clock injection) -->
                     <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
                         <h3 class="text-lg font-semibold mb-1">NTP Watch <span class="text-xs font-normal text-gray-500">(rogue time source · clock injection)</span></h3>
@@ -5884,7 +5895,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-ntpsnmpdiag"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-raguard"></script>
 
 </body>
 </html>
