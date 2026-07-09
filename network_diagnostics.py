@@ -4520,6 +4520,444 @@ def _ntp_selftest():
 
 
 # --------------------------------------------------------------------------
+# ICMP Watch: passive ICMP-redirect / L3-injection scanner (detection-only)
+# --------------------------------------------------------------------------
+# The ICMP Redirect (type 5) is the classic Layer-3 gateway-injection MITM: any
+# host on the segment can forge a Redirect that appears to come from the real
+# gateway and tell a victim "for destination X, use next-hop Y instead" — steering
+# that traffic through the attacker. It needs no ARP poisoning and no gateway
+# compromise, and most hosts historically honoured redirects by default. Related
+# L3 ICMP abuses live on the same wire: rogue ICMP Router Discovery (IRDP, type 9)
+# advertisements that inject a default gateway, ICMP echo floods (ping-flood /
+# smurf DoS), ICMP tunnelling / covert channels (oversized echo payloads used to
+# exfiltrate data), and host reconnaissance (timestamp / address-mask / information
+# requests that leak host facts). This scanner is PASSIVE: one short tcpdump window
+# over IPv4 `icmp`, parsed and classified against the host's authoritative default
+# gateway. It never sends an ICMP packet. (ICMPv6 Redirects, type 137, are covered
+# by IPv6 First-Hop Watch.) What it flags:
+#   * redirect    — an ICMP Redirect steering traffic to a next-hop that isn't a
+#     known gateway (attacker insertion), or from a source that isn't the gateway
+#     (spoofed) — the headline MITM.
+#   * rogue-irdp  — an ICMP Router Advertisement (type 9) from a non-gateway host
+#     (IRDP default-gateway injection).
+#   * flood       — an ICMP storm (echo-flood / smurf, or a redirect flood) by rate.
+#   * tunnel      — echo packets with oversized payloads (ICMP covert channel/exfil).
+#   * recon       — ICMP timestamp / address-mask / information requests (host recon).
+#   * anomaly     — a redirect/IRDP that matches known gateways (rare but benign),
+#     or a deprecated type (source quench).
+_ICMP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'icmp_watch.json')
+_icmp_watch_lock = threading.Lock()
+
+# ICMP is intrinsically low-volume passively; a sustained rate at/above this is a
+# flood (ping-flood / smurf / redirect storm).
+_ICMP_FLOOD_RATE = 50.0
+# A normal ping is ~64 bytes of ICMP. An echo whose ICMP length exceeds this is
+# carrying a payload no ping needs — the ICMP-tunnel / exfil tell.
+_ICMP_TUNNEL_LEN = 1024
+_ICMP_EVENTS_CAP = 200
+
+_ICMP_LINE_RE = re.compile(
+    r'^\s*(\d+\.\d+\.\d+\.\d+)\s*>\s*(\d+\.\d+\.\d+\.\d+):\s*ICMP\s+(.+)$')
+_ICMP_REDIR_RE = re.compile(r'redirect\s+(\S+)\s+to\s+(?:host|net)\s+([\d.]+)')
+_ICMP_LEN_RE = re.compile(r'length\s+(\d+)\s*$')
+
+
+def _parse_icmp_capture(output):
+    """Parse `tcpdump -nn -t -v icmp` text into ICMP events. Each ICMP message
+    prints a `<src> > <dst>: ICMP <detail>, length N` line (a Redirect carries a
+    quoted inner IP packet on following lines, which never matches this pattern
+    because it has no `: ICMP`). Each event is a dict with a 'kind':
+      redirect  : {src, dst, redirected, new_gw, length}
+      echo      : {src, dst, length}
+      irdp      : {src, dst}                 (router advertisement, type 9)
+      irdp_sol  : {src, dst}                 (router solicitation, type 10)
+      recon     : {src, dst, what}           (timestamp / address-mask / information)
+      other     : {src, dst, what}           (unreachable / time-exceeded / quench …)
+    """
+    events = []
+    for raw in output.splitlines():
+        m = _ICMP_LINE_RE.match(raw)
+        if not m:
+            continue
+        src, dst, rest = m.group(1), m.group(2), m.group(3).strip()
+        low = rest.lower()
+        lm = _ICMP_LEN_RE.search(rest)
+        length = int(lm.group(1)) if lm else None
+
+        if low.startswith('redirect'):
+            rm = _ICMP_REDIR_RE.search(rest)
+            events.append({'kind': 'redirect', 'src': src, 'dst': dst,
+                           'redirected': rm.group(1) if rm else None,
+                           'new_gw': rm.group(2) if rm else None, 'length': length})
+        elif 'echo' in low:
+            events.append({'kind': 'echo', 'src': src, 'dst': dst, 'length': length})
+        elif 'router advertisement' in low:
+            events.append({'kind': 'irdp', 'src': src, 'dst': dst})
+        elif 'router solicitation' in low:
+            events.append({'kind': 'irdp_sol', 'src': src, 'dst': dst})
+        elif 'time stamp' in low or 'timestamp' in low:
+            events.append({'kind': 'recon', 'src': src, 'dst': dst,
+                           'what': 'timestamp'})
+        elif 'address mask' in low:
+            events.append({'kind': 'recon', 'src': src, 'dst': dst,
+                           'what': 'address-mask'})
+        elif 'information' in low:
+            events.append({'kind': 'recon', 'src': src, 'dst': dst,
+                           'what': 'information'})
+        else:
+            events.append({'kind': 'other', 'src': src, 'dst': dst,
+                           'what': rest.split(',')[0][:40]})
+    return events
+
+
+def _icmp_watch_load():
+    try:
+        with open(_ICMP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _icmp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_ICMP_WATCH_PATH), exist_ok=True)
+        tmp = _ICMP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _ICMP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_icmp_baseline(action='get'):
+    """Manage the trusted gateway baseline the ICMP-redirect check compares against
+    (the legitimate router(s) allowed to redirect / advertise). action='reset'
+    re-seeds from the host's default gateway on the next scan."""
+    with _icmp_watch_lock:
+        if action == 'reset':
+            _icmp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _icmp_watch_load()
+        return {'success': True, 'baseline': {
+            'gateways': sorted(b.get('gateways') or []),
+        }}
+
+
+def _icmp_analyze(events, seconds, baseline, sys_gateway=None, learn=True):
+    """Pure classifier over parsed ICMP events. The host's authoritative default
+    gateway (sys_gateway) is always trusted, plus any learned gateways. Separated
+    from capture so the self-test can drive it with synthetic packets. May
+    mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    # Learn-on-first-run: seed the trusted-gateway baseline from the host's own
+    # default gateway (authoritative — never from redirect sources, which could be
+    # the attacker).
+    learned = False
+    if learn and not (baseline.get('gateways')) and sys_gateway:
+        baseline['gateways'] = [sys_gateway]
+        learned = True
+    # The live default gateway is always trusted, on top of the stored baseline.
+    known_gw = set(baseline.get('gateways') or [])
+    if sys_gateway:
+        known_gw.add(sys_gateway)
+    had_gw = bool(known_gw)
+
+    redirects = [e for e in events if e['kind'] == 'redirect']
+    echoes = [e for e in events if e['kind'] == 'echo']
+    irdp = [e for e in events if e['kind'] == 'irdp']
+    recon = [e for e in events if e['kind'] == 'recon']
+    rate = round(len(events) / seconds, 2)
+
+    PRIORITY = ['redirect', 'rogue-irdp', 'flood', 'tunnel', 'recon', 'anomaly',
+                'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # --- redirect: the headline L3 MITM ---
+    redir_rows = []
+    malicious_redir = False
+    for e in redirects:
+        spoofed = had_gw and e['src'] not in known_gw
+        # steering traffic to a next-hop that isn't a known router = attacker insert
+        insert = bool(e['new_gw']) and (not had_gw or e['new_gw'] not in known_gw)
+        mal = spoofed or insert or not had_gw
+        malicious_redir = malicious_redir or mal
+        redir_rows.append({'src': e['src'], 'dst': e['dst'],
+                           'redirected': e['redirected'], 'new_gw': e['new_gw'],
+                           'malicious': mal})
+    if redirects:
+        if malicious_redir:
+            bump('redirect')
+        elif verdict == 'clean':
+            verdict = 'anomaly'
+        for r in redir_rows:
+            if r['malicious']:
+                why = []
+                if had_gw and r['src'] not in known_gw:
+                    why.append(f"source {r['src']} is not the gateway (spoofed)")
+                if r['new_gw'] and (not had_gw or r['new_gw'] not in known_gw):
+                    why.append(f"steers traffic for {r['redirected'] or '?'} to "
+                               f"non-gateway {r['new_gw']} (attacker next-hop)")
+                if not had_gw:
+                    why.append("no trusted gateway baseline — treat any redirect as "
+                               "suspect")
+                reasons.append(
+                    f"ICMP Redirect from {r['src']} to {r['dst']}: "
+                    f"{'; '.join(why)} — L3 man-in-the-middle (route injection)")
+            else:
+                reasons.append(
+                    f"ICMP Redirect from gateway {r['src']} to {r['dst']} "
+                    f"(→ {r['new_gw']}) — benign-looking but redirects are rare on "
+                    f"switched networks; verify it is expected")
+
+    # --- rogue-irdp: type-9 router advertisement injecting a gateway ---
+    for e in irdp:
+        if had_gw and e['src'] in known_gw:
+            if verdict == 'clean':
+                verdict = 'anomaly'
+            reasons.append(f"ICMP Router Advertisement (IRDP) from gateway {e['src']} "
+                           f"— unusual on modern networks; verify")
+        else:
+            bump('rogue-irdp')
+            reasons.append(
+                f"ICMP Router Advertisement (IRDP) from {e['src']} (not a known "
+                f"gateway) — injects itself as a default gateway (IRDP spoofing MITM)")
+
+    # --- flood: ICMP storm ---
+    if rate >= _ICMP_FLOOD_RATE and len(events) >= _ICMP_FLOOD_RATE * seconds:
+        bump('flood')
+        talkers = {}
+        for e in events:
+            talkers[e['src']] = talkers.get(e['src'], 0) + 1
+        top = max(talkers, key=talkers.get)
+        reasons.append(
+            f"ICMP flood: {len(events)} packets in {seconds}s ({rate}/s), mostly "
+            f"echo — ping-flood / smurf DoS; top source {top} ({talkers[top]})")
+
+    # --- tunnel: oversized echo payloads (covert channel / exfil) ---
+    big = [e for e in echoes if (e['length'] or 0) > _ICMP_TUNNEL_LEN]
+    if big:
+        bump('tunnel')
+        pairs = sorted({f"{e['src']}→{e['dst']}" for e in big})
+        maxlen = max(e['length'] for e in big)
+        reasons.append(
+            f"{len(big)} ICMP echo packet(s) with oversized payloads (up to "
+            f"{maxlen}B, normal ping ~64B) between {', '.join(pairs[:4])} — ICMP "
+            f"tunnelling / data exfiltration over a covert channel")
+
+    # --- recon: info-leak request types ---
+    if recon:
+        kinds = sorted({e['what'] for e in recon})
+        srcs = sorted({e['src'] for e in recon})
+        bump('recon')
+        reasons.append(
+            f"ICMP {', '.join(kinds)} request(s) from {', '.join(srcs[:4])} — host "
+            f"reconnaissance / information leak; block these ICMP types at the edge")
+
+    advisories = []
+    if events:
+        advisories.append(
+            "Ignore ICMP redirects on hosts (net.ipv4.conf.all.accept_redirects=0, "
+            "secure_redirects=0) and on the gateway "
+            "(send_redirects=0); disable IRDP; rate-limit ICMP and block timestamp/"
+            "address-mask/information types at the network edge.")
+
+    counts = {'redirect': len(redirects), 'echo': len(echoes), 'irdp': len(irdp),
+              'recon': len(recon),
+              'other': len([e for e in events if e['kind'] == 'other'])}
+
+    if reasons:
+        summary = reasons
+    elif not events:
+        summary = ['No ICMP traffic seen — segment quiet']
+    else:
+        summary = ['ICMP traffic seen but no redirects / injections / floods — clean']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'icmp_count': len(events),
+        'rate': rate,
+        'counts': counts,
+        'redirects': redir_rows,
+        'gateways': sorted(known_gw),
+        'advisories': advisories,
+    }
+
+
+def _icmp_capture(interface, seconds):
+    """Run one passive tcpdump window over IPv4 ICMP and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '128', '-c', '20000', 'icmp'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_icmp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive ICMP L3-security scanner (detection-only). Captures ICMP for a few
+    seconds and classifies the segment: redirect / rogue-irdp / flood / tunnel /
+    recon / anomaly / clean. Trusts the host's default gateway; learns it on first
+    run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _icmp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_icmp_capture(text)
+    sys_gw = _default_gateway()
+
+    with _icmp_watch_lock:
+        baseline = _icmp_watch_load()
+        result = _icmp_analyze(events, seconds, baseline, sys_gateway=sys_gw,
+                               learn=learn)
+        if result.get('learned'):
+            _icmp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _icmp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_ICMP_EVENTS_CAP:]
+            _icmp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _icmp_selftest():
+    """Self-test the ICMP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -t -v icmp` text through the real parser +
+    classifier, and — if Scapy is available — builds a real ICMP Redirect into a
+    pcap and parses it back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+    GW = '192.168.1.1'
+
+    def redirect(src, dst='192.168.1.50', dest='8.8.8.8', newgw='192.168.1.66'):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto ICMP "
+                f"(1), length 56)\n"
+                f"    {src} > {dst}: ICMP redirect {dest} to host {newgw}, length 36\n"
+                f"\tIP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto TCP "
+                f"(6), length 40)\n"
+                f"    {dst} > {dest}: tcp 0")
+
+    def echo(src, dst, length=64):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto ICMP "
+                f"(1), length {length + 20})\n"
+                f"    {src} > {dst}: ICMP echo request, id 1, seq 1, length {length}")
+
+    def simple(src, dst, detail):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto ICMP "
+                f"(1), length 40)\n    {src} > {dst}: ICMP {detail}")
+
+    def run(name, text, seconds, expect, gw=GW, baseline=None):
+        events = _parse_icmp_capture(text)
+        res = _icmp_analyze(events, seconds, dict(baseline or {}),
+                            sys_gateway=gw, learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'gateways': ['192.168.1.1']}
+
+    # 1. clean: ordinary echo request/reply between hosts, no redirects.
+    run('clean', echo('192.168.1.50', '8.8.8.8') + "\n" +
+        echo('8.8.8.8', '192.168.1.50'), 12, 'clean', baseline=base)
+
+    # 2. redirect: a spoofed Redirect steering traffic to a non-gateway next-hop.
+    run('redirect', redirect('192.168.1.66'), 12, 'redirect', baseline=base)
+
+    # 3. rogue-irdp: an ICMP Router Advertisement from a non-gateway host.
+    run('rogue-irdp',
+        simple('192.168.1.66', '224.0.0.1',
+               'router advertisement lifetime 1800 1: {192.168.1.66 128}, length 16'),
+        12, 'rogue-irdp', baseline=base)
+
+    # 4. flood: an ICMP echo storm.
+    flood = "\n".join(echo(f"10.0.0.{i % 250}", '192.168.1.50')
+                      for i in range(700))
+    run('flood', flood, 5, 'flood', baseline=base)
+
+    # 5. tunnel: echo packets with oversized payloads (covert channel).
+    run('tunnel', echo('192.168.1.50', '10.0.0.9', length=1400) + "\n" +
+        echo('192.168.1.50', '10.0.0.9', length=1400), 12, 'tunnel', baseline=base)
+
+    # 6. recon: ICMP timestamp + address-mask requests.
+    run('recon', simple('192.168.1.66', '192.168.1.50',
+                        'time stamp query id 0 seq 0, length 20') + "\n" +
+        simple('192.168.1.66', '192.168.1.51', 'address mask request, length 12'),
+        12, 'recon', baseline=base)
+
+    # 7. anomaly: a benign redirect from the real gateway to another known gateway.
+    run('anomaly', redirect('192.168.1.1', newgw='192.168.1.1'), 12, 'anomaly',
+        baseline=base)
+
+    # 8. parse: a redirect yields src, redirected-dest and the new next-hop.
+    pev = _parse_icmp_capture(redirect('192.168.1.66'))
+    p_ok = (len(pev) == 1 and pev[0]['kind'] == 'redirect'
+            and pev[0]['src'] == '192.168.1.66'
+            and pev[0]['redirected'] == '8.8.8.8'
+            and pev[0]['new_gw'] == '192.168.1.66')
+    scenarios.append({'name': 'redirect-parse', 'expect': 'src+dest+newgw',
+                      'got': str(pev[0] if pev else None)[:90], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real Redirect -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, ICMP, Raw, wrpcap
+        if _have('tcpdump'):
+            pkt = (Ether() / IP(src='192.168.1.1', dst='192.168.1.50')
+                   / ICMP(type=5, code=1, gw='192.168.1.66')
+                   / IP(src='192.168.1.50', dst='8.8.8.8') / Raw(b'\x00' * 8))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_icmp_capture(res['out'])
+            reds = [e for e in evs if e['kind'] == 'redirect']
+            ok = bool(reds) and reds[0]['new_gw'] == '192.168.1.66'
+            scapy_result = {'ran': True, 'redirects': len(reds),
+                            'new_gw': reds[0]['new_gw'] if reds else None,
+                            'pass': ok, 'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # OSPF Watch: passive OSPF security scanner (detection-only)
 # --------------------------------------------------------------------------
 # OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
@@ -5780,7 +6218,8 @@ def do_routing_selftest():
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
-              'ntp': _ntp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+              'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
+              'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
@@ -6586,6 +7025,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/ntp-baseline {action}")
         return jsonify(do_ntp_baseline(action))
 
+    @app.route('/api/net/icmp-watch', methods=['GET'])
+    def net_icmp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/icmp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_icmp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/icmp-baseline', methods=['GET', 'POST'])
+    def net_icmp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/icmp-baseline {action}")
+        return jsonify(do_icmp_baseline(action))
+
     @app.route('/api/net/ospf-watch', methods=['GET'])
     def net_ospf_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -6816,6 +7273,15 @@ def _cli(argv=None):
     ntst = sub.add_parser('ntp-selftest', help='self-test the NTP detectors (no root)')
     ntst.add_argument('--json', action='store_true', help='emit JSON')
 
+    ic = sub.add_parser('icmp-watch', help='passive ICMP (redirect/IRDP) L3 scan')
+    ic.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    ic.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    ic.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    ic.add_argument('--json', action='store_true', help='emit JSON')
+
+    icst = sub.add_parser('icmp-selftest', help='self-test the ICMP detectors (no root)')
+    icst.add_argument('--json', action='store_true', help='emit JSON')
+
     o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
     o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
@@ -6958,6 +7424,48 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"NTP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'icmp-watch':
+        r = do_icmp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            c = r['counts']
+            print(f"ICMP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['icmp_count']} pkts @ {r['rate']}/s · "
+                  f"redir {c['redirect']} echo {c['echo']} irdp {c['irdp']} "
+                  f"recon {c['recon']})")
+            if r.get('learned'):
+                print("  (gateway baseline learned this run)")
+            if r.get('gateways'):
+                print(f"  trusted gateways: {', '.join(r['gateways'])}")
+            for rd in r.get('redirects', []):
+                tag = ' *MITM*' if rd['malicious'] else ''
+                print(f"  redirect {rd['src']} → {rd['dst']}: {rd['redirected']} "
+                      f"via {rd['new_gw']}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'icmp-selftest':
+        r = _icmp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"new_gw={sc.get('new_gw')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"ICMP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ospf-watch':

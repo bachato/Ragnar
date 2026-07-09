@@ -1220,6 +1220,7 @@ function showNetworkSubtab(name) {
         _igmpFillIfaces();
         _ipv6FillIfaces();
         _ntpFillIfaces();
+        _icmpFillIfaces();
         _ospfFillIfaces();
         _bgpFillIfaces();
         dhcpSnoopStatus();
@@ -2836,6 +2837,102 @@ async function ntpTrustBaseline() {
     }
 }
 
+// ---- ICMP Watch (passive ICMP-redirect / L3 route injection) ---------------
+const _ICMP_VERDICT_STYLE = {
+    clean:         ['bg-green-950/40 border-green-900 text-green-400', '✓ No ICMP redirects / injections / floods detected'],
+    anomaly:       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ ICMP anomaly — a redirect/IRDP from a known gateway (verify)'],
+    recon:         ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ ICMP reconnaissance — timestamp / address-mask / info requests'],
+    tunnel:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ ICMP tunnelling — oversized echo payloads (covert channel / exfil)'],
+    flood:         ['bg-red-950/60 border-red-800 text-red-300', '🛑 ICMP flood — ping-flood / smurf DoS'],
+    'rogue-irdp':  ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue IRDP router advertisement — gateway injection'],
+    redirect:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 ICMP Redirect — Layer-3 man-in-the-middle (route injection)'],
+    unknown:       ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _icmpFillIfaces() {
+    const sel = document.getElementById('icmp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runIcmpWatch() {
+    const out = document.getElementById('icmp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('icmp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('icmp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '12';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing ICMP on the segment…</p>';
+    try {
+        _icmpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/icmp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runIcmpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _ICMP_VERDICT_STYLE[d.verdict] || _ICMP_VERDICT_STYLE.unknown;
+        const c = d.counts || {};
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.icmp_count} pkts (${d.rate}/s) · redirect ${c.redirect || 0} · echo ${c.echo || 0} · IRDP ${c.irdp || 0} · recon ${c.recon || 0}${d.learned ? ' · <span class="text-gray-400">gateway baseline learned now</span>' : ''}</p>`;
+        if ((d.gateways || []).length) {
+            html += `<p class="text-xs text-gray-500 mb-2">Trusted gateway(s): <span class="font-mono text-gray-400">${escapeHtml(d.gateways.join(', '))}</span></p>`;
+        }
+        const redirects = d.redirects || [];
+        if (redirects.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">ICMP redirects (' + redirects.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Source</th><th class="px-2 py-1">Told</th><th class="px-2 py-1">For destination</th><th class="px-2 py-1">Use next-hop</th><th class="px-2 py-1">Verdict</th></tr>' +
+                '</thead><tbody>' +
+                redirects.map(r => {
+                    const mal = r.malicious;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${mal ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(r.src)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(r.dst)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(r.redirected || '—')}</td>
+                        <td class="px-2 py-1 font-mono ${mal ? 'text-red-300' : 'text-gray-400'}">${escapeHtml(r.new_gw || '—')}</td>
+                        <td class="px-2 py-1">${mal ? '<span class="text-red-300">MITM</span>' : '<span class="text-gray-500">benign</span>'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function icmpTrustBaseline() {
+    try {
+        await postAPI('/api/net/icmp-baseline', { action: 'reset' });
+        addConsoleMessage('ICMP baseline reset — re-seeding from the current default gateway', 'info');
+        await runIcmpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset ICMP baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- OSPF Security Scanner (passive) ---------------------------------------
 const _OSPF_VERDICT_STYLE = {
     clean:     ['bg-green-950/40 border-green-900 text-green-400', '✓ No OSPF anomalies detected'],
@@ -3180,7 +3277,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ntp: 'NTP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ntp: 'NTP Watch', icmp: 'ICMP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -3189,7 +3286,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'ntp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'ntp', 'icmp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">

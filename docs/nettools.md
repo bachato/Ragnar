@@ -45,6 +45,7 @@ alert.
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
 | [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
 | [NTP Watch](#ntp-watch) | Switch & L2/L3 | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
+| [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -85,14 +86,14 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NTP**,
-OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**ICMP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no live traffic) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
 scanners. This is how you confirm the routing-security detectors are working on a
 given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
 The same checks run headless via
-`python3 network_diagnostics.py {igmp,ipv6,ntp,ospf,bgp}-selftest` and each module's
+`python3 network_diagnostics.py {igmp,ipv6,ntp,icmp,ospf,bgp}-selftest` and each module's
 `selftest()`.
 
 ---
@@ -711,6 +712,56 @@ capture→parse path end to end.
 
 - Endpoint: `GET /api/net/ntp-watch` `{interface, seconds}`,
   `POST /api/net/ntp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### ICMP Watch
+The **ICMP Redirect** (type 5) is the classic **Layer-3 man-in-the-middle**. Any
+host on the segment can forge a Redirect that appears to come from the real gateway
+and tell a victim *"for destination X, use next-hop Y instead"* — steering that
+traffic **through the attacker**. It needs **no ARP poisoning and no gateway
+compromise**, and historically most hosts honoured redirects by default, so it's an
+easy, quiet insertion. Related L3 ICMP abuses ride the same wire. This scanner is
+**passive and detection-only**: one short `tcpdump` window over IPv4 `icmp`, parsed
+and classified against the host's **authoritative default gateway** (never learned
+from redirect sources — those could be the attacker). It never sends an ICMP packet.
+What it flags:
+
+- **Redirect** — an ICMP Redirect steering traffic to a **next-hop that isn't a
+  known gateway** (attacker insertion), or **from a source that isn't the gateway**
+  (spoofed). The headline MITM. On a modern switched network redirects are rare
+  enough that even a "benign-looking" one (gateway → another known router) is
+  surfaced as an **anomaly** to verify.
+- **Rogue IRDP** — an ICMP **Router Advertisement** (type 9) from a non-gateway
+  host: the ICMP Router Discovery Protocol gateway-injection MITM (IRDP is
+  effectively obsolete, so any type-9 from a non-router is suspect).
+- **Flood** — an ICMP storm (**ping-flood / smurf**, or a redirect flood) by rate.
+- **Tunnel** — ICMP **echo** packets with **oversized payloads** (normal ping is
+  ~64 B): the ICMP-tunnelling / data-exfiltration covert-channel tell.
+- **Recon** — ICMP **timestamp / address-mask / information** requests that
+  enumerate hosts and leak facts.
+
+The host's default gateway is **always trusted**, plus any gateway learned into
+`data/icmp_watch.json` on the first scan; after a legitimate router change click
+**Trust current** to re-seed. Every result carries a **mitigation advisory**:
+ignore redirects on hosts (`net.ipv4.conf.all.accept_redirects=0`) and stop sending
+them on the gateway (`send_redirects=0`), disable IRDP, and rate-limit / filter the
+recon ICMP types at the edge. **ICMPv6 Redirects (type 137)** are covered separately
+by [IPv6 First-Hop Watch](#ipv6-first-hop-watch).
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py icmp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py icmp-selftest    # self-test the detectors, no root
+```
+
+`icmp-selftest` drives the real parser + classifier with synthetic captures (clean /
+redirect / rogue-irdp / flood / tunnel / recon / anomaly / redirect parse), and —
+when [Scapy](https://scapy.net) is installed — crafts a real ICMP Redirect into a
+pcap and parses it back through `tcpdump`, exercising the capture→parse path end to
+end.
+
+- Endpoint: `GET /api/net/icmp-watch` `{interface, seconds}`,
+  `POST /api/net/icmp-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
