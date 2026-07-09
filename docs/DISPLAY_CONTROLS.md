@@ -63,13 +63,15 @@ GPIO pins (BCM), fixed by the HAT: `KEY1=21`, `KEY2=20`, `KEY3=16`; joystick
 |-------|--------|
 | **Joystick ↑ / ←** | Previous display page |
 | **Joystick ↓ / →** | Next display page |
-| **Joystick press** | Restart the Ragnar service |
+| **Joystick press** | **Start / stop page autoscroll** — auto-cycle the pages every 5 s |
 | **KEY1** | **Toggle On‑Screen Network Diagnostic Mode** |
 | **KEY2** | **Rotate** the screen (0° → 90° → 180° → 270°) |
-| **KEY3** | **Next page** |
+| **KEY3** short / hold | **Next page** / **restart** the Ragnar service |
 
 > The e‑paper HAT uses KEY1 for the Pwnagotchi swap; on the LCD HAT KEY1 is the
 > field‑tester switch instead — it flips Network Diagnostic Mode on and off.
+> Autoscroll pauses automatically during Network Diagnostic mode and wardriving,
+> and any manual joystick page-nav switches it off.
 
 ### Network Diagnostic mode
 
