@@ -1186,22 +1186,34 @@ class Display:
         sd = self.shared_data
         font = sd.font_arial9
         # --- frame + header ---
+        # The header keeps a small connection glyph in the top-left corner and
+        # the battery in the top-right, so the centred title is fitted to the
+        # middle strip only (never colliding with either) and the divider sits
+        # below all three.
         draw.rectangle((0, 0, W - 1, H - 1), outline=0)
-        title_font = self._fit_font('Viking.TTF', sd.font_viking, "RAGNAR", W - 40)
-        tw = title_font.getlength("RAGNAR")
-        draw.text(((W - tw) / 2, 1), "RAGNAR", font=title_font, fill=0)
-        # WiFi / AP indicator, top-left
+        # Left connection glyph, confined to x<16 / y<14 so it clears the title.
         try:
             if getattr(sd, 'ap_mode_active', False):
                 ap_text = "AP"
                 if getattr(sd, 'ap_client_count', 0) > 0:
                     ap_text = f"AP:{sd.ap_client_count}"
-                draw.text((3, 3), ap_text, font=font, fill=0)
+                draw.text((2, 3), ap_text, font=font, fill=0)
             elif getattr(sd, 'wifi_connected', False):
-                self.render_wifi_wave_indicator(image, draw)
+                try:
+                    q = getattr(sd, 'wifi_signal_quality', None)
+                    if q is None:
+                        q = self._dbm_to_quality(getattr(sd, 'wifi_signal_dbm', None))
+                    waves = max(1, min(3, self.get_wifi_wave_count(q)))
+                except Exception:
+                    waves = 3
+                cx, cy = 4, 13
+                for i in range(waves):
+                    r = 3 + i * 3
+                    draw.arc((cx - r, cy - r, cx + r, cy + r), start=225, end=315, fill=0, width=1)
         except Exception:
             pass
         # Battery %, top-right (PiSugar)
+        bat_w = 0
         try:
             _ri = getattr(sd, 'ragnar_instance', None)
             _ps = getattr(_ri, 'pisugar_listener', None) if _ri else None
@@ -1209,43 +1221,65 @@ class Display:
                 bl = _ps.get_battery_level()
                 if bl is not None:
                     bt = f"{int(round(bl))}%{'+' if _ps.is_charging() else ''}"
-                    draw.text((W - font.getlength(bt) - 2, 3), bt, font=font, fill=0)
+                    bat_w = int(font.getlength(bt)) + 3
+                    draw.text((W - bat_w + 1, 3), bt, font=font, fill=0)
         except Exception:
             pass
-        draw.line((1, 15, W - 1, 15), fill=0)
+        # Centre the title in the strip between the glyph and the battery.
+        left_pad = 18
+        right_pad = max(18, bat_w)
+        avail = W - left_pad - right_pad
+        title_font = self._fit_font('Viking.TTF', sd.font_viking, "RAGNAR", avail)
+        tw = title_font.getlength("RAGNAR")
+        draw.text((left_pad + (avail - tw) / 2, 1), "RAGNAR", font=title_font, fill=0)
+        draw.line((1, 16, W - 1, 16), fill=0)
 
-        # --- two icon+count stat rows ---
+        # --- two icon+count stat rows (icons ~30% smaller so they fit) ---
+        icon_h = 13   # 18px source icons scaled down ~30%
+
+        def _fit_icon(icon):
+            if icon is None:
+                return None
+            try:
+                if icon.height > icon_h:
+                    ratio = icon_h / icon.height
+                    return icon.resize((max(1, int(icon.width * ratio)), icon_h), Image.NEAREST)
+            except Exception:
+                return icon
+            return icon
+
         def _row(y, items):
             slot = W // len(items)
             for i, (icon, val) in enumerate(items):
                 x = i * slot + 2
+                icon = _fit_icon(icon)
                 if icon is not None:
                     try:
                         image.paste(icon, (x, y))
                         tx = x + icon.width + 1
                     except Exception:
-                        tx = x
+                        tx = x + icon_h + 1
                 else:
                     tx = x
-                draw.text((tx, y + 4), str(val), font=font, fill=0)
+                draw.text((tx, y + 2), str(val), font=font, fill=0)
 
-        _row(18, [(getattr(sd, 'target', None), sd.targetnbr),
+        _row(20, [(getattr(sd, 'target', None), sd.targetnbr),
                   (getattr(sd, 'port', None),   sd.portnbr),
                   (getattr(sd, 'vuln', None),   sd.vulnnbr),
                   (getattr(sd, 'cred', None),   sd.crednbr)])
-        _row(38, [(getattr(sd, 'zombie', None),  sd.zombiesnbr),
+        _row(37, [(getattr(sd, 'zombie', None),  sd.zombiesnbr),
                   (getattr(sd, 'data', None),    sd.datanbr),
                   (getattr(sd, 'money', None),   sd.coinnbr),
                   (getattr(sd, 'attacks', None), sd.attacksnbr)])
-        draw.line((1, 57, W - 1, 57), fill=0)
+        draw.line((1, 54, W - 1, 54), fill=0)
 
         # --- mood / status lines ---
         try:
             sd.update_ragnarstatus()
         except Exception:
             pass
-        draw.text((3, 59), str(getattr(sd, 'ragnarstatustext', '') or '')[:24], font=font, fill=0)
-        draw.text((3, 69), str(getattr(sd, 'ragnarstatustext2', '') or '')[:24], font=font, fill=0)
+        draw.text((3, 56), str(getattr(sd, 'ragnarstatustext', '') or '')[:24], font=font, fill=0)
+        draw.text((3, 66), str(getattr(sd, 'ragnarstatustext2', '') or '')[:24], font=font, fill=0)
 
         # --- character sprite, shrunk into the bottom-right corner ---
         vk_w = 0
