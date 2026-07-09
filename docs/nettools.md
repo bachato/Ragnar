@@ -47,7 +47,7 @@ alert.
 | [NTP Watch](#ntp-watch) | Switch & L2/L3 | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [SNMP Watch](#snmp-watch) | Switch & L2/L3 | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
-| [TLS Watch](#tls-watch) | Switch & L2/L3 | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
+| [TLS Watch](#tls-watch) | Diagnostics | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -819,10 +819,12 @@ inference and write-community detection end to end.
 ### TLS Watch
 Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
 hypervisors, printers, IoT — with certificates **nobody audits**: long expired,
-self-signed, hostname-mismatched, or signed with weak crypto. Unlike every other tool
-in this section, a certificate checker is inherently **active** — it must complete a
-TLS handshake to read the cert, and **TLS 1.3 encrypts the Certificate message**, so
-passive sniffing can't read modern certs at all. So TLS Watch runs in two phases:
+self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive
+scanners in this guide, a certificate checker is inherently **active** — it must
+complete a TLS handshake to read the cert, and **TLS 1.3 encrypts the Certificate
+message**, so passive sniffing can't read modern certs at all. It therefore lives in
+the **Diagnostics** tab with the other active tools (ping / traceroute / speed test),
+and runs in two phases:
 
 - **Passive discovery** (optional, tick *Discover*) — one short `tcpdump` window over
   TLS **ClientHellos** to find the TLS servers active on the segment (server

@@ -1339,6 +1339,27 @@
                         </div>
                         <div id="ptp-results" class="hidden mt-3 text-sm"></div>
                     </div>
+                    <!-- TLS Watch (certificate & TLS hygiene) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">TLS Watch <span class="text-xs font-normal text-gray-500">(certificate &amp; TLS hygiene)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">Internal networks are full of TLS services — router/switch admin UIs, NAS boxes, hypervisors, printers, IoT — with certificates <strong>nobody audits</strong>: long expired, self-signed, hostname-mismatched, or signed with weak crypto. A certificate checker is inherently <strong>active</strong> — it must complete a TLS handshake to read the cert (TLS 1.3 encrypts it, so passive sniffing can't). It fetches the cert <strong>even when validation fails</strong>, so it can tell you exactly <em>why</em> it's invalid.</p>
+                        <p class="text-sm text-gray-400 mb-3">Grades each target for <strong>expired</strong> / not-yet-valid / <strong>self-signed</strong> / untrusted (not in the system CA store) / <strong>hostname-mismatch</strong> / <strong>weak-crypto</strong> (SHA-1/MD5, RSA&lt;2048, weak cipher) / <strong>deprecated-tls</strong> (TLS 1.0/1.1) / <strong>expiring</strong> (&lt;21 days). Type targets as <span class="font-mono">host</span> or <span class="font-mono">host:port</span>, and/or tick <strong>Discover</strong> to passively find the TLS servers on the segment first (server IP:port + SNI). A learned fingerprint baseline (<span class="font-mono">data/tls_watch.json</span>) flags a cert that <strong>changed</strong> between scans (rotation or possible MITM); "Trust current" re-learns.</p>
+                        <div class="flex flex-col gap-2">
+                            <textarea id="tls-targets" rows="2" placeholder="router.local, 192.168.1.1:443, nas.local:5001  (one or more; default port 443)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm font-mono text-gray-300"></textarea>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <label class="flex items-center gap-2 text-sm text-gray-300" title="Passively sniff TLS ClientHellos on the segment to discover servers to grade">
+                                    <input id="tls-discover" type="checkbox" class="accent-Ragnar-600"> Discover on
+                                </label>
+                                <select id="tls-iface" title="Interface for passive discovery" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (default route)</option>
+                                </select>
+                                <input id="tls-secs" type="number" min="4" max="30" value="8" title="discovery capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runTlsWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check TLS</button>
+                                <button onclick="tlsTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget stored cert fingerprints and re-learn on the next scan">Trust current</button>
+                            </div>
+                        </div>
+                        <div id="tls-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
                 </div>
             </div><!-- /#net-sub-diagnostics -->
 
@@ -1473,27 +1494,6 @@
                         <button onclick="snmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current SNMP agents / community strings as the baseline — use after a legitimate SNMP change">Trust current</button>
                     </div>
                     <div id="snmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
-                </div>
-                <!-- TLS Watch -->
-                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
-                    <h3 class="text-lg font-semibold mb-1">TLS Watch <span class="text-xs font-normal text-gray-500">(certificate &amp; TLS hygiene)</span></h3>
-                    <p class="text-xs text-amber-300/90 mb-2">Internal networks are full of TLS services — router/switch admin UIs, NAS boxes, hypervisors, printers, IoT — with certificates <strong>nobody audits</strong>: long expired, self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive scanners above, a cert checker is inherently <strong>active</strong> — it must complete a TLS handshake to read the cert (TLS 1.3 encrypts it, so sniffing can't). It fetches the cert <strong>even when validation fails</strong>, so it can tell you exactly <em>why</em> it's invalid.</p>
-                    <p class="text-sm text-gray-400 mb-3">Grades each target for <strong>expired</strong> / not-yet-valid / <strong>self-signed</strong> / untrusted (not in the system CA store) / <strong>hostname-mismatch</strong> / <strong>weak-crypto</strong> (SHA-1/MD5, RSA&lt;2048, weak cipher) / <strong>deprecated-tls</strong> (TLS 1.0/1.1) / <strong>expiring</strong> (&lt;21 days). Type targets as <span class="font-mono">host</span> or <span class="font-mono">host:port</span>, and/or tick <strong>Discover</strong> to passively find the TLS servers on the segment first (server IP:port + SNI). A learned fingerprint baseline (<span class="font-mono">data/tls_watch.json</span>) flags a cert that <strong>changed</strong> between scans (rotation or possible MITM); "Trust current" re-learns.</p>
-                    <div class="flex flex-col gap-2">
-                        <textarea id="tls-targets" rows="2" placeholder="router.local, 192.168.1.1:443, nas.local:5001  (one or more; default port 443)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm font-mono text-gray-300"></textarea>
-                        <div class="flex flex-wrap items-center gap-2">
-                            <label class="flex items-center gap-2 text-sm text-gray-300" title="Passively sniff TLS ClientHellos on the segment to discover servers to grade">
-                                <input id="tls-discover" type="checkbox" class="accent-Ragnar-600"> Discover on
-                            </label>
-                            <select id="tls-iface" title="Interface for passive discovery" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                                <option value="">Auto (default route)</option>
-                            </select>
-                            <input id="tls-secs" type="number" min="4" max="30" value="8" title="discovery capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                            <button onclick="runTlsWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check TLS</button>
-                            <button onclick="tlsTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget stored cert fingerprints and re-learn on the next scan">Trust current</button>
-                        </div>
-                    </div>
-                    <div id="tls-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <!-- IGMP Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
@@ -5884,7 +5884,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-tlswatch"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-tlsdiag"></script>
 
 </body>
 </html>
