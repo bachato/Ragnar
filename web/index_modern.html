@@ -1144,15 +1144,15 @@
                 <div class="glass rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
                     <div class="flex items-center justify-between gap-4">
                         <div class="min-w-0">
-                            <h3 class="text-lg font-semibold">E-Paper Network Diagnostic Mode</h3>
-                            <p class="text-sm text-gray-400">Turns the e-Paper display into an Ethernet-focused field tool — link speed/duplex, addressing, and the switch port you're plugged into (LLDP/CDP + PoE). Works with no internet and auto-cycles pages every 5&nbsp;seconds. Ideal for diagnosing a switch on-site.</p>
+                            <h3 class="text-lg font-semibold">On-Screen Network Diagnostic Mode</h3>
+                            <p class="text-sm text-gray-400">Turns the on-board display (e-Paper or LCD HAT) into an Ethernet-focused field tool — link speed/duplex, addressing, and the switch port you're plugged into (LLDP/CDP + PoE). Works with no internet and auto-cycles pages every 5&nbsp;seconds. Ideal for diagnosing a switch on-site. On the 1.44" LCD HAT, KEY1 toggles this mode directly.</p>
                         </div>
                         <label class="toggle-switch relative inline-flex items-center cursor-pointer shrink-0">
                             <input type="checkbox" id="netdiag-display-enabled" class="sr-only peer" onchange="onNetDiagDisplayToggled(this)">
                             <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
                         </label>
                     </div>
-                    <p id="netdiag-display-note" class="text-xs text-gray-500 mt-2 hidden">Active — the e-Paper is showing the network diagnostic screen. Turn off to restore the normal display.</p>
+                    <p id="netdiag-display-note" class="text-xs text-gray-500 mt-2 hidden">Active — the display is showing the network diagnostic screen. Turn off to restore the normal display.</p>
                 </div>
                 <!-- Passive network-integrity monitor (DNS poisoning + ARP spoofing) -->
                 <div class="glass rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
@@ -5803,7 +5803,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-bgpcol"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-netdiag-rename"></script>
 
 </body>
 </html>

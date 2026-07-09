@@ -2250,7 +2250,7 @@ async function loadInterfaces() {
     }
 }
 
-// E-Paper Network Diagnostic mode: a server-side config flag the display loop
+// On-Screen Network Diagnostic mode: a server-side config flag the display loop
 // reads live. Reflect the current server value into the toggle when the
 // Diagnostics sub-tab opens.
 async function syncNetDiagDisplayFromServer() {
