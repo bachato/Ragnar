@@ -1219,6 +1219,7 @@ function showNetworkSubtab(name) {
         _dhcpFillIfaces();
         _igmpFillIfaces();
         _ipv6FillIfaces();
+        _ntpFillIfaces();
         _ospfFillIfaces();
         _bgpFillIfaces();
         dhcpSnoopStatus();
@@ -2737,6 +2738,104 @@ async function ipv6TrustBaseline() {
     }
 }
 
+// ---- NTP Watch (passive rogue time-source / clock-injection) ---------------
+const _NTP_VERDICT_STYLE = {
+    clean:            ['bg-green-950/40 border-green-900 text-green-400', '✓ No rogue NTP activity — time sources agree'],
+    anomaly:          ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ NTP anomaly — unreliable / forged time source'],
+    recon:            ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ NTP mode 6/7 (ntpq / monlist) recon or amplification'],
+    broadcast:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Rogue NTP broadcast time source on the segment'],
+    'stratum-spoof':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ NTP stratum spoofing — forged Stratum-1 / preference grab'],
+    kod:              ['bg-red-950/60 border-red-800 text-red-300', '🛑 NTP Kiss-o\'-Death — time-sync DoS'],
+    'rogue-server':   ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue NTP server answering on the segment'],
+    'time-injection': ['bg-red-950/60 border-red-800 text-red-300', '🛑 NTP time injection — a source is serving a skewed clock'],
+    unknown:          ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _ntpFillIfaces() {
+    const sel = document.getElementById('ntp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runNtpWatch() {
+    const out = document.getElementById('ntp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('ntp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('ntp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing NTP (UDP/123) on the segment…</p>';
+    try {
+        _ntpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/ntp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runNtpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _NTP_VERDICT_STYLE[d.verdict] || _NTP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.server_count} source(s) · ${d.packet_count} pkts (${d.rate}/s)${d.control_count ? ' · ' + d.control_count + ' mode-6/7' : ''}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        const servers = d.servers || [];
+        if (servers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Time sources (' + servers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Server</th><th class="px-2 py-1">Mode</th><th class="px-2 py-1">Stratum</th><th class="px-2 py-1">Offset</th><th class="px-2 py-1">Ref-ID</th><th class="px-2 py-1">Trust</th></tr>' +
+                '</thead><tbody>' +
+                servers.map(s => {
+                    const rogue = !s.baseline;
+                    const off = (s.offset == null) ? '—' : (s.offset >= 0 ? '+' : '') + s.offset.toFixed(3) + 's';
+                    const bigOff = (s.offset != null && Math.abs(s.offset) > 2);
+                    const strata = (s.strata || []).join(',') || '—';
+                    const stCls = (s.kod || (s.strata || []).indexOf(0) !== -1) ? 'text-red-300' : ((s.strata || []).indexOf(1) !== -1 ? 'text-amber-300' : 'text-gray-400');
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${rogue ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(s.src)}${s.broadcast ? ' <span class="text-amber-300">bcast</span>' : ''}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((s.modes || []).join(', '))}</td>
+                        <td class="px-2 py-1 ${stCls}">${strata}${s.kod ? ' KoD' : ''}</td>
+                        <td class="px-2 py-1 font-mono ${bigOff ? 'text-red-300' : 'text-gray-400'}">${off}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((s.refids || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${rogue ? '<span class="text-red-300">ROGUE</span>' : '<span class="text-gray-500">trusted</span>'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function ntpTrustBaseline() {
+    try {
+        await postAPI('/api/net/ntp-baseline', { action: 'reset' });
+        addConsoleMessage('NTP baseline reset — re-learning current time source(s)', 'info');
+        await runNtpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset NTP baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- OSPF Security Scanner (passive) ---------------------------------------
 const _OSPF_VERDICT_STYLE = {
     clean:     ['bg-green-950/40 border-green-900 text-green-400', '✓ No OSPF anomalies detected'],
@@ -3081,7 +3180,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ntp: 'NTP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -3090,7 +3189,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'ntp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">

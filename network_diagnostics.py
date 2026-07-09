@@ -3959,6 +3959,567 @@ def _ipv6_selftest():
 
 
 # --------------------------------------------------------------------------
+# NTP Watch: passive rogue-NTP / time-injection scanner (detection-only)
+# --------------------------------------------------------------------------
+# NTP (UDP/123) is the network's clock of record. It touches every layer, but the
+# attack surface is Layer-7: a rogue NTP server that answers clients (or broadcasts)
+# with the *wrong* time silently poisons every downstream timestamp — audit logs,
+# TLS/Kerberos validity windows, MFA/TOTP, lab-result and chain-of-custody records.
+# In a precision-critical shop (medical, finance, industrial) a few seconds of skew
+# is a real-world incident, yet nobody watches 123. This scanner is PASSIVE: one
+# short tcpdump window, parsed and classified against a learned baseline of the
+# segment's trusted time sources. It never sends an NTP query. What it looks for:
+#   * time-injection — a server whose transmit timestamp disagrees with the segment
+#     consensus (or, with one source, the local clock) beyond a threshold: the core
+#     attack — someone is serving a shifted clock.
+#   * rogue-server   — an NTP server answering that isn't in the trusted baseline.
+#   * kod            — a Kiss-o'-Death (stratum 0) reply; a rogue can use KoD
+#     RATE/DENY to make clients back off legitimate sources (time-sync DoS).
+#   * stratum-spoof  — a source claiming Stratum 1 (primary/GPS) it shouldn't, or a
+#     known server lowering its stratum to win client preference.
+#   * broadcast      — a mode-Broadcast time source (hosts in broadcast client mode
+#     accept it blindly — a classic injection vector on modern unicast networks).
+#   * recon          — NTP mode 6/7 (ntpq control / monlist) traffic: reconnaissance
+#     or amplification abuse.
+#   * anomaly        — implausible root dispersion, a leap-alarm (unsynced) source,
+#     or a reference-ID loop.
+_NTP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'ntp_watch.json')
+_ntp_watch_lock = threading.Lock()
+
+# Seconds between the NTP timestamp epoch (1900-01-01) and the Unix epoch.
+_NTP_UNIX_DELTA = 2208988800
+# A server whose served time differs from consensus/local by more than this many
+# seconds is injecting a skewed clock. Honest LAN/WAN sources agree to well under a
+# second passively (offset ~ one-way delay), so this is far above the noise floor.
+_NTP_OFFSET_THRESHOLD = 2.0
+# Root dispersion above this (seconds) is implausible for a usable time source.
+_NTP_DISP_ALARM = 4.0
+_NTP_EVENTS_CAP = 200
+# tcpdump mode labels for a *time source* (something a client would sync to).
+_NTP_SERVER_MODES = ('Server', 'Broadcast', 'Symmetric Active', 'Symmetric Passive')
+# Non-standard modes on 123 = ntpq control (6) / private-monlist (7); some tcpdump
+# builds print both as 'Reserved'. Either way it's query/recon/amplification, never
+# normal client<->server time exchange.
+_NTP_CONTROL_MODES = ('Control Message', 'Private', 'Reserved')
+# RFC 5905 Kiss-o'-Death codes (stratum-0 refid as 4 ASCII chars).
+_NTP_KOD_CODES = frozenset(('DENY', 'RSTR', 'RATE', 'ACST', 'AUTH', 'AUTO', 'BCST',
+                            'CRYP', 'DROP', 'MCST', 'NKEY', 'RMOT', 'INIT', 'STEP'))
+
+_NTP_HDR_RE = re.compile(r'^(\d+\.\d+)\s+IP6?\b')
+_NTP_SRC_RE = re.compile(
+    r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s*>\s*(\d+\.\d+\.\d+\.\d+)\.(\d+):\s*'
+    r'NTPv(\d+),\s*([^,]+?),\s*length')
+
+
+def _parse_ntp_capture(output):
+    """Parse `tcpdump -nn -tt -v 'udp port 123'` text into per-packet NTP records.
+
+    tcpdump prints one packet as an epoch header line (`<epoch> IP (tos ...)`)
+    followed by an indented `SRC.port > DST.port: NTPvN, <Mode>, length` line and
+    tab-indented field lines. We group by packet block (new block at each epoch
+    header), then read each block. Each record is a dict:
+      {rx_epoch, src, dst, sport, dport, ver, mode, stratum, sdesc, refid, disp,
+       leap, xmit_unix, offset}
+    `offset` is (server transmit time - local capture time); on a healthy source it
+    is ~ -(one-way delay), i.e. near zero. `-tt` gives a per-packet Unix epoch so
+    the offset is immune to how long the capture window ran.
+    """
+    records = []
+    blocks, cur = [], []
+    for raw in output.splitlines():
+        if _NTP_HDR_RE.match(raw):
+            if cur:
+                blocks.append(cur)
+            cur = [raw]
+        elif cur:
+            cur.append(raw)
+    if cur:
+        blocks.append(cur)
+
+    for block in blocks:
+        head = _NTP_HDR_RE.match(block[0])
+        try:
+            rx_epoch = float(head.group(1))
+        except (TypeError, ValueError):
+            continue
+        text = '\n'.join(block)
+        sm = _NTP_SRC_RE.search(text)
+        if not sm:
+            continue  # not a decodable NTP packet (or truncated non-NTP)
+        rec = {'rx_epoch': rx_epoch, 'src': sm.group(1), 'sport': int(sm.group(2)),
+               'dst': sm.group(3), 'dport': int(sm.group(4)),
+               'ver': int(sm.group(5)), 'mode': sm.group(6).strip(),
+               'stratum': None, 'sdesc': '', 'refid': '', 'disp': 0.0,
+               'leap': None, 'xmit_unix': None, 'offset': None}
+
+        st = re.search(r'Stratum\s+(\d+)\s*\(([^)]*)\)', text)
+        if st:
+            rec['stratum'] = int(st.group(1))
+            rec['sdesc'] = st.group(2).strip()
+        rid = re.search(r'Reference-ID:\s*(\S.*?)\s*$', text, re.MULTILINE)
+        if rid:
+            rec['refid'] = rid.group(1).strip()
+        dp = re.search(r'Root dispersion:\s*([\d.]+)', text)
+        if dp:
+            try:
+                rec['disp'] = float(dp.group(1))
+            except ValueError:
+                pass
+        li = re.search(r'Leap indicator:\s*[^(]*\((\d+)\)', text)
+        if li:
+            rec['leap'] = int(li.group(1))
+        xm = re.search(r'(?<!- )Transmit Timestamp:\s*([\d.]+)', text)
+        if xm:
+            try:
+                ntp_secs = float(xm.group(1))
+                if ntp_secs > _NTP_UNIX_DELTA:  # sane, post-1970 timestamp
+                    rec['xmit_unix'] = ntp_secs - _NTP_UNIX_DELTA
+                    rec['offset'] = round(rec['xmit_unix'] - rx_epoch, 3)
+            except ValueError:
+                pass
+        records.append(rec)
+    return records
+
+
+def _ntp_watch_load():
+    try:
+        with open(_NTP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ntp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_NTP_WATCH_PATH), exist_ok=True)
+        tmp = _NTP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _NTP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ntp_baseline(action='get'):
+    """Manage the learned NTP baseline (trusted time source(s) + their stratum).
+    action='reset' re-learns the current segment's servers on the next scan (use
+    after a legitimate NTP change)."""
+    with _ntp_watch_lock:
+        if action == 'reset':
+            _ntp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ntp_watch_load()
+        return {'success': True, 'baseline': {
+            'servers': sorted((b.get('servers') or {}).keys()),
+        }}
+
+
+def _ntp_median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if not n:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _ntp_analyze(records, seconds, baseline, learn=True, threshold=None):
+    """Pure classifier over parsed NTP records. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with synthetic
+    packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    threshold = _NTP_OFFSET_THRESHOLD if threshold is None else threshold
+
+    server_recs = [r for r in records if r['mode'] in _NTP_SERVER_MODES]
+    client_recs = [r for r in records if r['mode'] == 'Client']
+    control_recs = [r for r in records if r['mode'] in _NTP_CONTROL_MODES]
+
+    # Aggregate time sources by address.
+    servers = {}
+    for r in server_recs:
+        s = servers.setdefault(r['src'], {
+            'src': r['src'], 'modes': set(), 'strata': set(), 'refids': set(),
+            'offsets': [], 'disp_max': 0.0, 'leaps': set(), 'broadcast': False,
+            'count': 0, 'kod': False, 'kod_codes': set()})
+        s['count'] += 1
+        s['modes'].add(r['mode'])
+        if r['stratum'] is not None:
+            s['strata'].add(r['stratum'])
+        if r['refid']:
+            s['refids'].add(r['refid'])
+        if r['offset'] is not None:
+            s['offsets'].append(r['offset'])
+        s['disp_max'] = max(s['disp_max'], r['disp'])
+        if r['leap'] is not None:
+            s['leaps'].add(r['leap'])
+        if r['mode'] == 'Broadcast':
+            s['broadcast'] = True
+        # A *server* reply at stratum 0 is by definition a Kiss-o'-Death.
+        if r['stratum'] == 0:
+            s['kod'] = True
+            code = re.sub(r'[^A-Za-z]', '', r['refid']).upper()
+            if code in _NTP_KOD_CODES:
+                s['kod_codes'].add(code)
+
+    known = dict(baseline.get('servers') or {})
+    had_baseline = bool(known)
+
+    # Learn-on-first-run: adopt the segment's current time sources as trusted.
+    learned = False
+    if learn and not had_baseline and servers:
+        baseline['servers'] = {
+            src: {'stratum': (min(s['strata']) if s['strata'] else None),
+                  'refid': (sorted(s['refids'])[0] if s['refids'] else ''),
+                  'broadcast': s['broadcast']}
+            for src, s in servers.items()}
+        learned = True
+        known = dict(baseline['servers'])
+        had_baseline = True
+
+    PRIORITY = ['time-injection', 'rogue-server', 'kod', 'stratum-spoof',
+                'broadcast', 'recon', 'anomaly', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Representative (median) offset per source.
+    offsets_by_server = {src: round(_ntp_median(s['offsets']), 3)
+                         for src, s in servers.items() if s['offsets']}
+
+    # --- time-injection: someone is serving a shifted clock ---
+    if len(offsets_by_server) >= 2:
+        consensus = round(_ntp_median(list(offsets_by_server.values())), 3)
+        offenders = {src: off for src, off in offsets_by_server.items()
+                     if abs(off - consensus) > threshold}
+        if offenders:
+            for src, off in sorted(offenders.items()):
+                bump('time-injection')
+                reasons.append(
+                    f"NTP server {src} is serving time {off:+.3f}s vs the segment "
+                    f"consensus ({consensus:+.3f}s) — active time injection "
+                    f"(poisons logs, TLS/Kerberos windows, MFA and audit records)")
+        elif abs(consensus) > threshold:
+            bump('time-injection')
+            reasons.append(
+                f"All {len(offsets_by_server)} NTP sources agree but disagree with "
+                f"the local clock by {consensus:+.3f}s — the local clock is wrong or "
+                f"every source is serving a shifted time")
+    elif len(offsets_by_server) == 1:
+        src, off = next(iter(offsets_by_server.items()))
+        if abs(off) > threshold:
+            bump('time-injection')
+            reasons.append(
+                f"NTP server {src}'s time is off by {off:+.3f}s from the local clock "
+                f"— possible time injection (only one source seen, cannot cross-check)")
+
+    # --- rogue-server: a source not in the trusted baseline ---
+    if had_baseline:
+        for src in sorted(servers):
+            if src not in known:
+                bump('rogue-server')
+                reasons.append(
+                    f"Unexpected NTP server {src} answering on the segment (not in "
+                    f"the trusted baseline) — clients may silently sync to it")
+
+    # --- kod: Kiss-o'-Death (stratum 0) reply ---
+    for src in sorted(servers):
+        s = servers[src]
+        if s['kod']:
+            bump('kod')
+            codes = ', '.join(sorted(s['kod_codes'])) or 'stratum-0'
+            reasons.append(
+                f"Kiss-o'-Death from {src} ({codes}) — a rogue server uses KoD "
+                f"RATE/DENY to make clients back off legitimate time (sync DoS)")
+
+    # --- stratum-spoof: forged/lowered stratum to win client preference ---
+    for src in sorted(servers):
+        s = servers[src]
+        good_strata = {n for n in s['strata'] if n and n < 16}
+        if not good_strata:
+            continue
+        claimed = min(good_strata)
+        base_stratum = (known.get(src) or {}).get('stratum')
+        if src not in known:
+            if claimed == 1:
+                bump('stratum-spoof')
+                reasons.append(
+                    f"NTP server {src} claims Stratum 1 (primary/GPS reference) — "
+                    f"verify it is a real reference clock; a forged low stratum makes "
+                    f"clients prefer this source")
+        elif base_stratum and claimed < base_stratum:
+            bump('stratum-spoof')
+            reasons.append(
+                f"Known NTP server {src} now advertises Stratum {claimed} "
+                f"(baseline {base_stratum}) — stratum manipulation to win preference")
+
+    # --- broadcast: a mode-Broadcast time source ---
+    for src in sorted(servers):
+        s = servers[src]
+        base_bcast = bool((known.get(src) or {}).get('broadcast'))
+        if s['broadcast'] and not base_bcast:
+            bump('broadcast')
+            reasons.append(
+                f"NTP broadcast/multicast server {src} on the segment — hosts in "
+                f"broadcast client mode accept it blindly (classic rogue-time vector)")
+
+    # --- recon: mode 6/7 control / monlist ---
+    if control_recs:
+        srcs = sorted({r['src'] for r in control_recs})
+        bump('recon')
+        reasons.append(
+            f"NTP mode 6/7 (ntpq control / monlist) traffic from {', '.join(srcs)} "
+            f"— reconnaissance or amplification abuse; disable 'monitor' and restrict "
+            f"mode 6/7")
+
+    # --- anomaly: unusable / forged time source ---
+    for src in sorted(servers):
+        s = servers[src]
+        if s['disp_max'] > _NTP_DISP_ALARM:
+            bump('anomaly')
+            reasons.append(
+                f"NTP server {src} root dispersion {s['disp_max']:.3f}s is "
+                f"implausibly large — unreliable/forged time")
+        if 3 in s['leaps']:
+            bump('anomaly')
+            reasons.append(
+                f"NTP server {src} leap indicator = alarm (unsynchronized) — "
+                f"serving unusable time")
+        if src in s['refids']:
+            bump('anomaly')
+            reasons.append(
+                f"NTP server {src} reference-ID equals its own address — reference "
+                f"loop / forged sync chain")
+
+    advisories = []
+    if servers or control_recs:
+        advisories.append(
+            "Pin clients to known NTP servers (prefer authenticated NTS or symmetric "
+            "keys), restrict inbound/outbound UDP 123 to expected hosts, and disable "
+            "mode 6/7 (monlist) on servers. On precision-critical segments "
+            "(lab/medical/finance/industrial) alert on any new time source or skew.")
+
+    def _pub(s):
+        off = offsets_by_server.get(s['src'])
+        return {'src': s['src'], 'modes': sorted(s['modes']),
+                'strata': sorted(s['strata']), 'refids': sorted(s['refids']),
+                'offset': off, 'disp': round(s['disp_max'], 3), 'count': s['count'],
+                'kod': s['kod'], 'broadcast': s['broadcast'],
+                'baseline': s['src'] in known}
+
+    if reasons:
+        summary = reasons
+    elif not (servers or control_recs):
+        summary = ['No NTP traffic seen — segment quiet on UDP/123']
+    else:
+        summary = ['All time sources match the trusted baseline and agree on time']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'server_count': len(servers),
+        'packet_count': len(records),
+        'client_count': len(client_recs),
+        'control_count': len(control_recs),
+        'rate': round(len(records) / seconds, 2),
+        'servers': [_pub(servers[s]) for s in sorted(servers)],
+        'advisories': advisories,
+    }
+
+
+def _ntp_capture(interface, seconds):
+    """Run one passive tcpdump window over NTP (UDP/123) and return (raw, error).
+    Uses -tt (per-packet Unix epoch) so the served-vs-local time offset is exact."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-tt', '-v', '-s', '512', '-c', '20000', 'udp port 123'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ntp_watch(interface=None, seconds=15, learn=True, quick=False):
+    """Passive NTP security scanner (detection-only). Captures NTP for a few
+    seconds and classifies the segment's time sources: time-injection / rogue-server
+    / kod / stratum-spoof / broadcast / recon / anomaly / clean. Learns the trusted
+    time source(s) on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _ntp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    records = _parse_ntp_capture(text)
+
+    with _ntp_watch_lock:
+        baseline = _ntp_watch_load()
+        result = _ntp_analyze(records, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _ntp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ntp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_NTP_EVENTS_CAP:]
+            _ntp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _ntp_selftest():
+    """Self-test the NTP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -tt -v` text through the real parser +
+    classifier, and — if Scapy is available — builds a real NTP server reply into a
+    pcap and parses it back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+    BASE = 1780000000.0  # fixed capture epoch for deterministic offsets
+
+    def block(src, mode='Server', stratum=2, refid='17.253.14.125', xmit_off=0.0,
+              disp='0.020000', leap=0, ver=4, rx=BASE, dst='192.168.1.50'):
+        """Craft one tcpdump -tt -v NTP packet block. xmit_off is how far the
+        server's transmit time is from the capture time (the injected skew)."""
+        ntp_secs = rx + xmit_off + _NTP_UNIX_DELTA
+        sdesc = {0: 'unspecified', 1: 'primary reference'}.get(
+            stratum, 'secondary reference')
+        return "\n".join([
+            f"{rx:.6f} IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], "
+            f"proto UDP (17), length 76)",
+            f"    {src}.123 > {dst}.123: NTPv{ver}, {mode}, length 48",
+            f"\tLeap indicator:  ({leap}), Stratum {stratum} ({sdesc}), "
+            f"poll 10 (1024s), precision -23",
+            f"\tRoot Delay: 0.000000, Root dispersion: {disp}, "
+            f"Reference-ID: {refid}",
+            f"\t  Reference Timestamp:  {ntp_secs - 60:.9f} (2026-05-28T20:00:00Z)",
+            f"\t  Originator Timestamp: {ntp_secs - 1:.9f} (2026-05-28T20:26:39Z)",
+            f"\t  Receive Timestamp:    {ntp_secs:.9f} (2026-05-28T20:26:40Z)",
+            f"\t  Transmit Timestamp:   {ntp_secs:.9f} (2026-05-28T20:26:40Z)",
+            f"\t    Originator - Receive Timestamp:  +1.000000000",
+            f"\t    Originator - Transmit Timestamp: +1.000000000",
+        ])
+
+    def run(name, text, seconds, baseline, expect):
+        recs = _parse_ntp_capture(text)
+        res = _ntp_analyze(recs, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'records': len(recs), 'pass': ok})
+        return res
+
+    base = {'servers': {
+        '10.0.0.1': {'stratum': 2, 'refid': '17.253.14.125', 'broadcast': False},
+        '10.0.0.2': {'stratum': 2, 'refid': '132.163.96.1', 'broadcast': False},
+        '10.0.0.3': {'stratum': 2, 'refid': '17.253.14.125', 'broadcast': False}}}
+
+    # 1. clean: three known servers, all agreeing on time.
+    run('clean',
+        "\n".join([block('10.0.0.1'), block('10.0.0.2'), block('10.0.0.3')]),
+        15, base, 'clean')
+
+    # 2. time-injection: a known server now serves time an hour off; two others agree.
+    run('time-injection',
+        "\n".join([block('10.0.0.1'), block('10.0.0.2'),
+                   block('10.0.0.3', xmit_off=3600.0)]),
+        15, base, 'time-injection')
+
+    # 3. rogue-server: an unknown server answers with correct time.
+    run('rogue-server',
+        "\n".join([block('10.0.0.1'), block('10.0.0.9')]),
+        15, base, 'rogue-server')
+
+    # 4. kod: a known server sends a stratum-0 Kiss-o'-Death (RATE).
+    run('kod', block('10.0.0.1', stratum=0, refid='RATE'), 15, base, 'kod')
+
+    # 5. stratum-spoof: a known secondary now claims Stratum 1 (primary/GPS).
+    run('stratum-spoof', block('10.0.0.1', stratum=1, refid='GPS'), 15, base,
+        'stratum-spoof')
+
+    # 6. broadcast: a known server now broadcasts time (mode Broadcast).
+    run('broadcast', block('10.0.0.1', mode='Broadcast', dst='224.0.1.1'), 15,
+        base, 'broadcast')
+
+    # 7. recon: an ntpq/monlist mode-6/7 (Reserved) query on 123.
+    recon = ("1780000000.100000 IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], "
+             "proto UDP (17), length 40)\n"
+             "    10.0.0.66.45000 > 10.0.0.1.123: NTPv2, Reserved, length 12\n"
+             "\tLeap indicator:  (0)")
+    run('recon', recon, 15, base, 'recon')
+
+    # 8. anomaly: a known server with an implausible root dispersion.
+    run('anomaly', block('10.0.0.1', disp='9.500000'), 15, base, 'anomaly')
+
+    # 9. parse: a server block yields stratum, refid and a ~0 offset.
+    pr = _parse_ntp_capture(block('10.0.0.1'))
+    p_ok = (len(pr) == 1 and pr[0]['mode'] == 'Server' and pr[0]['stratum'] == 2
+            and pr[0]['refid'] == '17.253.14.125' and pr[0]['offset'] is not None
+            and abs(pr[0]['offset']) < 0.001)
+    scenarios.append({'name': 'ntp-parse', 'expect': 'stratum2+refid+offset~0',
+                      'got': str(pr[0] if pr else None)[:90], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real NTP reply -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import struct
+        import tempfile
+        import time as _time
+        from scapy.all import Ether, IP, UDP, Raw, wrpcap
+        if _have('tcpdump'):
+            now = _time.time()
+            ntp = now + _NTP_UNIX_DELTA
+
+            def _ts(u):
+                s = int(u)
+                return struct.pack('!II', s, int((u - s) * (1 << 32)))
+            payload = (struct.pack('!BBBb', 0x24, 2, 10, -23)  # LI0 VN4 Mode4, str2
+                       + struct.pack('!ii', 0, 1310)           # root delay/disp
+                       + bytes((17, 253, 14, 125))             # refid
+                       + _ts(ntp - 3) + _ts(ntp - 1) + _ts(ntp) + _ts(ntp))
+            pkt = (Ether() / IP(src='192.0.2.123', dst='192.0.2.9')
+                   / UDP(sport=123, dport=123) / Raw(payload))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-tt', '-v', '-r', pcap_path], timeout=10)
+            recs = _parse_ntp_capture(res['out'])
+            srv = [r for r in recs if r['src'] == '192.0.2.123']
+            ok = bool(srv) and srv[0]['stratum'] == 2 and srv[0]['offset'] is not None
+            scapy_result = {'ran': True, 'servers': [r['src'] for r in recs],
+                            'stratum': srv[0]['stratum'] if srv else None,
+                            'offset': srv[0]['offset'] if srv else None, 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # OSPF Watch: passive OSPF security scanner (detection-only)
 # --------------------------------------------------------------------------
 # OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
@@ -5219,7 +5780,7 @@ def do_routing_selftest():
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
-              'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+              'ntp': _ntp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
@@ -6007,6 +6568,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/ipv6-baseline {action}")
         return jsonify(do_ipv6_baseline(action))
 
+    @app.route('/api/net/ntp-watch', methods=['GET'])
+    def net_ntp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        _log(f"net/ntp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ntp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ntp-baseline', methods=['GET', 'POST'])
+    def net_ntp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ntp-baseline {action}")
+        return jsonify(do_ntp_baseline(action))
+
     @app.route('/api/net/ospf-watch', methods=['GET'])
     def net_ospf_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -6228,6 +6807,15 @@ def _cli(argv=None):
     v6st = sub.add_parser('ipv6-selftest', help='self-test the IPv6 first-hop detectors (no root)')
     v6st.add_argument('--json', action='store_true', help='emit JSON')
 
+    nt = sub.add_parser('ntp-watch', help='passive NTP (rogue time-source) scan')
+    nt.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    nt.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    nt.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    nt.add_argument('--json', action='store_true', help='emit JSON')
+
+    ntst = sub.add_parser('ntp-selftest', help='self-test the NTP detectors (no root)')
+    ntst.add_argument('--json', action='store_true', help='emit JSON')
+
     o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
     o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
@@ -6329,6 +6917,47 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"IPv6 first-hop self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ntp-watch':
+        r = do_ntp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"NTP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['server_count']} source(s), {r['packet_count']} pkts @ "
+                  f"{r['rate']}/s)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for s in r.get('servers', []):
+                tag = '' if s['baseline'] else ' *ROGUE*'
+                off = f" off={s['offset']:+.3f}s" if s['offset'] is not None else ''
+                strata = ','.join(str(n) for n in s['strata'])
+                extra = (' KoD' if s['kod'] else '') + (' bcast' if s['broadcast'] else '')
+                print(f"  {s['src']} stratum={strata} {'/'.join(s['modes'])}"
+                      f"{off}{extra}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ntp-selftest':
+        r = _ntp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"stratum={sc.get('stratum')} offset={sc.get('offset')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"NTP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ospf-watch':

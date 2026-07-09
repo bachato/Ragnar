@@ -44,6 +44,7 @@ alert.
 | [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
 | [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
+| [NTP Watch](#ntp-watch) | Switch & L2/L3 | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -83,15 +84,15 @@ leg that crafts real packets → pcap → `tcpdump` → parse to exercise the wh
 capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
-A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, OSPF and
-BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NTP**,
+OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no live traffic) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
 scanners. This is how you confirm the routing-security detectors are working on a
 given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
 The same checks run headless via
-`python3 network_diagnostics.py {igmp,ipv6,ospf,bgp}-selftest` and each module's
+`python3 network_diagnostics.py {igmp,ipv6,ntp,ospf,bgp}-selftest` and each module's
 `selftest()`.
 
 ---
@@ -651,6 +652,65 @@ exercising the capture→parse path end to end.
 
 - Endpoint: `GET /api/net/ipv6-watch` `{interface, seconds}`,
   `POST /api/net/ipv6-baseline` `{action: reset}` · binary: `tcpdump`
+
+### NTP Watch
+NTP (**UDP/123**) is the network's **clock of record**. It touches every layer, but
+the attack surface is **Layer-7**: a rogue NTP server that answers clients — or
+**broadcasts** — with the **wrong time** silently poisons every downstream
+timestamp. Wrong time breaks **TLS / Kerberos validity windows**, invalidates
+**MFA/TOTP** codes, corrupts **audit logs**, and — in a precision-critical shop
+(medical lab, finance, industrial control) — falsifies **lab-result and
+chain-of-custody records**, where a few seconds of skew is a real incident. Yet
+almost nobody watches 123. This scanner is **passive and detection-only**: it never
+sends an NTP query. One short `tcpdump` window over `udp port 123` (captured with a
+per-packet Unix timestamp via `-tt`) is parsed and classified:
+
+- **Time injection** — a source whose served **transmit timestamp** disagrees with
+  the **segment consensus** (the median of all sources) — or, when only one source
+  is seen, with the **local clock** — beyond a threshold (default **2 s**; honest
+  sources agree to well under a second passively). This is the core attack: someone
+  is serving a skewed clock. If *every* source agrees but all disagree with the
+  local clock, that's flagged too (the host clock is wrong, or all sources shifted).
+- **Rogue server** — an NTP server answering on the segment that **isn't in the
+  learned baseline**. Clients may silently prefer it.
+- **Kiss-o'-Death** — a **stratum-0** reply (RFC 5905 KoD, e.g. `RATE` / `DENY`). A
+  rogue uses KoD to make clients **back off legitimate time sources** — a time-sync
+  DoS that softens them up for a rogue server.
+- **Stratum spoof** — a source claiming **Stratum 1** (primary / GPS reference) it
+  shouldn't, or a known server **lowering its stratum** to win client preference.
+- **Broadcast** — a **mode-Broadcast** time source: hosts in broadcast client mode
+  accept it blindly, a classic injection vector on modern unicast networks.
+- **Recon** — NTP **mode 6/7** (`ntpq` control / `monlist`) traffic: reconnaissance
+  or amplification abuse.
+- **Anomaly** — an implausible **root dispersion**, a **leap-alarm** (unsynchronized)
+  source, or a **reference-ID loop** (refid equals the source's own address).
+
+The **first scan learns** the trusted time source(s) + their stratum into
+`data/ntp_watch.json`; after a legitimate NTP change, click **Trust current** to
+re-learn. Every result carries a **mitigation advisory**: pin clients to known
+servers (prefer authenticated **NTS** or symmetric keys), restrict UDP 123 to
+expected hosts, and disable `monitor` (mode 6/7) on servers.
+
+> Passive over a capture window, NTP Watch catches **gross time injection, rogue and
+> broadcast sources, KoD, and stratum/mode abuse** — not sub-millisecond clock
+> *discipline* accuracy (that needs an active, round-trip measurement). It answers
+> "**is something on this segment serving the wrong time, or trying to?**"
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py ntp-watch [--iface eth0] [--seconds 15] [--json]
+python3 network_diagnostics.py ntp-selftest    # self-test the detectors, no root
+```
+
+`ntp-selftest` drives the real parser + classifier with synthetic captures (clean /
+time-injection / rogue-server / kod / stratum-spoof / broadcast / recon / anomaly /
+parse), and — when [Scapy](https://scapy.net) is installed — crafts a real NTP
+server reply into a pcap and parses it back through `tcpdump`, exercising the
+capture→parse path end to end.
+
+- Endpoint: `GET /api/net/ntp-watch` `{interface, seconds}`,
+  `POST /api/net/ntp-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
