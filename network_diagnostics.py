@@ -26,9 +26,10 @@ import os
 import threading
 import time
 import socket
+import ssl
 import tempfile
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import bgp_speaker
 import path_asymmetry
@@ -5418,6 +5419,651 @@ def _snmp_selftest():
 
 
 # --------------------------------------------------------------------------
+# TLS Watch: TLS / certificate hygiene checker (active grade + passive discovery)
+# --------------------------------------------------------------------------
+# Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
+# hypervisors, printers, IoT — with certificates nobody audits: long expired,
+# self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive
+# "Watch" scanners, a certificate checker is inherently ACTIVE: it must complete a
+# TLS handshake to read the cert, and TLS 1.3 encrypts the Certificate message, so
+# passive sniffing can't read modern certs at all. So this tool has two phases:
+#   * passive discovery — one short tcpdump window over TLS ClientHellos to find the
+#     TLS servers on the segment (server IP:port + SNI), so you don't have to type
+#     them. Best-effort; TLS 1.3 SNI is still in the clear in the ClientHello.
+#   * active grading — connect to each target, fetch the presented cert even when it
+#     fails validation (unverified fallback), and grade it for the full range of
+#     TLS/cert hygiene problems.
+# Verdicts (worst first): expired / not-yet-valid / self-signed / untrusted /
+# hostname-mismatch / weak-crypto / deprecated-tls / expiring / valid. A learned
+# fingerprint baseline flags a certificate that *changed* between scans (rotation or
+# a possible MITM). Targets are explicit (typed or discovered on the local segment)
+# — this is device-hygiene auditing of your own network, not a scanner.
+_TLS_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'tls_watch.json')
+_tls_watch_lock = threading.Lock()
+
+_TLS_EXPIRING_DAYS = 21          # a valid cert with fewer days left is "expiring"
+_TLS_WEAK_RSA_BITS = 2048        # RSA below this is weak
+_TLS_CONNECT_TIMEOUT = 6         # per-target TLS connect/handshake timeout (s)
+_TLS_MAX_TARGETS = 32            # cap graded targets per run (this is not a scanner)
+_TLS_POOL = 8                    # parallel handshakes
+_TLS_DEPRECATED_PROTOS = ('SSLv2', 'SSLv3', 'TLSv1', 'TLSv1.1')
+_TLS_WEAK_CIPHER_RE = re.compile(r'RC4|RC2|(?<![A-Z0-9])DES|3DES|NULL|EXPORT|MD5|'
+                                 r'ANON|_anon', re.IGNORECASE)
+# Severity order used for the per-target verdict and the overall roll-up.
+_TLS_PRIORITY = ['expired', 'not-yet-valid', 'self-signed', 'untrusted',
+                 'hostname-mismatch', 'weak-crypto', 'deprecated-tls', 'expiring',
+                 'valid']
+
+
+def _tls_is_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _tls_parse_targets(text):
+    """Parse a free-form string of `host[:port]` targets (comma / space / newline
+    separated) into a de-duplicated list of (host, port). Default port 443. Strips
+    an accidental scheme/path (https://host/…)."""
+    out, seen = [], set()
+    for tok in re.split(r'[\s,]+', (text or '').strip()):
+        if not tok:
+            continue
+        tok = re.sub(r'^[a-zA-Z]+://', '', tok)   # drop scheme
+        tok = tok.split('/')[0]                    # drop path
+        host, port = tok, 443
+        # [v6]:port or host:port (but not bare IPv6 with colons)
+        m = re.match(r'^\[(.+)\]:(\d+)$', tok)
+        if m:
+            host, port = m.group(1), int(m.group(2))
+        elif tok.count(':') == 1:
+            h, p = tok.rsplit(':', 1)
+            if p.isdigit():
+                host, port = h, int(p)
+        if not host or not (1 <= port <= 65535):
+            continue
+        key = (host.lower(), port)
+        if key not in seen:
+            seen.add(key)
+            out.append((host, port))
+    return out
+
+
+def _tls_watch_load():
+    try:
+        with open(_TLS_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _tls_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_TLS_WATCH_PATH), exist_ok=True)
+        tmp = _TLS_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _TLS_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_tls_baseline(action='get'):
+    """Manage the learned certificate-fingerprint baseline (per host:port). Used to
+    flag a cert that *changed* between scans. action='reset' forgets it."""
+    with _tls_watch_lock:
+        if action == 'reset':
+            _tls_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _tls_watch_load()
+        return {'success': True, 'baseline': {
+            'certs': sorted((b.get('certs') or {}).keys()),
+        }}
+
+
+def _tls_name_cn(name):
+    """Best-effort Common Name from an x509 Name."""
+    try:
+        from cryptography.x509.oid import NameOID
+        attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
+        return attrs[0].value if attrs else name.rfc4514_string()
+    except Exception:
+        try:
+            return name.rfc4514_string()
+        except Exception:
+            return ''
+
+
+def _tls_get_san(cert):
+    """Return (dns_names, ip_strings) from the SubjectAltName extension."""
+    try:
+        from cryptography import x509
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAltName).value
+        dns = ext.get_values_for_type(x509.DNSName)
+        ips = [str(ip) for ip in ext.get_values_for_type(x509.IPAddress)]
+        return dns, ips
+    except Exception:
+        return [], []
+
+
+def _tls_name_matches(name, dns_names, ip_names, cn):
+    """Does `name` (the host/SNI we connected to) match the certificate's names?
+    Wildcard-aware for DNS; exact for IPs; falls back to CN when no SAN."""
+    if not name:
+        return True
+    candidates = list(dns_names)
+    if not candidates and cn:
+        candidates = [cn]
+    if _tls_is_ip(name):
+        try:
+            target = ipaddress.ip_address(name)
+        except ValueError:
+            target = None
+        for ip in ip_names:
+            try:
+                if target is not None and ipaddress.ip_address(ip) == target:
+                    return True
+            except ValueError:
+                continue
+        # a few certs put the IP in a DNS SAN / CN as a literal
+        return name in candidates
+    name = name.lower().rstrip('.')
+    for c in candidates:
+        c = (c or '').lower().rstrip('.')
+        if c == name:
+            return True
+        if c.startswith('*.'):
+            # wildcard matches exactly one left-most label
+            if name.split('.', 1)[1:] == [c[2:]] and '.' in name:
+                return True
+    return False
+
+
+def _tls_key_desc(cert):
+    """Return (description, weak_bool) for the certificate's public key."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import rsa, ec, dsa
+        pub = cert.public_key()
+        if isinstance(pub, rsa.RSAPublicKey):
+            return f'RSA-{pub.key_size}', pub.key_size < _TLS_WEAK_RSA_BITS
+        if isinstance(pub, dsa.DSAPublicKey):
+            return f'DSA-{pub.key_size}', True          # DSA is deprecated
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            return f'EC-{pub.curve.name}', pub.key_size < 256
+        return type(pub).__name__.replace('PublicKey', ''), False
+    except Exception:
+        return '?', False
+
+
+def _tls_classify(der, check_name, trusted, verify_reason, proto, cipher, now):
+    """Pure classifier over one presented certificate + connection facts. Returns a
+    per-target result dict. Separated from the network I/O so the self-test can drive
+    it with synthetic certs. `check_name` is the host/SNI we connected to."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    cert = x509.load_der_x509_certificate(der)
+
+    not_before = cert.not_valid_before_utc
+    not_after = cert.not_valid_after_utc
+    subject_cn = _tls_name_cn(cert.subject)
+    issuer_cn = _tls_name_cn(cert.issuer)
+    san_dns, san_ip = _tls_get_san(cert)
+    self_signed = cert.subject == cert.issuer
+    key_desc, weak_key = _tls_key_desc(cert)
+    try:
+        sig = (cert.signature_hash_algorithm.name
+               if cert.signature_hash_algorithm else 'none')
+    except Exception:
+        sig = 'unknown'
+    fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+
+    expired = now > not_after
+    not_yet = now < not_before
+    days_left = (not_after - now).days
+    hostname_ok = _tls_name_matches(check_name, san_dns, san_ip, subject_cn)
+    weak_sig = sig in ('md5', 'sha1')
+    deprecated = proto in _TLS_DEPRECATED_PROTOS
+    weak_cipher = bool(cipher and _TLS_WEAK_CIPHER_RE.search(cipher))
+
+    names = san_dns + san_ip or ([subject_cn] if subject_cn else [])
+    findings = []   # (verdict_key, reason)
+    if expired:
+        findings.append(('expired', f"certificate EXPIRED {(now - not_after).days} "
+                         f"days ago (notAfter {not_after:%Y-%m-%d})"))
+    if not_yet:
+        findings.append(('not-yet-valid', f"certificate not valid until "
+                         f"{not_before:%Y-%m-%d} — clock skew or premature deploy"))
+    if not trusted:
+        if self_signed:
+            findings.append(('self-signed', "self-signed certificate "
+                             "(issuer == subject; not anchored to any CA)"))
+        else:
+            findings.append(('untrusted', "not trusted by the system CA store"
+                             + (f": {verify_reason}" if verify_reason else
+                                " (incomplete chain or private CA)")))
+    if not hostname_ok:
+        shown = ', '.join(names[:4]) or '(no names)'
+        findings.append(('hostname-mismatch', f"hostname mismatch: certificate is "
+                         f"for {shown}, you connected to {check_name}"))
+    if weak_sig:
+        findings.append(('weak-crypto', f"weak signature algorithm {sig.upper()}"))
+    if weak_key:
+        findings.append(('weak-crypto', f"weak key {key_desc}"))
+    if weak_cipher:
+        findings.append(('weak-crypto', f"weak cipher {cipher}"))
+    if deprecated:
+        findings.append(('deprecated-tls', f"deprecated protocol {proto} negotiated"))
+    if not expired and days_left <= _TLS_EXPIRING_DAYS:
+        findings.append(('expiring', f"expires in {days_left} days "
+                         f"(notAfter {not_after:%Y-%m-%d})"))
+
+    if findings:
+        verdict = min((k for k, _ in findings), key=_TLS_PRIORITY.index)
+        reasons = [r for _, r in findings]
+    else:
+        verdict = 'valid'
+        reasons = [f"valid — trusted chain, hostname matches, {days_left} days left"]
+
+    return {
+        'verdict': verdict, 'reasons': reasons,
+        'subject': subject_cn, 'issuer': issuer_cn,
+        'san': san_dns + san_ip, 'self_signed': self_signed, 'trusted': trusted,
+        'not_before': not_before.strftime('%Y-%m-%d'),
+        'not_after': not_after.strftime('%Y-%m-%d'),
+        'days_left': days_left, 'sig_alg': sig, 'key': key_desc,
+        'proto': proto, 'cipher': cipher, 'fingerprint': fingerprint,
+    }
+
+
+def _tls_grade_connection(host, port, sni, timeout):
+    """Do the TLS handshake(s) for one target and return the connection facts:
+    reachability, chain-trust result, and the presented cert (DER) + negotiated
+    protocol/cipher — fetched even when the cert fails validation."""
+    res = {'reachable': False, 'error': None, 'trusted': False,
+           'verify_reason': None, 'der': None, 'proto': None, 'cipher': None}
+    server_name = sni or host
+    if _tls_is_ip(server_name):
+        server_name = None   # SNI must not be an IP literal
+
+    # 1. Verifying connection (chain only; hostname is checked separately). On a
+    #    healthy cert this is the single round trip and also yields the cert.
+    vctx = ssl.create_default_context()
+    vctx.check_hostname = False
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with vctx.wrap_socket(raw, server_hostname=server_name) as ss:
+                res.update(reachable=True, trusted=True,
+                           der=ss.getpeercert(binary_form=True),
+                           proto=ss.version(),
+                           cipher=ss.cipher()[0] if ss.cipher() else None)
+                return res
+    except ssl.SSLCertVerificationError as e:
+        res['reachable'] = True
+        res['verify_reason'] = getattr(e, 'verify_message', None) or 'verify failed'
+    except ssl.SSLError as e:
+        res['reachable'] = True
+        res['error'] = f'TLS handshake error: {str(e)[:120]}'
+    except (socket.timeout, TimeoutError):
+        res['error'] = 'connection timed out'
+        return res
+    except (ConnectionRefusedError, OSError) as e:
+        res['error'] = f'{type(e).__name__}: {str(e)[:80]}'
+        return res
+
+    # 2. Cert failed validation (or handshake hiccup) — fetch it unverified so we can
+    #    say *why* it's invalid.
+    uctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    uctx.check_hostname = False
+    uctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with uctx.wrap_socket(raw, server_hostname=server_name) as ss:
+                res.update(reachable=True, der=ss.getpeercert(binary_form=True),
+                           proto=ss.version(),
+                           cipher=ss.cipher()[0] if ss.cipher() else None)
+    except Exception as e:
+        if not res.get('error'):
+            res['error'] = f'{type(e).__name__}: {str(e)[:80]}'
+    return res
+
+
+def _tls_check_target(host, port, sni, now):
+    """Grade one target end to end: connect, then classify the presented cert."""
+    base = {'target': f'{host}:{port}', 'host': host, 'port': port, 'sni': sni}
+    try:
+        conn = _tls_grade_connection(host, port, sni, _TLS_CONNECT_TIMEOUT)
+    except Exception as e:                       # never let one target crash the run
+        return {**base, 'verdict': 'unreachable', 'status': 'unreachable',
+                'reasons': [f'{type(e).__name__}: {str(e)[:100]}']}
+    if not conn.get('der'):
+        return {**base, 'verdict': 'unreachable', 'status': 'unreachable',
+                'reasons': [conn.get('error') or 'no TLS handshake / no certificate']}
+    try:
+        graded = _tls_classify(conn['der'], sni or host, conn['trusted'],
+                               conn.get('verify_reason'), conn.get('proto'),
+                               conn.get('cipher'), now)
+    except Exception as e:
+        return {**base, 'verdict': 'unreachable', 'status': 'unreachable',
+                'reasons': [f'certificate parse error: {str(e)[:100]}']}
+    return {**base, 'status': 'graded', **graded}
+
+
+def _tls_discover(interface, seconds):
+    """Passive discovery: one tcpdump window capturing TLS ClientHellos, parsed for
+    the server IP:port + SNI. Returns (targets, error). Best-effort — needs Scapy's
+    TLS layer for SNI; without it, falls back to server IP:port from tcpdump text."""
+    if not _have('tcpdump'):
+        return [], 'tcpdump is not installed. Click Install to add it.'
+    # BPF: a TCP segment whose first payload byte is 0x16 (TLS handshake record) and
+    # whose handshake message type (5 bytes in) is 0x01 (ClientHello).
+    bpf = ('tcp and (tcp[((tcp[12:1]&0xf0)>>2)]=0x16) and '
+           '(tcp[((tcp[12:1]&0xf0)>>2)+5]=0x01)')
+    pcap_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+            pcap_path = tf.name
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn',
+                    '-s', '0', '-c', '2000', '-w', pcap_path, bpf],
+                   timeout=seconds + 8)
+        err = res.get('err', '')
+        if (not os.path.getsize(pcap_path)) and err and (
+                'permission' in err.lower() or "couldn't" in err.lower()
+                or 'no such device' in err.lower() or 'syntax' in err.lower()):
+            return [], err.strip()[:200]
+        found = {}
+        try:
+            from scapy.all import rdpcap, IP, IPv6, TCP
+            from scapy.layers.tls.extensions import TLS_Ext_ServerName
+            for p in rdpcap(pcap_path):
+                if TCP not in p:
+                    continue
+                ip = p[IP].dst if IP in p else (p[IPv6].dst if IPv6 in p else None)
+                if not ip:
+                    continue
+                key = (ip, int(p[TCP].dport))
+                sni = found.get(key)
+                if TLS_Ext_ServerName in p:
+                    for sn in p[TLS_Ext_ServerName].servernames:
+                        try:
+                            sni = sn.servername.decode('idna', 'ignore') or sni
+                        except Exception:
+                            sni = sn.servername.decode('latin-1', 'ignore') or sni
+                found[key] = sni
+        except Exception:
+            # Scapy TLS layer unavailable — fall back to server IP:port from text.
+            res2 = _run(['tcpdump', '-nn', '-r', pcap_path], timeout=15)
+            for line in res2.get('out', '').splitlines():
+                m = re.search(r'>\s*(\d+\.\d+\.\d+\.\d+)\.(\d+):', line)
+                if m:
+                    found[(m.group(1), int(m.group(2)))] = None
+        targets = [{'host': ip, 'port': port, 'sni': sni}
+                   for (ip, port), sni in sorted(found.items())]
+        return targets, None
+    finally:
+        if pcap_path:
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+
+
+def do_tls_watch(targets='', interface=None, seconds=8, discover=False, learn=True):
+    """Active TLS/certificate hygiene checker with optional passive discovery.
+    Grades each target host:port (typed and/or discovered on the segment) for
+    expired / not-yet-valid / self-signed / untrusted / hostname-mismatch /
+    weak-crypto / deprecated-tls / expiring certs, and flags a cert that changed
+    since the learned fingerprint baseline."""
+    try:
+        import cryptography  # noqa: F401
+    except Exception:
+        return {'success': False,
+                'error': 'the Python "cryptography" package is required for TLS '
+                         'grading (pip install cryptography)'}
+    now = datetime.now(timezone.utc)
+
+    # Merge explicit targets with passively-discovered ones (SNI carried along).
+    order, sni_of = [], {}
+    for host, port in _tls_parse_targets(targets):
+        k = (host, port)
+        if k not in sni_of:
+            sni_of[k] = None
+            order.append(k)
+
+    discovered_n, disc_err = 0, None
+    if discover:
+        iface = interface if _valid_iface(interface or '') else _default_route_iface()
+        if not iface or iface not in _list_iface_names(include_virtual=True):
+            disc_err = 'no interface to capture on for discovery'
+        else:
+            found, disc_err = _tls_discover(iface, _clamp_int(seconds, 8, 4, 30))
+            discovered_n = len(found or [])
+            for d in (found or []):
+                k = (d['host'], d['port'])
+                if k not in sni_of:
+                    sni_of[k] = d.get('sni')
+                    order.append(k)
+                elif d.get('sni') and not sni_of[k]:
+                    sni_of[k] = d['sni']
+
+    order = order[:_TLS_MAX_TARGETS]
+    if not order:
+        return {'success': True, 'verdict': 'clean', 'targets': [], 'counts': {},
+                'reasons': [disc_err or 'No TLS targets given or discovered'],
+                'discovered': discovered_n, 'discover_error': disc_err,
+                'advisories': [], 'interface': interface}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = []
+    with ThreadPoolExecutor(max_workers=min(_TLS_POOL, len(order))) as ex:
+        futs = [ex.submit(_tls_check_target, h, p, sni_of[(h, p)], now)
+                for (h, p) in order]
+        for fut in as_completed(futs):
+            results.append(fut.result())
+
+    # Fingerprint baseline: flag changed certs, then learn.
+    with _tls_watch_lock:
+        base = _tls_watch_load()
+        certs = base.get('certs') or {}
+        for r in results:
+            fp = r.get('fingerprint')
+            if not fp:
+                continue
+            prev = certs.get(r['target'])
+            if prev and prev != fp:
+                r['cert_changed'] = True
+                r['reasons'] = ['certificate CHANGED since baseline '
+                                '(rotation or possible MITM)'] + r.get('reasons', [])
+            if learn:
+                certs[r['target']] = fp
+        if learn:
+            base['certs'] = certs
+            _tls_watch_save(base)
+
+    # Sort worst-first; roll up an overall verdict from graded targets.
+    def sev(r):
+        v = r.get('verdict', 'valid')
+        return _TLS_PRIORITY.index(v) if v in _TLS_PRIORITY else len(_TLS_PRIORITY) + 1
+    results.sort(key=sev)
+    counts = {}
+    for r in results:
+        counts[r['verdict']] = counts.get(r['verdict'], 0) + 1
+    graded = [r for r in results if r.get('status') == 'graded']
+    bad = [r for r in graded if r['verdict'] != 'valid']
+    if not graded:
+        overall = 'unreachable'
+    elif not bad:
+        overall = 'clean'
+    else:
+        overall = bad[0]['verdict']
+
+    n_bad = len(bad)
+    summary = ([f"{n_bad} of {len(graded)} TLS service(s) have certificate/TLS "
+                f"problems — worst: {overall}"] if bad else
+               ([f"All {len(graded)} TLS service(s) present valid, trusted, "
+                 f"in-date certificates"] if graded else
+                ['No TLS service could be graded']))
+    if counts.get('unreachable'):
+        summary.append(f"{counts['unreachable']} target(s) unreachable / not TLS")
+
+    advisories = []
+    if bad:
+        advisories.append(
+            "Replace expired/weak certs and re-issue from a trusted internal CA "
+            "(or a public ACME/Let's Encrypt cert for internet-facing services); "
+            "include every hostname/IP in the SAN, use RSA≥2048 or ECDSA P-256 "
+            "with SHA-256+, and disable TLS 1.0/1.1. Automate renewal so nothing "
+            "silently expires.")
+
+    return {
+        'success': True,
+        'verdict': overall,
+        'reasons': summary,
+        'counts': counts,
+        'targets': results,
+        'discovered': discovered_n,
+        'discover_error': disc_err,
+        'graded': len(graded),
+        'learned': bool(learn),
+        'advisories': advisories,
+        'interface': interface,
+    }
+
+
+def _tls_selftest():
+    """Self-test the TLS/cert grader (no root, no network for the classifier legs).
+    Builds synthetic certs with `cryptography` and drives the real classifier, then
+    — as an end-to-end leg — starts a local TLS server with a self-signed cert and
+    grades it through the real handshake path. Returns a results dict."""
+    scenarios = []
+    now = datetime.now(timezone.utc)
+
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except Exception as e:
+        return {'success': False, 'scenarios': [],
+                'error': f'cryptography unavailable: {e}',
+                'scapy': {'ran': False, 'reason': 'n/a'}}
+
+    def make(cn, d_from, d_to, bits=2048, sans=None, issuer_cn=None):
+        key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+        issuer = (x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn)])
+                  if issuer_cn else subject)
+        b = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+             .public_key(key.public_key()).serial_number(x509.random_serial_number())
+             .not_valid_before(now + timedelta(days=d_from))
+             .not_valid_after(now + timedelta(days=d_to)))
+        if sans:
+            b = b.add_extension(x509.SubjectAlternativeName(
+                [x509.DNSName(s) for s in sans]), critical=False)
+        cert = b.sign(key, hashes.SHA256())
+        return key, cert.public_bytes(serialization.Encoding.DER)
+
+    def run(name, der, check, trusted, expect, proto='TLSv1.3',
+            cipher='TLS_AES_256_GCM_SHA384', reason=None):
+        res = _tls_classify(der, check, trusted, reason, proto, cipher, now)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'pass': ok})
+        return res
+
+    # 1. valid: trusted, in-date, hostname matches.
+    _, d = make('host.test', -2, 200, sans=['host.test'])
+    run('valid', d, 'host.test', True, 'valid')
+    # 2. expired.
+    _, d = make('host.test', -400, -5, sans=['host.test'])
+    run('expired', d, 'host.test', True, 'expired')
+    # 3. not-yet-valid.
+    _, d = make('host.test', 5, 200, sans=['host.test'])
+    run('not-yet-valid', d, 'host.test', True, 'not-yet-valid')
+    # 4. self-signed (untrusted + issuer==subject).
+    _, d = make('host.test', -2, 200, sans=['host.test'])
+    run('self-signed', d, 'host.test', False, 'self-signed',
+        reason='self-signed certificate')
+    # 5. untrusted (untrusted + issuer != subject = private CA).
+    _, d = make('host.test', -2, 200, sans=['host.test'], issuer_cn='Corp Root CA')
+    run('untrusted', d, 'host.test', False, 'untrusted',
+        reason='unable to get local issuer certificate')
+    # 6. hostname-mismatch: trusted cert for other.test, connect to host.test.
+    _, d = make('other.test', -2, 200, sans=['other.test'])
+    run('hostname-mismatch', d, 'host.test', True, 'hostname-mismatch')
+    # 7. weak-crypto: 1024-bit RSA key.
+    _, d = make('host.test', -2, 200, bits=1024, sans=['host.test'])
+    run('weak-crypto', d, 'host.test', True, 'weak-crypto')
+    # 8. deprecated-tls: fine cert but TLS 1.0 negotiated.
+    _, d = make('host.test', -2, 200, sans=['host.test'])
+    run('deprecated-tls', d, 'host.test', True, 'deprecated-tls', proto='TLSv1')
+    # 9. expiring: valid but < 21 days left.
+    _, d = make('host.test', -2, 10, sans=['host.test'])
+    run('expiring', d, 'host.test', True, 'expiring')
+    # 10. wildcard SAN matches sub-domain -> valid.
+    _, d = make('*.lan', -2, 200, sans=['*.lan'])
+    run('wildcard-match', d, 'nas.lan', True, 'valid')
+
+    # End-to-end: real local TLS server with a self-signed cert, graded live.
+    e2e = {'ran': False, 'reason': 'skipped'}
+    try:
+        import threading as _thr
+        skey, sder = make('localhost', -1, 60, sans=['localhost', '127.0.0.1'])
+        from cryptography.hazmat.primitives import serialization as _ser
+        from cryptography import x509 as _x509
+        scert = _x509.load_der_x509_certificate(sder)
+        tmpd = tempfile.mkdtemp()
+        cp = os.path.join(tmpd, 'c.pem')
+        kp = os.path.join(tmpd, 'k.pem')
+        with open(cp, 'wb') as f:
+            f.write(scert.public_bytes(_ser.Encoding.PEM))
+        with open(kp, 'wb') as f:
+            f.write(skey.private_bytes(_ser.Encoding.PEM,
+                                       _ser.PrivateFormat.TraditionalOpenSSL,
+                                       _ser.NoEncryption()))
+        sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.load_cert_chain(cp, kp)
+        lsock = socket.socket()
+        lsock.bind(('127.0.0.1', 0))
+        lsock.listen(2)
+        lport = lsock.getsockname()[1]
+
+        def _serve():
+            while True:
+                try:
+                    conn, _ = lsock.accept()
+                except OSError:
+                    return
+                try:
+                    with sctx.wrap_socket(conn, server_side=True) as s:
+                        s.recv(16)
+                except Exception:
+                    pass
+        _thr.Thread(target=_serve, daemon=True).start()
+        r = _tls_check_target('127.0.0.1', lport, 'localhost', now)
+        lsock.close()
+        try:
+            os.remove(cp)
+            os.remove(kp)
+            os.rmdir(tmpd)
+        except OSError:
+            pass
+        ok = (r.get('status') == 'graded' and r['verdict'] == 'self-signed'
+              and r.get('proto', '').startswith('TLS'))
+        e2e = {'ran': True, 'verdict': r.get('verdict'), 'proto': r.get('proto'),
+               'trusted': r.get('trusted'), 'pass': ok}
+    except Exception as e:
+        e2e = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not e2e.get('ran')
+                                                    or e2e.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'e2e': e2e}
+
+
+# --------------------------------------------------------------------------
 # OSPF Watch: passive OSPF security scanner (detection-only)
 # --------------------------------------------------------------------------
 # OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
@@ -6679,7 +7325,8 @@ def do_routing_selftest():
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
-              'snmp': _snmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+              'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
+              'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
@@ -6689,7 +7336,7 @@ def do_routing_selftest():
             'passed': sum(1 for s in v['scenarios'] if s['pass']),
             'total': len(v['scenarios']),
             'scenarios': v['scenarios'],
-            'scapy': v.get('scapy'),
+            'scapy': v.get('scapy') or v.get('e2e'),
         } for k, v in suites.items()},
     }
 
@@ -7521,6 +8168,29 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/snmp-baseline {action}")
         return jsonify(do_snmp_baseline(action))
 
+    @app.route('/api/net/tls-watch', methods=['POST'])
+    def net_tls_watch():
+        data = request.get_json(silent=True) or {}
+        targets = (data.get('targets') or '')[:4000]
+        discover = bool(data.get('discover'))
+        iface = (data.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(data.get('seconds'), 8, 4, 30)
+        _log(f"net/tls-watch discover={discover} iface={iface or '-'} "
+             f"targets={len(_tls_parse_targets(targets))}")
+        return jsonify(do_tls_watch(targets=targets, interface=iface, seconds=secs,
+                                    discover=discover))
+
+    @app.route('/api/net/tls-baseline', methods=['GET', 'POST'])
+    def net_tls_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/tls-baseline {action}")
+        return jsonify(do_tls_baseline(action))
+
     @app.route('/api/net/ospf-watch', methods=['GET'])
     def net_ospf_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -7769,6 +8439,18 @@ def _cli(argv=None):
     snst = sub.add_parser('snmp-selftest', help='self-test the SNMP detectors (no root)')
     snst.add_argument('--json', action='store_true', help='emit JSON')
 
+    tw = sub.add_parser('tls-watch', help='active TLS/certificate hygiene checker')
+    tw.add_argument('targets', nargs='*', help='host[:port] target(s) to grade')
+    tw.add_argument('--discover', action='store_true',
+                    help='passively discover TLS servers on the segment first')
+    tw.add_argument('--iface', '-i', default=None, help='interface for discovery')
+    tw.add_argument('--seconds', '-s', type=int, default=8, help='discovery window (4-30)')
+    tw.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    tw.add_argument('--json', action='store_true', help='emit JSON')
+
+    twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
+    twst.add_argument('--json', action='store_true', help='emit JSON')
+
     o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
     o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
@@ -7997,6 +8679,52 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"SNMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'tls-watch':
+        r = do_tls_watch(targets=' '.join(args.targets or []), interface=args.iface,
+                         seconds=args.seconds, discover=args.discover,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"TLS Watch: {r['verdict'].upper()}  "
+                  f"({r.get('graded', 0)} graded"
+                  f"{', ' + str(r['discovered']) + ' discovered' if r.get('discovered') else ''})")
+            for t in r.get('targets', []):
+                head = f"  {t['target']}"
+                if t.get('sni'):
+                    head += f" (SNI {t['sni']})"
+                print(f"{head}: {t['verdict'].upper()}")
+                if t.get('status') == 'graded':
+                    print(f"      subject={t.get('subject')} issuer={t.get('issuer')} "
+                          f"{t.get('key')} {t.get('sig_alg')} {t.get('proto')} "
+                          f"valid→{t.get('not_after')} ({t.get('days_left')}d)")
+                for reason in t.get('reasons', []):
+                    print(f"      - {reason}")
+            for reason in r.get('reasons', []):
+                print(f"  {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'tls-selftest':
+        r = _tls_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            if r.get('error'):
+                print(f"  {r['error']}")
+            for s in r.get('scenarios', []):
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            e = r.get('e2e', {})
+            if e.get('ran'):
+                print(f"  [{'PASS' if e.get('pass') else 'FAIL'}] e2e-local-server: "
+                      f"verdict={e.get('verdict')} proto={e.get('proto')}")
+            else:
+                print(f"  [skip] e2e-local-server: {e.get('reason')}")
+            print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ospf-watch':

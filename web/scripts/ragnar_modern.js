@@ -1222,6 +1222,7 @@ function showNetworkSubtab(name) {
         _ntpFillIfaces();
         _icmpFillIfaces();
         _snmpFillIfaces();
+        _tlsFillIfaces();
         _ospfFillIfaces();
         _bgpFillIfaces();
         dhcpSnoopStatus();
@@ -3042,6 +3043,110 @@ async function snmpTrustBaseline() {
     }
 }
 
+// ---- TLS Watch (active certificate & TLS hygiene checker) ------------------
+const _TLS_VERDICT_STYLE = {
+    valid:              ['bg-green-950/40 border-green-900 text-green-400', '✓ valid'],
+    clean:              ['bg-green-950/40 border-green-900 text-green-400', '✓ All certificates valid, trusted and in-date'],
+    expiring:           ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ expiring soon'],
+    'deprecated-tls':   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ deprecated TLS'],
+    'weak-crypto':      ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ weak crypto'],
+    'hostname-mismatch':['bg-red-950/60 border-red-800 text-red-300', '🛑 hostname mismatch'],
+    untrusted:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 untrusted chain'],
+    'self-signed':      ['bg-red-950/60 border-red-800 text-red-300', '🛑 self-signed'],
+    'not-yet-valid':    ['bg-red-950/60 border-red-800 text-red-300', '🛑 not yet valid'],
+    expired:            ['bg-red-950/60 border-red-800 text-red-300', '🛑 EXPIRED'],
+    unreachable:        ['bg-slate-800 border-slate-700 text-slate-400', '— unreachable / not TLS'],
+    unknown:            ['bg-slate-800 border-slate-700 text-slate-400', '—'],
+};
+function _tlsBadge(v) {
+    const [cls, label] = _TLS_VERDICT_STYLE[v] || _TLS_VERDICT_STYLE.unknown;
+    return `<span class="px-2 py-0.5 rounded border text-xs ${cls}">${label}</span>`;
+}
+function _tlsFillIfaces() {
+    const sel = document.getElementById('tls-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runTlsWatch() {
+    const out = document.getElementById('tls-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const targets = (document.getElementById('tls-targets') || {}).value || '';
+    const discover = !!(document.getElementById('tls-discover') || {}).checked;
+    const ifaceSel = document.getElementById('tls-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('tls-secs');
+    const secs = secsEl && secsEl.value ? parseInt(secsEl.value, 10) : 8;
+    if (!targets.trim() && !discover) {
+        out.classList.remove('hidden');
+        out.innerHTML = '<p class="text-sm text-amber-300">Enter one or more host[:port] targets, or tick Discover.</p>';
+        return;
+    }
+    _ndBusy(btn, true, discover ? 'Discovering + grading…' : 'Grading…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Completing TLS handshakes and grading certificates…</p>';
+    try {
+        _tlsFillIfaces();
+        const d = await postAPI('/api/net/tls-watch', { targets, discover, interface: iface, seconds: secs });
+        if (!d || d.success === false) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
+            return;
+        }
+        const [cls, label] = _TLS_VERDICT_STYLE[d.verdict] || _TLS_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${escapeHtml((d.reasons && d.reasons[0]) || label)}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">${d.graded || 0} graded${d.discovered ? ' · ' + d.discovered + ' discovered passively' : ''}${d.discover_error ? ' · <span class="text-amber-300">discovery: ' + escapeHtml(d.discover_error) + '</span>' : ''}</p>`;
+        const rows = d.targets || [];
+        if (rows.length) {
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Target</th><th class="px-2 py-1">Verdict</th><th class="px-2 py-1">Expires</th><th class="px-2 py-1">Key / Sig</th><th class="px-2 py-1">TLS</th><th class="px-2 py-1">Finding</th></tr>' +
+                '</thead><tbody>' +
+                rows.map(t => {
+                    const graded = t.status === 'graded';
+                    const exp = graded ? `${escapeHtml(t.not_after || '?')} <span class="${t.days_left < 0 ? 'text-red-300' : t.days_left <= 21 ? 'text-amber-300' : 'text-gray-500'}">(${t.days_left}d)</span>` : '—';
+                    const keysig = graded ? `${escapeHtml(t.key || '?')} / ${escapeHtml((t.sig_alg || '').toUpperCase())}` : '—';
+                    const proto = graded ? escapeHtml(t.proto || '?') : '—';
+                    const finding = escapeHtml((t.reasons || [])[0] || '');
+                    const sni = t.sni ? ` <span class="text-gray-500">SNI ${escapeHtml(t.sni)}</span>` : '';
+                    return `<tr class="border-t border-slate-800 align-top">
+                        <td class="px-2 py-1 font-mono text-gray-200">${escapeHtml(t.target)}${sni}${t.cert_changed ? ' <span class="text-red-300">⟳changed</span>' : ''}</td>
+                        <td class="px-2 py-1">${_tlsBadge(t.verdict)}</td>
+                        <td class="px-2 py-1 font-mono">${exp}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${keysig}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${proto}</td>
+                        <td class="px-2 py-1 text-gray-400">${finding}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function tlsTrustBaseline() {
+    try {
+        await postAPI('/api/net/tls-baseline', { action: 'reset' });
+        addConsoleMessage('TLS cert-fingerprint baseline reset — re-learning on the next scan', 'info');
+        await runTlsWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset TLS baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- OSPF Security Scanner (passive) ---------------------------------------
 const _OSPF_VERDICT_STYLE = {
     clean:     ['bg-green-950/40 border-green-900 text-green-400', '✓ No OSPF anomalies detected'],
@@ -3362,8 +3467,8 @@ async function runPathAsymmetry() {
 // ---- Routing-scanner detector self-test (+ optional Scapy) ------------------
 function _scapyLegLabel(sc) {
     if (!sc) return '';
-    if (sc.ran) return sc.pass ? '<span class="text-green-400">scapy e2e ✓</span>' : '<span class="text-red-300">scapy e2e ✗</span>';
-    return '<span class="text-gray-500">scapy e2e skipped</span>';
+    if (sc.ran) return sc.pass ? '<span class="text-green-400">e2e ✓</span>' : '<span class="text-red-300">e2e ✗</span>';
+    return '<span class="text-gray-500">e2e skipped</span>';
 }
 async function runRoutingSelftest() {
     const out = document.getElementById('routing-selftest-results');
@@ -3386,7 +3491,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -3395,7 +3500,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'ntp', 'icmp', 'snmp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'ntp', 'icmp', 'snmp', 'tls', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">

@@ -47,6 +47,7 @@ alert.
 | [NTP Watch](#ntp-watch) | Switch & L2/L3 | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [SNMP Watch](#snmp-watch) | Switch & L2/L3 | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
+| [TLS Watch](#tls-watch) | Switch & L2/L3 | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -87,14 +88,15 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NTP**,
-**ICMP**, **SNMP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**ICMP**, **SNMP**, **TLS-cert**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
-captures (no root, no live traffic) and reports per-suite pass/fail. With Scapy
+captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
-scanners. This is how you confirm the routing-security detectors are working on a
+scanners, and TLS Watch grades a real self-signed cert over a local (loopback)
+handshake. This is how you confirm the routing-security detectors are working on a
 given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
 The same checks run headless via
-`python3 network_diagnostics.py {igmp,ipv6,ntp,icmp,snmp,ospf,bgp}-selftest` and each module's
+`python3 network_diagnostics.py {igmp,ipv6,ntp,icmp,snmp,tls,ospf,bgp}-selftest` and each module's
 `selftest()`.
 
 ---
@@ -813,6 +815,61 @@ inference and write-community detection end to end.
 
 - Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
   `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### TLS Watch
+Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
+hypervisors, printers, IoT — with certificates **nobody audits**: long expired,
+self-signed, hostname-mismatched, or signed with weak crypto. Unlike every other tool
+in this section, a certificate checker is inherently **active** — it must complete a
+TLS handshake to read the cert, and **TLS 1.3 encrypts the Certificate message**, so
+passive sniffing can't read modern certs at all. So TLS Watch runs in two phases:
+
+- **Passive discovery** (optional, tick *Discover*) — one short `tcpdump` window over
+  TLS **ClientHellos** to find the TLS servers active on the segment (server
+  **IP:port + SNI**), so you don't have to type them. Best-effort; the SNI is still in
+  the clear in the ClientHello even under TLS 1.3. Needs Scapy's TLS layer for SNI,
+  else falls back to server IP:port.
+- **Active grading** — connect to each target (typed as `host` / `host:port`, and/or
+  discovered), fetch the presented certificate **even when it fails validation** (an
+  unverified fallback fetch), and grade it. Chain trust is checked against the system
+  CA store; hostname matching (wildcard-aware, SAN then CN) is done independently so
+  *why* a cert is bad is unambiguous.
+
+Per-target verdicts, worst first: **expired** · **not-yet-valid** · **self-signed** ·
+**untrusted** (chain doesn't build to a trusted CA — private CA or missing
+intermediate) · **hostname-mismatch** · **weak-crypto** (SHA-1/MD5 signature,
+RSA < 2048, or a weak/anon/NULL/RC4/DES cipher) · **deprecated-tls** (SSLv3 / TLS 1.0 /
+TLS 1.1 negotiated) · **expiring** (valid but < 21 days left) · **valid**. Each result
+carries the subject / issuer / SAN, validity dates + days-remaining, key type + size,
+signature algorithm, and the negotiated protocol + cipher. A learned **fingerprint
+baseline** (`data/tls_watch.json`, per `host:port`) flags a certificate that
+**changed** between scans — a rotation, or a possible **MITM** — and *Trust current*
+re-learns. Targets are always explicit (typed, or discovered on your own segment), and
+runs are capped — this is device-hygiene auditing of your own network, not a scanner.
+
+Uses Python's `ssl` + the `cryptography` library (no external binary for grading;
+`tcpdump` is only needed for the optional discovery phase). Every result carries a
+**mitigation advisory**: re-issue from a trusted internal CA (or ACME/Let's Encrypt
+for internet-facing services), put every hostname/IP in the SAN, use RSA ≥ 2048 or
+ECDSA P-256 with SHA-256+, disable TLS 1.0/1.1, and automate renewal.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py tls-watch router.local 192.168.1.1:443 nas:5001
+python3 network_diagnostics.py tls-watch --discover --iface eth0    # find + grade
+python3 network_diagnostics.py tls-selftest    # self-test the grader, no root
+```
+
+`tls-selftest` drives the real classifier with synthetic certs built by
+`cryptography` (valid / expired / not-yet-valid / self-signed / untrusted /
+hostname-mismatch / weak-crypto / deprecated-tls / expiring / wildcard-match), then
+runs an **end-to-end** leg that starts a local TLS server with a self-signed cert and
+grades it through the real handshake path — no root, no network.
+
+- Endpoint: `POST /api/net/tls-watch` `{targets, discover, interface, seconds}`,
+  `POST /api/net/tls-baseline` `{action: reset}` · Python: `cryptography` ·
+  binary: `tcpdump` (discovery only)
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
