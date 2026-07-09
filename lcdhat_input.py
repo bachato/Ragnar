@@ -7,9 +7,15 @@
 #   KEY1 = 21   KEY2 = 20   KEY3 = 16
 #   Joystick: Up=6  Down=19  Left=5  Right=26  Press=13
 #
+# The joystick directions below are given as the user SEES them on the upright
+# text, not as the raw GPIO pins: the HAT's joystick is mounted 90° clockwise of
+# the panel's text, so a raw "down" push points to the on-screen "right". The
+# listener remaps every joystick direction into this visual frame (see
+# _visual_dir) and keeps it correct as KEY2 rotates the screen.
+#
 # Default layer (not wardriving, not net-diag):
-#   Joy Up/Left   : previous display page
-#   Joy Down/Right: next display page
+#   Joy Up/Left   : previous display page   (as seen on the text)
+#   Joy Down/Right: next display page       (as seen on the text)
 #   Joy Press     : restart Ragnar service
 #   KEY1          : swap to/from Pwnagotchi
 #   KEY2          : rotate the screen (0→90→180→270)
@@ -18,8 +24,8 @@
 # Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad.
 # The joystick navigates, the keys fire tests (a long key-press fires the
 # "advanced" variant, mirroring the 2.7" HAT's short/long netdiag gestures):
-#   Joy Left/Up   : previous diagnostic page
-#   Joy Right/Down: next diagnostic page
+#   Joy Left/Up   : previous diagnostic page   (as seen on the text)
+#   Joy Right/Down: next diagnostic page       (as seen on the text)
 #   Joy Press     : dismiss a shown result, else pause/resume auto-cycle
 #   KEY1 short/long: ping gateway  / ping internet (8.8.8.8)
 #   KEY2 short/long: locate switch port / L2 health capture (~12s)
@@ -61,6 +67,10 @@ _INPUTS = (
 
 # Keys that support a long press in net-diag mode → advanced-test variant.
 _LONG_PRESS_INPUTS = {'key1', 'key2', 'key3'}
+
+# Joystick directions in clockwise order — used to rotate a raw pin direction
+# into the frame the user reads on the panel.
+_CW_ORDER = ('up', 'right', 'down', 'left')
 
 
 class LCDHATInputListener(EPDButtonListener):
@@ -125,9 +135,29 @@ class LCDHATInputListener(EPDButtonListener):
         else:
             self._default_input(name)
 
+    # --- Orientation ------------------------------------------------------
+    def _visual_dir(self, name):
+        """Remap a raw joystick pin direction into the direction the user sees
+        on the upright text. The HAT's joystick sits 90° clockwise of the panel
+        (raw 'down' points to the on-screen 'right'), and the square ST7735S
+        render path only realises two orientations — 0° for a 0/90 rotation and
+        180° for 180/270 — so fold KEY2's rotation to that and rotate the
+        direction to match. Non-directional inputs (keys, press) pass through."""
+        if name not in ('up', 'down', 'left', 'right'):
+            return name
+        try:
+            rot = int(getattr(self.shared_data, 'screen_reversed', 0) or 0) % 360
+        except (TypeError, ValueError):
+            rot = 0
+        eff_steps = 0 if rot < 180 else 2          # visual 0° or 180°
+        offset = (3 - eff_steps) % 4               # +90° CW panel-mount offset
+        idx = _CW_ORDER.index(name)
+        return _CW_ORDER[(idx + offset) % 4]
+
     # --- Default layer (page navigation + key actions) --------------------
 
     def _default_input(self, name):
+        name = self._visual_dir(name)
         if name in ('up', 'left'):
             self._change_page(-1)
         elif name in ('down', 'right', 'key3'):
@@ -149,6 +179,7 @@ class LCDHATInputListener(EPDButtonListener):
         """Map a joystick/key input to a net-diag navigation or test action."""
         self.netdiag_seq += 1   # wake the display promptly
 
+        name = self._visual_dir(name)
         if name in ('left', 'up'):
             self._netdiag_step_page(-1)
             return

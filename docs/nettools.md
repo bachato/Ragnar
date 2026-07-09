@@ -160,6 +160,12 @@ LCD HAT + joystick"*. While Network Diagnostic mode is on:
 | **KEY2** short / long | **Locate port** — blink the switch link LED / **L2 health** capture (~12 s) |
 | **KEY3** short / long | **Speed test** / **DNS Doctor** — poisoning/hijack verdict |
 
+The joystick arrows above are **as you read them on the screen**: the HAT's
+joystick is physically mounted 90° clockwise of the panel's text, so the listener
+remaps each push into the on-screen frame (and re-aligns automatically when
+**KEY2** rotates the display) — up/left is always "back" and down/right always
+"forward" relative to the text, whichever way the panel is turned.
+
 Outside net-diag mode the joystick pages through the normal Ragnar screens,
 **KEY1** swaps to/from Pwnagotchi, **KEY2** rotates the screen, and a joystick
 press restarts the service.
