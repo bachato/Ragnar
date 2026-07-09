@@ -1468,13 +1468,13 @@
                         <div class="border border-slate-700 rounded p-3">
                             <h4 class="text-sm font-semibold mb-2 text-gray-200">Receive-only collector</h4>
                             <div class="flex flex-col gap-2">
-                                <input id="bgpc-peer" type="text" autocomplete="off" placeholder="peer IP (e.g. 10.0.0.1)" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <input id="bgpc-peer" type="text" autocomplete="off" placeholder="peer IP (e.g. 10.0.0.1)" class="w-full min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                                 <div class="flex gap-2">
-                                    <input id="bgpc-peeras" type="number" min="1" placeholder="peer AS" title="the peer router's ASN" class="w-1/2 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                                    <input id="bgpc-localas" type="number" min="1" placeholder="our AS" title="the ASN Ragnar presents" class="w-1/2 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                    <input id="bgpc-peeras" type="number" min="1" placeholder="peer AS" title="the peer router's ASN" class="w-1/2 min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                    <input id="bgpc-localas" type="number" min="1" placeholder="our AS" title="the ASN Ragnar presents" class="w-1/2 min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                                 </div>
-                                <input id="bgpc-rid" type="text" autocomplete="off" placeholder="our router-id (e.g. 10.0.0.9)" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                                <div class="flex flex-wrap gap-2">
+                                <input id="bgpc-rid" type="text" autocomplete="off" placeholder="our router-id (e.g. 10.0.0.9)" class="w-full min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <div class="grid grid-cols-2 sm:flex sm:flex-wrap gap-2">
                                     <button onclick="bgpCollector('start')" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-2 rounded text-sm">Start</button>
                                     <button onclick="bgpCollector('stop')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Stop</button>
                                     <button onclick="bgpCollector('status')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Status</button>
@@ -1487,15 +1487,15 @@
                             <h4 class="text-sm font-semibold mb-2 text-gray-200">One-way-delay probe</h4>
                             <div class="flex flex-col gap-2">
                                 <div class="flex flex-wrap items-center gap-2">
-                                    <button onclick="owdReflector('start')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm" title="Run the local reflector so a remote node can probe this box">Reflector: Start</button>
-                                    <button onclick="owdReflector('stop')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Stop</button>
-                                    <span id="owd-reflector-status" class="text-xs text-gray-400"></span>
+                                    <button onclick="owdReflector('start')" class="flex-1 sm:flex-none bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap" title="Run the local reflector so a remote node can probe this box">Reflector: Start</button>
+                                    <button onclick="owdReflector('stop')" class="flex-1 sm:flex-none bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Stop</button>
+                                    <span id="owd-reflector-status" class="text-xs text-gray-400 basis-full sm:basis-auto"></span>
                                 </div>
-                                <input id="pa-target" type="text" autocomplete="off" placeholder="target running a reflector (IP/host)" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
-                                <div class="flex gap-2 items-center">
-                                    <input id="pa-count" type="number" min="5" max="100" value="20" title="probe count" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <input id="pa-target" type="text" autocomplete="off" placeholder="target running a reflector (IP/host)" class="w-full min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <div class="flex flex-wrap gap-2 items-center">
+                                    <input id="pa-count" type="number" min="5" max="100" value="20" title="probe count" class="w-20 shrink-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                                     <label class="text-xs text-gray-400 flex items-center gap-1"><input id="pa-synced" type="checkbox" class="accent-Ragnar-600"> clocks PTP/GPS-synced</label>
-                                    <button onclick="runPathAsymmetry()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-2 rounded text-sm ml-auto">Measure</button>
+                                    <button onclick="runPathAsymmetry()" class="w-full sm:w-auto sm:ml-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-2 rounded text-sm">Measure</button>
                                 </div>
                             </div>
                             <div id="pa-results" class="hidden mt-2 overflow-x-auto text-sm"></div>
