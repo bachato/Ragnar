@@ -134,6 +134,11 @@ Change the value according to your screen model:
 You can also pick the display from the web UI under **Display settings** instead
 of editing this file — that path auto-detects and restarts the service for you.
 
+If your HAT has hardware controls (the 2.7" e‑Paper HAT's 4 keys, or the 1.44"
+LCD HAT's 3 keys + joystick), see the
+[Display Buttons & Joystick Reference](DISPLAY_CONTROLS.md) for what every key
+does in each mode.
+
 Press Esc to exit insert mode
 Type :wq and press Enter to save and quit
 
