@@ -5,7 +5,7 @@ toolbox — everything you'd normally reach for a laptop, a terminal and a bag o
 CLI tools to do, run straight from the device that's already sitting on the
 segment you care about.
 
-It is split into three sub-tabs: **Diagnostics**, **Switch & L2**, and
+It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 **Interfaces**.
 
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
@@ -29,8 +29,8 @@ alert.
 | [DNS Doctor (poisoning check)](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
 | [ARP Poisoning](#arp-poisoning) | Diagnostics | `GET /api/net/arp-check`, `/arp-baseline` |
 | [MAC Watch](#mac-watch) | Diagnostics | `GET /api/net/mac-watch`, `POST /api/net/mac-watch-reset` |
-| [DHCP Guardian](#dhcp-guardian) | Switch & L2 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
-| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
+| [DHCP Guardian](#dhcp-guardian) | Switch & L2/L3 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
+| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2/L3 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
 | [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
 | [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
 | [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
@@ -39,11 +39,15 @@ alert.
 | [Live Flow Telemetry](#live-flow-telemetry) | Diagnostics | `GET /api/net/flows` |
 | [PTP Timing Detection](#ptp-timing-detection) | Diagnostics | `POST /api/net/ptp` |
 | [E-Paper Network Diagnostic Mode](#-e-paper-network-diagnostic-mode) | Diagnostics (toggle) | config `network_diagnostic_mode` |
-| [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2 | `GET /api/net/lldp` |
-| [ARP Scan](#arp-scan) | Switch & L2 | `GET /api/net/arp-scan` |
-| [L2 Link Health](#l2-link-health) | Switch & L2 | `POST /api/net/l2-health` |
-| [Locate Port](#locate-port) | Switch & L2 | `POST /api/net/locate-port` |
-| [PCAP Analyzer](#pcap-analyzer) | Switch & L2 | `POST /api/net/pcap` |
+| [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2/L3 | `GET /api/net/lldp` |
+| [ARP Scan](#arp-scan) | Switch & L2/L3 | `GET /api/net/arp-scan` |
+| [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
+| [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
+| [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
+| [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
+| [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
+| [Locate Port](#locate-port) | Switch & L2/L3 | `POST /api/net/locate-port` |
+| [PCAP Analyzer](#pcap-analyzer) | Switch & L2/L3 | `POST /api/net/pcap` |
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
 | [Network Identity](#network-identity) | Interfaces | `GET /api/net/identity` |
 | [ISP / WAN + VPN Detection](#isp--wan-detection) | Interfaces | `GET /api/net/isp` |
@@ -69,6 +73,24 @@ Installable packages are whitelisted (`iputils-ping`, `traceroute`, `mtr-tiny`,
 `whois`, `speedtest-cli`, `lldpd`, `arp-scan`, `ethtool`, `curl`, `dnsutils`,
 `iperf3`, `tcpdump`), so the tool name is never interpolated into a shell
 command.
+
+**Scapy** (for the routing-scanner end-to-end self-test) is installable the same
+way — the **Detector Self-Test** panel in Switch & L2/L3 has an **Install Scapy**
+button that installs `python3-scapy` (falling back to `pip`). It's optional: the
+IGMP / OSPF / BGP scanners work fully without it; Scapy only adds the end-to-end
+leg that crafts real packets → pcap → `tcpdump` → parse to exercise the whole
+capture path.
+
+### Detector Self-Test (Switch & L2/L3)
+A one-click **Run self-test** that validates the IGMP, OSPF and BGP detectors —
+plus the **BGP speaker** (codec/framer/FSM/RIB) and **path-asymmetry / OWD**
+engine — by running each classifier against crafted attack captures (no root, no
+live traffic) and reports per-suite pass/fail. With Scapy installed it also runs
+the end-to-end packet-crafting leg for the capture-based scanners. This is how you
+confirm the routing-security detectors are working on a given box without waiting
+for a real attack — endpoint `GET /api/net/routing-selftest`. The same checks run
+headless via `python3 network_diagnostics.py {igmp,ospf,bgp}-selftest` and each
+module's `selftest()`.
 
 ---
 
@@ -122,8 +144,34 @@ KEY4-long resolves a preset hostname (`netdiag_dns_test_name`, default
 press is never blocked, and the panel wakes immediately on a press rather than
 waiting out the 5 s cycle.
 
-> Applies to the e-Paper display. Headless installs (no display) accept the
-> toggle but have nothing to render it on.
+#### Field-test pad (1.44" LCD HAT + joystick)
+
+The Waveshare **1.44" LCD HAT** (ST7735S, 128×128) carries **3 keys plus a
+5-way joystick**, so navigation and tests get separate controls — no long-press
+needed for the common ones. Select it in **Display settings** as *"1.44" ST7735S
+LCD HAT + joystick"*. While Network Diagnostic mode is on:
+
+| Input | Action |
+|-------|--------|
+| **Joystick ← / ↑** | Previous diagnostic page |
+| **Joystick → / ↓** | Next diagnostic page |
+| **Joystick press** | Dismiss a shown result, else **pause / resume** the auto-cycle |
+| **KEY1** short / long | **Ping the gateway** (LAN) / **Ping the internet** (`8.8.8.8`, WAN) |
+| **KEY2** short / long | **Locate port** — blink the switch link LED / **L2 health** capture (~12 s) |
+| **KEY3** short / long | **Speed test** / **DNS Doctor** — poisoning/hijack verdict |
+
+The joystick arrows above are **as you read them on the screen**: the HAT's
+joystick is physically mounted 90° clockwise of the panel's text, so the listener
+remaps each push into the on-screen frame (and re-aligns automatically when
+**KEY2** rotates the display) — up/left is always "back" and down/right always
+"forward" relative to the text, whichever way the panel is turned.
+
+Outside net-diag mode the joystick pages through the normal Ragnar screens,
+**KEY1** swaps to/from Pwnagotchi, **KEY2** rotates the screen, and a joystick
+press restarts the service.
+
+> Applies to the e-Paper / LCD display. Headless installs (no display) accept
+> the toggle but have nothing to render it on.
 
 ---
 
@@ -355,7 +403,7 @@ on the far end.)
 
 - Endpoint: `POST /api/net/ptp` `{interface, seconds}` · binary: `tcpdump`
 
-## 🔌 Switch & L2
+## 🔌 Switch & L2/L3
 
 Layer-2 discovery: what switch you're plugged into, and what else is on the
 segment.
@@ -508,6 +556,197 @@ Findings are ranked (warn / info / ok). This is the one-tap "why is this
 segment misbehaving" check that normally needs a laptop and Wireshark.
 
 - Endpoint: `POST /api/net/l2-health` `{interface, seconds}` · binary: `tcpdump`
+
+### IGMP Watch
+A **passive** IGMP-snooping security scanner for the IPv4 multicast control
+plane — **detection-only**: it never joins a group, sends a query, or becomes a
+querier. One short `tcpdump` window is parsed and classified into four things:
+
+- **Storm / flood** — an IGMP report/query rate far above normal (IGMP is
+  intrinsically low-volume), or a single source flooding reports. This is a real
+  multicast DoS and a switch-CPU exhaustion vector.
+- **Anomaly** — more than one **querier** on the segment. There must be exactly
+  one; a second, lower-IP querier is the classic *"become the querier to draw
+  all multicast to yourself"* attack. Also flags mixed query versions
+  (a v3→v2/v1 downgrade).
+- **Reconnaissance** — one host joining a wide spread of **distinct groups** —
+  multicast stream enumeration.
+- **Unauthorized join** — a host on an **admin-scoped** (239/8), **globally-scoped**
+  or **SSM** (232/8) group it has never been seen on, measured against a learned
+  baseline. Link-local control groups (224.0.0.0/24) and normal service discovery
+  (mDNS, SSDP) are recognised and not flagged.
+
+Following the passive-floor doctrine (see [MAC Watch](#mac-watch) /
+[L2 Link Health](#l2-link-health)), thresholds sit above ordinary chatter so a
+healthy segment reads clean. The **first scan learns** the current querier(s) and
+host→group memberships as the trusted baseline (`data/igmp_watch.json`); after a
+legitimate multicast/router change, click **Trust current** to re-learn. Comfortable
+on a Pi Zero 2 W even off a busy SPAN, since IGMP is low-rate control traffic.
+
+There is also a small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py igmp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py igmp-selftest     # self-test the detectors, no root
+```
+
+`igmp-selftest` drives the real parser + classifier with synthetic captures
+(clean / storm / rogue-querier / recon / unauthorized / v3 group-record parse),
+and — when [Scapy](https://scapy.net) is installed — additionally crafts real
+IGMP packets into a pcap and parses them back through `tcpdump`, exercising the
+capture→parse path end to end.
+
+- Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
+  `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### OSPF Security Scanner
+A **passive** routing-security scanner for OSPF (the interior routing control
+plane, IP proto 89 / multicast 224.0.0.5–6). **Detection-only** — it never forms
+an adjacency, floods an LSA, or touches the LSDB; it just captures one short
+window and classifies it. OSPF is the classic route-poisoning target: without
+cryptographic auth, any host on the segment can inject LSAs and silently redirect
+traffic. What it flags:
+
+- **Weak / no authentication** — Auth Type 0 (none) or 1 (plaintext). This is the
+  enabler for every injection attack and the one thing always visible on the wire;
+  it surfaces a CVE/OSV advisory.
+- **Anomaly** — a new/rogue OSPF router (adjacency spoofing), a **duplicate
+  Router-ID** (conflict/spoof), Hello parameter mismatch, or mixed OSPF versions.
+- **Injection** — an LSA whose **Advertising Router** never announced itself (a
+  spoofed/injected LSA), a **MaxSequence** (0x7fffffff) or **MaxAge** fight-provoking
+  LSA, **fight-back** (one LSA re-originated rapidly = the owner countering an
+  active injection), or a **new AS-External (Type-5)** originator (route injection /
+  default-route hijack).
+- **Storm** — an LS-Update flood (control-plane DoS).
+
+Design is inspired by **[OSPFwatcher](https://github.com/Vadims06/ospfwatcher)**
+(topology-change monitoring) and **FRR-MAD** (expected-vs-observed LSDB anomaly
+detection), approximated passively from the wire with a learned baseline — the
+first scan learns the routers and Type-5 originators (`data/ospf_watch.json`),
+**Trust current** re-learns after a legitimate change. Follows the passive-floor
+doctrine so a healthy segment reads clean. Put the Pi on the **routed VLAN or a
+SPAN/mirror** to observe OSPF.
+
+**On vulnerabilities vs [OSV](https://osv.dev):** OSPF carries no software version
+on the wire, so a version→CVE lookup isn't possible passively — the scanner
+detects the *exposure conditions* instead (weak auth; opaque/TE LSAs, which are
+the trigger for FRRouting ospfd DoS crashes such as CVE-2024-27913 /
+CVE-2025-61107 / CVE-2025-61105, and equivalent Cisco ASA/FTD OSPF-LSA advisories)
+and points at OSV for the version lookup. It **detects, never exploits**, and is
+harmless to the network.
+
+Small **CLI** (no web app / no root for the self-test):
+
+```
+python3 network_diagnostics.py ospf-watch [--iface eth0] [--seconds 15] [--json]
+python3 network_diagnostics.py ospf-selftest
+```
+
+`ospf-selftest` drives the parser + classifier with synthetic captures (clean /
+weak-auth / rogue-router / spoofed-LSA / MaxSequence / LSA-field parse) and, when
+[Scapy](https://scapy.net) (`scapy.contrib.ospf`) is present, crafts a real OSPF
+packet into a pcap and parses it back through `tcpdump` end to end.
+
+- Endpoint: `GET /api/net/ospf-watch` `{interface, seconds}`,
+  `POST /api/net/ospf-baseline` `{action: reset}` · binary: `tcpdump`
+
+### BGP Path Watch
+The L3-edge companion to the OSPF scanner — a **passive** BGP routing-security
+scanner (TCP/179). **Detection-only**: it never opens a session or announces /
+withdraws a route. BGP is where traffic gets silently redirected across the
+Internet edge, so where it's visible this is the highest-value watch. It flags:
+
+- **Injection (hijack)** — an announced prefix whose **origin AS changed** vs the
+  learned baseline (prefix/origin hijack), or a **new more-specific** of a
+  baseline prefix (sub-prefix hijack — the most effective real-world BGP attack).
+- **Anomaly** — a new/rogue **peer** (new AS or BGP-ID), a **NOTIFICATION** /
+  session reset (teardown/flap), a **bogon/martian** prefix announcement, a
+  **reserved/documentation ASN** in a received path, an **AS-path loop**, or a
+  **BLACKHOLE** community (65535:666).
+- **Storm** — an UPDATE churn/flood, or a per-peer **prefix-count spike**
+  (full-table route leak).
+- **Weak session** — BGP seen but **no TCP-MD5/TCP-AO** signature (RFC 2385/5925),
+  exposed to off-path session-reset attacks. Advisory only.
+
+> **Visibility caveat:** unlike OSPF (multicast, on the broadcast domain), BGP is
+> **unicast TCP/179 between routers** — the Pi must be **inline, on a SPAN/mirror,
+> or a peer** to observe it. Private ASNs (RFC 6996, e.g. 65001) are treated as
+> normal, since internal/DC fabric is the most likely place to see BGP passively.
+
+The first scan learns the peers and prefix→origin map as the baseline
+(`data/bgp_watch.json`); **Trust current** re-learns after a legitimate change.
+As with OSPF, software-version CVEs aren't on the wire, so exposure conditions are
+flagged (weak auth; malformed-UPDATE crash class — **CVE-2023-38802** /
+**CERT VU#347067**) with an [OSV](https://osv.dev) pointer for the version lookup.
+
+**ASN enrichment:** origin ASNs and peer IPs are enriched with AS **owner names**
++ country via [Team Cymru's IP-to-ASN](https://team-cymru.com/community-services/ip-asn-mapping/)
+whois service, so a hijack reads `AS64500 (SOME-HOSTER, RU)` instead of a bare
+number. This needs **outbound TCP/43** to `whois.cymru.com` and **fails soft** —
+if your NOC egress filters it, the scan degrades to AS-number-only (a blocked
+egress is negatively cached for 5 min so it doesn't add a timeout to every scan).
+Results are cached for a day. Disable with `?enrich=0` on the endpoint or
+`--no-enrich` on the CLI.
+
+Small **CLI** (no web app / no root for the self-test):
+
+```
+python3 network_diagnostics.py bgp-watch [--iface eth0] [--seconds 15] [--json]
+python3 network_diagnostics.py bgp-selftest
+```
+
+`bgp-selftest` drives the parser + classifier with synthetic captures (clean /
+origin-hijack / sub-prefix hijack / session-reset / bogon-prefix / UPDATE parse)
+and, when [Scapy](https://scapy.net) (`scapy.contrib.bgp`) is present, crafts a
+real BGP packet into a pcap and parses it back through `tcpdump`.
+
+- Endpoint: `GET /api/net/bgp-watch` `{interface, seconds}`,
+  `POST /api/net/bgp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### BGP Collector & Path Asymmetry (control-plane ↔ data-plane)
+Where BGP Path Watch is a passive **capture** scanner, this is the active-but-safe
+pairing of **routing truth** with a **measured** data-plane symptom. Two cooperating
+pieces:
+
+**Receive-only BGP collector** (`bgp_speaker.py`) — a from-scratch BGP speaker
+(RFC 4271 + 4-octet ASN RFC 6793) that opens a real session to a peer to *learn its
+RIB*, but is **receive-only**: the FSM (Idle → Connect → OpenSent → OpenConfirm →
+Established) sends only OPEN / KEEPALIVE and **never an UPDATE**, so it structurally
+**cannot advertise or withdraw a route**. It decodes UPDATEs into an Adj-RIB-In with
+per-prefix **churn/flap tracking** (a prefix changing origin/next-hop faster than a
+threshold is marked *flapping*) and longest-prefix lookup. Point it at a router
+configured to peer with the Pi's AS (a route-server client / passive peer works well).
+
+**One-way-delay probe** (`path_asymmetry.py`) — a tiny UDP prober/reflector using the
+OWAMP/TWAMP 4-timestamp model (T1 send, T2 remote-recv, T3 remote-send, T4 recv). It
+computes forward and reverse delay separately and derives **path asymmetry**. Because
+a single unsynced clock pair can't separate a constant offset from a constant
+asymmetry, it uses the **Paxson min-pair estimator** (θ̂ = (min fwd − min rev)/2) to
+cancel the clock offset and report *change-sensitive* asymmetry with hysteresis — so
+it flags a **shift** in asymmetry without false-alarming on a static clock skew. Tick
+**clocks PTP/GPS-synced** only if both ends are truly synchronized, in which case the
+absolute number is trustworthy. Run the **reflector** on the far node (or here) so the
+other side can measure both directions.
+
+**Correlator** — when the collector is `Established`, each asymmetry event is
+annotated with control-plane truth from the RIB: the covering prefix, origin AS,
+AS-path, whether that prefix is currently flapping, and how recently it changed. The
+attribution heuristic then labels the event **route-churn** (RIB is flapping — the
+delay shift lines up with a real routing change), **recent path shift** (a fresh but
+stable change), or **stable / data-plane** (no matching control-plane change — the
+asymmetry is happening below BGP, e.g. a congested or re-routed transit leg).
+
+> **Safety:** the collector never originates routing information, and the OWD probe is
+> a handful of small UDP datagrams — neither injects state into the network. Both are
+> long-lived daemons managed with start/stop/status; nothing is persisted to disk.
+
+- Endpoints: `GET/POST /api/net/bgp-collector` `{action: start|stop|status|rib,
+  peer_ip, peer_as, local_as, router_id, port, hold}`,
+  `GET/POST /api/net/owd-reflector` `{action: start|stop|status, port}`,
+  `POST /api/net/path-asymmetry` `{target, count, clock_synced}`
+- CLI: `python3 path_asymmetry.py reflector [port]` runs a standalone reflector;
+  `bgp_speaker.py` and `path_asymmetry.py` each expose `selftest()`, aggregated into
+  the Detector Self-Test panel (`GET /api/net/routing-selftest`).
 
 ### Locate Port
 Physically find **which switch port** the device is plugged into — the software

@@ -523,6 +523,7 @@ function epdTypeToSizeKey(epd_type) {
     if (epd_type.startsWith('epd3in7')) return '3in7';
     if (epd_type.startsWith('epd4in26')) return '4in26';
     if (epd_type === 'gc9a01') return '1in28_tft';
+    if (epd_type === 'st7735s') return '1in44_lcd';
     if (epd_type === 'whisplay') return '1in69_tft';
     if (epd_type === 'ssd1306') return '0in96_oled';
     if (epd_type === 'lcd1602') return 'lcd1602';
@@ -538,6 +539,7 @@ const displaySelectOptions = {
         { value: '3in7', label: '3.7" e-Paper (280x480)' },
         { value: '4in26', label: '4.26" e-Paper (800x480)' },
         { value: '1in28_tft', label: '1.28" GC9A01 Round TFT (240x240)' },
+        { value: '1in44_lcd', label: '1.44" ST7735S LCD HAT + joystick (128x128)' },
         { value: '1in69_tft', label: '1.69" Whisplay ST7789 TFT (240x280)' },
         { value: '0in96_oled', label: '0.96" SSD1306 OLED (128x64)' },
         { value: 'lcd1602', label: '16×2 LCD1602 Character LCD (I2C)' },
@@ -1215,6 +1217,9 @@ function showNetworkSubtab(name) {
     } else if (name === 'switch') {
         loadLldp();
         _dhcpFillIfaces();
+        _igmpFillIfaces();
+        _ospfFillIfaces();
+        _bgpFillIfaces();
         dhcpSnoopStatus();
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
@@ -2528,6 +2533,475 @@ async function dhcpTrustCurrent() {
         await runDhcpGuardian();
     } catch (e) {
         addConsoleMessage('Failed to reset DHCP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- IGMP Watch (passive multicast security scanner) -----------------------
+const _IGMP_VERDICT_STYLE = {
+    clean:        ['bg-green-950/40 border-green-900 text-green-400', '✓ No IGMP / multicast anomalies detected'],
+    recon:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Multicast reconnaissance — a host is enumerating groups'],
+    unauthorized: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Unauthorized multicast join detected'],
+    anomaly:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 IGMP anomaly — possible rogue querier / takeover'],
+    storm:        ['bg-red-950/60 border-red-800 text-red-300', '🛑 IGMP storm / flood detected'],
+    unknown:      ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _igmpFillIfaces() {
+    const sel = document.getElementById('igmp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runIgmpWatch() {
+    const out = document.getElementById('igmp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('igmp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('igmp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '12';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing IGMP on the segment…</p>';
+    try {
+        _igmpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/igmp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runIgmpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _IGMP_VERDICT_STYLE[d.verdict] || _IGMP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s window · ${d.packets} IGMP msgs (${d.rate_per_s}/s)${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        const q = d.queriers || [], tq = d.trusted_queriers || [];
+        if (q.length || tq.length) {
+            const rogue = q.filter(x => tq.length && tq.indexOf(x) < 0);
+            html += `<p class="text-xs text-gray-400 mb-1">Querier(s): ` +
+                (q.length ? q.map(x => `<span class="font-mono ${rogue.indexOf(x) >= 0 ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(x)}</span>`).join(', ') : '<span class="text-gray-500">none seen</span>') +
+                (tq.length ? ` · trusted: <span class="font-mono text-gray-500">${escapeHtml(tq.join(', '))}</span>` : '') + `</p>`;
+        }
+        const groups = d.groups || [];
+        if (groups.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Multicast groups joined (' + groups.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Group</th><th class="px-2 py-1">Scope</th><th class="px-2 py-1">Members</th></tr>' +
+                '</thead><tbody>' +
+                groups.map(g => {
+                    const nm = g.name ? ` <span class="text-gray-500">(${escapeHtml(g.name)})</span>` : '';
+                    const flag = g.new ? ' <span class="text-amber-300">•new</span>' : '';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${g.new && g.sensitive ? 'text-amber-300' : ''}">${escapeHtml(g.group)}${nm}${flag}</td>
+                        <td class="px-2 py-1 ${g.sensitive ? 'text-gray-300' : 'text-gray-500'}">${escapeHtml(g.scope)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((g.members || []).join(', ') || '—')}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function igmpTrustBaseline() {
+    try {
+        await postAPI('/api/net/igmp-baseline', { action: 'reset' });
+        addConsoleMessage('IGMP baseline reset — re-learning current querier(s) & memberships', 'info');
+        await runIgmpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset IGMP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- OSPF Security Scanner (passive) ---------------------------------------
+const _OSPF_VERDICT_STYLE = {
+    clean:     ['bg-green-950/40 border-green-900 text-green-400', '✓ No OSPF anomalies detected'],
+    weak_auth: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak / no OSPF authentication — exposed to LSA injection'],
+    anomaly:   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ OSPF anomaly — rogue router / Router-ID conflict / mismatch'],
+    injection: ['bg-red-950/60 border-red-800 text-red-300', '🛑 OSPF LSA injection / route poisoning detected'],
+    storm:     ['bg-red-950/60 border-red-800 text-red-300', '🛑 OSPF flooding storm detected'],
+    unknown:   ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+const _OSPF_AUTH_NAME = { 0: 'none (0)', 1: 'plaintext (1)', 2: 'cryptographic (2)' };
+function _ospfFillIfaces() {
+    const sel = document.getElementById('ospf-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runOspfWatch() {
+    const out = document.getElementById('ospf-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('ospf-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('ospf-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing OSPF on the segment…</p>';
+    try {
+        _ospfFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/ospf-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runOspfWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _OSPF_VERDICT_STYLE[d.verdict] || _OSPF_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packets} OSPF pkts (${d.hellos} hello, ${d.ls_updates} LSU @ ${d.lsu_per_s}/s)${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if (d.note) html += `<p class="text-xs text-gray-500 mb-2">${escapeHtml(d.note)}</p>`;
+        const auth = (d.auth_types || []).map(a => _OSPF_AUTH_NAME[a] || a);
+        if (auth.length) {
+            const bad = (d.auth_types || []).some(a => a < 2);
+            html += `<p class="text-xs mb-1 ${bad ? 'text-amber-300' : 'text-gray-400'}">Authentication: ${escapeHtml(auth.join(', '))}${bad ? ' — no cryptographic auth' : ''}</p>`;
+        }
+        // Advisories (CVE / OSV)
+        (d.advisories || []).forEach(a => {
+            const sev = a.severity === 'high' ? 'text-red-300 border-red-800 bg-red-950/40' : 'text-amber-300 border-amber-800 bg-amber-950/30';
+            const refs = (a.refs || []).map(r => r.startsWith('http')
+                ? `<a href="${escapeHtml(r)}" target="_blank" rel="noopener" class="underline text-cyan-400">OSV</a>`
+                : `<span class="font-mono">${escapeHtml(r)}</span>`).join(', ');
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs ${sev}"><strong>${escapeHtml(a.title)}</strong><br>${escapeHtml(a.detail)}${refs ? '<br><span class="text-gray-400">Refs:</span> ' + refs : ''}</div>`;
+        });
+        // Routers table
+        const routers = d.routers || [], tr = d.trusted_routers || [];
+        if (routers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">OSPF routers seen (' + routers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Router-ID</th><th class="px-2 py-1">Source(s)</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                routers.map(r => {
+                    const badge = r.new ? '<span class="text-amber-300">? new</span>' : (tr.indexOf(r.router_id) >= 0 ? '<span class="text-green-400">✓ known</span>' : '<span class="text-gray-500">—</span>');
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${r.new ? 'text-amber-300' : ''}">${escapeHtml(r.router_id)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((r.sources || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        const lc = d.lsa_counts || {};
+        const lcKeys = Object.keys(lc);
+        if (lcKeys.length) {
+            html += '<p class="text-xs text-gray-500 mt-2">LSAs: ' + lcKeys.map(k => `${escapeHtml(k)}×${lc[k]}`).join(', ') + '</p>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function ospfTrustBaseline() {
+    try {
+        await postAPI('/api/net/ospf-baseline', { action: 'reset' });
+        addConsoleMessage('OSPF baseline reset — re-learning current routers & originators', 'info');
+        await runOspfWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset OSPF baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- BGP Path Watch (passive) ----------------------------------------------
+const _BGP_VERDICT_STYLE = {
+    clean:        ['bg-green-950/40 border-green-900 text-green-400', '✓ No BGP anomalies detected'],
+    weak_session: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ BGP session without TCP-MD5/TCP-AO'],
+    anomaly:      ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ BGP anomaly — rogue peer / session reset / bogon / leak'],
+    injection:    ['bg-red-950/60 border-red-800 text-red-300', '🛑 BGP prefix / origin hijack detected'],
+    storm:        ['bg-red-950/60 border-red-800 text-red-300', '🛑 BGP route-churn / leak storm detected'],
+    unknown:      ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _bgpFillIfaces() {
+    const sel = document.getElementById('bgp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runBgpWatch() {
+    const out = document.getElementById('bgp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('bgp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('bgp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing BGP (TCP/179) on the segment…</p>';
+    try {
+        _bgpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/bgp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runBgpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _BGP_VERDICT_STYLE[d.verdict] || _BGP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.messages} BGP msgs (${d.updates} UPDATE @ ${d.update_per_s}/s, ${d.notifications} NOTIFICATION) · ${d.prefix_total} prefixes${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if (d.note) html += `<p class="text-xs text-gray-500 mb-2">${escapeHtml(d.note)}</p>`;
+        if (d.enrich_note) html += `<p class="text-xs text-gray-500 mb-2">${escapeHtml(d.enrich_note)}</p>`;
+        const asnNames = d.asn_names || {};
+        if (d.peers && d.peers.length) {
+            const tp = d.trusted_peers || [];
+            html += `<p class="text-xs mb-1 text-gray-400">Peers: ` +
+                d.peers.map(a => {
+                    const nm = asnNames[a] ? ` <span class="text-gray-500">(${escapeHtml(asnNames[a])})</span>` : '';
+                    return `<span class="font-mono ${tp.length && tp.indexOf(a) < 0 ? 'text-amber-300' : 'text-gray-200'}">AS${a}</span>${nm}`;
+                }).join(', ') +
+                ` · TCP-MD5: <span class="${d.md5 ? 'text-green-400' : 'text-amber-300'}">${d.md5 ? 'yes' : 'not seen'}</span></p>`;
+        }
+        (d.advisories || []).forEach(a => {
+            const sev = a.severity === 'high' ? 'text-red-300 border-red-800 bg-red-950/40' : 'text-amber-300 border-amber-800 bg-amber-950/30';
+            const refs = (a.refs || []).map(r => r.startsWith('http')
+                ? `<a href="${escapeHtml(r)}" target="_blank" rel="noopener" class="underline text-cyan-400">OSV</a>`
+                : `<span class="font-mono">${escapeHtml(r)}</span>`).join(', ');
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs ${sev}"><strong>${escapeHtml(a.title)}</strong><br>${escapeHtml(a.detail)}${refs ? '<br><span class="text-gray-400">Refs:</span> ' + refs : ''}</div>`;
+        });
+        const prefixes = d.prefixes || [];
+        if (prefixes.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Announced prefixes (' + d.prefix_total + (d.prefix_total > prefixes.length ? ', showing ' + prefixes.length : '') + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Prefix</th><th class="px-2 py-1">Origin AS</th><th class="px-2 py-1">Baseline</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                prefixes.map(p => {
+                    const badge = p.hijack ? '<span class="text-red-300">🛑 hijack</span>' : (p.bogon ? '<span class="text-amber-300">bogon</span>' : '<span class="text-gray-500">—</span>');
+                    const oname = p.origin_name ? ` <span class="text-gray-500">${escapeHtml(p.origin_name)}</span>` : '';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${p.hijack || p.bogon ? 'text-amber-300' : ''}">${escapeHtml(p.prefix)}</td>
+                        <td class="px-2 py-1 font-mono ${p.hijack ? 'text-red-300' : ''}">${p.origin_as != null ? 'AS' + p.origin_as : '—'}${oname}</td>
+                        <td class="px-2 py-1 font-mono text-gray-500">${p.baseline_as != null ? 'AS' + p.baseline_as : '—'}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function bgpTrustBaseline() {
+    try {
+        await postAPI('/api/net/bgp-baseline', { action: 'reset' });
+        addConsoleMessage('BGP baseline reset — re-learning current peers & prefix origins', 'info');
+        await runBgpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset BGP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- BGP receive-only collector + one-way-delay path asymmetry -------------
+const _BGP_STATE_STYLE = {
+    Established: 'text-green-400', OpenConfirm: 'text-cyan-400', OpenSent: 'text-cyan-400',
+    Connect: 'text-amber-300', Active: 'text-amber-300', Idle: 'text-gray-400',
+};
+async function bgpCollector(action) {
+    const out = document.getElementById('bgpc-results');
+    if (out) { out.classList.remove('hidden'); out.innerHTML = '<span class="text-gray-400">…</span>'; }
+    try {
+        let d;
+        if (action === 'start') {
+            const body = {
+                action: 'start',
+                peer_ip: (document.getElementById('bgpc-peer').value || '').trim(),
+                peer_as: parseInt(document.getElementById('bgpc-peeras').value, 10),
+                local_as: parseInt(document.getElementById('bgpc-localas').value, 10),
+                router_id: (document.getElementById('bgpc-rid').value || '').trim(),
+            };
+            d = await postAPI('/api/net/bgp-collector', body);
+        } else {
+            d = await postAPI('/api/net/bgp-collector', { action });
+        }
+        if (!out) return;
+        if (!d.success) { out.innerHTML = '<span class="text-red-300">' + escapeHtml(d.error || 'failed') + '</span>'; return; }
+        if (action === 'rib') {
+            const rib = d.rib || { total: 0, routes: [] };
+            let h = '<div class="text-xs text-gray-400 mb-1">RIB: ' + rib.total + ' prefixes · session ' + escapeHtml(d.state || '?') + '</div>';
+            if (rib.routes && rib.routes.length) {
+                h += '<table class="w-full text-xs"><tr class="text-gray-500 text-left"><th class="pr-3">Prefix</th><th class="pr-3">Origin AS</th><th class="pr-3">AS-path</th><th>Flapping</th></tr>';
+                for (const r of rib.routes) {
+                    h += '<tr><td class="pr-3 font-mono">' + escapeHtml(r.prefix) + '</td><td class="pr-3">' + escapeHtml(String(r.origin_as ?? '?')) + '</td><td class="pr-3 font-mono text-gray-400">' + escapeHtml((r.as_path || []).join(' ')) + '</td><td>' + (r.flapping ? '<span class="text-red-300">yes</span>' : '<span class="text-gray-500">no</span>') + '</td></tr>';
+                }
+                h += '</table>';
+            } else { h += '<div class="text-gray-500 text-xs">no prefixes learned yet</div>'; }
+            out.innerHTML = h;
+            return;
+        }
+        const st = (d.status || {});
+        const cls = _BGP_STATE_STYLE[st.state] || 'text-gray-400';
+        let h = '<div>Session: <span class="' + cls + ' font-semibold">' + escapeHtml(st.state || 'Idle') + '</span>';
+        if (st.peer_ip) h += ' <span class="text-gray-400">peer ' + escapeHtml(st.peer_ip) + ' AS' + escapeHtml(String(st.peer_as ?? '?')) + '</span>';
+        if (st.rib && typeof st.rib.total === 'number') h += ' · <span class="text-gray-400">' + st.rib.total + ' prefixes' + (st.rib.flapping ? ', ' + st.rib.flapping + ' flapping' : '') + '</span>';
+        h += '</div>';
+        if (action === 'start') addConsoleMessage('BGP collector starting toward ' + (st.peer_ip || '?') + ' (receive-only)', 'info');
+        if (action === 'stop') addConsoleMessage('BGP collector stopped', 'info');
+        out.innerHTML = h;
+    } catch (e) {
+        if (out) out.innerHTML = '<span class="text-red-300">' + escapeHtml(e.message) + '</span>';
+    }
+}
+async function owdReflector(action) {
+    const span = document.getElementById('owd-reflector-status');
+    try {
+        const d = await postAPI('/api/net/owd-reflector', { action });
+        if (!span) return;
+        if (!d.success) { span.innerHTML = '<span class="text-red-300">' + escapeHtml(d.error || 'failed') + '</span>'; return; }
+        if (d.running || d.already_running) span.innerHTML = '<span class="text-green-400">reflecting on udp/' + (d.port || '?') + '</span>';
+        else span.innerHTML = '<span class="text-gray-500">stopped</span>';
+    } catch (e) { if (span) span.innerHTML = '<span class="text-red-300">' + escapeHtml(e.message) + '</span>'; }
+}
+async function runPathAsymmetry() {
+    const out = document.getElementById('pa-results');
+    if (!out) return;
+    const target = (document.getElementById('pa-target').value || '').trim();
+    if (!target) { out.classList.remove('hidden'); out.innerHTML = '<span class="text-amber-300">enter a target</span>'; return; }
+    out.classList.remove('hidden');
+    out.innerHTML = '<span class="text-gray-400">measuring one-way delay…</span>';
+    try {
+        const body = {
+            target,
+            count: parseInt(document.getElementById('pa-count').value, 10) || 20,
+            clock_synced: document.getElementById('pa-synced').checked,
+        };
+        const d = await postAPI('/api/net/path-asymmetry', body);
+        if (!d.success) { out.innerHTML = '<span class="text-red-300">' + escapeHtml(d.error || 'failed') + '</span>'; return; }
+        const s = d.summary || {};
+        let h = '<div class="text-xs text-gray-400 mb-1">' + d.replies + '/' + d.probes_sent + ' replies · state <span class="' + (s.state === 'asymmetric' ? 'text-red-300' : 'text-green-400') + '">' + escapeHtml(s.state || '?') + '</span>';
+        if (d.rib_correlation) h += ' · <span class="text-cyan-400">RIB-correlated</span>';
+        h += '</div>';
+        if (d.note) h += '<div class="text-amber-300 text-xs mb-1">' + escapeHtml(d.note) + '</div>';
+        if (s.last) {
+            h += '<table class="w-full text-xs"><tr class="text-gray-500 text-left"><th class="pr-3">RTT min</th><th class="pr-3">θ offset</th><th class="pr-3">asymmetry</th><th>clocks</th></tr>';
+            h += '<tr><td class="pr-3 font-mono">' + (s.rtt_min_ms != null ? s.rtt_min_ms.toFixed(2) : '?') + ' ms</td>';
+            h += '<td class="pr-3 font-mono">' + (s.theta_ms != null ? s.theta_ms.toFixed(2) : '?') + ' ms</td>';
+            h += '<td class="pr-3 font-mono">' + (s.last.asymmetry_ms != null ? s.last.asymmetry_ms.toFixed(2) : '?') + ' ms</td>';
+            h += '<td>' + (s.clock_synced ? '<span class="text-green-400">synced (absolute)</span>' : '<span class="text-gray-400">unsynced (change-sensitive)</span>') + '</td></tr></table>';
+        }
+        if (d.events && d.events.length) {
+            h += '<div class="mt-2 text-xs font-semibold text-amber-300">' + d.events.length + ' asymmetry event(s)</div>';
+            for (const ev of d.events) {
+                h += '<div class="text-xs mt-1 border-l-2 border-amber-400 pl-2">';
+                h += 'Δ ' + (ev.asymmetry_ms != null ? ev.asymmetry_ms.toFixed(2) : '?') + ' ms · dir ' + escapeHtml(ev.direction || '?');
+                if (ev.attribution) h += ' — <span class="text-cyan-400">' + escapeHtml(ev.attribution) + '</span>';
+                if (ev.control_plane && ev.control_plane.covering_prefix) {
+                    h += '<div class="text-gray-400 pl-1">prefix ' + escapeHtml(ev.control_plane.covering_prefix) + ' origin AS' + escapeHtml(String(ev.control_plane.origin_as ?? '?')) + (ev.control_plane.flapping ? ' <span class="text-red-300">flapping</span>' : '') + '</div>';
+                }
+                h += '</div>';
+            }
+        }
+        out.innerHTML = h;
+    } catch (e) {
+        out.innerHTML = '<span class="text-red-300">' + escapeHtml(e.message) + '</span>';
+    }
+}
+
+// ---- Routing-scanner detector self-test (+ optional Scapy) ------------------
+function _scapyLegLabel(sc) {
+    if (!sc) return '';
+    if (sc.ran) return sc.pass ? '<span class="text-green-400">scapy e2e ✓</span>' : '<span class="text-red-300">scapy e2e ✗</span>';
+    return '<span class="text-gray-500">scapy e2e skipped</span>';
+}
+async function runRoutingSelftest() {
+    const out = document.getElementById('routing-selftest-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, 'Running…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Running IGMP / OSPF / BGP detector self-tests…</p>';
+    try {
+        const d = await fetchAPI('/api/net/routing-selftest');
+        if (!d || d.success === undefined) {
+            out.innerHTML = '<p class="text-sm text-red-400">Self-test failed to run.</p>';
+            return;
+        }
+        // Scapy status + install button
+        const status = document.getElementById('scapy-status');
+        const instBtn = document.getElementById('scapy-install-btn');
+        if (status) status.innerHTML = d.scapy_available
+            ? 'Scapy: <span class="text-green-400">installed</span> — end-to-end leg active'
+            : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
+        if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
+
+        const names = { igmp: 'IGMP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+                        bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
+        const overall = d.success
+            ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
+            : '<div class="mb-2 px-3 py-2 rounded border bg-red-950/60 border-red-800 text-red-300 text-sm">🛑 A detector self-test FAILED — see below</div>';
+        let html = overall +
+            '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+            '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
+            '</thead><tbody>';
+        ['igmp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+            const s = d.suites[k]; if (!s) return;
+            const okAll = s.success;
+            html += `<tr class="border-t border-slate-800">
+                <td class="px-2 py-1">${names[k]}</td>
+                <td class="px-2 py-1 font-mono ${okAll ? 'text-gray-300' : 'text-red-300'}">${s.passed}/${s.total}</td>
+                <td class="px-2 py-1">${_scapyLegLabel(s.scapy)}</td>
+                <td class="px-2 py-1">${okAll ? '<span class="text-green-400">PASS</span>' : '<span class="text-red-300">FAIL</span>'}</td>
+            </tr>`;
+            // list any failing scenarios
+            (s.scenarios || []).filter(x => !x.pass).forEach(x => {
+                html += `<tr class="border-t border-slate-900"><td class="px-2 py-1 text-red-300 text-xs" colspan="4">↳ ${escapeHtml(x.name)}: expected ${escapeHtml(String(x.expect))}, got ${escapeHtml(String(x.got))}</td></tr>`;
+            });
+        });
+        html += '</tbody></table>';
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
     }
 }
 
@@ -13298,8 +13772,9 @@ function displayConfigForm(config) {
         const isMax7219 = val === 'max7219_8panel' || val === 'max7219_4panel';
         const isSsd1306 = val === '0in96_oled';
         const isGc9a01 = val === '1in28_tft';
+        const isSt7735s = val === '1in44_lcd';
         const isLcd1602 = val === 'lcd1602';
-        const isEpaper = !isMax7219 && !isSsd1306 && !isGc9a01 && !isLcd1602;
+        const isEpaper = !isMax7219 && !isSsd1306 && !isGc9a01 && !isSt7735s && !isLcd1602;
         if (colorRow) colorRow.style.display = isGc9a01 ? '' : 'none';
         if (addrRow) addrRow.style.display = isSsd1306 ? '' : 'none';
         if (lcdAddrRow) lcdAddrRow.style.display = isLcd1602 ? '' : 'none';

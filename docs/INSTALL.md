@@ -127,6 +127,17 @@ Change the value according to your screen model:
 - For 2.13 V2: "epd_type": "epd2in13_V2",
 - For 2.13 V3: "epd_type": "epd2in13_V3",
 - For 2.13 V4: "epd_type": "epd2in13_V4",
+- For 1.28" GC9A01 round TFT: "epd_type": "gc9a01",
+- For 1.44" ST7735S LCD HAT (keys + joystick): "epd_type": "st7735s",
+- For 0.96" SSD1306 OLED: "epd_type": "ssd1306",
+
+You can also pick the display from the web UI under **Display settings** instead
+of editing this file — that path auto-detects and restarts the service for you.
+
+If your HAT has hardware controls (the 2.7" e‑Paper HAT's 4 keys, or the 1.44"
+LCD HAT's 3 keys + joystick), see the
+[Display Buttons & Joystick Reference](DISPLAY_CONTROLS.md) for what every key
+does in each mode.
 
 Press Esc to exit insert mode
 Type :wq and press Enter to save and quit

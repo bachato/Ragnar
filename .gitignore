@@ -169,6 +169,9 @@ data/arp_baseline.json
 data/mac_watch.json
 data/dhcp_baseline.json
 data/dhcp_snoop.json
+data/igmp_watch.json
+data/ospf_watch.json
+data/bgp_watch.json
 data/logs/temp_log.txt
 data/networks/*/db/*.db
 data/networks/*/intelligence/*.json

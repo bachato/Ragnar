@@ -146,9 +146,19 @@ class Display:
         # y_stretch is no longer needed — scale_factor_y handles vertical spacing
         self.y_stretch = 1.0
 
-        # Hardware button support (2.7" HAT has KEY1-KEY4)
+        # Hardware button support.
+        #  * 1.44" LCD HAT (ST7735S): 3 keys + 5-way joystick (own pin set)
+        #  * 2.7" e-Paper HAT: KEY1-KEY4 (only when the panel is "wide")
+        # Both drive the same page/net-diag state the render loop reads.
         self.button_listener = None
-        if self.is_wide and EPDButtonListener is not None:
+        if self.config.get("epd_type") == "st7735s":
+            try:
+                from lcdhat_input import LCDHATInputListener
+                self.button_listener = LCDHATInputListener(shared_data)
+                self.button_listener.start()
+            except Exception as e:
+                logger.warning(f"LCD HAT input listener unavailable: {e}")
+        elif self.is_wide and EPDButtonListener is not None:
             self.button_listener = EPDButtonListener(shared_data)
             self.button_listener.start()
 
@@ -790,6 +800,35 @@ class Display:
         self._page_cache[key] = (now, data)
         return data
 
+    def _font_at(self, font_name, size):
+        """Return a truetype font at `size`, cached across frames."""
+        if not hasattr(self, '_font_size_cache'):
+            self._font_size_cache = {}
+        size = max(6, int(size))
+        key = (font_name, size)
+        f = self._font_size_cache.get(key)
+        if f is None:
+            try:
+                from PIL import ImageFont
+                f = ImageFont.truetype(os.path.join(self.shared_data.fontdir, font_name), size)
+            except Exception:
+                f = self.shared_data.font_arial9
+            self._font_size_cache[key] = f
+        return f
+
+    def _fit_font(self, font_name, base_font, text, max_w):
+        """Pick the largest `font_name` size ≤ base that renders `text` within
+        `max_w` px. Used so page titles shrink instead of clipping on the 128px
+        LCD; on roomy e-paper the base font already fits, so this is a no-op."""
+        if not text or base_font is None or base_font.getlength(text) <= max_w:
+            return base_font
+        base_size = getattr(base_font, 'size', 13)
+        for size in range(base_size - 1, 6, -1):
+            f = self._font_at(font_name, size)
+            if f.getlength(text) <= max_w:
+                return f
+        return self._font_at(font_name, 7)
+
     def _draw_page_frame(self, draw, title, hint="K1:Home K2:Flip K3:Next K4:Rst"):
         """Draw standard page frame: border, title, divider, footer."""
         w = getattr(self, 'render_w', self.shared_data.width)
@@ -797,20 +836,31 @@ class Display:
         sx = getattr(self, 'render_sx', self.scale_factor_x)
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         font = self.shared_data.font_arial9
-        font_title = self.shared_data.font_viking
+        # Shrink the title to fit the panel width so long names ("NET DNS
+        # DOCTOR") aren't clipped mid-word on the narrow LCD.
+        font_title = self._fit_font('Viking.TTF', self.shared_data.font_viking,
+                                    title, w - int(8 * sx))
         draw.rectangle((1, 1, w - 1, h - 1), outline=0)
         draw.text((int(4 * sx), int(4 * sy)), title, font=font_title, fill=0)
         draw.line((1, int(22 * sy), w - 1, int(22 * sy)), fill=0)
         draw.line((1, h - int(18 * sy), w - 1, h - int(18 * sy)), fill=0)
+        # Trim the footer hint so it never overflows a narrow panel (e.g. the
+        # 128px LCD HAT); on wider e-paper it already fits, so this is a no-op.
+        avail = w - int(8 * sx)
+        while hint and font.getlength(hint) > avail:
+            hint = hint[:-1]
         draw.text((int(4 * sx), h - int(16 * sy)), hint, font=font, fill=0)
 
     def _draw_stat_rows(self, draw, y, stats):
         """Draw key-value stat rows. Returns final y position."""
         w = getattr(self, 'render_w', self.shared_data.width)
+        h = getattr(self, 'render_h', self.shared_data.height)
         sx = getattr(self, 'render_sx', self.scale_factor_x)
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         font = self.shared_data.font_arial9
-        line_h = int(14 * sy)
+        # Tighten row spacing on a short panel so tall pages (up to ~7 rows) fit
+        # a 128px square without spilling into the footer band.
+        line_h = int(12 * sy) if h < 150 else int(14 * sy)
         pad_x = int(6 * sx)
         for label, value in stats:
             val_str = str(value)[:22]
@@ -948,8 +998,14 @@ class Display:
         names = ["LINK", "IP", "SWITCH", "DHCP"]
         name = names[page % len(names)]
         state = "PAUSED" if frozen else "auto5s"
-        self._draw_page_frame(draw, f"NET {name}",
-                              hint=f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}  K1nav K2port K3png K4dns")
+        # Narrow panels (128px LCD HAT) have no room for the key legend, and its
+        # joystick drives navigation anyway — show just the page counter/state.
+        render_w = getattr(self, 'render_w', self.shared_data.width)
+        if render_w < 150:
+            hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}"
+        else:
+            hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}  K1nav K2port K3png K4dns"
+        self._draw_page_frame(draw, f"NET {name}", hint=hint)
         y = int(28 * sy)
         if not data:
             self._draw_stat_rows(draw, y, [("Status", "gathering...")])
@@ -1119,6 +1175,153 @@ class Display:
                 os.fsync(img_file.fileno())
         except Exception:
             pass
+
+    def _render_main_compact(self, image, draw, W, H):
+        """Compact PAGE_MAIN layout for a small square panel (e.g. the 128x128
+        LCD HAT). The default dashboard is authored for a ~122x250 canvas, so on
+        a 128-tall panel its absolute coordinates fall off-screen and the speech
+        text collides with the 78px character sprite. This lays the same
+        elements out to fit: header, two icon+count stat rows, the mood lines,
+        the speech line beside a shrunk character, all inside 128x128."""
+        sd = self.shared_data
+        font = sd.font_arial9
+        # --- frame + header ---
+        # The header keeps a small connection glyph in the top-left corner and
+        # the battery in the top-right, so the centred title is fitted to the
+        # middle strip only (never colliding with either) and the divider sits
+        # below all three.
+        draw.rectangle((0, 0, W - 1, H - 1), outline=0)
+        # Left connection glyph + IP octet, confined to the top-left so they
+        # clear the title. `left_used` grows to whatever they occupy so the
+        # title padding can step around them.
+        left_used = 2
+        try:
+            if getattr(sd, 'ap_mode_active', False):
+                ap_text = "AP"
+                if getattr(sd, 'ap_client_count', 0) > 0:
+                    ap_text = f"AP:{sd.ap_client_count}"
+                draw.text((2, 3), ap_text, font=font, fill=0)
+                left_used = 2 + int(font.getlength(ap_text))
+            elif getattr(sd, 'wifi_connected', False):
+                try:
+                    q = getattr(sd, 'wifi_signal_quality', None)
+                    if q is None:
+                        q = self._dbm_to_quality(getattr(sd, 'wifi_signal_dbm', None))
+                    waves = max(1, min(3, self.get_wifi_wave_count(q)))
+                except Exception:
+                    waves = 3
+                cx, cy = 4, 13
+                for i in range(waves):
+                    r = 3 + i * 3
+                    draw.arc((cx - r, cy - r, cx + r, cy + r), start=225, end=315, fill=0, width=1)
+                left_used = 14
+                try:
+                    ip_octet = self.get_wifi_ip_last_octet()
+                except Exception:
+                    ip_octet = None
+                if ip_octet:
+                    draw.text((15, 4), ip_octet, font=font, fill=0)
+                    left_used = 15 + int(font.getlength(ip_octet))
+        except Exception:
+            pass
+        # Battery %, top-right (PiSugar)
+        bat_w = 0
+        try:
+            _ri = getattr(sd, 'ragnar_instance', None)
+            _ps = getattr(_ri, 'pisugar_listener', None) if _ri else None
+            if _ps and _ps.available:
+                bl = _ps.get_battery_level()
+                if bl is not None:
+                    bt = f"{int(round(bl))}%{'+' if _ps.is_charging() else ''}"
+                    bat_w = int(font.getlength(bt)) + 3
+                    draw.text((W - bat_w + 1, 3), bt, font=font, fill=0)
+        except Exception:
+            pass
+        # Centre the title in the strip between the glyph/IP and the battery.
+        left_pad = max(18, left_used + 2)
+        right_pad = max(18, bat_w)
+        avail = W - left_pad - right_pad
+        title_font = self._fit_font('Viking.TTF', sd.font_viking, "RAGNAR", avail)
+        tw = title_font.getlength("RAGNAR")
+        draw.text((left_pad + (avail - tw) / 2, 1), "RAGNAR", font=title_font, fill=0)
+        draw.line((1, 16, W - 1, 16), fill=0)
+
+        # --- two icon+count stat rows (icons ~30% smaller so they fit) ---
+        icon_h = 13   # 18px source icons scaled down ~30%
+
+        def _fit_icon(icon):
+            if icon is None:
+                return None
+            try:
+                if icon.height > icon_h:
+                    ratio = icon_h / icon.height
+                    return icon.resize((max(1, int(icon.width * ratio)), icon_h), Image.NEAREST)
+            except Exception:
+                return icon
+            return icon
+
+        def _row(y, items):
+            slot = W // len(items)
+            for i, (icon, val) in enumerate(items):
+                x = i * slot + 2
+                icon = _fit_icon(icon)
+                if icon is not None:
+                    try:
+                        image.paste(icon, (x, y))
+                        tx = x + icon.width + 1
+                    except Exception:
+                        tx = x + icon_h + 1
+                else:
+                    tx = x
+                draw.text((tx, y + 2), str(val), font=font, fill=0)
+
+        _row(20, [(getattr(sd, 'target', None), sd.targetnbr),
+                  (getattr(sd, 'port', None),   sd.portnbr),
+                  (getattr(sd, 'vuln', None),   sd.vulnnbr),
+                  (getattr(sd, 'cred', None),   sd.crednbr)])
+        _row(37, [(getattr(sd, 'zombie', None),  sd.zombiesnbr),
+                  (getattr(sd, 'data', None),    sd.datanbr),
+                  (getattr(sd, 'money', None),   sd.coinnbr),
+                  (getattr(sd, 'attacks', None), sd.attacksnbr)])
+        draw.line((1, 54, W - 1, 54), fill=0)
+
+        # --- mood / status lines ---
+        try:
+            sd.update_ragnarstatus()
+        except Exception:
+            pass
+        draw.text((3, 56), str(getattr(sd, 'ragnarstatustext', '') or '')[:24], font=font, fill=0)
+        draw.text((3, 66), str(getattr(sd, 'ragnarstatustext2', '') or '')[:24], font=font, fill=0)
+
+        # --- character sprite, shrunk into the bottom-right corner ---
+        vk_w = 0
+        vk = getattr(sd, 'imagegen', None)
+        if vk is not None:
+            try:
+                target_h = 46
+                if vk.height > target_h:
+                    ratio = target_h / vk.height
+                    vk = vk.resize((max(1, int(vk.width * ratio)), target_h), Image.NEAREST)
+                vk_w = vk.width
+                image.paste(vk, (W - vk_w - 1, H - vk.height - 1))
+            except Exception:
+                vk_w = 0
+
+        # --- speech, wrapped into the space left of the sprite ---
+        says = str(getattr(sd, 'ragnarsays', '') or '')
+        if says:
+            avail_w = W - vk_w - 6
+            try:
+                lines = sd.wrap_text(says, sd.font_arialbold, avail_w)
+            except Exception:
+                lines = [says]
+            y = 82
+            for line in lines:
+                if y > H - 12:
+                    break
+                draw.text((3, y), line, font=sd.font_arialbold, fill=0)
+                bb = sd.font_arialbold.getbbox(line)
+                y += (bb[3] - bb[1]) + 2
 
     def _fetch_network_data(self):
         """Fetch real host data from database."""
@@ -3067,6 +3270,25 @@ class Display:
                 # For 90°/270° we render in portrait so W < H.
                 W = render_w
                 H = render_h
+                # Small square panels (e.g. the 128x128 LCD HAT) can't fit the
+                # tall e-paper dashboard — its absolute coords fall off-screen and
+                # the speech text collides with the character sprite. Render a
+                # dedicated compact layout instead and commit it directly.
+                if render_w < 150 and 100 <= render_h < 170:
+                    try:
+                        self._render_main_compact(image, draw, W, H)
+                    except Exception as e:
+                        logger.debug(f"compact main render error: {e}")
+                    epd_img = _apply_epd_rotation(image, self.screen_reversed)
+                    self.epd_helper.display_partial(epd_img)
+                    self.epd_helper.display_partial(epd_img)
+                    web_img = _apply_web_rotation(image, self.web_screen_reversed)
+                    with open(os.path.join(self.shared_data.webdir, "screen.png"), 'wb') as img_file:
+                        web_img.save(img_file)
+                        img_file.flush()
+                        os.fsync(img_file.fileno())
+                    self._sleep_interruptible(PAGE_MAIN)
+                    continue
                 ref_w = self.shared_data.config.get('ref_width', 122)
                 ref_h = self.shared_data.config.get('ref_height', 250)
                 if self.screen_reversed in (90, 270):

@@ -30,6 +30,9 @@ import tempfile
 import urllib.parse
 from datetime import datetime
 
+import bgp_speaker
+import path_asymmetry
+
 try:
     from flask import request, jsonify
 except Exception:  # pragma: no cover - flask always present in the app
@@ -83,6 +86,17 @@ def _run(cmd, timeout=30, env=None):
 
 def _have(binname):
     return shutil.which(binname) is not None
+
+
+def _have_scapy():
+    """True if the Scapy Python module is importable (not just the CLI). Scapy is
+    optional — only the scanners' end-to-end self-test leg uses it — so this is a
+    lightweight spec check that doesn't pay Scapy's slow import."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec('scapy') is not None
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -3042,6 +3056,1854 @@ def do_l2_health(interface, seconds=12):
 
 
 # --------------------------------------------------------------------------
+# IGMP Watch: passive IGMP-snooping security scanner (detection-only)
+# --------------------------------------------------------------------------
+# IGMP is the low-volume control plane of IPv4 multicast: hosts announce group
+# membership (reports/joins), the multicast router periodically queries. That
+# makes it a cheap, high-signal thing to watch on a Pi Zero 2 W — a few
+# packets a minute on a healthy segment. This scanner is PASSIVE: one short
+# tcpdump window, parsed and classified. It never joins a group, never sends a
+# query, never becomes a querier. Four things it looks for:
+#   1. Storm / flood   — an IGMP report/query rate far above normal noise
+#      (report floods are a real multicast DoS and a switch-CPU exhaustion vector).
+#   2. Anomaly         — >1 querier on the segment. There must be exactly one;
+#      a second, lower-IP querier is the classic "become the querier to draw all
+#      multicast to yourself" attack, plus version downgrades (v3->v2/v1).
+#   3. Reconnaissance  — one host joining a wide spread of distinct groups (or
+#      sweeping group-specific queries): multicast stream enumeration.
+#   4. Unauthorized join — a host joining an admin-scoped / globally-scoped group
+#      it has never been seen on, measured against a learned baseline.
+#
+# Passive-floor doctrine (see MAC Watch / L2 Health): thresholds sit above the
+# ordinary chatter (mDNS 224.0.0.251, SSDP 239.255.255.250, ~125s general
+# queries) so a normal segment reads clean. First run learns the querier(s) and
+# host->group memberships into data/igmp_watch.json; "Trust current" re-learns.
+
+_IGMP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'igmp_watch.json')
+_igmp_watch_lock = threading.Lock()
+
+# Total IGMP messages/sec at or above which the window is a storm. IGMP is
+# intrinsically low-rate, so even a modest sustained rate is abnormal.
+_IGMP_STORM_RATE = 30.0
+# One source emitting at or above this many messages in the window is flooding
+# on its own (report-flood DoS), independent of the aggregate rate.
+_IGMP_SRC_FLOOD = 120
+# One source joining at or above this many distinct groups in the window is
+# enumerating multicast (reconnaissance).
+_IGMP_RECON_GROUPS = 20
+# Keep at most this many anomaly events in the store (newest wins).
+_IGMP_EVENTS_CAP = 200
+
+# Well-known multicast groups, for readable output and to avoid flagging normal
+# service discovery as an unauthorized join.
+_IGMP_WELL_KNOWN = {
+    '224.0.0.1': 'all-hosts', '224.0.0.2': 'all-routers',
+    '224.0.0.5': 'OSPF', '224.0.0.6': 'OSPF-DR', '224.0.0.9': 'RIPv2',
+    '224.0.0.13': 'PIM', '224.0.0.18': 'VRRP', '224.0.0.22': 'IGMPv3',
+    '224.0.0.102': 'HSRPv2/GLBP', '224.0.0.251': 'mDNS', '224.0.0.252': 'LLMNR',
+    '224.0.1.1': 'NTP', '224.0.1.129': 'PTP', '239.255.255.250': 'SSDP/UPnP',
+    '239.255.255.253': 'SLP',
+}
+
+
+def _igmp_scope(group):
+    """Classify a multicast group address into a readable scope. Returns
+    (scope, sensitive) — sensitive=True means a join there is worth policing
+    (admin/global/SSM), False for link-local control traffic (normal)."""
+    try:
+        octets = [int(x) for x in group.split('.')]
+        if len(octets) != 4:
+            return ('invalid', False)
+    except (ValueError, AttributeError):
+        return ('invalid', False)
+    a, b, c, _d = octets
+    if a == 224 and b == 0 and c == 0:
+        return ('link-local control', False)   # 224.0.0.0/24 — normal
+    if a == 239:
+        return ('admin-scoped (private)', True)  # 239.0.0.0/8
+    if a == 232:
+        return ('source-specific (SSM)', True)   # 232.0.0.0/8
+    if 224 <= a <= 238:
+        return ('globally-scoped', True)
+    return ('other', False)
+
+
+_IGMP_IP_RE = r'(\d{1,3}(?:\.\d{1,3}){3})'
+
+
+def _parse_igmp_capture(output):
+    """Parse `tcpdump -nn -t -v 'igmp'` text into a list of membership events:
+    {src, group, kind, version}. kind is 'query' | 'report' | 'leave'.
+
+    Handles v1/v2 reports (dst == group), v2 leaves, and v3 reports whose group
+    records tcpdump prints as `gaddr <addr> ...` (one event per group record).
+    Robust to tcpdump version differences: it keys off the `igmp` keyword and
+    pulls every group address it can find rather than a single rigid format."""
+    events = []
+    ver_re = re.compile(r'igmp\s+v(\d)', re.I)
+    src_re = re.compile(r'^' + _IGMP_IP_RE + r'\s*>\s*' + _IGMP_IP_RE)
+    gaddr_re = re.compile(r'gaddr\s+' + _IGMP_IP_RE, re.I)
+    # v3 record modes that mean "leaving / no interest" vs joining.
+    leave_modes = ('to_in', 'is_in', 'block')
+    for raw in output.splitlines():
+        line = raw.strip()
+        if 'igmp' not in line.lower():
+            continue
+        sm = src_re.search(line)
+        src = sm.group(1) if sm else None
+        dst = sm.group(2) if sm else None
+        vm = ver_re.search(line)
+        version = int(vm.group(1)) if vm else 2
+        low = line.lower()
+        if 'query' in low:
+            events.append({'src': src, 'group': None, 'kind': 'query',
+                           'version': version})
+            continue
+        if 'leave' in low:
+            # v2 leave-group: the left group is named after "leave" or is dst.
+            lm = re.search(r'leave.*?' + _IGMP_IP_RE, low)
+            grp = (lm.group(1) if lm else None) or (dst if dst != '224.0.0.2' else None)
+            events.append({'src': src, 'group': grp, 'kind': 'leave',
+                           'version': version})
+            continue
+        if 'report' in low:
+            gaddrs = gaddr_re.findall(line)
+            if gaddrs:
+                # v3 report — one event per group record.
+                for g in gaddrs:
+                    # crude record-mode read near this gaddr; default to report.
+                    seg = low.split(g.lower(), 1)[-1][:24]
+                    kind = 'leave' if any(m in seg for m in leave_modes) and '{ }' in seg else 'report'
+                    events.append({'src': src, 'group': g, 'kind': kind,
+                                   'version': version})
+            else:
+                # v1/v2 report — the destination address IS the group.
+                grp = None
+                rm = re.search(r'report\s+' + _IGMP_IP_RE, low)
+                grp = rm.group(1) if rm else (dst if dst and dst not in _IGMP_WELL_KNOWN else dst)
+                events.append({'src': src, 'group': grp, 'kind': 'report',
+                               'version': version})
+    return events
+
+
+def _igmp_watch_load():
+    try:
+        with open(_IGMP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _igmp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_IGMP_WATCH_PATH), exist_ok=True)
+        tmp = _IGMP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _IGMP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_igmp_baseline(action='get'):
+    """Manage the learned IGMP baseline (trusted querier(s) + known host->group
+    memberships). action='reset' clears it so the current segment is re-learned
+    on the next scan (use after a legitimate multicast/router change)."""
+    with _igmp_watch_lock:
+        if action == 'reset':
+            _igmp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _igmp_watch_load()
+        return {'success': True, 'baseline': {
+            'queriers': sorted(b.get('queriers') or []),
+            'groups': sorted((b.get('members') or {}).keys()),
+        }}
+
+
+def _igmp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed IGMP events. Returns the result payload
+    (minus interface). Separated from capture so the self-test can drive it with
+    synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    total = len(events)
+    rate = round(total / seconds, 1)
+
+    queriers = sorted({e['src'] for e in events if e['kind'] == 'query' and e['src']})
+    per_src = {}
+    src_groups = {}
+    members = {}
+    for e in events:
+        s = e.get('src')
+        if s:
+            per_src[s] = per_src.get(s, 0) + 1
+        g = e.get('group')
+        if g and e['kind'] == 'report':
+            src_groups.setdefault(s, set()).add(g)
+            members.setdefault(g, set()).add(s)
+
+    trusted_q = set(baseline.get('queriers') or [])
+    known_members = {g: set(v) for g, v in (baseline.get('members') or {}).items()}
+    learned = False
+    # Learn-on-first-run: an empty baseline adopts the current querier(s) and
+    # memberships as trusted (mirrors ARP/DHCP baseline behaviour).
+    if learn and not trusted_q and not known_members and (queriers or members):
+        baseline['queriers'] = queriers
+        baseline['members'] = {g: sorted(v) for g, v in members.items()}
+        learned = True
+        trusted_q = set(queriers)
+        known_members = {g: set(v) for g, v in members.items()}
+
+    findings = []       # (level, category, text)
+    categories = set()
+
+    # (1) storm / flood
+    if rate >= _IGMP_STORM_RATE:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'IGMP rate {rate}/s over {seconds}s ({total} msgs) — '
+                         'far above normal; multicast report/query flood'))
+    floods = sorted([(s, n) for s, n in per_src.items() if n >= _IGMP_SRC_FLOOD],
+                    key=lambda x: -x[1])
+    for s, n in floods:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'{s} sent {n} IGMP messages in {seconds}s — single-source flood'))
+
+    # (2) anomaly — rogue / extra querier, version downgrade
+    if len(queriers) > 1:
+        categories.add('anomaly')
+        extra = [q for q in queriers if q not in trusted_q] or queriers[1:]
+        findings.append(('crit', 'anomaly',
+                         f'{len(queriers)} IGMP queriers on the segment '
+                         f'({", ".join(queriers)}) — there must be exactly one; '
+                         f'possible rogue querier ({", ".join(extra)}) drawing multicast'))
+    elif queriers and trusted_q and queriers[0] not in trusted_q:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'querier is {queriers[0]}, not the trusted '
+                         f'{", ".join(sorted(trusted_q))} — querier takeover'))
+    q_versions = sorted({e['version'] for e in events if e['kind'] == 'query'})
+    if len(q_versions) > 1:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'mixed IGMP query versions {q_versions} — possible '
+                         'version-downgrade to force weaker v1/v2'))
+
+    # (3) reconnaissance — a source joining many distinct groups
+    recon = sorted([(s, len(g)) for s, g in src_groups.items() if len(g) >= _IGMP_RECON_GROUPS],
+                   key=lambda x: -x[1])
+    recon_srcs = {s for s, _n in recon}
+    for s, n in recon:
+        categories.add('recon')
+        findings.append(('warn', 'recon',
+                         f'{s} joined {n} distinct multicast groups in {seconds}s '
+                         '— multicast group enumeration (reconnaissance)'))
+
+    # (4) unauthorized join — a new host on a sensitive (admin/global/SSM) group.
+    # A source already flagged as recon is folded under that finding — its joins
+    # are the enumeration, not N separate unauthorized alerts.
+    unauth = []
+    if trusted_q or known_members:   # only meaningful once a baseline exists
+        for g, srcs in members.items():
+            scope, sensitive = _igmp_scope(g)
+            if not sensitive:
+                continue
+            for s in srcs:
+                if s in recon_srcs:
+                    continue
+                if s not in known_members.get(g, set()):
+                    unauth.append((s, g, scope))
+    for s, g, scope in unauth:
+        categories.add('unauthorized')
+        name = _IGMP_WELL_KNOWN.get(g)
+        findings.append(('warn', 'unauthorized',
+                         f'{s} joined {g}{" (" + name + ")" if name else ""} '
+                         f'[{scope}] — not in the learned baseline (unauthorized join)'))
+
+    # verdict = most severe triggered category
+    order = ['storm', 'anomaly', 'unauthorized', 'recon']
+    verdict = next((c for c in order if c in categories), 'clean')
+    if not findings:
+        findings.append(('ok', 'clean', 'No IGMP anomalies in the capture window.'))
+
+    groups_out = []
+    for g in sorted(members.keys()):
+        scope, sensitive = _igmp_scope(g)
+        srcs = sorted(members[g])
+        new = bool((trusted_q or known_members) and
+                   any(s not in known_members.get(g, set()) for s in srcs))
+        groups_out.append({'group': g, 'name': _IGMP_WELL_KNOWN.get(g),
+                           'scope': scope, 'sensitive': sensitive,
+                           'members': srcs, 'new': new})
+
+    top_joiners = sorted(([{'src': s, 'groups': len(g)} for s, g in src_groups.items()]),
+                         key=lambda x: -x['groups'])[:8]
+
+    return {
+        'success': True, 'verdict': verdict, 'seconds': seconds,
+        'packets': total, 'rate_per_s': rate, 'learned': learned,
+        'queriers': queriers, 'trusted_queriers': sorted(trusted_q),
+        'groups': groups_out, 'top_joiners': top_joiners,
+        'findings': [{'level': l, 'category': c, 'text': t} for l, c, t in findings],
+        'reasons': [t for _l, _c, t in findings if _l != 'ok'],
+    }
+
+
+def _igmp_capture(interface, seconds):
+    """Run one passive tcpdump IGMP window and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '256', '-c', '20000', 'igmp'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_igmp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive IGMP-snooping security scanner (detection-only). Captures IGMP for
+    a few seconds and classifies the segment: storm / anomaly / recon /
+    unauthorized / clean. Learns the querier(s) + memberships on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 30)
+
+    text, err = _igmp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_igmp_capture(text)
+
+    with _igmp_watch_lock:
+        baseline = _igmp_watch_load()
+        result = _igmp_analyze(events, seconds, baseline, learn=learn)
+        # Persist a freshly-learned baseline, and append anomaly events to history.
+        if result.get('learned'):
+            _igmp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _igmp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_IGMP_EVENTS_CAP:]
+            _igmp_watch_save(b)
+
+    result['interface'] = iface
+    return result
+
+
+def _igmp_selftest():
+    """Self-test the IGMP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted tcpdump text through the real parser + classifier,
+    and — if Scapy is available — also builds real IGMP packets into a pcap and
+    parses them back through tcpdump, exercising the capture->parse path end to
+    end (mirrors the MAC Watch self-test approach). Returns a results dict."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_igmp_capture(text)
+        res = _igmp_analyze(events, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect,
+                          'got': res['verdict'], 'events': len(events),
+                          'pass': ok})
+        return res
+
+    # 1. clean: one querier + normal service-discovery joins.
+    clean = "\n".join([
+        "192.168.1.1 > 224.0.0.1: igmp query v2",
+        "192.168.1.50 > 224.0.0.251: igmp v2 report 224.0.0.251",
+        "192.168.1.51 > 239.255.255.250: igmp v2 report 239.255.255.250",
+    ])
+    run('clean', clean, 12, {}, 'clean')
+
+    # 2. storm: a report flood from one host.
+    storm = "\n".join(
+        [f"192.168.1.77 > 239.1.2.3: igmp v2 report 239.1.2.3" for _ in range(400)])
+    run('storm', storm, 5, {'queriers': ['192.168.1.1'], 'members': {}}, 'storm')
+
+    # 3. anomaly: a second (rogue) querier appears.
+    anomaly = "\n".join([
+        "192.168.1.1 > 224.0.0.1: igmp query v2",
+        "192.168.1.9 > 224.0.0.1: igmp query v2",
+    ])
+    run('anomaly', anomaly, 12, {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+
+    # 4. recon: one host enumerates many groups.
+    recon = "\n".join(
+        [f"192.168.1.66 > 239.0.0.{i}: igmp v2 report 239.0.0.{i}" for i in range(1, 41)])
+    run('recon', recon, 10, {'queriers': ['192.168.1.1'],
+                             'members': {'239.0.0.1': ['192.168.1.66']}}, 'recon')
+
+    # 5. unauthorized: a new host joins an admin-scoped group not in baseline.
+    unauth = "192.168.1.200 > 239.5.5.5: igmp v2 report 239.5.5.5"
+    run('unauthorized', unauth, 12,
+        {'queriers': ['192.168.1.1'], 'members': {'239.1.1.1': ['192.168.1.50']}},
+        'unauthorized')
+
+    # 6. v3 group-record parse (via gaddr) — assert the group is extracted.
+    v3 = ("192.168.1.50 > 224.0.0.22: igmp v3 report, 1 group record(s) "
+          "[gaddr 239.9.9.9 to_ex { }]")
+    v3_events = _parse_igmp_capture(v3)
+    v3_ok = any(e['group'] == '239.9.9.9' and e['kind'] == 'report' for e in v3_events)
+    scenarios.append({'name': 'v3-parse', 'expect': 'group 239.9.9.9',
+                      'got': str([e.get('group') for e in v3_events]),
+                      'pass': v3_ok})
+
+    # Optional Scapy end-to-end: craft real IGMP packets -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import IP, Ether, wrpcap  # noqa
+        try:
+            from scapy.contrib.igmp import IGMP
+        except Exception:
+            IGMP = None
+        if IGMP is not None and _have('tcpdump'):
+            pkts = [Ether() / IP(src='192.168.1.50', dst='239.7.7.7') /
+                    IGMP(type=0x16, gaddr='239.7.7.7')]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'igmp'],
+                       timeout=10)
+            evs = _parse_igmp_capture(res['out'])
+            got = [e.get('group') for e in evs]
+            scapy_result = {'ran': True, 'groups': got,
+                            'pass': any(g == '239.7.7.7' for g in got),
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# OSPF Watch: passive OSPF security scanner (detection-only)
+# --------------------------------------------------------------------------
+# OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
+# It is the classic target for route poisoning: without cryptographic auth, any
+# host on the segment can inject/spoof LSAs and silently redirect traffic
+# (persistent OSPF poisoning, disguised-LSA and fight-back-bypass attacks —
+# Nakibly et al.). This scanner is PASSIVE: one short tcpdump window, parsed and
+# classified. It never forms an adjacency, never floods an LSA, never touches the
+# LSDB — inspired by OSPFwatcher (topology-change monitoring) and FRR-MAD
+# (expected-vs-observed LSDB anomaly detection), approximated here from the wire
+# with a learned baseline. What it looks for:
+#   * weak_auth — Auth Type 0 (none) / 1 (plaintext). The enabler for every
+#     injection attack, and the one thing we can always see. Surfaces advisories.
+#   * anomaly   — a new/rogue OSPF router (adjacency spoofing), a duplicate
+#     Router-ID (RID conflict/spoof), DR takeover, or Hello parameter mismatch.
+#   * injection — an LSA whose Advertising Router isn't a known router (spoofed
+#     LSA), a MaxSequence (0x7fffffff) or MaxAge fight-provoking LSA, rapid
+#     re-origination of one LSA (fight-back = active injection in progress), or a
+#     new AS-External (Type-5) originator (route injection / default hijack).
+#   * storm     — an LS-Update flood (control-plane DoS).
+# Version-specific CVEs (FRR/Quagga ospfd crashes via malformed/opaque LSAs) are
+# NOT visible on the wire, so instead of guessing a version we detect the
+# exposure conditions and point at OSV for a version lookup (honest by design).
+
+_OSPF_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'ospf_watch.json')
+_ospf_watch_lock = threading.Lock()
+
+_OSPF_MAXAGE = 3600            # LSA MaxAge — used by the premature-aging attack
+_OSPF_MAXSEQ = 0x7fffffff      # LSA MaxSequence — used by the seq-wrap attack
+# LS-Update rate/sec at or above which the window is a flood (LSU is low-rate).
+_OSPF_LSU_STORM_RATE = 20.0
+# Distinct increasing sequence numbers for one (lsa-id, adv-router) in the window
+# at or above which it's rapid re-origination — the fight-back signature.
+_OSPF_FIGHTBACK_SEQS = 4
+_OSPF_EVENTS_CAP = 200
+
+# Curated OSPF vulnerability references, surfaced by observed condition. Version-
+# specific CVEs can't be fingerprinted passively, so these tie to what IS visible
+# (auth posture, opaque/malformed LSAs) and point at OSV for the version lookup.
+_OSPF_OSV_URL = 'https://osv.dev/list?ecosystem=&q=frr%20ospfd'
+_OSPF_ADVISORIES = {
+    'no_auth': {
+        'severity': 'high',
+        'title': 'OSPF without cryptographic authentication',
+        'detail': ('Auth Type 0 (none) or 1 (plaintext) lets any host on the '
+                   'segment inject or spoof LSAs — the enabler for persistent '
+                   'route poisoning, disguised-LSA and fight-back-bypass attacks '
+                   '(Nakibly et al.). Enable RFC 5709 HMAC-SHA cryptographic auth '
+                   '(OSPFv2) or IPsec AH/ESP (OSPFv3).'),
+        'refs': ['RFC 5709'],
+    },
+    'opaque_lsa': {
+        'severity': 'medium',
+        'title': 'Opaque/TE LSAs present — patch ospfd for malformed-LSA crashes',
+        'detail': ('Opaque (Type 9/10/11) / TE LSAs are on the segment. Several '
+                   'FRRouting ospfd DoS crashes are triggered by malformed opaque '
+                   'LSAs (e.g. CVE-2024-27913, CVE-2025-61107, CVE-2025-61105). '
+                   'The software version is not visible on the wire — check OSV '
+                   'for your ospfd build and patch. Cisco ASA/FTD have had '
+                   'equivalent OSPF-LSA DoS advisories.'),
+        'refs': ['CVE-2024-27913', 'CVE-2025-61107', 'CVE-2025-61105', _OSPF_OSV_URL],
+    },
+}
+
+_OSPF_LSA_TYPES = [
+    (re.compile(r'\bRouter\s+LSA\b', re.I), 'router'),
+    (re.compile(r'\bNetwork\s+LSA\b', re.I), 'network'),
+    (re.compile(r'\bASBR[- ]Summary\s+LSA\b', re.I), 'asbr-summary'),
+    (re.compile(r'\bSummary\s+LSA\b', re.I), 'summary'),
+    (re.compile(r'\b(?:AS[- ]?)?External\s+LSA\b', re.I), 'external'),
+    (re.compile(r'\bNSSA\s+LSA\b', re.I), 'nssa'),
+    (re.compile(r'\b(?:Opaque|Grace|TE)\s+LSA\b', re.I), 'opaque'),
+]
+_OSPF_IPRE = r'(\d{1,3}(?:\.\d{1,3}){3})'
+_OSPF_HDR_RE = re.compile(r'(?:IP6?\s+)?' + _OSPF_IPRE + r'(?:\.\d+)?\s+>\s+\S+:\s+OSPFv(\d),\s*([^,]+)')
+
+
+def _ospf_pkt_type(kw):
+    k = kw.strip().lower()
+    if k.startswith('hello'):
+        return 'hello'
+    if k.startswith('ls-update') or k.startswith('ls update'):
+        return 'lsupdate'
+    if k.startswith('ls-ack') or k.startswith('ls ack'):
+        return 'lsack'
+    if k.startswith('database') or k == 'dd':
+        return 'dd'
+    if k.startswith('ls-request') or k.startswith('ls request'):
+        return 'lsrequest'
+    return k.split()[0] if k else 'other'
+
+
+def _parse_ospf_capture(output):
+    """Parse `tcpdump -nn -v 'proto ospf'` text into a list of packet dicts:
+    {src, version, type, router_id, area, auth, hello{...}, lsas[...]}. Tolerant
+    of tcpdump version differences — it keys off the OSPFv2/OSPFv3 header line and
+    pulls whatever fields it can from the indented body of each packet."""
+    packets = []
+    cur = None
+
+    def flush():
+        if cur is not None:
+            packets.append(cur)
+
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        h = _OSPF_HDR_RE.search(line)
+        if h:
+            flush()
+            cur = {'src': h.group(1), 'version': int(h.group(2)),
+                   'type': _ospf_pkt_type(h.group(3)), 'router_id': None,
+                   'area': None, 'auth': None,
+                   'hello': None, 'adv_router': None, 'lsas': []}
+            continue
+        if cur is None:
+            continue
+        rid = re.search(r'Router-ID\s+' + _OSPF_IPRE, line)
+        if rid:
+            cur['router_id'] = rid.group(1)
+        if cur['area'] is None:
+            if re.search(r'Backbone Area', line):
+                cur['area'] = '0.0.0.0'
+            else:
+                am = re.search(r'\bArea\s+' + _OSPF_IPRE, line)
+                if am:
+                    cur['area'] = am.group(1)
+        au = re.search(r'Authentication Type:\s*\w+\s*\((\d)\)', line)
+        if au:
+            cur['auth'] = int(au.group(1))
+        av = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
+        if av and cur['adv_router'] is None:
+            cur['adv_router'] = av.group(1)
+        if cur['type'] == 'hello':
+            hp = cur['hello'] or {'hello_timer': None, 'dead_timer': None,
+                                  'mask': None, 'dr': None, 'neighbors': []}
+            ht = re.search(r'Hello Timer\s+(\d+)s', line)
+            if ht:
+                hp['hello_timer'] = int(ht.group(1))
+            dt = re.search(r'Dead Timer\s+(\d+)s', line)
+            if dt:
+                hp['dead_timer'] = int(dt.group(1))
+            mk = re.search(r'Mask\s+' + _OSPF_IPRE, line)
+            if mk:
+                hp['mask'] = mk.group(1)
+            dr = re.search(r'Designated Router(?:\s+\(ID\))?\s+' + _OSPF_IPRE, line)
+            if dr:
+                hp['dr'] = dr.group(1)
+            nb = re.search(r'Neighbor\s+' + _OSPF_IPRE, line)
+            if nb:
+                hp['neighbors'].append(nb.group(1))
+            cur['hello'] = hp
+        # LSA record line (LS-Update / DD carry these)
+        for rx, lsa_type in _OSPF_LSA_TYPES:
+            if rx.search(line):
+                lid = re.search(r'LSA-ID:?\s+' + _OSPF_IPRE, line)
+                adv = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
+                sq = re.search(r'seq\s+(0x[0-9a-fA-F]+)', line)
+                ag = re.search(r'age\s+(\d+)', line)
+                cur['lsas'].append({
+                    'lsa_type': lsa_type,
+                    'lsa_id': lid.group(1) if lid else None,
+                    'adv_router': (adv.group(1) if adv else cur.get('adv_router')),
+                    'seq': int(sq.group(1), 16) if sq else None,
+                    'age': int(ag.group(1)) if ag else None,
+                })
+                break
+    flush()
+    return packets
+
+
+def _ospf_watch_load():
+    try:
+        with open(_OSPF_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ospf_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_OSPF_WATCH_PATH), exist_ok=True)
+        tmp = _OSPF_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _OSPF_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ospf_baseline(action='get'):
+    """Manage the learned OSPF baseline (trusted routers + Type-5 originators).
+    action='reset' clears it so the current segment is re-learned next scan."""
+    with _ospf_watch_lock:
+        if action == 'reset':
+            _ospf_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ospf_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted(b.get('routers') or []),
+            'asbrs': sorted(b.get('asbrs') or []),
+        }}
+
+
+def _ospf_analyze(packets, seconds, baseline, learn=True):
+    """Pure classifier over parsed OSPF packets. Returns the result payload
+    (minus interface). Split from capture so the self-test can drive it with
+    synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    hellos = [p for p in packets if p['type'] == 'hello']
+    lsupdates = [p for p in packets if p['type'] == 'lsupdate']
+    total = len(packets)
+
+    # routers seen (via Hello Router-ID), and the src IP(s) each was seen from
+    rid_srcs = {}
+    for p in hellos:
+        if p.get('router_id'):
+            rid_srcs.setdefault(p['router_id'], set()).add(p.get('src'))
+    routers_seen = set(rid_srcs.keys())
+
+    # auth posture
+    auth_types = sorted({p['auth'] for p in packets if p.get('auth') is not None})
+
+    # all LSAs, flattened
+    lsas = []
+    for p in lsupdates:
+        for l in p['lsas']:
+            l = dict(l)
+            l['pkt_src'] = p.get('src')
+            l['pkt_router_id'] = p.get('router_id')
+            lsas.append(l)
+    adv_routers = {l['adv_router'] for l in lsas if l.get('adv_router')}
+    asbrs_seen = {l['adv_router'] for l in lsas
+                  if l.get('lsa_type') == 'external' and l.get('adv_router')}
+    has_opaque = any(l.get('lsa_type') == 'opaque' for l in lsas)
+
+    trusted_routers = set(baseline.get('routers') or [])
+    trusted_asbrs = set(baseline.get('asbrs') or [])
+    known_advs = set(baseline.get('advs') or []) | trusted_routers
+    learned = False
+    have_baseline = bool(trusted_routers or known_advs or baseline.get('asbrs') is not None)
+    if learn and not have_baseline and (routers_seen or adv_routers):
+        baseline['routers'] = sorted(routers_seen)
+        baseline['advs'] = sorted(adv_routers | routers_seen)
+        baseline['asbrs'] = sorted(asbrs_seen)
+        learned = True
+        trusted_routers = set(routers_seen)
+        known_advs = adv_routers | routers_seen
+        trusted_asbrs = set(asbrs_seen)
+        have_baseline = True
+
+    findings = []      # (level, category, text)
+    categories = set()
+    advisories = []
+
+    # weak / no authentication
+    if 0 in auth_types:
+        categories.add('weak_auth')
+        advisories.append(dict(_OSPF_ADVISORIES['no_auth'], key='no_auth'))
+        findings.append(('warn', 'weak_auth',
+                         'OSPF packets use Authentication Type 0 (none) — any host '
+                         'can inject LSAs; enable cryptographic auth'))
+    if 1 in auth_types:
+        categories.add('weak_auth')
+        if not any(a.get('key') == 'no_auth' for a in advisories):
+            advisories.append(dict(_OSPF_ADVISORIES['no_auth'], key='no_auth'))
+        findings.append(('warn', 'weak_auth',
+                         'OSPF uses Authentication Type 1 (plaintext) — trivially '
+                         'forged; move to cryptographic (HMAC) auth'))
+
+    # storm
+    lsu_rate = round(len(lsupdates) / seconds, 1)
+    if lsu_rate >= _OSPF_LSU_STORM_RATE:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'{len(lsupdates)} LS-Updates in {seconds}s ({lsu_rate}/s) '
+                         '— OSPF flooding / control-plane DoS'))
+
+    # rogue / new router (adjacency spoofing)
+    if have_baseline:
+        for rid in sorted(routers_seen - trusted_routers):
+            categories.add('anomaly')
+            findings.append(('warn', 'anomaly',
+                             f'new OSPF router {rid} (from {", ".join(sorted(s for s in rid_srcs[rid] if s))}) '
+                             '— not in the learned baseline (possible rogue adjacency)'))
+    # duplicate Router-ID (conflict / spoof)
+    for rid, srcs in rid_srcs.items():
+        real = {s for s in srcs if s}
+        if len(real) > 1:
+            categories.add('anomaly')
+            findings.append(('crit', 'anomaly',
+                             f'Router-ID {rid} claimed by multiple sources '
+                             f'({", ".join(sorted(real))}) — Router-ID conflict or spoof'))
+    # Hello parameter mismatch on the segment
+    hp_params = {(p['hello'].get('hello_timer'), p['hello'].get('dead_timer'), p.get('area'))
+                 for p in hellos if p.get('hello')}
+    hp_params = {x for x in hp_params if x != (None, None, None)}
+    if len(hp_params) > 1:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         'mismatched Hello parameters (hello/dead timer or area) on '
+                         'the segment — misconfig or an attacker probing for adjacency'))
+
+    # injection — spoofed advertising router
+    if have_baseline:
+        spoofed = sorted({a for a in adv_routers if a not in known_advs and a not in routers_seen})
+        for a in spoofed:
+            categories.add('injection')
+            findings.append(('crit', 'injection',
+                             f'LSA advertised by {a}, which never announced itself via '
+                             'Hello and is not in the baseline — spoofed/injected LSA'))
+        # new AS-External (Type-5) originator — route injection / default hijack
+        for a in sorted(asbrs_seen - trusted_asbrs):
+            categories.add('injection')
+            findings.append(('crit', 'injection',
+                             f'new AS-External (Type-5) LSAs from {a} — not a known '
+                             'ASBR; possible route injection / default-route hijack'))
+
+    # MaxSequence / MaxAge attack signatures
+    if any(l.get('seq') == _OSPF_MAXSEQ for l in lsas):
+        categories.add('injection')
+        findings.append(('crit', 'injection',
+                         'LSA with MaxSequence (0x7fffffff) — sequence-wrap attack to '
+                         'force LSDB reset'))
+    # MaxAge for an LSA-ID that is ALSO seen fresh in the window = premature-aging
+    fresh_ids = {l['lsa_id'] for l in lsas if l.get('age') is not None and l['age'] < _OSPF_MAXAGE}
+    maxage_hot = sorted({l['lsa_id'] for l in lsas
+                         if l.get('age') is not None and l['age'] >= _OSPF_MAXAGE
+                         and l['lsa_id'] in fresh_ids and l['lsa_id']})
+    for lid in maxage_hot:
+        categories.add('injection')
+        findings.append(('warn', 'injection',
+                         f'LSA {lid} flooded at MaxAge while also fresh — premature-'
+                         'aging (MaxAge) attack to flush it from the LSDB'))
+
+    # fight-back — rapid re-origination of one (lsa-id, adv-router)
+    seq_by_lsa = {}
+    for l in lsas:
+        if l.get('lsa_id') and l.get('adv_router') and l.get('seq') is not None:
+            seq_by_lsa.setdefault((l['lsa_id'], l['adv_router']), set()).add(l['seq'])
+    for (lid, adv), seqs in seq_by_lsa.items():
+        if len(seqs) >= _OSPF_FIGHTBACK_SEQS:
+            categories.add('injection')
+            findings.append(('crit', 'injection',
+                             f'LSA {lid} from {adv} re-originated {len(seqs)} times with '
+                             'rising sequence — fight-back: the owner is countering an '
+                             'active LSA injection'))
+
+    if has_opaque:
+        advisories.append(dict(_OSPF_ADVISORIES['opaque_lsa'], key='opaque_lsa'))
+
+    # version anomaly
+    versions = sorted({p['version'] for p in packets})
+    if len(versions) > 1:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'mixed OSPF versions {versions} on the segment'))
+
+    order = ['storm', 'injection', 'anomaly', 'weak_auth']
+    verdict = next((c for c in order if c in categories), 'clean')
+    if not findings:
+        findings.append(('ok', 'clean', 'No OSPF anomalies in the capture window.'))
+
+    routers_out = []
+    for rid in sorted(routers_seen):
+        routers_out.append({'router_id': rid,
+                            'sources': sorted(s for s in rid_srcs[rid] if s),
+                            'new': bool(have_baseline and rid not in trusted_routers)})
+    lsa_summary = {}
+    for l in lsas:
+        lsa_summary[l['lsa_type']] = lsa_summary.get(l['lsa_type'], 0) + 1
+
+    return {
+        'success': True, 'verdict': verdict, 'seconds': seconds,
+        'packets': total, 'hellos': len(hellos), 'ls_updates': len(lsupdates),
+        'lsu_per_s': lsu_rate, 'learned': learned,
+        'auth_types': auth_types, 'versions': versions,
+        'routers': routers_out, 'trusted_routers': sorted(trusted_routers),
+        'lsa_counts': lsa_summary,
+        'advisories': [{'key': a.get('key'), 'severity': a['severity'],
+                        'title': a['title'], 'detail': a['detail'],
+                        'refs': a.get('refs', [])} for a in advisories],
+        'findings': [{'level': l, 'category': c, 'text': t} for l, c, t in findings],
+        'reasons': [t for _l, _c, t in findings if _l != 'ok'],
+    }
+
+
+def _ospf_capture(interface, seconds):
+    """Run one passive tcpdump OSPF window and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', 'proto', 'ospf'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ospf_watch(interface=None, seconds=15, learn=True, quick=False):
+    """Passive OSPF security scanner (detection-only). Captures OSPF for a few
+    seconds and classifies the segment: weak_auth / anomaly / injection / storm /
+    clean, with CVE/OSV advisories for observed exposure conditions. Learns the
+    routers + Type-5 originators on first run; never forms an adjacency."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _ospf_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    packets = _parse_ospf_capture(text)
+
+    with _ospf_watch_lock:
+        baseline = _ospf_watch_load()
+        result = _ospf_analyze(packets, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _ospf_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ospf_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_OSPF_EVENTS_CAP:]
+            _ospf_watch_save(b)
+
+    if not packets:
+        result['note'] = ('No OSPF seen — this segment may not run OSPF, or the Pi '
+                          'is not on the OSPF broadcast domain (put it on a SPAN/'
+                          'mirror or the routed VLAN to observe).')
+    result['interface'] = iface
+    return result
+
+
+def _ospf_selftest():
+    """Self-test the OSPF detectors with synthetic tcpdump captures (no root, no
+    live traffic), plus an optional Scapy end-to-end leg (scapy.contrib.ospf ->
+    pcap -> tcpdump -> parse). Mirrors the IGMP/MAC Watch self-tests."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        pkts = _parse_ospf_capture(text)
+        res = _ospf_analyze(pkts, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'packets': len(pkts), 'pass': ok})
+        return res
+
+    base = {'routers': ['10.0.0.1', '10.0.0.2'],
+            'advs': ['10.0.0.1', '10.0.0.2'], 'asbrs': ['10.0.0.1']}
+
+    clean = "\n".join([
+        "10.0.0.1 > 224.0.0.5: OSPFv2, Hello, length 48",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tHello Timer 10s, Dead Timer 40s, Mask 255.255.255.0",
+        "10.0.0.2 > 224.0.0.5: OSPFv2, LS-Update, length 64",
+        "\tRouter-ID 10.0.0.2, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tRouter LSA (1), LSA-ID: 10.0.0.2, Advertising Router: 10.0.0.2, seq 0x80000005, age 12",
+    ])
+    run('clean', clean, 15, base, 'clean')
+
+    weak = "\n".join([
+        "10.0.0.1 > 224.0.0.5: OSPFv2, Hello, length 48",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: none (0)",
+        "\tHello Timer 10s, Dead Timer 40s, Mask 255.255.255.0",
+    ])
+    run('weak_auth', weak, 15, base, 'weak_auth')
+
+    rogue = "\n".join([
+        "10.0.0.9 > 224.0.0.5: OSPFv2, Hello, length 48",
+        "\tRouter-ID 10.0.0.9, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tHello Timer 10s, Dead Timer 40s, Mask 255.255.255.0",
+    ])
+    run('anomaly', rogue, 15, base, 'anomaly')
+
+    inject = "\n".join([
+        "10.0.0.66 > 224.0.0.5: OSPFv2, LS-Update, length 64",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tRouter LSA (1), LSA-ID: 10.0.0.66, Advertising Router: 10.0.0.66, seq 0x80000002, age 1",
+    ])
+    run('injection', inject, 15, base, 'injection')
+
+    maxseq = "\n".join([
+        "10.0.0.1 > 224.0.0.5: OSPFv2, LS-Update, length 64",
+        "\tRouter-ID 10.0.0.1, Backbone Area, Authentication Type: Cryptographic (2)",
+        "\tRouter LSA (1), LSA-ID: 10.0.0.1, Advertising Router: 10.0.0.1, seq 0x7fffffff, age 1",
+    ])
+    run('injection-maxseq', maxseq, 15, base, 'injection')
+
+    # parser check: a full LS-Update parses out the LSA fields.
+    p = _parse_ospf_capture(clean)
+    lsu = [x for x in p if x['type'] == 'lsupdate']
+    parse_ok = bool(lsu and lsu[0]['lsas'] and
+                    lsu[0]['lsas'][0]['adv_router'] == '10.0.0.2' and
+                    lsu[0]['lsas'][0]['seq'] == 0x80000005)
+    scenarios.append({'name': 'lsa-parse', 'expect': 'adv=10.0.0.2 seq=0x80000005',
+                      'got': str(lsu[0]['lsas'][0] if lsu and lsu[0]['lsas'] else None),
+                      'pass': parse_ok})
+
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import IP, Ether, wrpcap  # noqa
+        try:
+            from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello
+        except Exception:
+            OSPF_Hdr = None
+        if OSPF_Hdr is not None and _have('tcpdump'):
+            pkt = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
+                   OSPF_Hdr(version=2, type=1, src='10.0.0.5', area='0.0.0.0',
+                            authtype=0) / OSPF_Hello(mask='255.255.255.0'))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'proto', 'ospf'],
+                       timeout=10)
+            parsed = _parse_ospf_capture(res['out'])
+            got_auth = next((x.get('auth') for x in parsed if x.get('auth') is not None), None)
+            scapy_result = {'ran': True, 'parsed_packets': len(parsed),
+                            'auth': got_auth, 'pass': len(parsed) >= 1,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# BGP Path Watch: passive BGP routing-security scanner (detection-only)
+# --------------------------------------------------------------------------
+# BGP is the exterior/edge routing control plane (TCP 179). Unlike OSPF it is
+# unicast between peers, so the Pi only sees it when it is INLINE, on a SPAN/
+# mirror, or is itself a peer — this is made explicit in the UI. Where visible,
+# BGP is the highest-value thing to watch: origin hijacks, sub-prefix hijacks,
+# route leaks and session resets are how traffic gets silently redirected across
+# the Internet edge. This scanner is PASSIVE: one short tcpdump window parsed and
+# classified. It never opens a session, never announces or withdraws a route.
+# Companion to OSPF Watch (L3 routing security). What it looks for:
+#   * injection — an announced prefix whose ORIGIN AS changed vs the baseline
+#     (prefix / origin hijack), or a new more-specific of a baseline prefix
+#     (sub-prefix hijack — the most effective real-world BGP attack).
+#   * anomaly   — a new/rogue peer (new AS or BGP-ID), a NOTIFICATION / session
+#     reset (teardown / flap), a private or bogon ASN in a received AS-path
+#     (route leak), a bogon/martian prefix announcement, an AS-path loop, or a
+#     BLACKHOLE community (65535:666).
+#   * storm     — a route-churn / UPDATE flood, or a per-peer prefix-count spike
+#     (full-table leak).
+#   * weak_session — BGP seen but no TCP-MD5/TCP-AO signature (RFC 2385/5925);
+#     exposed to off-path session-reset attacks. Advisory only.
+# Version CVEs (FRR/BIRD bgpd crashes on malformed UPDATE attributes) aren't on
+# the wire, so — as with OSPF — the exposure conditions are flagged and OSV is
+# pointed at for the version lookup.
+
+_BGP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'bgp_watch.json')
+_bgp_watch_lock = threading.Lock()
+
+# UPDATE messages/sec at or above which the window is churn/flood.
+_BGP_STORM_RATE = 40.0
+# A peer announcing at or above this many prefixes in the window, when the
+# baseline saw far fewer, is a route-leak (full-table) signature.
+_BGP_LEAK_PREFIXES = 500
+_BGP_EVENTS_CAP = 200
+
+# Bogon / martian IPv4 prefixes that should never be announced in BGP.
+_BGP_BOGON_NETS = [
+    ('0.0.0.0', 8), ('10.0.0.0', 8), ('100.64.0.0', 10), ('127.0.0.0', 8),
+    ('169.254.0.0', 16), ('172.16.0.0', 12), ('192.0.0.0', 24),
+    ('192.0.2.0', 24), ('192.168.0.0', 16), ('198.18.0.0', 15),
+    ('198.51.100.0', 24), ('203.0.113.0', 24), ('224.0.0.0', 4), ('240.0.0.0', 4),
+]
+
+_BGP_OSV_URL = 'https://osv.dev/list?ecosystem=&q=frr%20bgpd'
+_BGP_ADVISORIES = {
+    'no_md5': {
+        'severity': 'medium',
+        'title': 'BGP sessions without TCP-MD5 / TCP-AO authentication',
+        'detail': ('No TCP-MD5 (RFC 2385) or TCP-AO (RFC 5925) signature was seen '
+                   'on the BGP session. Unauthenticated sessions are exposed to '
+                   'off-path RST/session-reset attacks and easier hijacking. '
+                   'Enable TCP-MD5/TCP-AO and RPKI Route Origin Validation to '
+                   'reject invalid origins.'),
+        'refs': ['RFC 2385', 'RFC 5925', 'RFC 6811'],
+    },
+    'malformed_attr': {
+        'severity': 'medium',
+        'title': 'Patch bgpd for malformed BGP-UPDATE attribute crashes',
+        'detail': ('Malformed BGP path attributes have repeatedly crashed router '
+                   'BGP daemons (e.g. FRRouting CVE-2023-38802 via a corrupted '
+                   'Tunnel-Encapsulation attribute; CERT VU#347067 covers multiple '
+                   'implementations). The software version is not visible on the '
+                   'wire — check OSV for your bgpd build and patch.'),
+        'refs': ['CVE-2023-38802', 'VU#347067', _BGP_OSV_URL],
+    },
+}
+
+# Classify an ASN. Only 'reserved' / 'documentation' ASNs are truly illegitimate
+# in any AS-path; 'private' (RFC 6996) is normal on internal/DC BGP fabric — which
+# is exactly where a passive Pi is most likely to sit — so it is NOT alerted on.
+def _bgp_asn_class(asn):
+    if asn in (0, 23456, 65535, 4294967295):
+        return 'reserved'
+    if 64496 <= asn <= 64511 or 65536 <= asn <= 65551:   # RFC 5398 documentation
+        return 'documentation'
+    if 64512 <= asn <= 65534 or 4200000000 <= asn <= 4294967294:  # RFC 6996 private
+        return 'private'
+    return None
+
+
+def _ip_to_int(ip):
+    try:
+        a, b, c, d = (int(x) for x in ip.split('.'))
+        return (a << 24) | (b << 16) | (c << 8) | d
+    except (ValueError, AttributeError):
+        return None
+
+
+def _bgp_is_bogon(prefix):
+    """True if an IPv4 CIDR announcement falls inside a bogon/martian net."""
+    try:
+        net, length = prefix.split('/')
+        length = int(length)
+    except ValueError:
+        return False
+    n = _ip_to_int(net)
+    if n is None:
+        return False
+    if length < 8:            # absurdly short — /0../7 (near-default hijack)
+        return True
+    for bnet, blen in _BGP_BOGON_NETS:
+        bn = _ip_to_int(bnet)
+        if bn is None:
+            continue
+        mask = (0xffffffff << (32 - blen)) & 0xffffffff
+        if length >= blen and (n & mask) == (bn & mask):
+            return True
+    return False
+
+
+_BGP_IPRE = r'(\d{1,3}(?:\.\d{1,3}){3})'
+_BGP_CIDR_RE = re.compile(r'^' + _BGP_IPRE + r'/(\d{1,2})\s*$')
+_BGP_HDR_RE = re.compile(r'(?:IP6?\s+)?' + _BGP_IPRE + r'\.(\d+)\s+>\s+' + _BGP_IPRE + r'\.(\d+):')
+
+
+def _parse_bgp_capture(output):
+    """Parse `tcpdump -nn -t -v 'tcp port 179'` text into BGP messages:
+    {src, dst, type, ...}. Tolerant of tcpdump version differences — keys off the
+    'Open/Update/Notification/Keepalive Message' lines and pulls whatever path
+    attributes and NLRI it can from the indented body."""
+    messages = []
+    cur = None
+    flow = (None, None)   # (src, dst) of the current TCP segment
+    nlri_mode = None      # 'announced' | 'withdrawn'
+    md5_seen = ['md5' in output.lower()]
+
+    def flush():
+        if cur is not None:
+            messages.append(cur)
+
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        h = _BGP_HDR_RE.search(line)
+        if h:
+            # 179 side is the sender's BGP port; keep src/dst as printed.
+            flow = (h.group(1), h.group(3))
+        mt = re.search(r'\b(Open|Update|Notification|Keepalive|Route Refresh)\s+Message\b', line)
+        if mt:
+            flush()
+            nlri_mode = None
+            cur = {'src': flow[0], 'dst': flow[1],
+                   'type': mt.group(1).lower().replace(' ', '_'),
+                   'my_as': None, 'holdtime': None, 'bgp_id': None, 'version': None,
+                   'as_path': [], 'origin': None, 'next_hop': None,
+                   'communities': [], 'announced': [], 'withdrawn': [],
+                   'notif_code': None, 'notif_sub': None}
+            if cur['type'] == 'open':
+                m = re.search(r'my AS\s+(\d+)', line)
+                if m:
+                    cur['my_as'] = int(m.group(1))
+                m = re.search(r'Holdtime\s+(\d+)', line)
+                if m:
+                    cur['holdtime'] = int(m.group(1))
+                m = re.search(r'\bID\s+' + _BGP_IPRE, line)
+                if m:
+                    cur['bgp_id'] = m.group(1)
+            if cur['type'] == 'notification':
+                m = re.search(r'Message\s*\(3\),[^,]*,\s*([A-Za-z /]+?)\s*\((\d+)\)', line)
+                if m:
+                    cur['notif_code'] = m.group(1).strip()
+                m = re.search(r'subcode\s+([A-Za-z /]+?)\s*\((\d+)\)', line)
+                if m:
+                    cur['notif_sub'] = m.group(1).strip()
+            continue
+        if cur is None:
+            continue
+        # OPEN continuation
+        if cur['type'] == 'open':
+            if cur['my_as'] is None:
+                m = re.search(r'my AS\s+(\d+)', line)
+                if m:
+                    cur['my_as'] = int(m.group(1))
+            if cur['bgp_id'] is None:
+                m = re.search(r'\bID\s+' + _BGP_IPRE, line)
+                if m:
+                    cur['bgp_id'] = m.group(1)
+        # UPDATE attributes + NLRI
+        if cur['type'] == 'update':
+            # AS numbers come after the final colon (past "length: N, Flags [T]:").
+            ap = re.search(r'AS Path\b.*:\s*([0-9][0-9 {},]*)\s*$', line)
+            if ap and not cur['as_path']:
+                cur['as_path'] = [int(x) for x in re.findall(r'\d+', ap.group(1))]
+            og = re.search(r'\bOrigin\b.*?:\s*(IGP|EGP|Incomplete)', line)
+            if og:
+                cur['origin'] = og.group(1)
+            nh = re.search(r'Next Hop\b.*?:\s*' + _BGP_IPRE, line)
+            if nh:
+                cur['next_hop'] = nh.group(1)
+            if re.search(r'\bCommunity\b', line):
+                for tok in re.findall(r'\b(\d{1,10}:\d{1,10})\b', line):
+                    cur['communities'].append(tok)
+            if re.search(r'blackhole', line, re.I):
+                cur['communities'].append('blackhole')
+            if re.search(r'Updated routes|Advertised routes|Prefixes', line, re.I):
+                nlri_mode = 'announced'
+            elif re.search(r'Withdrawn routes', line, re.I):
+                nlri_mode = 'withdrawn'
+            cidr = _BGP_CIDR_RE.match(line.strip())
+            if cidr and nlri_mode:
+                pfx = f'{cidr.group(1)}/{cidr.group(2)}'
+                cur[nlri_mode].append(pfx)
+    flush()
+    for m in messages:
+        m['md5'] = md5_seen[0]
+    return messages
+
+
+def _bgp_watch_load():
+    try:
+        with open(_BGP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _bgp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_BGP_WATCH_PATH), exist_ok=True)
+        tmp = _BGP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _BGP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_bgp_baseline(action='get'):
+    """Manage the learned BGP baseline (trusted peer ASNs + prefix→origin map).
+    action='reset' re-learns the current peers/origins on the next scan."""
+    with _bgp_watch_lock:
+        if action == 'reset':
+            _bgp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _bgp_watch_load()
+        return {'success': True, 'baseline': {
+            'peers': sorted(b.get('peers') or []),
+            'prefixes': len((b.get('origins') or {})),
+        }}
+
+
+def _bgp_analyze(messages, seconds, baseline, learn=True):
+    """Pure classifier over parsed BGP messages. Returns the result payload
+    (minus interface). Split from capture so the self-test can drive it."""
+    seconds = max(1, int(seconds))
+    opens = [m for m in messages if m['type'] == 'open']
+    updates = [m for m in messages if m['type'] == 'update']
+    notifs = [m for m in messages if m['type'] == 'notification']
+    total = len(messages)
+
+    peers = sorted({m['my_as'] for m in opens if m.get('my_as')})
+    peer_ids = sorted({m['bgp_id'] for m in opens if m.get('bgp_id')})
+    md5 = any(m.get('md5') for m in messages)
+
+    # prefix -> origin AS (rightmost ASN in the path), and per-peer prefix counts
+    origins = {}
+    per_peer_prefixes = {}
+    for m in updates:
+        origin_as = m['as_path'][-1] if m.get('as_path') else None
+        src = m.get('src')
+        for pfx in m.get('announced', []):
+            origins.setdefault(pfx, origin_as)
+            per_peer_prefixes.setdefault(src, set()).add(pfx)
+
+    trusted_peers = set(baseline.get('peers') or [])
+    base_origins = dict(baseline.get('origins') or {})
+    base_counts = dict(baseline.get('prefix_count') or {})
+    have_baseline = bool(trusted_peers or base_origins or baseline.get('peers') is not None)
+    learned = False
+    if learn and not have_baseline and (peers or origins):
+        baseline['peers'] = peers
+        baseline['origins'] = {p: o for p, o in origins.items() if o is not None}
+        baseline['prefix_count'] = {s: len(v) for s, v in per_peer_prefixes.items()}
+        learned = True
+        trusted_peers = set(peers)
+        base_origins = dict(baseline['origins'])
+        have_baseline = True
+
+    findings = []
+    categories = set()
+    advisories = []
+
+    # storm — UPDATE churn
+    upd_rate = round(len(updates) / seconds, 1)
+    if upd_rate >= _BGP_STORM_RATE:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'{len(updates)} BGP UPDATEs in {seconds}s ({upd_rate}/s) '
+                         '— route churn / flooding'))
+    # route leak — per-peer prefix-count spike
+    for src, pfxs in per_peer_prefixes.items():
+        base_n = base_counts.get(src, 0)
+        if len(pfxs) >= _BGP_LEAK_PREFIXES and (not base_n or len(pfxs) > base_n * 5):
+            categories.add('storm')
+            findings.append(('crit', 'storm',
+                             f'peer {src} announced {len(pfxs)} prefixes '
+                             f'(baseline {base_n or "—"}) — possible full-table route leak'))
+
+    # injection — origin hijack (same prefix, different origin AS)
+    if have_baseline:
+        for pfx, origin_as in origins.items():
+            b = base_origins.get(pfx)
+            if b is not None and origin_as is not None and origin_as != b:
+                categories.add('injection')
+                findings.append(('crit', 'injection',
+                                 f'prefix {pfx} now originated by AS{origin_as} '
+                                 f'(baseline AS{b}) — BGP origin hijack'))
+        # sub-prefix hijack — a new more-specific of a baseline prefix
+        for pfx, origin_as in origins.items():
+            if pfx in base_origins:
+                continue
+            for bpfx, bas in base_origins.items():
+                if _bgp_prefix_covers(bpfx, pfx) and origin_as != bas:
+                    categories.add('injection')
+                    findings.append(('crit', 'injection',
+                                     f'more-specific {pfx} (inside baseline {bpfx}) '
+                                     f'from AS{origin_as} — sub-prefix hijack'))
+                    break
+
+    # anomaly — new/rogue peer
+    if have_baseline:
+        for asn in peers:
+            if asn not in trusted_peers:
+                categories.add('anomaly')
+                findings.append(('warn', 'anomaly',
+                                 f'new BGP peer AS{asn} — not in the learned baseline'))
+    # session reset / teardown
+    for m in notifs:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'BGP NOTIFICATION ({m.get("notif_code") or "?"}'
+                         f'{"/" + m["notif_sub"] if m.get("notif_sub") else ""}) '
+                         '— session reset / teardown'))
+    # private / bogon ASN in a received path
+    seen_bad_asn = set()
+    for m in updates:
+        for asn in m.get('as_path', []):
+            klass = _bgp_asn_class(asn)
+            # private ASNs are normal on internal/DC fabric — only alert on
+            # reserved/documentation ASNs, which are never legitimate in a path.
+            if klass in ('reserved', 'documentation') and asn not in seen_bad_asn:
+                seen_bad_asn.add(asn)
+                categories.add('anomaly')
+                findings.append(('warn', 'anomaly',
+                                 f'{klass} ASN {asn} in a received AS-path — route leak / misconfig'))
+        # AS-path loop (an ASN appears more than once non-adjacently)
+        path = m.get('as_path', [])
+        # collapse consecutive repeats (legitimate prepending), then a repeat
+        # of the same ASN is a loop
+        dedup = [a for i, a in enumerate(path) if i == 0 or a != path[i - 1]]
+        if len(dedup) != len(set(dedup)):
+            categories.add('anomaly')
+            findings.append(('warn', 'anomaly',
+                             f'AS-path loop in {" ".join(map(str, path))}'))
+    # bogon / martian prefix announcement
+    bogons = sorted({p for p in origins if _bgp_is_bogon(p)})
+    for p in bogons:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'bogon/martian prefix {p} announced in BGP — route leak or hijack'))
+    # blackhole community
+    if any('blackhole' in c.lower() or '65535:666' in c for m in updates for c in m.get('communities', [])):
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         'BLACKHOLE community (65535:666) seen — RTBH in use (verify it is intended)'))
+
+    # weak session — no TCP-MD5/TCP-AO seen while BGP is present
+    if messages and not md5:
+        categories.add('weak_session')
+        advisories.append(dict(_BGP_ADVISORIES['no_md5'], key='no_md5'))
+        findings.append(('warn', 'weak_session',
+                         'no TCP-MD5/TCP-AO signature on the BGP session — exposed to '
+                         'off-path session-reset attacks'))
+    if updates:
+        advisories.append(dict(_BGP_ADVISORIES['malformed_attr'], key='malformed_attr'))
+
+    order = ['storm', 'injection', 'anomaly', 'weak_session']
+    verdict = next((c for c in order if c in categories), 'clean')
+    if not findings:
+        findings.append(('ok', 'clean', 'No BGP anomalies in the capture window.'))
+
+    prefixes_out = []
+    for pfx in sorted(origins):
+        oa = origins[pfx]
+        prefixes_out.append({'prefix': pfx, 'origin_as': oa,
+                             'baseline_as': base_origins.get(pfx),
+                             'hijack': bool(have_baseline and base_origins.get(pfx) is not None
+                                            and oa is not None and oa != base_origins.get(pfx)),
+                             'bogon': _bgp_is_bogon(pfx)})
+
+    return {
+        'success': True, 'verdict': verdict, 'seconds': seconds,
+        'messages': total, 'opens': len(opens), 'updates': len(updates),
+        'notifications': len(notifs), 'update_per_s': upd_rate, 'learned': learned,
+        'peers': peers, 'peer_ids': peer_ids, 'trusted_peers': sorted(trusted_peers),
+        'md5': md5, 'prefixes': prefixes_out[:100], 'prefix_total': len(origins),
+        'advisories': [{'key': a.get('key'), 'severity': a['severity'],
+                        'title': a['title'], 'detail': a['detail'],
+                        'refs': a.get('refs', [])} for a in advisories],
+        'findings': [{'level': l, 'category': c, 'text': t} for l, c, t in findings],
+        'reasons': [t for _l, _c, t in findings if _l != 'ok'],
+    }
+
+
+def _bgp_prefix_covers(supernet, subnet):
+    """True if CIDR `supernet` strictly contains CIDR `subnet` (more-specific)."""
+    try:
+        sn, sl = supernet.split('/'); sl = int(sl)
+        tn, tl = subnet.split('/'); tl = int(tl)
+    except ValueError:
+        return False
+    if tl <= sl:
+        return False
+    a, b = _ip_to_int(sn), _ip_to_int(tn)
+    if a is None or b is None:
+        return False
+    mask = (0xffffffff << (32 - sl)) & 0xffffffff
+    return (a & mask) == (b & mask)
+
+
+# --- ASN enrichment via Team Cymru IP-to-ASN whois (TCP/43) -----------------
+# Turns raw AS numbers / peer IPs into AS names + owner country. Purely additive
+# and SOFT-FAILING: a NOC that egress-filters outbound TCP/43 just gets IP/AS-
+# number-only output (per Solarflere's note). Results are cached, and a failed
+# lookup is negatively cached for a few minutes so a blocked egress doesn't add
+# a connect-timeout to every scan.
+_CYMRU_HOST = 'whois.cymru.com'
+_CYMRU_PORT = 43
+_CYMRU_TTL = 86400          # ASN mappings are stable — cache a day
+_CYMRU_FAIL_TTL = 300       # after a failure, don't retry for 5 min (fast soft-fail)
+_cymru_cache = {}           # ('ip'|'as', key) -> (ts, value)
+_cymru_lock = threading.Lock()
+_cymru_blocked_until = [0.0]
+
+
+def _cymru_query(lines, timeout):
+    """Send a bulk Team Cymru whois query; return the raw response or None on any
+    failure (soft-fail: outbound TCP/43 may be filtered)."""
+    payload = ('begin\nverbose\n' + '\n'.join(lines) + '\nend\n').encode()
+    try:
+        with socket.create_connection((_CYMRU_HOST, _CYMRU_PORT), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(payload)
+            chunks = []
+            while True:
+                b = s.recv(4096)
+                if not b:
+                    break
+                chunks.append(b)
+        return b''.join(chunks).decode('utf-8', 'replace')
+    except Exception:
+        return None
+
+
+def _parse_cymru(resp, out):
+    now = time.time()
+    for raw in resp.splitlines():
+        line = raw.strip()
+        if not line or '|' not in line or line.lower().startswith('bulk mode') \
+           or 'AS Name' in line:
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) >= 7:            # AS | IP | Prefix | CC | Registry | Alloc | Name
+            asn, ip, prefix, cc = parts[0], parts[1], parts[2], parts[3]
+            name = parts[6]
+            try:
+                asn_i = int(asn)
+            except ValueError:
+                asn_i = None
+            rec = {'asn': asn_i, 'name': name or None,
+                   'prefix': prefix if prefix and prefix != 'NA' else None,
+                   'cc': cc if cc and cc != 'NA' else None}
+            out['ips'][ip] = rec
+            with _cymru_lock:
+                _cymru_cache[('ip', ip)] = (now, rec)
+            if asn_i is not None:
+                out['asns'].setdefault(asn_i, name or None)
+                with _cymru_lock:
+                    _cymru_cache[('as', asn_i)] = (now, name or None)
+        elif len(parts) >= 5:          # AS | CC | Registry | Alloc | Name
+            try:
+                asn_i = int(parts[0])
+            except ValueError:
+                continue
+            name = parts[4]
+            out['asns'][asn_i] = name or None
+            with _cymru_lock:
+                _cymru_cache[('as', asn_i)] = (now, name or None)
+
+
+def _cymru_asn_lookup(ips=None, asns=None, timeout=4):
+    """Enrich IPs -> {asn,name,prefix,cc} and ASNs -> name via Team Cymru. Cached;
+    soft-fails to whatever the cache holds (possibly nothing) so callers degrade
+    to IP/AS-number-only output. `out['ok']` is False when the live lookup was
+    skipped/failed and nothing came back."""
+    ips = sorted({i for i in (ips or []) if i})
+    asns = sorted({int(a) for a in (asns or []) if a is not None})
+    out = {'ips': {}, 'asns': {}, 'ok': False, 'filtered': False}
+    if not ips and not asns:
+        out['ok'] = True
+        return out
+    now = time.time()
+    need_ips, need_asns = [], []
+    with _cymru_lock:
+        for ip in ips:
+            c = _cymru_cache.get(('ip', ip))
+            if c and now - c[0] < _CYMRU_TTL:
+                out['ips'][ip] = c[1]
+            else:
+                need_ips.append(ip)
+        for a in asns:
+            c = _cymru_cache.get(('as', a))
+            if c and now - c[0] < _CYMRU_TTL:
+                out['asns'][a] = c[1]
+            else:
+                need_asns.append(a)
+        blocked = now < _cymru_blocked_until[0]
+    if need_ips or need_asns:
+        if blocked:
+            out['filtered'] = True
+        else:
+            resp = _cymru_query(need_ips + [f'AS{a}' for a in need_asns], timeout)
+            if resp:
+                _parse_cymru(resp, out)
+            else:
+                out['filtered'] = True
+                with _cymru_lock:
+                    _cymru_blocked_until[0] = now + _CYMRU_FAIL_TTL
+    out['ok'] = not out['filtered'] or bool(out['ips'] or out['asns'])
+    return out
+
+
+def _bgp_capture(interface, seconds):
+    """Run one passive tcpdump BGP window and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '1500', '-c', '20000', 'tcp', 'port', '179'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_bgp_watch(interface=None, seconds=15, learn=True, quick=False, enrich=True):
+    """Passive BGP path/security scanner (detection-only). Captures BGP for a few
+    seconds and classifies the edge: injection (hijack) / anomaly / storm /
+    weak_session / clean, with CVE/OSV advisories. Learns peers + prefix origins
+    on first run; never opens a session or announces a route.
+
+    enrich=True adds Team Cymru ASN names/owner (outbound TCP/43, soft-fails to
+    AS-number-only if egress filters it)."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _bgp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    messages = _parse_bgp_capture(text)
+
+    with _bgp_watch_lock:
+        baseline = _bgp_watch_load()
+        result = _bgp_analyze(messages, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _bgp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _bgp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_BGP_EVENTS_CAP:]
+            _bgp_watch_save(b)
+
+    # ASN enrichment (additive, soft-failing). Kept out of _bgp_analyze so the
+    # self-test stays offline/deterministic.
+    if enrich and (result.get('peers') or result.get('prefixes')):
+        asns = set(result.get('peers') or [])
+        for p in result.get('prefixes', []):
+            if p.get('origin_as') is not None:
+                asns.add(p['origin_as'])
+        enr = _cymru_asn_lookup(ips=result.get('peer_ids') or [], asns=asns)
+        result['asn_names'] = {str(k): v for k, v in enr['asns'].items() if v}
+        result['enriched'] = enr['ok'] and bool(enr['asns'] or enr['ips'])
+        if enr.get('filtered'):
+            result['enrich_note'] = ('ASN name enrichment unavailable — needs '
+                                     'outbound TCP/43 to whois.cymru.com; showing '
+                                     'AS numbers only.')
+        for p in result.get('prefixes', []):
+            oa = p.get('origin_as')
+            if oa is not None and enr['asns'].get(oa):
+                p['origin_name'] = enr['asns'][oa]
+        result['peer_info'] = enr.get('ips') or {}
+
+    if not messages:
+        result['note'] = ('No BGP seen — BGP is unicast TCP/179 between routers, so '
+                          'the Pi must be inline, on a SPAN/mirror, or a peer to '
+                          'observe it (unlike OSPF, it is not on the broadcast domain).')
+    result['interface'] = iface
+    return result
+
+
+def _bgp_selftest():
+    """Self-test the BGP detectors with synthetic tcpdump captures (no root, no
+    live traffic), plus an optional Scapy end-to-end leg (scapy.contrib.bgp ->
+    pcap -> tcpdump -> parse). Mirrors the OSPF/IGMP self-tests."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        msgs = _parse_bgp_capture(text)
+        res = _bgp_analyze(msgs, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'messages': len(msgs), 'pass': ok})
+        return res
+
+    base = {'peers': [65001, 65002],
+            'origins': {'93.184.216.0/24': 65002, '45.33.0.0/16': 65003},
+            'prefix_count': {'10.0.0.1': 2}}
+
+    clean = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  Origin (1), length: 1, Flags [T]: IGP",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65002",
+        "\t  Updated routes:",
+        "\t    93.184.216.0/24",
+    ])
+    run('clean', clean, 15, base, 'clean')
+
+    hijack = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65666",
+        "\t  Updated routes:",
+        "\t    93.184.216.0/24",
+    ])
+    run('injection-hijack', hijack, 15, base, 'injection')
+
+    subprefix = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65666",
+        "\t  Updated routes:",
+        "\t    93.184.216.128/25",
+    ])
+    run('injection-subprefix', subprefix, 15, base, 'injection')
+
+    notif = "\n".join([
+        "10.0.0.9.179 > 10.0.0.2.179: Flags [P.], length 40: BGP md5",
+        "\tNotification Message (3), length: 21, Cease (6), subcode Administrative Reset (4)",
+    ])
+    run('anomaly-notif', notif, 15, base, 'anomaly')
+
+    bogon = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65002",
+        "\t  Updated routes:",
+        "\t    192.168.0.0/16",
+    ])
+    run('anomaly-bogon', bogon, 15, base, 'anomaly')
+
+    # parser check
+    msgs = _parse_bgp_capture(clean)
+    up = [m for m in msgs if m['type'] == 'update']
+    parse_ok = bool(up and up[0]['as_path'] == [65001, 65002] and
+                    '93.184.216.0/24' in up[0]['announced'])
+    scenarios.append({'name': 'update-parse',
+                      'expect': 'path=[65001,65002] pfx=93.184.216.0/24',
+                      'got': str({'as_path': up[0]['as_path'], 'announced': up[0]['announced']} if up else None),
+                      'pass': parse_ok})
+
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import IP, TCP, Ether, wrpcap  # noqa
+        try:
+            from scapy.contrib.bgp import BGPHeader, BGPKeepAlive
+        except Exception:
+            BGPHeader = None
+        if BGPHeader is not None and _have('tcpdump'):
+            pkt = (Ether() / IP(src='10.0.0.1', dst='10.0.0.2') /
+                   TCP(sport=179, dport=50000, flags='PA') /
+                   BGPHeader(type=4) / BGPKeepAlive())
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'tcp', 'port', '179'],
+                       timeout=10)
+            parsed = _parse_bgp_capture(res['out'])
+            scapy_result = {'ran': True, 'parsed_messages': len(parsed),
+                            'pass': True, 'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+def do_routing_selftest():
+    """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
+    plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
+    the web 'validate detectors' panel. No root, no live traffic, no persistence."""
+    suites = {'igmp': _igmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+              'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
+    return {
+        'success': all(s['success'] for s in suites.values()),
+        'scapy_available': _have_scapy(),
+        'suites': {k: {
+            'success': v['success'],
+            'passed': sum(1 for s in v['scenarios'] if s['pass']),
+            'total': len(v['scenarios']),
+            'scenarios': v['scenarios'],
+            'scapy': v.get('scapy'),
+        } for k, v in suites.items()},
+    }
+
+
+# --------------------------------------------------------------------------
+# BGP Route Collector (receive-only speaker) + Path Asymmetry (OWD) + correlator
+# --------------------------------------------------------------------------
+# Control-plane truth (bgp_speaker.BGPSpeaker's Adj-RIB-In) tied to data-plane
+# measurement (path_asymmetry's measured one-way delay), via path_asymmetry.
+# correlate(). Both the collector session and the OWD reflector are long-lived
+# daemons, so these managers keep a single instance each with start/stop/status.
+
+_bgp_collector = {'speaker': None, 'events': []}     # correlated asymmetry events
+_bgp_collector_lock = threading.Lock()
+_owd_reflector = {'reflector': None}
+_owd_lock = threading.Lock()
+_COLLECTOR_EVENT_CAP = 100
+
+
+def _collector_on_update(upd, changed):
+    """RIB update hook — reserved for pushing churn into a live correlation feed.
+    Kept lightweight; correlation is done on demand in do_path_asymmetry."""
+    return None
+
+
+def do_bgp_collector(action='status', peer_ip=None, peer_as=None, local_as=None,
+                     router_id=None, port=179, hold=90):
+    """Manage the receive-only BGP collector session. Actions: start / stop /
+    status / rib. Never advertises a route — it only learns the peer's RIB."""
+    with _bgp_collector_lock:
+        sp = _bgp_collector['speaker']
+        if action == 'start':
+            if sp and sp.state != 'Idle':
+                return {'success': False, 'error': 'collector already running',
+                        'status': sp.status()}
+            try:
+                ipaddress.ip_address(peer_ip or '')
+                ipaddress.ip_address(router_id or '')
+                peer_as = int(peer_as); local_as = int(local_as)
+                port = _clamp_int(port, 179, 1, 65535)
+                hold = _clamp_int(hold, 90, 0, 65535)
+            except (ValueError, TypeError):
+                return {'success': False, 'error': 'need valid peer_ip, router_id, '
+                        'peer_as, local_as'}
+            if not (0 < peer_as <= 0xFFFFFFFF and 0 < local_as <= 0xFFFFFFFF):
+                return {'success': False, 'error': 'AS numbers out of range'}
+            sp = bgp_speaker.BGPSpeaker(peer_ip, peer_as, local_as, router_id,
+                                        hold_time=hold, port=port,
+                                        on_update=_collector_on_update)
+            sp.start()
+            _bgp_collector['speaker'] = sp
+            time.sleep(0.3)
+            return {'success': True, 'status': sp.status()}
+        if action == 'stop':
+            if sp:
+                sp.stop()
+            return {'success': True, 'stopped': True}
+        if action == 'rib':
+            limit = 200
+            return {'success': True,
+                    'rib': sp.rib.snapshot(limit) if sp else {'total': 0, 'routes': []},
+                    'state': sp.state if sp else 'Idle'}
+        # status (default)
+        return {'success': True,
+                'status': sp.status() if sp else {'state': 'Idle', 'peer_ip': None},
+                'events': _bgp_collector['events'][-20:]}
+
+
+def do_owd_reflector(action='status', port=path_asymmetry.DEFAULT_PORT):
+    """Manage the local one-way-delay reflector so another node can probe THIS
+    box for measured asymmetry. Actions: start / stop / status."""
+    with _owd_lock:
+        r = _owd_reflector['reflector']
+        if action == 'start':
+            if r and r._thread and r._thread.is_alive():
+                return {'success': True, 'already_running': True, 'port': r.port}
+            port = _clamp_int(port, path_asymmetry.DEFAULT_PORT, 1, 65535)
+            try:
+                r = path_asymmetry.Reflector(port=port)
+                r.start()
+            except OSError as e:
+                return {'success': False, 'error': f'could not bind udp/{port}: {e}'}
+            _owd_reflector['reflector'] = r
+            return {'success': True, 'running': True, 'port': port}
+        if action == 'stop':
+            if r:
+                r.stop()
+            return {'success': True, 'stopped': True}
+        running = bool(r and r._thread and r._thread.is_alive())
+        return {'success': True, 'running': running,
+                'port': r.port if r else path_asymmetry.DEFAULT_PORT,
+                'reflected': r.count if r else 0}
+
+
+def do_path_asymmetry(target, port=path_asymmetry.DEFAULT_PORT, count=20,
+                      threshold_ms=5.0, clock_synced=False):
+    """Measure one-way-delay asymmetry to a target running the OWD reflector, and
+    correlate any asymmetry event against the BGP collector's RIB (control-plane
+    truth). Falls back to a note if no reflector answers."""
+    try:
+        ipaddress.ip_address(target or '')
+    except (ValueError, TypeError):
+        # allow hostnames — resolve
+        try:
+            target = socket.gethostbyname(target)
+        except (OSError, TypeError):
+            return {'success': False, 'error': 'invalid or unresolvable target'}
+    port = _clamp_int(port, path_asymmetry.DEFAULT_PORT, 1, 65535)
+    count = _clamp_int(count, 20, 5, 100)
+    det = path_asymmetry.AsymmetryDetector(threshold_ms=float(threshold_ms),
+                                           clock_synced=bool(clock_synced), target=target)
+    samples = path_asymmetry.probe_series(target, port=port, count=count, interval=0.03)
+    events = []
+    for s in samples:
+        ev = det.add(*s)
+        if ev:
+            events.append(ev)
+    # correlate events against the live RIB (control-plane truth)
+    rib = None
+    with _bgp_collector_lock:
+        sp = _bgp_collector['speaker']
+        if sp and sp.state == 'Established':
+            rib = sp.rib
+    correlated = [path_asymmetry.correlate(e, rib) for e in events] if rib else events
+    if correlated:
+        with _bgp_collector_lock:
+            _bgp_collector['events'] = (_bgp_collector['events'] + correlated)[-_COLLECTOR_EVENT_CAP:]
+    out = {'success': True, 'target': target, 'port': port,
+           'probes_sent': count, 'replies': len(samples),
+           'summary': det.summary(), 'events': correlated,
+           'rib_correlation': bool(rib)}
+    if not samples:
+        out['note'] = ('No reply from the OWD reflector at %s:%d. Run the reflector '
+                       'on the target (`python3 path_asymmetry.py reflector %d`) or '
+                       'enable it there, then retry. Without a reflector, only the '
+                       'passive TTL hop-count fallback is available.' % (target, port, port))
+    return out
+
+
+# --------------------------------------------------------------------------
 # PCAP Analyzer: triage an uploaded capture with tshark/capinfos
 # --------------------------------------------------------------------------
 
@@ -3417,9 +5279,40 @@ def _configure_lldpd():
     _run(['systemctl', 'restart', 'lldpd'], timeout=15)
 
 
+def _install_scapy():
+    """Install the Scapy Python module (used by the scanners' end-to-end self-test
+    leg). Prefers the Debian package python3-scapy so it lands in the system
+    interpreter the service runs under; falls back to pip (PEP-668 override on
+    Pi OS). Idempotent."""
+    if _have_scapy():
+        return {'success': True, 'already_installed': True, 'tool': 'scapy',
+                'message': 'scapy is already installed.'}
+    env = dict(os.environ)
+    env['DEBIAN_FRONTEND'] = 'noninteractive'
+    res = {'err': '', 'out': ''}
+    if _have('apt-get'):
+        res = _run(['apt-get', 'install', '-y', 'python3-scapy'], timeout=300, env=env)
+        if not _have_scapy():
+            _run(['apt-get', 'update', '-y'], timeout=180, env=env)
+            res = _run(['apt-get', 'install', '-y', 'python3-scapy'], timeout=300, env=env)
+    if not _have_scapy():
+        import sys
+        py = sys.executable or 'python3'
+        res = _run([py, '-m', 'pip', 'install', '--break-system-packages', 'scapy'],
+                   timeout=300, env=env)
+    if not _have_scapy():
+        tail = (res.get('err') or res.get('out') or '').strip()[-400:]
+        return {'success': False, 'tool': 'scapy',
+                'error': 'Could not install scapy (tried apt python3-scapy and pip). '
+                         + (f'Detail: {tail}' if tail else '')}
+    return {'success': True, 'tool': 'scapy', 'message': 'Installed scapy.'}
+
+
 def do_install_tool(tool):
     """Install a missing network tool on demand via apt. Whitelisted packages
     only. The Ragnar service runs as root, so apt is invoked directly."""
+    if tool == 'scapy':
+        return _install_scapy()
     entry = _NET_TOOL_PKGS.get(tool)
     if entry is None:
         return {'success': False, 'error': f'Unknown or non-installable tool: {tool}'}
@@ -3612,6 +5505,107 @@ def register_network_diagnostics(app, logger=None):
         _log("net/mac-watch-reset")
         return jsonify(do_mac_watch_reset())
 
+    @app.route('/api/net/igmp-watch', methods=['GET'])
+    def net_igmp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 30)
+        _log(f"net/igmp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_igmp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/igmp-baseline', methods=['GET', 'POST'])
+    def net_igmp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/igmp-baseline {action}")
+        return jsonify(do_igmp_baseline(action))
+
+    @app.route('/api/net/ospf-watch', methods=['GET'])
+    def net_ospf_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        _log(f"net/ospf-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ospf_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ospf-baseline', methods=['GET', 'POST'])
+    def net_ospf_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ospf-baseline {action}")
+        return jsonify(do_ospf_baseline(action))
+
+    @app.route('/api/net/bgp-watch', methods=['GET'])
+    def net_bgp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        enrich = request.args.get('enrich', '1') not in ('0', 'false', 'no')
+        _log(f"net/bgp-watch iface={iface or 'default-route'} secs={secs} enrich={enrich}")
+        return jsonify(do_bgp_watch(interface=iface, seconds=secs, enrich=enrich))
+
+    @app.route('/api/net/bgp-baseline', methods=['GET', 'POST'])
+    def net_bgp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/bgp-baseline {action}")
+        return jsonify(do_bgp_baseline(action))
+
+    @app.route('/api/net/bgp-collector', methods=['GET', 'POST'])
+    def net_bgp_collector():
+        if request.method == 'GET':
+            action = (request.args.get('action') or 'status').strip()
+            if action not in ('status', 'rib'):
+                action = 'status'
+            _log(f"net/bgp-collector {action}")
+            return jsonify(do_bgp_collector(action))
+        data = request.get_json(silent=True) or {}
+        action = (data.get('action') or 'status').strip()
+        if action not in ('start', 'stop', 'status', 'rib'):
+            return _bad('action must be start/stop/status/rib')
+        _log(f"net/bgp-collector {action} peer={data.get('peer_ip')}")
+        return jsonify(do_bgp_collector(
+            action, peer_ip=data.get('peer_ip'), peer_as=data.get('peer_as'),
+            local_as=data.get('local_as'), router_id=data.get('router_id'),
+            port=data.get('port', 179), hold=data.get('hold', 90)))
+
+    @app.route('/api/net/owd-reflector', methods=['GET', 'POST'])
+    def net_owd_reflector():
+        if request.method == 'GET':
+            return jsonify(do_owd_reflector('status'))
+        data = request.get_json(silent=True) or {}
+        action = (data.get('action') or 'status').strip()
+        if action not in ('start', 'stop', 'status'):
+            return _bad('action must be start/stop/status')
+        _log(f"net/owd-reflector {action}")
+        return jsonify(do_owd_reflector(action, port=data.get('port', path_asymmetry.DEFAULT_PORT)))
+
+    @app.route('/api/net/path-asymmetry', methods=['POST'])
+    def net_path_asymmetry():
+        data = request.get_json(silent=True) or {}
+        target = (data.get('target') or '').strip()
+        if not target:
+            return _bad('target required')
+        _log(f"net/path-asymmetry target={target}")
+        return jsonify(do_path_asymmetry(
+            target, port=data.get('port', path_asymmetry.DEFAULT_PORT),
+            count=data.get('count', 20), threshold_ms=data.get('threshold_ms', 5.0),
+            clock_synced=bool(data.get('clock_synced', False))))
+
+    @app.route('/api/net/routing-selftest', methods=['GET'])
+    def net_routing_selftest():
+        _log("net/routing-selftest")
+        return jsonify(do_routing_selftest())
+
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():
         _log("net/identity")
@@ -3715,3 +5709,184 @@ def register_network_diagnostics(app, logger=None):
         except Exception:
             pass
     return app
+
+
+# --------------------------------------------------------------------------
+# Small CLI — currently the IGMP Watch scanner and its self-test, so the
+# passive multicast checks can run standalone (cron, SSH, CI) without the web
+# app.  Usage:
+#     python3 network_diagnostics.py igmp-watch [--iface eth0] [--seconds 12] [--json]
+#     python3 network_diagnostics.py igmp-selftest [--json]
+# --------------------------------------------------------------------------
+
+def _cli(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        prog='network_diagnostics',
+        description='Ragnar passive network diagnostics (CLI subset).')
+    sub = p.add_subparsers(dest='cmd')
+
+    w = sub.add_parser('igmp-watch', help='passive IGMP-snooping security scan')
+    w.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    w.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-30)')
+    w.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    w.add_argument('--json', action='store_true', help='emit JSON')
+
+    st = sub.add_parser('igmp-selftest', help='self-test the IGMP detectors (no root)')
+    st.add_argument('--json', action='store_true', help='emit JSON')
+
+    o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
+    o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    o.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    o.add_argument('--json', action='store_true', help='emit JSON')
+
+    ost = sub.add_parser('ospf-selftest', help='self-test the OSPF detectors (no root)')
+    ost.add_argument('--json', action='store_true', help='emit JSON')
+
+    b = sub.add_parser('bgp-watch', help='passive BGP path/security scan')
+    b.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    b.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    b.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    b.add_argument('--no-enrich', action='store_true', help='skip Team Cymru ASN enrichment (no TCP/43)')
+    b.add_argument('--json', action='store_true', help='emit JSON')
+
+    bst = sub.add_parser('bgp-selftest', help='self-test the BGP detectors (no root)')
+    bst.add_argument('--json', action='store_true', help='emit JSON')
+
+    args = p.parse_args(argv)
+    if args.cmd == 'igmp-watch':
+        r = do_igmp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            v = r['verdict'].upper()
+            print(f"IGMP Watch [{r['interface']}] {r['seconds']}s: {v}  "
+                  f"({r['packets']} msgs, {r['rate_per_s']}/s)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            if r.get('queriers'):
+                print(f"  queriers: {', '.join(r['queriers'])}")
+            for g in r.get('groups', []):
+                flag = ' *NEW*' if g.get('new') else ''
+                nm = f" {g['name']}" if g.get('name') else ''
+                print(f"  group {g['group']}{nm} [{g['scope']}]"
+                      f" <- {', '.join(g['members'])}{flag}")
+            for f in r.get('findings', []):
+                print(f"  [{f['level']}] {f['text']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'igmp-selftest':
+        r = _igmp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                mark = 'PASS' if s['pass'] else 'FAIL'
+                print(f"  [{mark}] {s['name']}: expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"groups={sc.get('groups')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"IGMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ospf-watch':
+        r = do_ospf_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"OSPF Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packets']} pkts, {r['hellos']} hello, {r['ls_updates']} LSU)")
+            if r.get('note'):
+                print(f"  note: {r['note']}")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            if r.get('auth_types'):
+                print(f"  auth types seen: {r['auth_types']}")
+            for rt in r.get('routers', []):
+                print(f"  router {rt['router_id']}{' *NEW*' if rt.get('new') else ''}"
+                      f" <- {', '.join(rt['sources'])}")
+            for a in r.get('advisories', []):
+                print(f"  [advisory:{a['severity']}] {a['title']}"
+                      f"{' (' + ', '.join(a['refs']) + ')' if a.get('refs') else ''}")
+            for f in r.get('findings', []):
+                print(f"  [{f['level']}] {f['text']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ospf-selftest':
+        r = _ospf_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"parsed={sc.get('parsed_packets')} auth={sc.get('auth')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"OSPF self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'bgp-watch':
+        r = do_bgp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn, enrich=not args.no_enrich)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"BGP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['messages']} msgs, {r['updates']} UPDATE, {r['prefix_total']} prefixes)")
+            if r.get('note'):
+                print(f"  note: {r['note']}")
+            if r.get('enrich_note'):
+                print(f"  {r['enrich_note']}")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            if r.get('peers'):
+                names = r.get('asn_names') or {}
+                ps = ', '.join('AS' + str(a) + (' (' + names[str(a)] + ')' if names.get(str(a)) else '') for a in r['peers'])
+                print(f"  peers: {ps} · MD5: {r['md5']}")
+            for a in r.get('advisories', []):
+                print(f"  [advisory:{a['severity']}] {a['title']}"
+                      f"{' (' + ', '.join(a['refs']) + ')' if a.get('refs') else ''}")
+            for f in r.get('findings', []):
+                print(f"  [{f['level']}] {f['text']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'bgp-selftest':
+        r = _bgp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"parsed={sc.get('parsed_messages')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"BGP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    p.print_help()
+    return 2
+
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(_cli())
