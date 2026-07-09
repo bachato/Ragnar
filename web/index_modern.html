@@ -1465,7 +1465,7 @@
                     <p class="text-xs text-amber-300/90 mb-2"><strong>Receive-only</strong> — the collector opens a passive BGP session to learn the peer's RIB but <strong>never advertises or withdraws a route</strong>. Pairs the routing truth (which AS should originate a prefix, whether it's flapping) with a measured <strong>one-way-delay</strong> probe, so a path-asymmetry event can be attributed to a real routing change vs. a pure data-plane shift.</p>
                     <p class="text-sm text-gray-400 mb-3">Point the collector at a router willing to peer (configure the Pi's AS as a passive/route-server client). Run the <strong>OWD reflector</strong> on the far node (or here) so the other side can measure delay in both directions; asymmetry uses the Paxson min-pair estimator to cancel clock offset, so it reports <em>change-sensitive</em> asymmetry unless both clocks are PTP/GPS-synced. Events are correlated against the live RIB when the collector is <span class="font-mono">Established</span>.</p>
                     <div class="grid sm:grid-cols-2 gap-4">
-                        <div class="border border-slate-700 rounded p-3">
+                        <div class="min-w-0 border border-slate-700 rounded p-3">
                             <h4 class="text-sm font-semibold mb-2 text-gray-200">Receive-only collector</h4>
                             <div class="flex flex-col gap-2">
                                 <input id="bgpc-peer" type="text" autocomplete="off" placeholder="peer IP (e.g. 10.0.0.1)" class="w-full min-w-0 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
@@ -1483,7 +1483,7 @@
                             </div>
                             <div id="bgpc-results" class="hidden mt-2 overflow-x-auto text-sm"></div>
                         </div>
-                        <div class="border border-slate-700 rounded p-3">
+                        <div class="min-w-0 border border-slate-700 rounded p-3">
                             <h4 class="text-sm font-semibold mb-2 text-gray-200">One-way-delay probe</h4>
                             <div class="flex flex-col gap-2">
                                 <div class="flex flex-wrap items-center gap-2">
