@@ -1459,10 +1459,53 @@
                     </div>
                     <div id="bgp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- BGP Collector + Path Asymmetry (OWD) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">BGP Collector &amp; Path Asymmetry <span class="text-xs font-normal text-gray-500">(control-plane ↔ data-plane)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2"><strong>Receive-only</strong> — the collector opens a passive BGP session to learn the peer's RIB but <strong>never advertises or withdraws a route</strong>. Pairs the routing truth (which AS should originate a prefix, whether it's flapping) with a measured <strong>one-way-delay</strong> probe, so a path-asymmetry event can be attributed to a real routing change vs. a pure data-plane shift.</p>
+                    <p class="text-sm text-gray-400 mb-3">Point the collector at a router willing to peer (configure the Pi's AS as a passive/route-server client). Run the <strong>OWD reflector</strong> on the far node (or here) so the other side can measure delay in both directions; asymmetry uses the Paxson min-pair estimator to cancel clock offset, so it reports <em>change-sensitive</em> asymmetry unless both clocks are PTP/GPS-synced. Events are correlated against the live RIB when the collector is <span class="font-mono">Established</span>.</p>
+                    <div class="grid sm:grid-cols-2 gap-4">
+                        <div class="border border-slate-700 rounded p-3">
+                            <h4 class="text-sm font-semibold mb-2 text-gray-200">Receive-only collector</h4>
+                            <div class="flex flex-col gap-2">
+                                <input id="bgpc-peer" type="text" autocomplete="off" placeholder="peer IP (e.g. 10.0.0.1)" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <div class="flex gap-2">
+                                    <input id="bgpc-peeras" type="number" min="1" placeholder="peer AS" title="the peer router's ASN" class="w-1/2 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                    <input id="bgpc-localas" type="number" min="1" placeholder="our AS" title="the ASN Ragnar presents" class="w-1/2 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                </div>
+                                <input id="bgpc-rid" type="text" autocomplete="off" placeholder="our router-id (e.g. 10.0.0.9)" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <div class="flex flex-wrap gap-2">
+                                    <button onclick="bgpCollector('start')" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-2 rounded text-sm">Start</button>
+                                    <button onclick="bgpCollector('stop')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Stop</button>
+                                    <button onclick="bgpCollector('status')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Status</button>
+                                    <button onclick="bgpCollector('rib')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm" title="Show the learned Adj-RIB-In">RIB</button>
+                                </div>
+                            </div>
+                            <div id="bgpc-results" class="hidden mt-2 overflow-x-auto text-sm"></div>
+                        </div>
+                        <div class="border border-slate-700 rounded p-3">
+                            <h4 class="text-sm font-semibold mb-2 text-gray-200">One-way-delay probe</h4>
+                            <div class="flex flex-col gap-2">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <button onclick="owdReflector('start')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm" title="Run the local reflector so a remote node can probe this box">Reflector: Start</button>
+                                    <button onclick="owdReflector('stop')" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Stop</button>
+                                    <span id="owd-reflector-status" class="text-xs text-gray-400"></span>
+                                </div>
+                                <input id="pa-target" type="text" autocomplete="off" placeholder="target running a reflector (IP/host)" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <div class="flex gap-2 items-center">
+                                    <input id="pa-count" type="number" min="5" max="100" value="20" title="probe count" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                    <label class="text-xs text-gray-400 flex items-center gap-1"><input id="pa-synced" type="checkbox" class="accent-Ragnar-600"> clocks PTP/GPS-synced</label>
+                                    <button onclick="runPathAsymmetry()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-2 rounded text-sm ml-auto">Measure</button>
+                                </div>
+                            </div>
+                            <div id="pa-results" class="hidden mt-2 overflow-x-auto text-sm"></div>
+                        </div>
+                    </div>
+                </div>
                 <!-- Routing-scanner self-test + Scapy -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · OSPF · BGP)</span></h3>
+                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · OSPF · BGP · speaker · OWD)</span></h3>
                         <div id="scapy-status" class="text-xs text-gray-400"></div>
                     </div>
                     <p class="text-sm text-gray-400 mb-3 mt-1">Validates the IGMP, OSPF and BGP detectors by running each classifier against crafted attack captures — no root, no live traffic. Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span>, so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
@@ -5760,7 +5803,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-asn"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-bgpcol"></script>
 
 </body>
 </html>

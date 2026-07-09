@@ -2841,6 +2841,111 @@ async function bgpTrustBaseline() {
     }
 }
 
+// ---- BGP receive-only collector + one-way-delay path asymmetry -------------
+const _BGP_STATE_STYLE = {
+    Established: 'text-green-400', OpenConfirm: 'text-cyan-400', OpenSent: 'text-cyan-400',
+    Connect: 'text-amber-300', Active: 'text-amber-300', Idle: 'text-gray-400',
+};
+async function bgpCollector(action) {
+    const out = document.getElementById('bgpc-results');
+    if (out) { out.classList.remove('hidden'); out.innerHTML = '<span class="text-gray-400">…</span>'; }
+    try {
+        let d;
+        if (action === 'start') {
+            const body = {
+                action: 'start',
+                peer_ip: (document.getElementById('bgpc-peer').value || '').trim(),
+                peer_as: parseInt(document.getElementById('bgpc-peeras').value, 10),
+                local_as: parseInt(document.getElementById('bgpc-localas').value, 10),
+                router_id: (document.getElementById('bgpc-rid').value || '').trim(),
+            };
+            d = await postAPI('/api/net/bgp-collector', body);
+        } else {
+            d = await postAPI('/api/net/bgp-collector', { action });
+        }
+        if (!out) return;
+        if (!d.success) { out.innerHTML = '<span class="text-red-300">' + escapeHtml(d.error || 'failed') + '</span>'; return; }
+        if (action === 'rib') {
+            const rib = d.rib || { total: 0, routes: [] };
+            let h = '<div class="text-xs text-gray-400 mb-1">RIB: ' + rib.total + ' prefixes · session ' + escapeHtml(d.state || '?') + '</div>';
+            if (rib.routes && rib.routes.length) {
+                h += '<table class="w-full text-xs"><tr class="text-gray-500 text-left"><th class="pr-3">Prefix</th><th class="pr-3">Origin AS</th><th class="pr-3">AS-path</th><th>Flapping</th></tr>';
+                for (const r of rib.routes) {
+                    h += '<tr><td class="pr-3 font-mono">' + escapeHtml(r.prefix) + '</td><td class="pr-3">' + escapeHtml(String(r.origin_as ?? '?')) + '</td><td class="pr-3 font-mono text-gray-400">' + escapeHtml((r.as_path || []).join(' ')) + '</td><td>' + (r.flapping ? '<span class="text-red-300">yes</span>' : '<span class="text-gray-500">no</span>') + '</td></tr>';
+                }
+                h += '</table>';
+            } else { h += '<div class="text-gray-500 text-xs">no prefixes learned yet</div>'; }
+            out.innerHTML = h;
+            return;
+        }
+        const st = (d.status || {});
+        const cls = _BGP_STATE_STYLE[st.state] || 'text-gray-400';
+        let h = '<div>Session: <span class="' + cls + ' font-semibold">' + escapeHtml(st.state || 'Idle') + '</span>';
+        if (st.peer_ip) h += ' <span class="text-gray-400">peer ' + escapeHtml(st.peer_ip) + ' AS' + escapeHtml(String(st.peer_as ?? '?')) + '</span>';
+        if (st.rib && typeof st.rib.total === 'number') h += ' · <span class="text-gray-400">' + st.rib.total + ' prefixes' + (st.rib.flapping ? ', ' + st.rib.flapping + ' flapping' : '') + '</span>';
+        h += '</div>';
+        if (action === 'start') addConsoleMessage('BGP collector starting toward ' + (st.peer_ip || '?') + ' (receive-only)', 'info');
+        if (action === 'stop') addConsoleMessage('BGP collector stopped', 'info');
+        out.innerHTML = h;
+    } catch (e) {
+        if (out) out.innerHTML = '<span class="text-red-300">' + escapeHtml(e.message) + '</span>';
+    }
+}
+async function owdReflector(action) {
+    const span = document.getElementById('owd-reflector-status');
+    try {
+        const d = await postAPI('/api/net/owd-reflector', { action });
+        if (!span) return;
+        if (!d.success) { span.innerHTML = '<span class="text-red-300">' + escapeHtml(d.error || 'failed') + '</span>'; return; }
+        if (d.running || d.already_running) span.innerHTML = '<span class="text-green-400">reflecting on udp/' + (d.port || '?') + '</span>';
+        else span.innerHTML = '<span class="text-gray-500">stopped</span>';
+    } catch (e) { if (span) span.innerHTML = '<span class="text-red-300">' + escapeHtml(e.message) + '</span>'; }
+}
+async function runPathAsymmetry() {
+    const out = document.getElementById('pa-results');
+    if (!out) return;
+    const target = (document.getElementById('pa-target').value || '').trim();
+    if (!target) { out.classList.remove('hidden'); out.innerHTML = '<span class="text-amber-300">enter a target</span>'; return; }
+    out.classList.remove('hidden');
+    out.innerHTML = '<span class="text-gray-400">measuring one-way delay…</span>';
+    try {
+        const body = {
+            target,
+            count: parseInt(document.getElementById('pa-count').value, 10) || 20,
+            clock_synced: document.getElementById('pa-synced').checked,
+        };
+        const d = await postAPI('/api/net/path-asymmetry', body);
+        if (!d.success) { out.innerHTML = '<span class="text-red-300">' + escapeHtml(d.error || 'failed') + '</span>'; return; }
+        const s = d.summary || {};
+        let h = '<div class="text-xs text-gray-400 mb-1">' + d.replies + '/' + d.probes_sent + ' replies · state <span class="' + (s.state === 'asymmetric' ? 'text-red-300' : 'text-green-400') + '">' + escapeHtml(s.state || '?') + '</span>';
+        if (d.rib_correlation) h += ' · <span class="text-cyan-400">RIB-correlated</span>';
+        h += '</div>';
+        if (d.note) h += '<div class="text-amber-300 text-xs mb-1">' + escapeHtml(d.note) + '</div>';
+        if (s.last) {
+            h += '<table class="w-full text-xs"><tr class="text-gray-500 text-left"><th class="pr-3">RTT min</th><th class="pr-3">θ offset</th><th class="pr-3">asymmetry</th><th>clocks</th></tr>';
+            h += '<tr><td class="pr-3 font-mono">' + (s.rtt_min_ms != null ? s.rtt_min_ms.toFixed(2) : '?') + ' ms</td>';
+            h += '<td class="pr-3 font-mono">' + (s.theta_ms != null ? s.theta_ms.toFixed(2) : '?') + ' ms</td>';
+            h += '<td class="pr-3 font-mono">' + (s.last.asymmetry_ms != null ? s.last.asymmetry_ms.toFixed(2) : '?') + ' ms</td>';
+            h += '<td>' + (s.clock_synced ? '<span class="text-green-400">synced (absolute)</span>' : '<span class="text-gray-400">unsynced (change-sensitive)</span>') + '</td></tr></table>';
+        }
+        if (d.events && d.events.length) {
+            h += '<div class="mt-2 text-xs font-semibold text-amber-300">' + d.events.length + ' asymmetry event(s)</div>';
+            for (const ev of d.events) {
+                h += '<div class="text-xs mt-1 border-l-2 border-amber-400 pl-2">';
+                h += 'Δ ' + (ev.asymmetry_ms != null ? ev.asymmetry_ms.toFixed(2) : '?') + ' ms · dir ' + escapeHtml(ev.direction || '?');
+                if (ev.attribution) h += ' — <span class="text-cyan-400">' + escapeHtml(ev.attribution) + '</span>';
+                if (ev.control_plane && ev.control_plane.covering_prefix) {
+                    h += '<div class="text-gray-400 pl-1">prefix ' + escapeHtml(ev.control_plane.covering_prefix) + ' origin AS' + escapeHtml(String(ev.control_plane.origin_as ?? '?')) + (ev.control_plane.flapping ? ' <span class="text-red-300">flapping</span>' : '') + '</div>';
+                }
+                h += '</div>';
+            }
+        }
+        out.innerHTML = h;
+    } catch (e) {
+        out.innerHTML = '<span class="text-red-300">' + escapeHtml(e.message) + '</span>';
+    }
+}
+
 // ---- Routing-scanner detector self-test (+ optional Scapy) ------------------
 function _scapyLegLabel(sc) {
     if (!sc) return '';
@@ -2868,7 +2973,8 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch' };
+        const names = { igmp: 'IGMP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+                        bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
             : '<div class="mb-2 px-3 py-2 rounded border bg-red-950/60 border-red-800 text-red-300 text-sm">🛑 A detector self-test FAILED — see below</div>';
@@ -2876,7 +2982,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ospf', 'bgp'].forEach(k => {
+        ['igmp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">

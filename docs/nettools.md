@@ -45,6 +45,7 @@ alert.
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
+| [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
 | [Locate Port](#locate-port) | Switch & L2/L3 | `POST /api/net/locate-port` |
 | [PCAP Analyzer](#pcap-analyzer) | Switch & L2/L3 | `POST /api/net/pcap` |
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
@@ -81,13 +82,15 @@ leg that crafts real packets → pcap → `tcpdump` → parse to exercise the wh
 capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
-A one-click **Run self-test** that validates the IGMP, OSPF and BGP detectors by
-running each classifier against crafted attack captures (no root, no live
-traffic) and reports per-scanner pass/fail. With Scapy installed it also runs the
-end-to-end packet-crafting leg for each scanner. This is how you confirm the
-routing-security detectors are working on a given box without waiting for a real
-attack — endpoint `GET /api/net/routing-selftest`. The same checks run headless
-via `python3 network_diagnostics.py {igmp,ospf,bgp}-selftest`.
+A one-click **Run self-test** that validates the IGMP, OSPF and BGP detectors —
+plus the **BGP speaker** (codec/framer/FSM/RIB) and **path-asymmetry / OWD**
+engine — by running each classifier against crafted attack captures (no root, no
+live traffic) and reports per-suite pass/fail. With Scapy installed it also runs
+the end-to-end packet-crafting leg for the capture-based scanners. This is how you
+confirm the routing-security detectors are working on a given box without waiting
+for a real attack — endpoint `GET /api/net/routing-selftest`. The same checks run
+headless via `python3 network_diagnostics.py {igmp,ospf,bgp}-selftest` and each
+module's `selftest()`.
 
 ---
 
@@ -693,6 +696,51 @@ real BGP packet into a pcap and parses it back through `tcpdump`.
 
 - Endpoint: `GET /api/net/bgp-watch` `{interface, seconds}`,
   `POST /api/net/bgp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### BGP Collector & Path Asymmetry (control-plane ↔ data-plane)
+Where BGP Path Watch is a passive **capture** scanner, this is the active-but-safe
+pairing of **routing truth** with a **measured** data-plane symptom. Two cooperating
+pieces:
+
+**Receive-only BGP collector** (`bgp_speaker.py`) — a from-scratch BGP speaker
+(RFC 4271 + 4-octet ASN RFC 6793) that opens a real session to a peer to *learn its
+RIB*, but is **receive-only**: the FSM (Idle → Connect → OpenSent → OpenConfirm →
+Established) sends only OPEN / KEEPALIVE and **never an UPDATE**, so it structurally
+**cannot advertise or withdraw a route**. It decodes UPDATEs into an Adj-RIB-In with
+per-prefix **churn/flap tracking** (a prefix changing origin/next-hop faster than a
+threshold is marked *flapping*) and longest-prefix lookup. Point it at a router
+configured to peer with the Pi's AS (a route-server client / passive peer works well).
+
+**One-way-delay probe** (`path_asymmetry.py`) — a tiny UDP prober/reflector using the
+OWAMP/TWAMP 4-timestamp model (T1 send, T2 remote-recv, T3 remote-send, T4 recv). It
+computes forward and reverse delay separately and derives **path asymmetry**. Because
+a single unsynced clock pair can't separate a constant offset from a constant
+asymmetry, it uses the **Paxson min-pair estimator** (θ̂ = (min fwd − min rev)/2) to
+cancel the clock offset and report *change-sensitive* asymmetry with hysteresis — so
+it flags a **shift** in asymmetry without false-alarming on a static clock skew. Tick
+**clocks PTP/GPS-synced** only if both ends are truly synchronized, in which case the
+absolute number is trustworthy. Run the **reflector** on the far node (or here) so the
+other side can measure both directions.
+
+**Correlator** — when the collector is `Established`, each asymmetry event is
+annotated with control-plane truth from the RIB: the covering prefix, origin AS,
+AS-path, whether that prefix is currently flapping, and how recently it changed. The
+attribution heuristic then labels the event **route-churn** (RIB is flapping — the
+delay shift lines up with a real routing change), **recent path shift** (a fresh but
+stable change), or **stable / data-plane** (no matching control-plane change — the
+asymmetry is happening below BGP, e.g. a congested or re-routed transit leg).
+
+> **Safety:** the collector never originates routing information, and the OWD probe is
+> a handful of small UDP datagrams — neither injects state into the network. Both are
+> long-lived daemons managed with start/stop/status; nothing is persisted to disk.
+
+- Endpoints: `GET/POST /api/net/bgp-collector` `{action: start|stop|status|rib,
+  peer_ip, peer_as, local_as, router_id, port, hold}`,
+  `GET/POST /api/net/owd-reflector` `{action: start|stop|status, port}`,
+  `POST /api/net/path-asymmetry` `{target, count, clock_synced}`
+- CLI: `python3 path_asymmetry.py reflector [port]` runs a standalone reflector;
+  `bgp_speaker.py` and `path_asymmetry.py` each expose `selftest()`, aggregated into
+  the Detector Self-Test panel (`GET /api/net/routing-selftest`).
 
 ### Locate Port
 Physically find **which switch port** the device is plugged into — the software

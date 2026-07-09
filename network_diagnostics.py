@@ -30,6 +30,9 @@ import tempfile
 import urllib.parse
 from datetime import datetime
 
+import bgp_speaker
+import path_asymmetry
+
 try:
     from flask import request, jsonify
 except Exception:  # pragma: no cover - flask always present in the app
@@ -4750,7 +4753,8 @@ def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
-    suites = {'igmp': _igmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest()}
+    suites = {'igmp': _igmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+              'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
         'scapy_available': _have_scapy(),
@@ -4759,9 +4763,144 @@ def do_routing_selftest():
             'passed': sum(1 for s in v['scenarios'] if s['pass']),
             'total': len(v['scenarios']),
             'scenarios': v['scenarios'],
-            'scapy': v['scapy'],
+            'scapy': v.get('scapy'),
         } for k, v in suites.items()},
     }
+
+
+# --------------------------------------------------------------------------
+# BGP Route Collector (receive-only speaker) + Path Asymmetry (OWD) + correlator
+# --------------------------------------------------------------------------
+# Control-plane truth (bgp_speaker.BGPSpeaker's Adj-RIB-In) tied to data-plane
+# measurement (path_asymmetry's measured one-way delay), via path_asymmetry.
+# correlate(). Both the collector session and the OWD reflector are long-lived
+# daemons, so these managers keep a single instance each with start/stop/status.
+
+_bgp_collector = {'speaker': None, 'events': []}     # correlated asymmetry events
+_bgp_collector_lock = threading.Lock()
+_owd_reflector = {'reflector': None}
+_owd_lock = threading.Lock()
+_COLLECTOR_EVENT_CAP = 100
+
+
+def _collector_on_update(upd, changed):
+    """RIB update hook — reserved for pushing churn into a live correlation feed.
+    Kept lightweight; correlation is done on demand in do_path_asymmetry."""
+    return None
+
+
+def do_bgp_collector(action='status', peer_ip=None, peer_as=None, local_as=None,
+                     router_id=None, port=179, hold=90):
+    """Manage the receive-only BGP collector session. Actions: start / stop /
+    status / rib. Never advertises a route — it only learns the peer's RIB."""
+    with _bgp_collector_lock:
+        sp = _bgp_collector['speaker']
+        if action == 'start':
+            if sp and sp.state != 'Idle':
+                return {'success': False, 'error': 'collector already running',
+                        'status': sp.status()}
+            try:
+                ipaddress.ip_address(peer_ip or '')
+                ipaddress.ip_address(router_id or '')
+                peer_as = int(peer_as); local_as = int(local_as)
+                port = _clamp_int(port, 179, 1, 65535)
+                hold = _clamp_int(hold, 90, 0, 65535)
+            except (ValueError, TypeError):
+                return {'success': False, 'error': 'need valid peer_ip, router_id, '
+                        'peer_as, local_as'}
+            if not (0 < peer_as <= 0xFFFFFFFF and 0 < local_as <= 0xFFFFFFFF):
+                return {'success': False, 'error': 'AS numbers out of range'}
+            sp = bgp_speaker.BGPSpeaker(peer_ip, peer_as, local_as, router_id,
+                                        hold_time=hold, port=port,
+                                        on_update=_collector_on_update)
+            sp.start()
+            _bgp_collector['speaker'] = sp
+            time.sleep(0.3)
+            return {'success': True, 'status': sp.status()}
+        if action == 'stop':
+            if sp:
+                sp.stop()
+            return {'success': True, 'stopped': True}
+        if action == 'rib':
+            limit = 200
+            return {'success': True,
+                    'rib': sp.rib.snapshot(limit) if sp else {'total': 0, 'routes': []},
+                    'state': sp.state if sp else 'Idle'}
+        # status (default)
+        return {'success': True,
+                'status': sp.status() if sp else {'state': 'Idle', 'peer_ip': None},
+                'events': _bgp_collector['events'][-20:]}
+
+
+def do_owd_reflector(action='status', port=path_asymmetry.DEFAULT_PORT):
+    """Manage the local one-way-delay reflector so another node can probe THIS
+    box for measured asymmetry. Actions: start / stop / status."""
+    with _owd_lock:
+        r = _owd_reflector['reflector']
+        if action == 'start':
+            if r and r._thread and r._thread.is_alive():
+                return {'success': True, 'already_running': True, 'port': r.port}
+            port = _clamp_int(port, path_asymmetry.DEFAULT_PORT, 1, 65535)
+            try:
+                r = path_asymmetry.Reflector(port=port)
+                r.start()
+            except OSError as e:
+                return {'success': False, 'error': f'could not bind udp/{port}: {e}'}
+            _owd_reflector['reflector'] = r
+            return {'success': True, 'running': True, 'port': port}
+        if action == 'stop':
+            if r:
+                r.stop()
+            return {'success': True, 'stopped': True}
+        running = bool(r and r._thread and r._thread.is_alive())
+        return {'success': True, 'running': running,
+                'port': r.port if r else path_asymmetry.DEFAULT_PORT,
+                'reflected': r.count if r else 0}
+
+
+def do_path_asymmetry(target, port=path_asymmetry.DEFAULT_PORT, count=20,
+                      threshold_ms=5.0, clock_synced=False):
+    """Measure one-way-delay asymmetry to a target running the OWD reflector, and
+    correlate any asymmetry event against the BGP collector's RIB (control-plane
+    truth). Falls back to a note if no reflector answers."""
+    try:
+        ipaddress.ip_address(target or '')
+    except (ValueError, TypeError):
+        # allow hostnames — resolve
+        try:
+            target = socket.gethostbyname(target)
+        except (OSError, TypeError):
+            return {'success': False, 'error': 'invalid or unresolvable target'}
+    port = _clamp_int(port, path_asymmetry.DEFAULT_PORT, 1, 65535)
+    count = _clamp_int(count, 20, 5, 100)
+    det = path_asymmetry.AsymmetryDetector(threshold_ms=float(threshold_ms),
+                                           clock_synced=bool(clock_synced), target=target)
+    samples = path_asymmetry.probe_series(target, port=port, count=count, interval=0.03)
+    events = []
+    for s in samples:
+        ev = det.add(*s)
+        if ev:
+            events.append(ev)
+    # correlate events against the live RIB (control-plane truth)
+    rib = None
+    with _bgp_collector_lock:
+        sp = _bgp_collector['speaker']
+        if sp and sp.state == 'Established':
+            rib = sp.rib
+    correlated = [path_asymmetry.correlate(e, rib) for e in events] if rib else events
+    if correlated:
+        with _bgp_collector_lock:
+            _bgp_collector['events'] = (_bgp_collector['events'] + correlated)[-_COLLECTOR_EVENT_CAP:]
+    out = {'success': True, 'target': target, 'port': port,
+           'probes_sent': count, 'replies': len(samples),
+           'summary': det.summary(), 'events': correlated,
+           'rib_correlation': bool(rib)}
+    if not samples:
+        out['note'] = ('No reply from the OWD reflector at %s:%d. Run the reflector '
+                       'on the target (`python3 path_asymmetry.py reflector %d`) or '
+                       'enable it there, then retry. Without a reflector, only the '
+                       'passive TTL hop-count fallback is available.' % (target, port, port))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -5420,6 +5559,47 @@ def register_network_diagnostics(app, logger=None):
             action = 'reset' if (data.get('action') == 'reset') else 'get'
         _log(f"net/bgp-baseline {action}")
         return jsonify(do_bgp_baseline(action))
+
+    @app.route('/api/net/bgp-collector', methods=['GET', 'POST'])
+    def net_bgp_collector():
+        if request.method == 'GET':
+            action = (request.args.get('action') or 'status').strip()
+            if action not in ('status', 'rib'):
+                action = 'status'
+            _log(f"net/bgp-collector {action}")
+            return jsonify(do_bgp_collector(action))
+        data = request.get_json(silent=True) or {}
+        action = (data.get('action') or 'status').strip()
+        if action not in ('start', 'stop', 'status', 'rib'):
+            return _bad('action must be start/stop/status/rib')
+        _log(f"net/bgp-collector {action} peer={data.get('peer_ip')}")
+        return jsonify(do_bgp_collector(
+            action, peer_ip=data.get('peer_ip'), peer_as=data.get('peer_as'),
+            local_as=data.get('local_as'), router_id=data.get('router_id'),
+            port=data.get('port', 179), hold=data.get('hold', 90)))
+
+    @app.route('/api/net/owd-reflector', methods=['GET', 'POST'])
+    def net_owd_reflector():
+        if request.method == 'GET':
+            return jsonify(do_owd_reflector('status'))
+        data = request.get_json(silent=True) or {}
+        action = (data.get('action') or 'status').strip()
+        if action not in ('start', 'stop', 'status'):
+            return _bad('action must be start/stop/status')
+        _log(f"net/owd-reflector {action}")
+        return jsonify(do_owd_reflector(action, port=data.get('port', path_asymmetry.DEFAULT_PORT)))
+
+    @app.route('/api/net/path-asymmetry', methods=['POST'])
+    def net_path_asymmetry():
+        data = request.get_json(silent=True) or {}
+        target = (data.get('target') or '').strip()
+        if not target:
+            return _bad('target required')
+        _log(f"net/path-asymmetry target={target}")
+        return jsonify(do_path_asymmetry(
+            target, port=data.get('port', path_asymmetry.DEFAULT_PORT),
+            count=data.get('count', 20), threshold_ms=data.get('threshold_ms', 5.0),
+            clock_synced=bool(data.get('clock_synced', False))))
 
     @app.route('/api/net/routing-selftest', methods=['GET'])
     def net_routing_selftest():
