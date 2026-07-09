@@ -1219,6 +1219,7 @@ function showNetworkSubtab(name) {
         _dhcpFillIfaces();
         _igmpFillIfaces();
         _ospfFillIfaces();
+        _bgpFillIfaces();
         dhcpSnoopStatus();
     } else if (name === 'interfaces') {
         loadNetworkIdentity();
@@ -2731,6 +2732,106 @@ async function ospfTrustBaseline() {
         await runOspfWatch();
     } catch (e) {
         addConsoleMessage('Failed to reset OSPF baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- BGP Path Watch (passive) ----------------------------------------------
+const _BGP_VERDICT_STYLE = {
+    clean:        ['bg-green-950/40 border-green-900 text-green-400', '✓ No BGP anomalies detected'],
+    weak_session: ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ BGP session without TCP-MD5/TCP-AO'],
+    anomaly:      ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ BGP anomaly — rogue peer / session reset / bogon / leak'],
+    injection:    ['bg-red-950/60 border-red-800 text-red-300', '🛑 BGP prefix / origin hijack detected'],
+    storm:        ['bg-red-950/60 border-red-800 text-red-300', '🛑 BGP route-churn / leak storm detected'],
+    unknown:      ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _bgpFillIfaces() {
+    const sel = document.getElementById('bgp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runBgpWatch() {
+    const out = document.getElementById('bgp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('bgp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('bgp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing BGP (TCP/179) on the segment…</p>';
+    try {
+        _bgpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/bgp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runBgpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _BGP_VERDICT_STYLE[d.verdict] || _BGP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.messages} BGP msgs (${d.updates} UPDATE @ ${d.update_per_s}/s, ${d.notifications} NOTIFICATION) · ${d.prefix_total} prefixes${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if (d.note) html += `<p class="text-xs text-gray-500 mb-2">${escapeHtml(d.note)}</p>`;
+        if (d.peers && d.peers.length) {
+            const tp = d.trusted_peers || [];
+            html += `<p class="text-xs mb-1 text-gray-400">Peers: ` +
+                d.peers.map(a => `<span class="font-mono ${tp.length && tp.indexOf(a) < 0 ? 'text-amber-300' : 'text-gray-200'}">AS${a}</span>`).join(', ') +
+                ` · TCP-MD5: <span class="${d.md5 ? 'text-green-400' : 'text-amber-300'}">${d.md5 ? 'yes' : 'not seen'}</span></p>`;
+        }
+        (d.advisories || []).forEach(a => {
+            const sev = a.severity === 'high' ? 'text-red-300 border-red-800 bg-red-950/40' : 'text-amber-300 border-amber-800 bg-amber-950/30';
+            const refs = (a.refs || []).map(r => r.startsWith('http')
+                ? `<a href="${escapeHtml(r)}" target="_blank" rel="noopener" class="underline text-cyan-400">OSV</a>`
+                : `<span class="font-mono">${escapeHtml(r)}</span>`).join(', ');
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs ${sev}"><strong>${escapeHtml(a.title)}</strong><br>${escapeHtml(a.detail)}${refs ? '<br><span class="text-gray-400">Refs:</span> ' + refs : ''}</div>`;
+        });
+        const prefixes = d.prefixes || [];
+        if (prefixes.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Announced prefixes (' + d.prefix_total + (d.prefix_total > prefixes.length ? ', showing ' + prefixes.length : '') + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Prefix</th><th class="px-2 py-1">Origin AS</th><th class="px-2 py-1">Baseline</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                prefixes.map(p => {
+                    const badge = p.hijack ? '<span class="text-red-300">🛑 hijack</span>' : (p.bogon ? '<span class="text-amber-300">bogon</span>' : '<span class="text-gray-500">—</span>');
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${p.hijack || p.bogon ? 'text-amber-300' : ''}">${escapeHtml(p.prefix)}</td>
+                        <td class="px-2 py-1 font-mono ${p.hijack ? 'text-red-300' : ''}">${p.origin_as != null ? 'AS' + p.origin_as : '—'}</td>
+                        <td class="px-2 py-1 font-mono text-gray-500">${p.baseline_as != null ? 'AS' + p.baseline_as : '—'}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function bgpTrustBaseline() {
+    try {
+        await postAPI('/api/net/bgp-baseline', { action: 'reset' });
+        addConsoleMessage('BGP baseline reset — re-learning current peers & prefix origins', 'info');
+        await runBgpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset BGP baseline: ' + e.message, 'error');
     }
 }
 

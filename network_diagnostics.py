@@ -4022,6 +4022,585 @@ def _ospf_selftest():
 
 
 # --------------------------------------------------------------------------
+# BGP Path Watch: passive BGP routing-security scanner (detection-only)
+# --------------------------------------------------------------------------
+# BGP is the exterior/edge routing control plane (TCP 179). Unlike OSPF it is
+# unicast between peers, so the Pi only sees it when it is INLINE, on a SPAN/
+# mirror, or is itself a peer — this is made explicit in the UI. Where visible,
+# BGP is the highest-value thing to watch: origin hijacks, sub-prefix hijacks,
+# route leaks and session resets are how traffic gets silently redirected across
+# the Internet edge. This scanner is PASSIVE: one short tcpdump window parsed and
+# classified. It never opens a session, never announces or withdraws a route.
+# Companion to OSPF Watch (L3 routing security). What it looks for:
+#   * injection — an announced prefix whose ORIGIN AS changed vs the baseline
+#     (prefix / origin hijack), or a new more-specific of a baseline prefix
+#     (sub-prefix hijack — the most effective real-world BGP attack).
+#   * anomaly   — a new/rogue peer (new AS or BGP-ID), a NOTIFICATION / session
+#     reset (teardown / flap), a private or bogon ASN in a received AS-path
+#     (route leak), a bogon/martian prefix announcement, an AS-path loop, or a
+#     BLACKHOLE community (65535:666).
+#   * storm     — a route-churn / UPDATE flood, or a per-peer prefix-count spike
+#     (full-table leak).
+#   * weak_session — BGP seen but no TCP-MD5/TCP-AO signature (RFC 2385/5925);
+#     exposed to off-path session-reset attacks. Advisory only.
+# Version CVEs (FRR/BIRD bgpd crashes on malformed UPDATE attributes) aren't on
+# the wire, so — as with OSPF — the exposure conditions are flagged and OSV is
+# pointed at for the version lookup.
+
+_BGP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'bgp_watch.json')
+_bgp_watch_lock = threading.Lock()
+
+# UPDATE messages/sec at or above which the window is churn/flood.
+_BGP_STORM_RATE = 40.0
+# A peer announcing at or above this many prefixes in the window, when the
+# baseline saw far fewer, is a route-leak (full-table) signature.
+_BGP_LEAK_PREFIXES = 500
+_BGP_EVENTS_CAP = 200
+
+# Bogon / martian IPv4 prefixes that should never be announced in BGP.
+_BGP_BOGON_NETS = [
+    ('0.0.0.0', 8), ('10.0.0.0', 8), ('100.64.0.0', 10), ('127.0.0.0', 8),
+    ('169.254.0.0', 16), ('172.16.0.0', 12), ('192.0.0.0', 24),
+    ('192.0.2.0', 24), ('192.168.0.0', 16), ('198.18.0.0', 15),
+    ('198.51.100.0', 24), ('203.0.113.0', 24), ('224.0.0.0', 4), ('240.0.0.0', 4),
+]
+
+_BGP_OSV_URL = 'https://osv.dev/list?ecosystem=&q=frr%20bgpd'
+_BGP_ADVISORIES = {
+    'no_md5': {
+        'severity': 'medium',
+        'title': 'BGP sessions without TCP-MD5 / TCP-AO authentication',
+        'detail': ('No TCP-MD5 (RFC 2385) or TCP-AO (RFC 5925) signature was seen '
+                   'on the BGP session. Unauthenticated sessions are exposed to '
+                   'off-path RST/session-reset attacks and easier hijacking. '
+                   'Enable TCP-MD5/TCP-AO and RPKI Route Origin Validation to '
+                   'reject invalid origins.'),
+        'refs': ['RFC 2385', 'RFC 5925', 'RFC 6811'],
+    },
+    'malformed_attr': {
+        'severity': 'medium',
+        'title': 'Patch bgpd for malformed BGP-UPDATE attribute crashes',
+        'detail': ('Malformed BGP path attributes have repeatedly crashed router '
+                   'BGP daemons (e.g. FRRouting CVE-2023-38802 via a corrupted '
+                   'Tunnel-Encapsulation attribute; CERT VU#347067 covers multiple '
+                   'implementations). The software version is not visible on the '
+                   'wire — check OSV for your bgpd build and patch.'),
+        'refs': ['CVE-2023-38802', 'VU#347067', _BGP_OSV_URL],
+    },
+}
+
+# Classify an ASN. Only 'reserved' / 'documentation' ASNs are truly illegitimate
+# in any AS-path; 'private' (RFC 6996) is normal on internal/DC BGP fabric — which
+# is exactly where a passive Pi is most likely to sit — so it is NOT alerted on.
+def _bgp_asn_class(asn):
+    if asn in (0, 23456, 65535, 4294967295):
+        return 'reserved'
+    if 64496 <= asn <= 64511 or 65536 <= asn <= 65551:   # RFC 5398 documentation
+        return 'documentation'
+    if 64512 <= asn <= 65534 or 4200000000 <= asn <= 4294967294:  # RFC 6996 private
+        return 'private'
+    return None
+
+
+def _ip_to_int(ip):
+    try:
+        a, b, c, d = (int(x) for x in ip.split('.'))
+        return (a << 24) | (b << 16) | (c << 8) | d
+    except (ValueError, AttributeError):
+        return None
+
+
+def _bgp_is_bogon(prefix):
+    """True if an IPv4 CIDR announcement falls inside a bogon/martian net."""
+    try:
+        net, length = prefix.split('/')
+        length = int(length)
+    except ValueError:
+        return False
+    n = _ip_to_int(net)
+    if n is None:
+        return False
+    if length < 8:            # absurdly short — /0../7 (near-default hijack)
+        return True
+    for bnet, blen in _BGP_BOGON_NETS:
+        bn = _ip_to_int(bnet)
+        if bn is None:
+            continue
+        mask = (0xffffffff << (32 - blen)) & 0xffffffff
+        if length >= blen and (n & mask) == (bn & mask):
+            return True
+    return False
+
+
+_BGP_IPRE = r'(\d{1,3}(?:\.\d{1,3}){3})'
+_BGP_CIDR_RE = re.compile(r'^' + _BGP_IPRE + r'/(\d{1,2})\s*$')
+_BGP_HDR_RE = re.compile(r'(?:IP6?\s+)?' + _BGP_IPRE + r'\.(\d+)\s+>\s+' + _BGP_IPRE + r'\.(\d+):')
+
+
+def _parse_bgp_capture(output):
+    """Parse `tcpdump -nn -t -v 'tcp port 179'` text into BGP messages:
+    {src, dst, type, ...}. Tolerant of tcpdump version differences — keys off the
+    'Open/Update/Notification/Keepalive Message' lines and pulls whatever path
+    attributes and NLRI it can from the indented body."""
+    messages = []
+    cur = None
+    flow = (None, None)   # (src, dst) of the current TCP segment
+    nlri_mode = None      # 'announced' | 'withdrawn'
+    md5_seen = ['md5' in output.lower()]
+
+    def flush():
+        if cur is not None:
+            messages.append(cur)
+
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        h = _BGP_HDR_RE.search(line)
+        if h:
+            # 179 side is the sender's BGP port; keep src/dst as printed.
+            flow = (h.group(1), h.group(3))
+        mt = re.search(r'\b(Open|Update|Notification|Keepalive|Route Refresh)\s+Message\b', line)
+        if mt:
+            flush()
+            nlri_mode = None
+            cur = {'src': flow[0], 'dst': flow[1],
+                   'type': mt.group(1).lower().replace(' ', '_'),
+                   'my_as': None, 'holdtime': None, 'bgp_id': None, 'version': None,
+                   'as_path': [], 'origin': None, 'next_hop': None,
+                   'communities': [], 'announced': [], 'withdrawn': [],
+                   'notif_code': None, 'notif_sub': None}
+            if cur['type'] == 'open':
+                m = re.search(r'my AS\s+(\d+)', line)
+                if m:
+                    cur['my_as'] = int(m.group(1))
+                m = re.search(r'Holdtime\s+(\d+)', line)
+                if m:
+                    cur['holdtime'] = int(m.group(1))
+                m = re.search(r'\bID\s+' + _BGP_IPRE, line)
+                if m:
+                    cur['bgp_id'] = m.group(1)
+            if cur['type'] == 'notification':
+                m = re.search(r'Message\s*\(3\),[^,]*,\s*([A-Za-z /]+?)\s*\((\d+)\)', line)
+                if m:
+                    cur['notif_code'] = m.group(1).strip()
+                m = re.search(r'subcode\s+([A-Za-z /]+?)\s*\((\d+)\)', line)
+                if m:
+                    cur['notif_sub'] = m.group(1).strip()
+            continue
+        if cur is None:
+            continue
+        # OPEN continuation
+        if cur['type'] == 'open':
+            if cur['my_as'] is None:
+                m = re.search(r'my AS\s+(\d+)', line)
+                if m:
+                    cur['my_as'] = int(m.group(1))
+            if cur['bgp_id'] is None:
+                m = re.search(r'\bID\s+' + _BGP_IPRE, line)
+                if m:
+                    cur['bgp_id'] = m.group(1)
+        # UPDATE attributes + NLRI
+        if cur['type'] == 'update':
+            # AS numbers come after the final colon (past "length: N, Flags [T]:").
+            ap = re.search(r'AS Path\b.*:\s*([0-9][0-9 {},]*)\s*$', line)
+            if ap and not cur['as_path']:
+                cur['as_path'] = [int(x) for x in re.findall(r'\d+', ap.group(1))]
+            og = re.search(r'\bOrigin\b.*?:\s*(IGP|EGP|Incomplete)', line)
+            if og:
+                cur['origin'] = og.group(1)
+            nh = re.search(r'Next Hop\b.*?:\s*' + _BGP_IPRE, line)
+            if nh:
+                cur['next_hop'] = nh.group(1)
+            if re.search(r'\bCommunity\b', line):
+                for tok in re.findall(r'\b(\d{1,10}:\d{1,10})\b', line):
+                    cur['communities'].append(tok)
+            if re.search(r'blackhole', line, re.I):
+                cur['communities'].append('blackhole')
+            if re.search(r'Updated routes|Advertised routes|Prefixes', line, re.I):
+                nlri_mode = 'announced'
+            elif re.search(r'Withdrawn routes', line, re.I):
+                nlri_mode = 'withdrawn'
+            cidr = _BGP_CIDR_RE.match(line.strip())
+            if cidr and nlri_mode:
+                pfx = f'{cidr.group(1)}/{cidr.group(2)}'
+                cur[nlri_mode].append(pfx)
+    flush()
+    for m in messages:
+        m['md5'] = md5_seen[0]
+    return messages
+
+
+def _bgp_watch_load():
+    try:
+        with open(_BGP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _bgp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_BGP_WATCH_PATH), exist_ok=True)
+        tmp = _BGP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _BGP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_bgp_baseline(action='get'):
+    """Manage the learned BGP baseline (trusted peer ASNs + prefix→origin map).
+    action='reset' re-learns the current peers/origins on the next scan."""
+    with _bgp_watch_lock:
+        if action == 'reset':
+            _bgp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _bgp_watch_load()
+        return {'success': True, 'baseline': {
+            'peers': sorted(b.get('peers') or []),
+            'prefixes': len((b.get('origins') or {})),
+        }}
+
+
+def _bgp_analyze(messages, seconds, baseline, learn=True):
+    """Pure classifier over parsed BGP messages. Returns the result payload
+    (minus interface). Split from capture so the self-test can drive it."""
+    seconds = max(1, int(seconds))
+    opens = [m for m in messages if m['type'] == 'open']
+    updates = [m for m in messages if m['type'] == 'update']
+    notifs = [m for m in messages if m['type'] == 'notification']
+    total = len(messages)
+
+    peers = sorted({m['my_as'] for m in opens if m.get('my_as')})
+    peer_ids = sorted({m['bgp_id'] for m in opens if m.get('bgp_id')})
+    md5 = any(m.get('md5') for m in messages)
+
+    # prefix -> origin AS (rightmost ASN in the path), and per-peer prefix counts
+    origins = {}
+    per_peer_prefixes = {}
+    for m in updates:
+        origin_as = m['as_path'][-1] if m.get('as_path') else None
+        src = m.get('src')
+        for pfx in m.get('announced', []):
+            origins.setdefault(pfx, origin_as)
+            per_peer_prefixes.setdefault(src, set()).add(pfx)
+
+    trusted_peers = set(baseline.get('peers') or [])
+    base_origins = dict(baseline.get('origins') or {})
+    base_counts = dict(baseline.get('prefix_count') or {})
+    have_baseline = bool(trusted_peers or base_origins or baseline.get('peers') is not None)
+    learned = False
+    if learn and not have_baseline and (peers or origins):
+        baseline['peers'] = peers
+        baseline['origins'] = {p: o for p, o in origins.items() if o is not None}
+        baseline['prefix_count'] = {s: len(v) for s, v in per_peer_prefixes.items()}
+        learned = True
+        trusted_peers = set(peers)
+        base_origins = dict(baseline['origins'])
+        have_baseline = True
+
+    findings = []
+    categories = set()
+    advisories = []
+
+    # storm — UPDATE churn
+    upd_rate = round(len(updates) / seconds, 1)
+    if upd_rate >= _BGP_STORM_RATE:
+        categories.add('storm')
+        findings.append(('crit', 'storm',
+                         f'{len(updates)} BGP UPDATEs in {seconds}s ({upd_rate}/s) '
+                         '— route churn / flooding'))
+    # route leak — per-peer prefix-count spike
+    for src, pfxs in per_peer_prefixes.items():
+        base_n = base_counts.get(src, 0)
+        if len(pfxs) >= _BGP_LEAK_PREFIXES and (not base_n or len(pfxs) > base_n * 5):
+            categories.add('storm')
+            findings.append(('crit', 'storm',
+                             f'peer {src} announced {len(pfxs)} prefixes '
+                             f'(baseline {base_n or "—"}) — possible full-table route leak'))
+
+    # injection — origin hijack (same prefix, different origin AS)
+    if have_baseline:
+        for pfx, origin_as in origins.items():
+            b = base_origins.get(pfx)
+            if b is not None and origin_as is not None and origin_as != b:
+                categories.add('injection')
+                findings.append(('crit', 'injection',
+                                 f'prefix {pfx} now originated by AS{origin_as} '
+                                 f'(baseline AS{b}) — BGP origin hijack'))
+        # sub-prefix hijack — a new more-specific of a baseline prefix
+        for pfx, origin_as in origins.items():
+            if pfx in base_origins:
+                continue
+            for bpfx, bas in base_origins.items():
+                if _bgp_prefix_covers(bpfx, pfx) and origin_as != bas:
+                    categories.add('injection')
+                    findings.append(('crit', 'injection',
+                                     f'more-specific {pfx} (inside baseline {bpfx}) '
+                                     f'from AS{origin_as} — sub-prefix hijack'))
+                    break
+
+    # anomaly — new/rogue peer
+    if have_baseline:
+        for asn in peers:
+            if asn not in trusted_peers:
+                categories.add('anomaly')
+                findings.append(('warn', 'anomaly',
+                                 f'new BGP peer AS{asn} — not in the learned baseline'))
+    # session reset / teardown
+    for m in notifs:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'BGP NOTIFICATION ({m.get("notif_code") or "?"}'
+                         f'{"/" + m["notif_sub"] if m.get("notif_sub") else ""}) '
+                         '— session reset / teardown'))
+    # private / bogon ASN in a received path
+    seen_bad_asn = set()
+    for m in updates:
+        for asn in m.get('as_path', []):
+            klass = _bgp_asn_class(asn)
+            # private ASNs are normal on internal/DC fabric — only alert on
+            # reserved/documentation ASNs, which are never legitimate in a path.
+            if klass in ('reserved', 'documentation') and asn not in seen_bad_asn:
+                seen_bad_asn.add(asn)
+                categories.add('anomaly')
+                findings.append(('warn', 'anomaly',
+                                 f'{klass} ASN {asn} in a received AS-path — route leak / misconfig'))
+        # AS-path loop (an ASN appears more than once non-adjacently)
+        path = m.get('as_path', [])
+        # collapse consecutive repeats (legitimate prepending), then a repeat
+        # of the same ASN is a loop
+        dedup = [a for i, a in enumerate(path) if i == 0 or a != path[i - 1]]
+        if len(dedup) != len(set(dedup)):
+            categories.add('anomaly')
+            findings.append(('warn', 'anomaly',
+                             f'AS-path loop in {" ".join(map(str, path))}'))
+    # bogon / martian prefix announcement
+    bogons = sorted({p for p in origins if _bgp_is_bogon(p)})
+    for p in bogons:
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'bogon/martian prefix {p} announced in BGP — route leak or hijack'))
+    # blackhole community
+    if any('blackhole' in c.lower() or '65535:666' in c for m in updates for c in m.get('communities', [])):
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         'BLACKHOLE community (65535:666) seen — RTBH in use (verify it is intended)'))
+
+    # weak session — no TCP-MD5/TCP-AO seen while BGP is present
+    if messages and not md5:
+        categories.add('weak_session')
+        advisories.append(dict(_BGP_ADVISORIES['no_md5'], key='no_md5'))
+        findings.append(('warn', 'weak_session',
+                         'no TCP-MD5/TCP-AO signature on the BGP session — exposed to '
+                         'off-path session-reset attacks'))
+    if updates:
+        advisories.append(dict(_BGP_ADVISORIES['malformed_attr'], key='malformed_attr'))
+
+    order = ['storm', 'injection', 'anomaly', 'weak_session']
+    verdict = next((c for c in order if c in categories), 'clean')
+    if not findings:
+        findings.append(('ok', 'clean', 'No BGP anomalies in the capture window.'))
+
+    prefixes_out = []
+    for pfx in sorted(origins):
+        oa = origins[pfx]
+        prefixes_out.append({'prefix': pfx, 'origin_as': oa,
+                             'baseline_as': base_origins.get(pfx),
+                             'hijack': bool(have_baseline and base_origins.get(pfx) is not None
+                                            and oa is not None and oa != base_origins.get(pfx)),
+                             'bogon': _bgp_is_bogon(pfx)})
+
+    return {
+        'success': True, 'verdict': verdict, 'seconds': seconds,
+        'messages': total, 'opens': len(opens), 'updates': len(updates),
+        'notifications': len(notifs), 'update_per_s': upd_rate, 'learned': learned,
+        'peers': peers, 'peer_ids': peer_ids, 'trusted_peers': sorted(trusted_peers),
+        'md5': md5, 'prefixes': prefixes_out[:100], 'prefix_total': len(origins),
+        'advisories': [{'key': a.get('key'), 'severity': a['severity'],
+                        'title': a['title'], 'detail': a['detail'],
+                        'refs': a.get('refs', [])} for a in advisories],
+        'findings': [{'level': l, 'category': c, 'text': t} for l, c, t in findings],
+        'reasons': [t for _l, _c, t in findings if _l != 'ok'],
+    }
+
+
+def _bgp_prefix_covers(supernet, subnet):
+    """True if CIDR `supernet` strictly contains CIDR `subnet` (more-specific)."""
+    try:
+        sn, sl = supernet.split('/'); sl = int(sl)
+        tn, tl = subnet.split('/'); tl = int(tl)
+    except ValueError:
+        return False
+    if tl <= sl:
+        return False
+    a, b = _ip_to_int(sn), _ip_to_int(tn)
+    if a is None or b is None:
+        return False
+    mask = (0xffffffff << (32 - sl)) & 0xffffffff
+    return (a & mask) == (b & mask)
+
+
+def _bgp_capture(interface, seconds):
+    """Run one passive tcpdump BGP window and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '1500', '-c', '20000', 'tcp', 'port', '179'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_bgp_watch(interface=None, seconds=15, learn=True, quick=False):
+    """Passive BGP path/security scanner (detection-only). Captures BGP for a few
+    seconds and classifies the edge: injection (hijack) / anomaly / storm /
+    weak_session / clean, with CVE/OSV advisories. Learns peers + prefix origins
+    on first run; never opens a session or announces a route."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _bgp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    messages = _parse_bgp_capture(text)
+
+    with _bgp_watch_lock:
+        baseline = _bgp_watch_load()
+        result = _bgp_analyze(messages, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _bgp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _bgp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_BGP_EVENTS_CAP:]
+            _bgp_watch_save(b)
+
+    if not messages:
+        result['note'] = ('No BGP seen — BGP is unicast TCP/179 between routers, so '
+                          'the Pi must be inline, on a SPAN/mirror, or a peer to '
+                          'observe it (unlike OSPF, it is not on the broadcast domain).')
+    result['interface'] = iface
+    return result
+
+
+def _bgp_selftest():
+    """Self-test the BGP detectors with synthetic tcpdump captures (no root, no
+    live traffic), plus an optional Scapy end-to-end leg (scapy.contrib.bgp ->
+    pcap -> tcpdump -> parse). Mirrors the OSPF/IGMP self-tests."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        msgs = _parse_bgp_capture(text)
+        res = _bgp_analyze(msgs, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'messages': len(msgs), 'pass': ok})
+        return res
+
+    base = {'peers': [65001, 65002],
+            'origins': {'93.184.216.0/24': 65002, '45.33.0.0/16': 65003},
+            'prefix_count': {'10.0.0.1': 2}}
+
+    clean = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  Origin (1), length: 1, Flags [T]: IGP",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65002",
+        "\t  Updated routes:",
+        "\t    93.184.216.0/24",
+    ])
+    run('clean', clean, 15, base, 'clean')
+
+    hijack = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65666",
+        "\t  Updated routes:",
+        "\t    93.184.216.0/24",
+    ])
+    run('injection-hijack', hijack, 15, base, 'injection')
+
+    subprefix = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65666",
+        "\t  Updated routes:",
+        "\t    93.184.216.128/25",
+    ])
+    run('injection-subprefix', subprefix, 15, base, 'injection')
+
+    notif = "\n".join([
+        "10.0.0.9.179 > 10.0.0.2.179: Flags [P.], length 40: BGP md5",
+        "\tNotification Message (3), length: 21, Cease (6), subcode Administrative Reset (4)",
+    ])
+    run('anomaly-notif', notif, 15, base, 'anomaly')
+
+    bogon = "\n".join([
+        "10.0.0.1.179 > 10.0.0.2.179: Flags [P.], length 60: BGP md5",
+        "\tUpdate Message (2), length: 55",
+        "\t  AS Path (2), length: 6, Flags [T]: 65001 65002",
+        "\t  Updated routes:",
+        "\t    192.168.0.0/16",
+    ])
+    run('anomaly-bogon', bogon, 15, base, 'anomaly')
+
+    # parser check
+    msgs = _parse_bgp_capture(clean)
+    up = [m for m in msgs if m['type'] == 'update']
+    parse_ok = bool(up and up[0]['as_path'] == [65001, 65002] and
+                    '93.184.216.0/24' in up[0]['announced'])
+    scenarios.append({'name': 'update-parse',
+                      'expect': 'path=[65001,65002] pfx=93.184.216.0/24',
+                      'got': str({'as_path': up[0]['as_path'], 'announced': up[0]['announced']} if up else None),
+                      'pass': parse_ok})
+
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import IP, TCP, Ether, wrpcap  # noqa
+        try:
+            from scapy.contrib.bgp import BGPHeader, BGPKeepAlive
+        except Exception:
+            BGPHeader = None
+        if BGPHeader is not None and _have('tcpdump'):
+            pkt = (Ether() / IP(src='10.0.0.1', dst='10.0.0.2') /
+                   TCP(sport=179, dport=50000, flags='PA') /
+                   BGPHeader(type=4) / BGPKeepAlive())
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'tcp', 'port', '179'],
+                       timeout=10)
+            parsed = _parse_bgp_capture(res['out'])
+            scapy_result = {'ran': True, 'parsed_messages': len(parsed),
+                            'pass': True, 'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # PCAP Analyzer: triage an uploaded capture with tshark/capinfos
 # --------------------------------------------------------------------------
 
@@ -4628,6 +5207,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/ospf-baseline {action}")
         return jsonify(do_ospf_baseline(action))
 
+    @app.route('/api/net/bgp-watch', methods=['GET'])
+    def net_bgp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        _log(f"net/bgp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_bgp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/bgp-baseline', methods=['GET', 'POST'])
+    def net_bgp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/bgp-baseline {action}")
+        return jsonify(do_bgp_baseline(action))
+
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():
         _log("net/identity")
@@ -4766,6 +5363,15 @@ def _cli(argv=None):
     ost = sub.add_parser('ospf-selftest', help='self-test the OSPF detectors (no root)')
     ost.add_argument('--json', action='store_true', help='emit JSON')
 
+    b = sub.add_parser('bgp-watch', help='passive BGP path/security scan')
+    b.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    b.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    b.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    b.add_argument('--json', action='store_true', help='emit JSON')
+
+    bst = sub.add_parser('bgp-selftest', help='self-test the BGP detectors (no root)')
+    bst.add_argument('--json', action='store_true', help='emit JSON')
+
     args = p.parse_args(argv)
     if args.cmd == 'igmp-watch':
         r = do_igmp_watch(interface=args.iface, seconds=args.seconds,
@@ -4849,6 +5455,46 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"OSPF self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'bgp-watch':
+        r = do_bgp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"BGP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['messages']} msgs, {r['updates']} UPDATE, {r['prefix_total']} prefixes)")
+            if r.get('note'):
+                print(f"  note: {r['note']}")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            if r.get('peers'):
+                print(f"  peers: {', '.join('AS' + str(a) for a in r['peers'])} · MD5: {r['md5']}")
+            for a in r.get('advisories', []):
+                print(f"  [advisory:{a['severity']}] {a['title']}"
+                      f"{' (' + ', '.join(a['refs']) + ')' if a.get('refs') else ''}")
+            for f in r.get('findings', []):
+                print(f"  [{f['level']}] {f['text']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'bgp-selftest':
+        r = _bgp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"parsed={sc.get('parsed_messages')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"BGP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     p.print_help()

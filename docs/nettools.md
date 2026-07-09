@@ -5,7 +5,7 @@ toolbox — everything you'd normally reach for a laptop, a terminal and a bag o
 CLI tools to do, run straight from the device that's already sitting on the
 segment you care about.
 
-It is split into three sub-tabs: **Diagnostics**, **Switch & L2**, and
+It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 **Interfaces**.
 
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
@@ -29,8 +29,8 @@ alert.
 | [DNS Doctor (poisoning check)](#dns-doctor) | Diagnostics | `POST /api/net/dns` |
 | [ARP Poisoning](#arp-poisoning) | Diagnostics | `GET /api/net/arp-check`, `/arp-baseline` |
 | [MAC Watch](#mac-watch) | Diagnostics | `GET /api/net/mac-watch`, `POST /api/net/mac-watch-reset` |
-| [DHCP Guardian](#dhcp-guardian) | Switch & L2 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
-| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
+| [DHCP Guardian](#dhcp-guardian) | Switch & L2/L3 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
+| [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2/L3 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
 | [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
 | [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
 | [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
@@ -39,13 +39,14 @@ alert.
 | [Live Flow Telemetry](#live-flow-telemetry) | Diagnostics | `GET /api/net/flows` |
 | [PTP Timing Detection](#ptp-timing-detection) | Diagnostics | `POST /api/net/ptp` |
 | [E-Paper Network Diagnostic Mode](#-e-paper-network-diagnostic-mode) | Diagnostics (toggle) | config `network_diagnostic_mode` |
-| [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2 | `GET /api/net/lldp` |
-| [ARP Scan](#arp-scan) | Switch & L2 | `GET /api/net/arp-scan` |
-| [L2 Link Health](#l2-link-health) | Switch & L2 | `POST /api/net/l2-health` |
-| [IGMP Watch](#igmp-watch) | Switch & L2 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
-| [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
-| [Locate Port](#locate-port) | Switch & L2 | `POST /api/net/locate-port` |
-| [PCAP Analyzer](#pcap-analyzer) | Switch & L2 | `POST /api/net/pcap` |
+| [Switch Discovery + PoE](#switch-discovery-lldp--cdpv1v2--edp--fdp) | Switch & L2/L3 | `GET /api/net/lldp` |
+| [ARP Scan](#arp-scan) | Switch & L2/L3 | `GET /api/net/arp-scan` |
+| [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
+| [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
+| [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
+| [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
+| [Locate Port](#locate-port) | Switch & L2/L3 | `POST /api/net/locate-port` |
+| [PCAP Analyzer](#pcap-analyzer) | Switch & L2/L3 | `POST /api/net/pcap` |
 | [Interfaces](#interface-list) | Interfaces | `GET /api/net/interfaces` |
 | [Network Identity](#network-identity) | Interfaces | `GET /api/net/identity` |
 | [ISP / WAN + VPN Detection](#isp--wan-detection) | Interfaces | `GET /api/net/isp` |
@@ -377,7 +378,7 @@ on the far end.)
 
 - Endpoint: `POST /api/net/ptp` `{interface, seconds}` · binary: `tcpdump`
 
-## 🔌 Switch & L2
+## 🔌 Switch & L2/L3
 
 Layer-2 discovery: what switch you're plugged into, and what else is on the
 segment.
@@ -623,6 +624,50 @@ packet into a pcap and parses it back through `tcpdump` end to end.
 
 - Endpoint: `GET /api/net/ospf-watch` `{interface, seconds}`,
   `POST /api/net/ospf-baseline` `{action: reset}` · binary: `tcpdump`
+
+### BGP Path Watch
+The L3-edge companion to the OSPF scanner — a **passive** BGP routing-security
+scanner (TCP/179). **Detection-only**: it never opens a session or announces /
+withdraws a route. BGP is where traffic gets silently redirected across the
+Internet edge, so where it's visible this is the highest-value watch. It flags:
+
+- **Injection (hijack)** — an announced prefix whose **origin AS changed** vs the
+  learned baseline (prefix/origin hijack), or a **new more-specific** of a
+  baseline prefix (sub-prefix hijack — the most effective real-world BGP attack).
+- **Anomaly** — a new/rogue **peer** (new AS or BGP-ID), a **NOTIFICATION** /
+  session reset (teardown/flap), a **bogon/martian** prefix announcement, a
+  **reserved/documentation ASN** in a received path, an **AS-path loop**, or a
+  **BLACKHOLE** community (65535:666).
+- **Storm** — an UPDATE churn/flood, or a per-peer **prefix-count spike**
+  (full-table route leak).
+- **Weak session** — BGP seen but **no TCP-MD5/TCP-AO** signature (RFC 2385/5925),
+  exposed to off-path session-reset attacks. Advisory only.
+
+> **Visibility caveat:** unlike OSPF (multicast, on the broadcast domain), BGP is
+> **unicast TCP/179 between routers** — the Pi must be **inline, on a SPAN/mirror,
+> or a peer** to observe it. Private ASNs (RFC 6996, e.g. 65001) are treated as
+> normal, since internal/DC fabric is the most likely place to see BGP passively.
+
+The first scan learns the peers and prefix→origin map as the baseline
+(`data/bgp_watch.json`); **Trust current** re-learns after a legitimate change.
+As with OSPF, software-version CVEs aren't on the wire, so exposure conditions are
+flagged (weak auth; malformed-UPDATE crash class — **CVE-2023-38802** /
+**CERT VU#347067**) with an [OSV](https://osv.dev) pointer for the version lookup.
+
+Small **CLI** (no web app / no root for the self-test):
+
+```
+python3 network_diagnostics.py bgp-watch [--iface eth0] [--seconds 15] [--json]
+python3 network_diagnostics.py bgp-selftest
+```
+
+`bgp-selftest` drives the parser + classifier with synthetic captures (clean /
+origin-hijack / sub-prefix hijack / session-reset / bogon-prefix / UPDATE parse)
+and, when [Scapy](https://scapy.net) (`scapy.contrib.bgp`) is present, crafts a
+real BGP packet into a pcap and parses it back through `tcpdump`.
+
+- Endpoint: `GET /api/net/bgp-watch` `{interface, seconds}`,
+  `POST /api/net/bgp-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### Locate Port
 Physically find **which switch port** the device is plugged into — the software

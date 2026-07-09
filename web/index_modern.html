@@ -878,7 +878,7 @@
                 <button id="net-subtab-archive" onclick="showNetworkSubtab('archive')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">AP Archive</button>
                 <button id="net-subtab-map" onclick="showNetworkSubtab('map')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Map</button>
                 <button id="net-subtab-diagnostics" onclick="showNetworkSubtab('diagnostics')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Diagnostics</button>
-                <button id="net-subtab-switch" onclick="showNetworkSubtab('switch')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Switch &amp; L2</button>
+                <button id="net-subtab-switch" onclick="showNetworkSubtab('switch')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Switch &amp; L2/L3</button>
                 <button id="net-subtab-interfaces" onclick="showNetworkSubtab('interfaces')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Interfaces</button>
             </div>
 
@@ -1342,7 +1342,7 @@
                 </div>
             </div><!-- /#net-sub-diagnostics -->
 
-            <!-- ===================== Switch & L2 ===================== -->
+            <!-- ===================== Switch & L2/L3 ===================== -->
             <div id="net-sub-switch" class="net-subview hidden">
                 <div class="glass rounded-xl p-4 sm:p-6 mb-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-2">
@@ -1443,6 +1443,21 @@
                         <button onclick="ospfTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current routers/originators as the trusted baseline — use after a legitimate topology change">Trust current</button>
                     </div>
                     <div id="ospf-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- BGP Path Watch -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">BGP Path Watch</h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive BGP routing-security scanner — <strong>detection-only</strong>, never opens a session or announces/withdraws a route. The L3-edge companion to the OSPF scanner. Watches for <strong>prefix / origin hijacks</strong> and <strong>sub-prefix hijacks</strong> (origin-AS change vs baseline), <strong>anomalies</strong> (rogue peer, session reset/NOTIFICATION, bogon/martian prefix, reserved ASN, AS-path loop, BLACKHOLE community), <strong>route-leak storms</strong>, and <strong>weak session security</strong> (no TCP-MD5/TCP-AO). Detects — never exploits.</p>
+                    <p class="text-sm text-gray-400 mb-3"><span class="text-amber-400">BGP is unicast TCP/179 between routers</span>, so the Pi must be <strong>inline, on a SPAN/mirror, or a peer</strong> to observe it (unlike OSPF, it's not on the broadcast domain). The first scan learns the current peers and prefix→origin map as the baseline (<span class="font-mono">data/bgp_watch.json</span>); "Trust current" re-learns. Version CVEs aren't visible on the wire — exposure conditions are flagged with <a href="https://osv.dev" target="_blank" rel="noopener" class="text-cyan-400 underline">OSV</a> pointers.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="bgp-iface" title="Interface for the BGP capture — pick the inline/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="bgp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runBgpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan BGP</button>
+                        <button onclick="bgpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current peers/origins as the trusted baseline — use after a legitimate routing change">Trust current</button>
+                    </div>
+                    <div id="bgp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="mb-3">
@@ -5732,7 +5747,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-ospf"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-bgp"></script>
 
 </body>
 </html>
