@@ -4454,6 +4454,118 @@ def _bgp_prefix_covers(supernet, subnet):
     return (a & mask) == (b & mask)
 
 
+# --- ASN enrichment via Team Cymru IP-to-ASN whois (TCP/43) -----------------
+# Turns raw AS numbers / peer IPs into AS names + owner country. Purely additive
+# and SOFT-FAILING: a NOC that egress-filters outbound TCP/43 just gets IP/AS-
+# number-only output (per Solarflere's note). Results are cached, and a failed
+# lookup is negatively cached for a few minutes so a blocked egress doesn't add
+# a connect-timeout to every scan.
+_CYMRU_HOST = 'whois.cymru.com'
+_CYMRU_PORT = 43
+_CYMRU_TTL = 86400          # ASN mappings are stable — cache a day
+_CYMRU_FAIL_TTL = 300       # after a failure, don't retry for 5 min (fast soft-fail)
+_cymru_cache = {}           # ('ip'|'as', key) -> (ts, value)
+_cymru_lock = threading.Lock()
+_cymru_blocked_until = [0.0]
+
+
+def _cymru_query(lines, timeout):
+    """Send a bulk Team Cymru whois query; return the raw response or None on any
+    failure (soft-fail: outbound TCP/43 may be filtered)."""
+    payload = ('begin\nverbose\n' + '\n'.join(lines) + '\nend\n').encode()
+    try:
+        with socket.create_connection((_CYMRU_HOST, _CYMRU_PORT), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(payload)
+            chunks = []
+            while True:
+                b = s.recv(4096)
+                if not b:
+                    break
+                chunks.append(b)
+        return b''.join(chunks).decode('utf-8', 'replace')
+    except Exception:
+        return None
+
+
+def _parse_cymru(resp, out):
+    now = time.time()
+    for raw in resp.splitlines():
+        line = raw.strip()
+        if not line or '|' not in line or line.lower().startswith('bulk mode') \
+           or 'AS Name' in line:
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) >= 7:            # AS | IP | Prefix | CC | Registry | Alloc | Name
+            asn, ip, prefix, cc = parts[0], parts[1], parts[2], parts[3]
+            name = parts[6]
+            try:
+                asn_i = int(asn)
+            except ValueError:
+                asn_i = None
+            rec = {'asn': asn_i, 'name': name or None,
+                   'prefix': prefix if prefix and prefix != 'NA' else None,
+                   'cc': cc if cc and cc != 'NA' else None}
+            out['ips'][ip] = rec
+            with _cymru_lock:
+                _cymru_cache[('ip', ip)] = (now, rec)
+            if asn_i is not None:
+                out['asns'].setdefault(asn_i, name or None)
+                with _cymru_lock:
+                    _cymru_cache[('as', asn_i)] = (now, name or None)
+        elif len(parts) >= 5:          # AS | CC | Registry | Alloc | Name
+            try:
+                asn_i = int(parts[0])
+            except ValueError:
+                continue
+            name = parts[4]
+            out['asns'][asn_i] = name or None
+            with _cymru_lock:
+                _cymru_cache[('as', asn_i)] = (now, name or None)
+
+
+def _cymru_asn_lookup(ips=None, asns=None, timeout=4):
+    """Enrich IPs -> {asn,name,prefix,cc} and ASNs -> name via Team Cymru. Cached;
+    soft-fails to whatever the cache holds (possibly nothing) so callers degrade
+    to IP/AS-number-only output. `out['ok']` is False when the live lookup was
+    skipped/failed and nothing came back."""
+    ips = sorted({i for i in (ips or []) if i})
+    asns = sorted({int(a) for a in (asns or []) if a is not None})
+    out = {'ips': {}, 'asns': {}, 'ok': False, 'filtered': False}
+    if not ips and not asns:
+        out['ok'] = True
+        return out
+    now = time.time()
+    need_ips, need_asns = [], []
+    with _cymru_lock:
+        for ip in ips:
+            c = _cymru_cache.get(('ip', ip))
+            if c and now - c[0] < _CYMRU_TTL:
+                out['ips'][ip] = c[1]
+            else:
+                need_ips.append(ip)
+        for a in asns:
+            c = _cymru_cache.get(('as', a))
+            if c and now - c[0] < _CYMRU_TTL:
+                out['asns'][a] = c[1]
+            else:
+                need_asns.append(a)
+        blocked = now < _cymru_blocked_until[0]
+    if need_ips or need_asns:
+        if blocked:
+            out['filtered'] = True
+        else:
+            resp = _cymru_query(need_ips + [f'AS{a}' for a in need_asns], timeout)
+            if resp:
+                _parse_cymru(resp, out)
+            else:
+                out['filtered'] = True
+                with _cymru_lock:
+                    _cymru_blocked_until[0] = now + _CYMRU_FAIL_TTL
+    out['ok'] = not out['filtered'] or bool(out['ips'] or out['asns'])
+    return out
+
+
 def _bgp_capture(interface, seconds):
     """Run one passive tcpdump BGP window and return (raw_text, error)."""
     if not _have('tcpdump'):
@@ -4469,11 +4581,14 @@ def _bgp_capture(interface, seconds):
     return out, None
 
 
-def do_bgp_watch(interface=None, seconds=15, learn=True, quick=False):
+def do_bgp_watch(interface=None, seconds=15, learn=True, quick=False, enrich=True):
     """Passive BGP path/security scanner (detection-only). Captures BGP for a few
     seconds and classifies the edge: injection (hijack) / anomaly / storm /
     weak_session / clean, with CVE/OSV advisories. Learns peers + prefix origins
-    on first run; never opens a session or announces a route."""
+    on first run; never opens a session or announces a route.
+
+    enrich=True adds Team Cymru ASN names/owner (outbound TCP/43, soft-fails to
+    AS-number-only if egress filters it)."""
     iface = interface if _valid_iface(interface or '') else _default_route_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
@@ -4499,6 +4614,26 @@ def do_bgp_watch(interface=None, seconds=15, learn=True, quick=False):
                         'reasons': result['reasons'][:6]})
             b['events'] = evs[-_BGP_EVENTS_CAP:]
             _bgp_watch_save(b)
+
+    # ASN enrichment (additive, soft-failing). Kept out of _bgp_analyze so the
+    # self-test stays offline/deterministic.
+    if enrich and (result.get('peers') or result.get('prefixes')):
+        asns = set(result.get('peers') or [])
+        for p in result.get('prefixes', []):
+            if p.get('origin_as') is not None:
+                asns.add(p['origin_as'])
+        enr = _cymru_asn_lookup(ips=result.get('peer_ids') or [], asns=asns)
+        result['asn_names'] = {str(k): v for k, v in enr['asns'].items() if v}
+        result['enriched'] = enr['ok'] and bool(enr['asns'] or enr['ips'])
+        if enr.get('filtered'):
+            result['enrich_note'] = ('ASN name enrichment unavailable — needs '
+                                     'outbound TCP/43 to whois.cymru.com; showing '
+                                     'AS numbers only.')
+        for p in result.get('prefixes', []):
+            oa = p.get('origin_as')
+            if oa is not None and enr['asns'].get(oa):
+                p['origin_name'] = enr['asns'][oa]
+        result['peer_info'] = enr.get('ips') or {}
 
     if not messages:
         result['note'] = ('No BGP seen — BGP is unicast TCP/179 between routers, so '
@@ -5273,8 +5408,9 @@ def register_network_diagnostics(app, logger=None):
         if iface is not None and not _valid_iface(iface):
             return _bad('Invalid interface')
         secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
-        _log(f"net/bgp-watch iface={iface or 'default-route'} secs={secs}")
-        return jsonify(do_bgp_watch(interface=iface, seconds=secs))
+        enrich = request.args.get('enrich', '1') not in ('0', 'false', 'no')
+        _log(f"net/bgp-watch iface={iface or 'default-route'} secs={secs} enrich={enrich}")
+        return jsonify(do_bgp_watch(interface=iface, seconds=secs, enrich=enrich))
 
     @app.route('/api/net/bgp-baseline', methods=['GET', 'POST'])
     def net_bgp_baseline():
@@ -5432,6 +5568,7 @@ def _cli(argv=None):
     b.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     b.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
     b.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    b.add_argument('--no-enrich', action='store_true', help='skip Team Cymru ASN enrichment (no TCP/43)')
     b.add_argument('--json', action='store_true', help='emit JSON')
 
     bst = sub.add_parser('bgp-selftest', help='self-test the BGP detectors (no root)')
@@ -5524,7 +5661,7 @@ def _cli(argv=None):
 
     if args.cmd == 'bgp-watch':
         r = do_bgp_watch(interface=args.iface, seconds=args.seconds,
-                         learn=not args.no_learn)
+                         learn=not args.no_learn, enrich=not args.no_enrich)
         if args.json:
             print(json.dumps(r, indent=2))
         elif not r.get('success'):
@@ -5534,10 +5671,14 @@ def _cli(argv=None):
                   f"({r['messages']} msgs, {r['updates']} UPDATE, {r['prefix_total']} prefixes)")
             if r.get('note'):
                 print(f"  note: {r['note']}")
+            if r.get('enrich_note'):
+                print(f"  {r['enrich_note']}")
             if r.get('learned'):
                 print("  (baseline learned this run)")
             if r.get('peers'):
-                print(f"  peers: {', '.join('AS' + str(a) for a in r['peers'])} · MD5: {r['md5']}")
+                names = r.get('asn_names') or {}
+                ps = ', '.join('AS' + str(a) + (' (' + names[str(a)] + ')' if names.get(str(a)) else '') for a in r['peers'])
+                print(f"  peers: {ps} · MD5: {r['md5']}")
             for a in r.get('advisories', []):
                 print(f"  [advisory:{a['severity']}] {a['title']}"
                       f"{' (' + ', '.join(a['refs']) + ')' if a.get('refs') else ''}")

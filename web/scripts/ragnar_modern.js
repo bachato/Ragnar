@@ -2784,10 +2784,15 @@ async function runBgpWatch() {
         let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
         html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.messages} BGP msgs (${d.updates} UPDATE @ ${d.update_per_s}/s, ${d.notifications} NOTIFICATION) · ${d.prefix_total} prefixes${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
         if (d.note) html += `<p class="text-xs text-gray-500 mb-2">${escapeHtml(d.note)}</p>`;
+        if (d.enrich_note) html += `<p class="text-xs text-gray-500 mb-2">${escapeHtml(d.enrich_note)}</p>`;
+        const asnNames = d.asn_names || {};
         if (d.peers && d.peers.length) {
             const tp = d.trusted_peers || [];
             html += `<p class="text-xs mb-1 text-gray-400">Peers: ` +
-                d.peers.map(a => `<span class="font-mono ${tp.length && tp.indexOf(a) < 0 ? 'text-amber-300' : 'text-gray-200'}">AS${a}</span>`).join(', ') +
+                d.peers.map(a => {
+                    const nm = asnNames[a] ? ` <span class="text-gray-500">(${escapeHtml(asnNames[a])})</span>` : '';
+                    return `<span class="font-mono ${tp.length && tp.indexOf(a) < 0 ? 'text-amber-300' : 'text-gray-200'}">AS${a}</span>${nm}`;
+                }).join(', ') +
                 ` · TCP-MD5: <span class="${d.md5 ? 'text-green-400' : 'text-amber-300'}">${d.md5 ? 'yes' : 'not seen'}</span></p>`;
         }
         (d.advisories || []).forEach(a => {
@@ -2805,9 +2810,10 @@ async function runBgpWatch() {
                 '</thead><tbody>' +
                 prefixes.map(p => {
                     const badge = p.hijack ? '<span class="text-red-300">🛑 hijack</span>' : (p.bogon ? '<span class="text-amber-300">bogon</span>' : '<span class="text-gray-500">—</span>');
+                    const oname = p.origin_name ? ` <span class="text-gray-500">${escapeHtml(p.origin_name)}</span>` : '';
                     return `<tr class="border-t border-slate-800">
                         <td class="px-2 py-1 font-mono ${p.hijack || p.bogon ? 'text-amber-300' : ''}">${escapeHtml(p.prefix)}</td>
-                        <td class="px-2 py-1 font-mono ${p.hijack ? 'text-red-300' : ''}">${p.origin_as != null ? 'AS' + p.origin_as : '—'}</td>
+                        <td class="px-2 py-1 font-mono ${p.hijack ? 'text-red-300' : ''}">${p.origin_as != null ? 'AS' + p.origin_as : '—'}${oname}</td>
                         <td class="px-2 py-1 font-mono text-gray-500">${p.baseline_as != null ? 'AS' + p.baseline_as : '—'}</td>
                         <td class="px-2 py-1">${badge}</td>
                     </tr>`;

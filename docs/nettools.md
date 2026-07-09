@@ -670,6 +670,15 @@ As with OSPF, software-version CVEs aren't on the wire, so exposure conditions a
 flagged (weak auth; malformed-UPDATE crash class — **CVE-2023-38802** /
 **CERT VU#347067**) with an [OSV](https://osv.dev) pointer for the version lookup.
 
+**ASN enrichment:** origin ASNs and peer IPs are enriched with AS **owner names**
++ country via [Team Cymru's IP-to-ASN](https://team-cymru.com/community-services/ip-asn-mapping/)
+whois service, so a hijack reads `AS64500 (SOME-HOSTER, RU)` instead of a bare
+number. This needs **outbound TCP/43** to `whois.cymru.com` and **fails soft** —
+if your NOC egress filters it, the scan degrades to AS-number-only (a blocked
+egress is negatively cached for 5 min so it doesn't add a timeout to every scan).
+Results are cached for a day. Disable with `?enrich=0` on the endpoint or
+`--no-enrich` on the CLI.
+
 Small **CLI** (no web app / no root for the self-test):
 
 ```

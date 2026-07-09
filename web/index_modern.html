@@ -1448,7 +1448,7 @@
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">BGP Path Watch</h3>
                     <p class="text-xs text-amber-300/90 mb-2">Passive BGP routing-security scanner — <strong>detection-only</strong>, never opens a session or announces/withdraws a route. The L3-edge companion to the OSPF scanner. Watches for <strong>prefix / origin hijacks</strong> and <strong>sub-prefix hijacks</strong> (origin-AS change vs baseline), <strong>anomalies</strong> (rogue peer, session reset/NOTIFICATION, bogon/martian prefix, reserved ASN, AS-path loop, BLACKHOLE community), <strong>route-leak storms</strong>, and <strong>weak session security</strong> (no TCP-MD5/TCP-AO). Detects — never exploits.</p>
-                    <p class="text-sm text-gray-400 mb-3"><span class="text-amber-400">BGP is unicast TCP/179 between routers</span>, so the Pi must be <strong>inline, on a SPAN/mirror, or a peer</strong> to observe it (unlike OSPF, it's not on the broadcast domain). The first scan learns the current peers and prefix→origin map as the baseline (<span class="font-mono">data/bgp_watch.json</span>); "Trust current" re-learns. Version CVEs aren't visible on the wire — exposure conditions are flagged with <a href="https://osv.dev" target="_blank" rel="noopener" class="text-cyan-400 underline">OSV</a> pointers.</p>
+                    <p class="text-sm text-gray-400 mb-3"><span class="text-amber-400">BGP is unicast TCP/179 between routers</span>, so the Pi must be <strong>inline, on a SPAN/mirror, or a peer</strong> to observe it (unlike OSPF, it's not on the broadcast domain). The first scan learns the current peers and prefix→origin map as the baseline (<span class="font-mono">data/bgp_watch.json</span>); "Trust current" re-learns. Version CVEs aren't visible on the wire — exposure conditions are flagged with <a href="https://osv.dev" target="_blank" rel="noopener" class="text-cyan-400 underline">OSV</a> pointers. ASNs are enriched with owner names via <span class="font-mono">Team Cymru</span> (outbound TCP/43; soft-fails to AS-number-only if egress filters it).</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="bgp-iface" title="Interface for the BGP capture — pick the inline/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
                             <option value="">Auto (default route)</option>
@@ -5760,7 +5760,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-selftest"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260709-asn"></script>
 
 </body>
 </html>
