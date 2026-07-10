@@ -1159,7 +1159,7 @@
                     <div class="flex items-center justify-between gap-4">
                         <div class="min-w-0">
                             <h3 class="text-lg font-semibold">Network Integrity Monitor</h3>
-                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong>, <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) and <strong>rogue DHCP servers</strong> in the background, and sends a Pushover alert if the verdict goes bad. Makes outbound DNS/DoH calls each cycle — off by default.</p>
+                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong>, <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) and <strong>rogue DHCP servers</strong> in the background, and sends a Pushover alert if the verdict goes bad. With <strong>extended monitoring</strong> it also rotates the full passive-scanner suite — STP root-hijack, DTP VLAN-hop, FHRP/OSPF/EIGRP/IS-IS/BGP routing hijack & injection, SMB poisoning, NTLM relay/coercion, IGMP/IPv6/ICMP/NTP/SNMP/TLS and RA-Guard posture — a few per cycle so each stays light. Makes outbound DNS/DoH calls each cycle — off by default.</p>
                         </div>
                         <label class="toggle-switch relative inline-flex items-center cursor-pointer shrink-0">
                             <input type="checkbox" id="netint-enabled" class="sr-only peer" onchange="onNetIntegrityToggled(this)">
@@ -1167,10 +1167,18 @@
                         </label>
                     </div>
                     <div id="netint-status" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
-                    <div class="mt-3 flex flex-wrap items-center gap-2">
+                    <div class="mt-3 flex flex-wrap items-center gap-3">
                         <button onclick="netIntegrityRefresh(true)" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Check now</button>
-                        <span class="text-xs text-gray-500">Runs the DNS Doctor, ARP Poisoning and DHCP Guardian checks below.</span>
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer" title="Also rotate the passive Watch scanners (STP/DTP/FHRP/OSPF/EIGRP/IS-IS/BGP/SMB/Relay/…) through the background monitor">
+                            <input type="checkbox" id="netint-extended" class="accent-Ragnar-600" onchange="onNetIntegrityExtendedToggled(this)">
+                            Extended (full passive suite)
+                        </label>
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400" title="How many capture-based scanners run per cycle (round-robin). Higher = fresher but heavier cycles.">
+                            <span>scanners/cycle</span>
+                            <input type="number" id="netint-batch" min="1" max="15" value="3" onchange="onNetIntegrityBatchChanged(this)" class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+                        </label>
                     </div>
+                    <p class="text-xs text-gray-500 mt-2">"Check now" runs the fast core (DNS · ARP · DHCP) immediately; the extended scanners run on the background rotation once the monitor is enabled.</p>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
@@ -1339,6 +1347,68 @@
                         </div>
                         <div id="ptp-results" class="hidden mt-3 text-sm"></div>
                     </div>
+                    <!-- IPv6 RA Guard (host first-hop posture + hardening) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">IPv6 RA Guard <span class="text-xs font-normal text-gray-500">(host first-hop hardening)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">The <strong>defence</strong> half of IPv6 first-hop security. Where <em>IPv6 First-Hop Watch</em> (Switch &amp; L2/L3) <strong>detects</strong> a rogue RA / DHCPv6 / ICMPv6-Redirect on the wire, RA Guard audits <strong>this host's own IPv6 settings</strong> so a rogue first-hop can't take effect even if it reaches you — and can <strong>harden</strong> them in one click. It never sends a packet; it reads <span class="font-mono">/proc/sys/net/ipv6/conf</span> and the routing table.</p>
+                        <p class="text-sm text-gray-400 mb-3">Grades each interface on <span class="font-mono">accept_redirects</span> (accepting an <strong>ICMPv6 Redirect</strong> lets any on-link host reroute your traffic — a Layer-3 MITM), <span class="font-mono">accept_ra_rtr_pref</span> (honouring RA <strong>Router-Preference</strong> lets a rogue "pref high" RA jump ahead of the real router), and <span class="font-mono">accept_ra</span>, and shows which IPv6 <strong>gateway the host has actually accepted</strong>. <strong>Harden</strong> sets the two safe sysctls (<span class="font-mono">accept_redirects=0</span>, <span class="font-mono">accept_ra_rtr_pref=0</span>) live and persists them to <span class="font-mono">/etc/sysctl.d</span>; <span class="font-mono">accept_ra</span> is left untouched so SLAAC connectivity keeps working.</p>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button onclick="runRaGuard()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check posture</button>
+                            <button onclick="raGuardHarden()" class="w-full sm:w-auto bg-amber-700 hover:bg-amber-600 text-white px-4 py-2 rounded text-sm whitespace-nowrap" title="Applies + persists accept_redirects=0 and accept_ra_rtr_pref=0 (leaves accept_ra alone)">Harden host</button>
+                        </div>
+                        <div id="raguard-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- NTP Watch (rogue time source / clock injection) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">NTP Watch <span class="text-xs font-normal text-gray-500">(rogue time source · clock injection)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">NTP (<span class="font-mono">UDP/123</span>) is the network's <strong>clock of record</strong>. A rogue NTP server that answers clients — or <strong>broadcasts</strong> — with the <strong>wrong time</strong> silently poisons every downstream timestamp: audit logs, <strong>TLS / Kerberos validity windows</strong>, MFA/TOTP codes, and lab-result / chain-of-custody records. On a precision-critical segment (medical, finance, industrial) a few seconds of skew is a real incident — yet nobody watches 123. <strong>Detection-only</strong> — it never sends an NTP query.</p>
+                        <p class="text-sm text-gray-400 mb-3">Passively captures NTP and flags <strong>time-injection</strong> (a source whose served time disagrees with the segment consensus / local clock), a <strong>rogue server</strong> (answering but not in the baseline), a <strong>Kiss-o'-Death</strong> (stratum-0 sync-DoS), <strong>stratum spoofing</strong> (a forged Stratum-1/GPS claim), a rogue <strong>broadcast</strong> time source, mode 6/7 <strong>monlist recon/amplification</strong>, and anomalies (implausible root dispersion, leap-alarm, refid loop). First scan learns the trusted time source(s) (<span class="font-mono">data/ntp_watch.json</span>); "Trust current" re-learns.</p>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <select id="ntp-iface" title="Interface for the NTP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Auto (default route)</option>
+                            </select>
+                            <input id="ntp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runNtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan NTP</button>
+                            <button onclick="ntpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current NTP time source(s) as the trusted baseline — use after a legitimate NTP change">Trust current</button>
+                        </div>
+                        <div id="ntp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- SNMP Watch (v1/v2c cleartext community exposure) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">SNMP Watch <span class="text-xs font-normal text-gray-500">(v1/v2c cleartext community exposure)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">SNMP <strong>v1 and v2c authenticate with a plaintext "community string"</strong> — effectively a device password sent in the clear on <em>every</em> request. Anyone sniffing the segment harvests it: the read community (often the default <span class="font-mono">public</span>) exposes the full device config, and a <strong>write</strong> community — seen on a <span class="font-mono">SetRequest</span> — lets whoever captured it <strong>reconfigure the device</strong> (routes, ACLs, interfaces). <strong>v3</strong> (USM auth + privacy) fixes this. <strong>Detection-only</strong> — it never sends an SNMP request.</p>
+                        <p class="text-sm text-gray-400 mb-3">Passively captures SNMP (UDP 161/162) and flags <strong>write-exposed</strong> (a cleartext SetRequest), <strong>cleartext</strong> v1/v2c community exposure (worse for default strings like <span class="font-mono">public</span>/<span class="font-mono">private</span>), SNMP <strong>amplification</strong> (GetBulk with huge max-repetitions — a reflection-DDoS vector), and <strong>enumeration</strong> (a host walking the MIB). Only <strong>v3</strong> reads clean. First scan learns the segment's agents + community strings (<span class="font-mono">data/snmp_watch.json</span>) so later scans highlight <em>new</em> exposure; "Trust current" re-learns.</p>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <select id="snmp-iface" title="Interface for the SNMP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Auto (default route)</option>
+                            </select>
+                            <input id="snmp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <button onclick="runSnmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan SNMP</button>
+                            <button onclick="snmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current SNMP agents / community strings as the baseline — use after a legitimate SNMP change">Trust current</button>
+                        </div>
+                        <div id="snmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
+                    <!-- TLS Watch (certificate & TLS hygiene) -->
+                    <div class="glass rounded-xl p-4 sm:p-6 md:col-span-2">
+                        <h3 class="text-lg font-semibold mb-1">TLS Watch <span class="text-xs font-normal text-gray-500">(certificate &amp; TLS hygiene)</span></h3>
+                        <p class="text-xs text-amber-300/90 mb-2">Internal networks are full of TLS services — router/switch admin UIs, NAS boxes, hypervisors, printers, IoT — with certificates <strong>nobody audits</strong>: long expired, self-signed, hostname-mismatched, or signed with weak crypto. A certificate checker is inherently <strong>active</strong> — it must complete a TLS handshake to read the cert (TLS 1.3 encrypts it, so passive sniffing can't). It fetches the cert <strong>even when validation fails</strong>, so it can tell you exactly <em>why</em> it's invalid.</p>
+                        <p class="text-sm text-gray-400 mb-3">Grades each target for <strong>expired</strong> / not-yet-valid / <strong>self-signed</strong> / untrusted (not in the system CA store) / <strong>hostname-mismatch</strong> / <strong>weak-crypto</strong> (SHA-1/MD5, RSA&lt;2048, weak cipher) / <strong>deprecated-tls</strong> (TLS 1.0/1.1) / <strong>expiring</strong> (&lt;21 days). Type targets as <span class="font-mono">host</span> or <span class="font-mono">host:port</span>, and/or tick <strong>Discover</strong> to passively find the TLS servers on the segment first (server IP:port + SNI). A learned fingerprint baseline (<span class="font-mono">data/tls_watch.json</span>) flags a cert that <strong>changed</strong> between scans (rotation or possible MITM); "Trust current" re-learns.</p>
+                        <div class="flex flex-col gap-2">
+                            <textarea id="tls-targets" rows="2" placeholder="router.local, 192.168.1.1:443, nas.local:5001  (one or more; default port 443)" class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm font-mono text-gray-300"></textarea>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <label class="flex items-center gap-2 text-sm text-gray-300" title="Passively sniff TLS ClientHellos on the segment to discover servers to grade">
+                                    <input id="tls-discover" type="checkbox" class="accent-Ragnar-600"> Discover on
+                                </label>
+                                <select id="tls-iface" title="Interface for passive discovery" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (default route)</option>
+                                </select>
+                                <input id="tls-secs" type="number" min="4" max="30" value="8" title="discovery capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                                <button onclick="runTlsWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check TLS</button>
+                                <button onclick="tlsTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Forget stored cert fingerprints and re-learn on the next scan">Trust current</button>
+                            </div>
+                        </div>
+                        <div id="tls-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                    </div>
                 </div>
             </div><!-- /#net-sub-diagnostics -->
 
@@ -1414,6 +1484,36 @@
                     </details>
                     <div id="dhcp-snoop-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- IPv6 First-Hop Watch -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">IPv6 First-Hop Watch <span class="text-xs font-normal text-gray-500">(rogue RA / DHCPv6 · mitm6)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">The <strong>most-overlooked LAN attack today.</strong> Every modern OS ships with IPv6 on and <strong>prefers it</strong> — even on "IPv4-only" networks nobody manages. A rogue <strong>Router Advertisement</strong> or <strong>DHCPv6 server</strong> silently becomes the segment's gateway/DNS (the <strong>SLAAC / mitm6</strong> attack), and a tech watching only IPv4 / ARP / DHCP never sees it. <strong>Detection-only</strong> — never sends an RA, never answers a solicit.</p>
+                    <p class="text-sm text-gray-400 mb-3">Passively captures ICMPv6 <span class="font-mono">RA/RS/Redirect</span> + DHCPv6 and flags a <strong>rogue RA</strong> (new gateway, injected DNS/prefix, <span class="font-mono">pref high</span>, or router-lifetime 0), a <strong>rogue DHCPv6</strong> server (mitm6's DNS-takeover signature), an <strong>RA flood</strong>, and conflicting routers. First scan learns the trusted router(s)+server(s) (<span class="font-mono">data/ipv6_watch.json</span>); "Trust current" re-learns. Mitigate with switch <strong>RA-Guard</strong> (RFC 6105) / DHCPv6 snooping.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="ipv6-iface" title="Interface for the IPv6 capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="ipv6-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runIpv6Watch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan IPv6</button>
+                        <button onclick="ipv6TrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current RA router(s) / DHCPv6 server(s) as the trusted baseline — use after a legitimate IPv6 change">Trust current</button>
+                    </div>
+                    <div id="ipv6-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- ICMP Watch -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">ICMP Watch <span class="text-xs font-normal text-gray-500">(ICMP redirect · L3 route injection)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">The <strong>ICMP Redirect</strong> (type 5) is the classic <strong>Layer-3 man-in-the-middle</strong>: any host on the segment can forge a redirect that looks like it came from the gateway and tell a victim "for destination X, use next-hop Y instead" — steering that traffic <strong>through the attacker</strong>. No ARP poisoning, no gateway compromise needed, and many hosts honour redirects by default. <strong>Detection-only</strong> — it never sends an ICMP packet.</p>
+                    <p class="text-sm text-gray-400 mb-3">Passively captures IPv4 ICMP and flags a <strong>redirect</strong> steering traffic to a non-gateway next-hop (or from a non-gateway source), a rogue <strong>IRDP</strong> router advertisement (type 9 gateway injection), an ICMP <strong>flood</strong> (ping-flood / smurf), <strong>tunnelling</strong> (oversized echo payloads = covert channel / exfil), and <strong>recon</strong> (timestamp / address-mask / information requests). Compares against the host's <strong>default gateway</strong> (learned into <span class="font-mono">data/icmp_watch.json</span>); "Trust current" re-seeds. <span class="text-gray-500">ICMPv6 redirects (type 137) are covered by IPv6 First-Hop Watch.</span></p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="icmp-iface" title="Interface for the ICMP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="icmp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runIcmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan ICMP</button>
+                        <button onclick="icmpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Re-seed the trusted gateway from the host's current default gateway — use after a legitimate router change">Trust current</button>
+                    </div>
+                    <div id="icmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- IGMP Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">IGMP Watch</h3>
@@ -1429,6 +1529,66 @@
                     </div>
                     <div id="igmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- STP/BPDU Watch (spanning tree) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">STP/BPDU Watch <span class="text-xs font-normal text-gray-500">(spanning tree · root hijack)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive spanning-tree security scanner — <strong>detection-only</strong>, never sends a BPDU. STP/RSTP/MSTP (and Cisco PVST+) elect a <strong>root bridge</strong> by lowest Bridge ID; BPDUs carry the election, multicast in the clear with no auth. An attacker who sends a BPDU claiming a <strong>superior root</strong> (priority 0 — Yersinia "claim root role") wins and the tree reconverges to pull traffic through them (<strong>L2 MITM</strong>). Flags <strong>root-hijack</strong> (a root superior to the baseline), <strong>rogue-bridge</strong> (a new bridge in spanning tree), <strong>bpdu-flood</strong> (reconvergence-storm DoS) and <strong>topology-change</strong> (TCN/TC churn that flushes MAC tables). Defenses are BPDU Guard on edge ports and Root Guard downstream.</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the BPDU group MACs (IEEE <span class="font-mono">01:80:c2:00:00:00</span> + Cisco PVST+ <span class="font-mono">01:00:0c:cc:cc:cd</span>). The first scan learns the current root(s) — per VLAN for PVST+ — and legitimate bridges as the baseline (<span class="font-mono">data/stp_watch.json</span>); after a legitimate topology change, click "Trust current".</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="stp-iface" title="Interface for the BPDU capture — pick the switch-facing NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="stp-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runStpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan STP</button>
+                        <button onclick="stpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current root(s) and bridges as the trusted baseline — use after a legitimate topology change">Trust current</button>
+                    </div>
+                    <div id="stp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- DTP Watch (VLAN hopping) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">DTP Watch <span class="text-xs font-normal text-gray-500">(Cisco · VLAN hopping)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive Dynamic Trunking Protocol scanner — <strong>detection-only</strong>, never sends a DTP frame. DTP auto-negotiates whether a switch port becomes an 802.1Q/ISL <strong>trunk</strong>; a port left in the default <span class="font-mono">dynamic auto/desirable</span> mode will form a trunk with anything that speaks DTP "desirable". That's the classic <strong>VLAN-hopping / switch-spoofing</strong> attack (Yersinia "enable trunking"): a rogue host trunks the port to itself and sees/injects into <strong>every VLAN</strong>. Flags <strong>vlan-hop</strong> (trunk-forming DTP from a new speaker), <strong>trunk-negotiation</strong> (a port isn't <span class="font-mono">nonegotiate</span>, so it's exploitable) and <strong>dtp-enabled</strong> (DTP present at all). DTP should never appear on an access segment.</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, DTP PID 0x2004). DTP hellos are ~30s apart, so give it a longer window. The first scan learns the current DTP speakers (real switches) as the baseline (<span class="font-mono">data/dtp_watch.json</span>); a new speaker sending trunk-forming DTP is the tell. Click "Trust current" after a legitimate switch change.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="dtp-iface" title="Interface for the DTP capture — pick the access-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="dtp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runDtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan DTP</button>
+                        <button onclick="dtpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current DTP speakers as the trusted baseline — use after a legitimate switch change">Trust current</button>
+                    </div>
+                    <div id="dtp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">SMB Watch <span class="text-xs font-normal text-gray-500">(SMBv1 · LLMNR/NBT-NS/mDNS poisoning)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive Windows-endpoint attack-surface scanner — <strong>detection-only</strong>, one capture, two parts. <strong>Part 1 — SMBv1:</strong> the deprecated SMB dialect and the <strong>EternalBlue / WannaCry (MS17-010)</strong> vector; still lurking on legacy NAS/printers. Tells a <em>real</em> SMBv1 session (tree-connect / server negotiate-response) apart from a harmless multi-dialect offer. <strong>Part 2 — LLMNR/NBT-NS/mDNS poisoning:</strong> when DNS fails, Windows falls back to these broadcast/multicast name lookups; <strong>Responder/Inveigh</strong> answer with the attacker's IP and harvest <strong>NTLMv2 hashes</strong> (crack or relay). Nothing legit answers LLMNR/NBT-NS, so a host that does is a poisoner. Flags <strong>poisoning</strong> (an active Responder, incl. WPAD targeting), <strong>spoof-conflict</strong> (two hosts answering one name), <strong>SMBv1</strong> use, and <strong>name-exposure</strong> (LLMNR/NBT-NS in use at all).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture (SMB tcp/445+139, LLMNR udp/5355, NBT-NS udp/137, mDNS udp/5353) — tcpdump captures, Scapy dissects. The first scan learns the accepted mDNS responders (printers/Macs) + any SMBv1 hosts as the baseline (<span class="font-mono">data/smb_watch.json</span>); LLMNR/NBT-NS answers are never trusted. Click "Trust current" after a legitimate change. <span class="text-amber-400">Needs Scapy</span> (Detector Self-Test → Install Scapy).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="smb-iface" title="Interface to audit — pick the LAN/access NIC where Windows clients live" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="smb-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runSmbWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan SMB</button>
+                        <button onclick="smbTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current mDNS responders + SMBv1 hosts as the trusted baseline">Trust current</button>
+                    </div>
+                    <div id="smb-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- Relay/Coercion Watch (NTLM relay defense) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">Relay/Coercion Watch <span class="text-xs font-normal text-gray-500">(NTLM relay defense)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive NTLM-relay + authentication-coercion scanner — <strong>detection-only</strong>, the defensive counterpart to Responder-style theft (SMB Watch catches the harvest; this catches the <strong>relay</strong> and the <strong>coercion</strong> that feed it). NTLM has no channel binding by default, so a captured or <em>coerced</em> auth can be relayed to another host as the victim. Flags <strong>coercion-attempt</strong> — an MSRPC call forcing a host to authenticate: <strong>PetitPotam</strong> (MS-EFSRPC), <strong>PrinterBug</strong> (MS-RPRN opnum 65/66), <strong>DFSCoerce</strong> (MS-DFSNM), <strong>ShadowCoerce</strong> (MS-FSRVP) — <strong>relay-suspected</strong> (the same NTLM server challenge seen from two servers = a relay in progress), and <strong>signing-not-required</strong> (an SMB server that makes relay possible in the first place).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on MSRPC/SMB (tcp/445 · 139 · 135). Coercion interfaces are matched by their DCE/RPC UUID in the RPC bind; NTLM challenges and SMB2 signing come from the payloads. tcpdump captures, Scapy dissects (<span class="text-amber-400">needs Scapy</span>). The first scan learns accepted unsigned servers as the baseline (<span class="font-mono">data/relay_watch.json</span>); coercion + relay are never baselined away. Fix: enforce SMB/LDAP signing + channel binding (EPA), patch the coercion vectors.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="relay-iface" title="Interface to audit — pick the NIC facing your servers/DCs" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="relay-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runRelayWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan relay/coercion</button>
+                        <button onclick="relayTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current unsigned servers as the trusted baseline">Trust current</button>
+                    </div>
+                    <div id="relay-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- OSPF Security Scanner -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">OSPF Security Scanner</h3>
@@ -1443,6 +1603,51 @@
                         <button onclick="ospfTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current routers/originators as the trusted baseline — use after a legitimate topology change">Trust current</button>
                     </div>
                     <div id="ospf-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- EIGRP Watch (Cisco IGP) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">EIGRP Watch <span class="text-xs font-normal text-gray-500">(Cisco · IGP)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive EIGRP routing-security scanner — <strong>detection-only</strong>, never forms an adjacency, sends a hello, or injects a route. EIGRP is Cisco's interior gateway protocol (the Cisco-world alternative to OSPF; IP proto 88, multicast 224.0.0.10 / ff02::a). Without an HMAC key-chain, any host on the segment can peer and inject <strong>Update</strong> packets with attractive metrics to blackhole/MITM traffic. Unlike OSPF, tcpdump decodes EIGRP's route TLVs, so this sees <strong>route injection</strong> directly. Flags <strong>injection</strong> (a prefix not in the baseline, or a known prefix with a new next-hop — route/next-hop hijack), <strong>rogue-router</strong> (a new EIGRP speaker), <strong>storm</strong> (hello/query flood), <strong>anomaly</strong> (K-value / AS mismatch) and <strong>weak-auth</strong> (no Authentication TLV).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture (put the Pi on the routed VLAN or a SPAN/mirror to see EIGRP). The first scan learns the current routers and advertised prefix→next-hop map as the baseline (<span class="font-mono">data/eigrp_watch.json</span>); after a legitimate topology change, click "Trust current". IPv4 route TLVs are fully decoded; IPv6 EIGRP gives speaker/AS/auth/K-values (per-prefix v6 TLVs aren't dissected by tcpdump).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="eigrp-iface" title="Interface for the EIGRP capture — pick the routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="eigrp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runEigrpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan EIGRP</button>
+                        <button onclick="eigrpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current routers/prefixes as the trusted baseline — use after a legitimate topology change">Trust current</button>
+                    </div>
+                    <div id="eigrp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- IS-IS Watch (IGP) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">IS-IS Watch <span class="text-xs font-normal text-gray-500">(IGP · ISP/DC core)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive IS-IS routing-security scanner — <strong>detection-only</strong>, never forms an adjacency or injects an LSP. IS-IS (ISO 10589) is the third interior gateway protocol alongside OSPF and EIGRP, and the one that dominates <strong>ISP / service-provider and data-center cores</strong>. It runs <strong>directly on L2</strong> (LLC DSAP 0xFE) — not over IP — so IP ACLs don't touch it; its only real protection is TLV-10 authentication. Without it, any host can peer and inject <strong>LSPs</strong> with attractive metrics to blackhole/MITM traffic. tcpdump decodes the reachable prefixes, so this sees injection directly. Flags <strong>injection</strong> (an LSP from a new system-id, or a new/re-homed prefix), <strong>rogue-router</strong> (a new IS-IS speaker), <strong>storm</strong> (hello/LSP flood), <strong>anomaly</strong> (duplicate system-id / new area) and <strong>weak-auth</strong> (no auth or cleartext password).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the IS-IS multicast MACs (AllL1ISs <span class="font-mono">01:80:c2:00:00:14</span> + AllL2ISs <span class="font-mono">01:80:c2:00:00:15</span>). The first scan learns the current routers — resolved to names via the dynamic-hostname TLV — their areas, and the advertised prefix→originator map as the baseline (<span class="font-mono">data/isis_watch.json</span>); after a legitimate topology change, click "Trust current".</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="isis-iface" title="Interface for the IS-IS capture — pick the routed/core-facing NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="isis-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runIsisWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan IS-IS</button>
+                        <button onclick="isisTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current routers/prefixes as the trusted baseline — use after a legitimate topology change">Trust current</button>
+                    </div>
+                    <div id="isis-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- FHRP Watch (HSRP/VRRP/GLBP/CARP) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">FHRP Watch <span class="text-xs font-normal text-gray-500">(HSRP · VRRP · GLBP · CARP)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive First-Hop-Redundancy-Protocol hijack scanner — <strong>detection-only</strong>, never sends an FHRP packet or joins an election. FHRP (HSRP/VRRP/GLBP/CARP) lets routers share one <strong>virtual gateway IP+MAC</strong> and picks the active router by <strong>priority</strong>; the hellos are multicast in the clear with weak/no auth. An attacker who sees them can inject a forged <strong>priority-255 hello + preempt</strong>, win the election, and become everyone's default gateway (subnet-wide MITM, e.g. Yersinia/Loki). Flags <strong>hijack</strong> (a new speaker advertising a winning priority, or an HSRP Coup), <strong>rogue-speaker</strong> (a new speaker not yet winning), <strong>priority-change</strong> (a known speaker's priority jumped) and <strong>weak-auth</strong> (plaintext/no FHRP auth — the enabler).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the routed segment (HSRP udp/1985, GLBP udp/3222, VRRP+CARP IP-proto-112). The first scan learns the current groups and their active speakers/priorities as the trusted baseline (<span class="font-mono">data/fhrp_watch.json</span>); after a legitimate router/priority change, click "Trust current". HSRP+VRRP are fully decoded; GLBP/CARP are best-effort (new-speaker detection).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="fhrp-iface" title="Interface for the FHRP capture — pick the routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="fhrp-secs" type="number" min="4" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runFhrpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan FHRP</button>
+                        <button onclick="fhrpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current groups/speakers/priorities as the trusted baseline — use after a legitimate router or priority change">Trust current</button>
+                    </div>
+                    <div id="fhrp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <!-- BGP Path Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
@@ -1505,10 +1710,10 @@
                 <!-- Routing-scanner self-test + Scapy -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · OSPF · BGP · speaker · OWD)</span></h3>
+                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · STP · DTP · SMB · Relay · EIGRP · IS-IS · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
                         <div id="scapy-status" class="text-xs text-gray-400"></div>
                     </div>
-                    <p class="text-sm text-gray-400 mb-3 mt-1">Validates the IGMP, OSPF and BGP detectors by running each classifier against crafted attack captures — no root, no live traffic. Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span>, so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
+                    <p class="text-sm text-gray-400 mb-3 mt-1">Validates the IGMP, IPv6 first-hop, NTP, ICMP, SNMP, TLS-cert, OSPF and BGP detectors by running each classifier against crafted attack captures — no root, no live traffic. Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span> (and TLS Watch grades a real local handshake), so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <button onclick="runRoutingSelftest()" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Run self-test</button>
                         <button id="scapy-install-btn" onclick="installNetTool('scapy', this, runRoutingSelftest)" class="hidden bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Install the Scapy Python module for the end-to-end packet-crafting self-test">Install Scapy</button>
@@ -5803,7 +6008,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-netdiag-rename"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260710-netint"></script>
 
 </body>
 </html>

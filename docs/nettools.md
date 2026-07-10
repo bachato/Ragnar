@@ -1,15 +1,20 @@
-# 🌐 Network Tools
+# 🛡️ Authority Verification Across the Stack
 
-The **Network** tab in the Ragnar web interface is a built-in network engineer's
-toolbox — everything you'd normally reach for a laptop, a terminal and a bag of
-CLI tools to do, run straight from the device that's already sitting on the
-segment you care about.
+The **Network** tab in the Ragnar web interface is a built-in engine for
+**verifying authority across the stack** — at every layer, someone claims to be
+the legitimate authority (the root bridge, the default gateway, the DNS
+resolver, the DHCP server, the routing neighbour, the name responder, the SMB
+server), and each tool here answers one question: *is that claim genuine, or is
+an impostor asserting authority it shouldn't have?* It runs straight from the
+device that's already sitting on the segment you care about, so it sees what the
+segment sees — plus the everyday diagnostics you'd normally reach for a laptop
+and a bag of CLI tools to do.
 
 It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 **Interfaces**.
 
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
-> Network Tools suite was designed and built in collaboration with Solarflere.
+> Authority Verification suite was designed and built in collaboration with Solarflere.
 
 All tools are served under `/api/net/*` by `network_diagnostics.py`, a
 self-contained module wrapped so a failure there can never take down the rest of
@@ -43,6 +48,19 @@ alert.
 | [ARP Scan](#arp-scan) | Switch & L2/L3 | `GET /api/net/arp-scan` |
 | [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
+| [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
+| [IPv6 RA Guard](#ipv6-ra-guard) | Diagnostics | `GET /api/net/raguard`, `POST /api/net/raguard` `{action: harden}` |
+| [NTP Watch](#ntp-watch) | Diagnostics | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
+| [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
+| [SNMP Watch](#snmp-watch) | Diagnostics | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
+| [TLS Watch](#tls-watch) | Diagnostics | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
+| [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
+| [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
+| [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
+| [Relay/Coercion Watch](#relaycoercion-watch) | Switch & L2/L3 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
+| [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
+| [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
+| [IS-IS Watch](#is-is-watch) | Switch & L2/L3 | `GET /api/net/isis-watch`, `POST /api/net/isis-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -82,15 +100,17 @@ leg that crafts real packets → pcap → `tcpdump` → parse to exercise the wh
 capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
-A one-click **Run self-test** that validates the IGMP, OSPF and BGP detectors —
-plus the **BGP speaker** (codec/framer/FSM/RIB) and **path-asymmetry / OWD**
-engine — by running each classifier against crafted attack captures (no root, no
-live traffic) and reports per-suite pass/fail. With Scapy installed it also runs
-the end-to-end packet-crafting leg for the capture-based scanners. This is how you
-confirm the routing-security detectors are working on a given box without waiting
-for a real attack — endpoint `GET /api/net/routing-selftest`. The same checks run
-headless via `python3 network_diagnostics.py {igmp,ospf,bgp}-selftest` and each
-module's `selftest()`.
+A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**path-asymmetry / OWD** engine — by running each classifier against crafted attack
+captures (no root, no external network) and reports per-suite pass/fail. With Scapy
+installed it also runs the end-to-end packet-crafting leg for the capture-based
+scanners, and TLS Watch grades a real self-signed cert over a local (loopback)
+handshake. This is how you confirm the routing-security detectors are working on a
+given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
+The same checks run headless via
+`python3 network_diagnostics.py {igmp,ipv6,raguard,ntp,icmp,snmp,tls,ospf,bgp}-selftest` and each module's
+`selftest()`.
 
 ---
 
@@ -181,7 +201,9 @@ page (tap) or restart the service (hold).
 
 ## 🩺 Diagnostics
 
-Reachability, path and bandwidth testing to any target.
+Reachability, path and bandwidth testing to any target — plus application-layer
+service-security checks (**NTP** time integrity, **SNMP** cleartext exposure, and
+**TLS/certificate** hygiene).
 
 ### Ping
 ICMP echo to a host or IP. Reports the raw output plus a parsed summary
@@ -328,23 +350,38 @@ tracking as the neighbour-table approximation.
 
 ### 🛡️ Network Integrity Monitor
 The one **passive, alerting** tool in the suite (everything else is on-demand).
-When enabled it runs the [DNS Doctor](#dns-doctor) poisoning check, the
-[ARP Poisoning](#arp-poisoning) check and the [DHCP Guardian](#dhcp-guardian)
-rogue-server check on a schedule (default **every 5 min**), derives an overall
-verdict — **clean / suspicious / compromised** — and:
+When enabled it runs a fast core every cycle (default **every 5 min**) — the
+[DNS Doctor](#dns-doctor) poisoning check, the [ARP Poisoning](#arp-poisoning)
+check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
+[IPv6 RA Guard](#ipv6-ra-guard) posture read — derives an overall verdict
+(**clean / suspicious / compromised**) and:
 
-- Surfaces a live **dashboard chip** (Overall / DNS / ARP / DHCP) in the
-  Diagnostics sub-tab, with the reasons and last-check time.
-- Sends a **Pushover alert** when the verdict *worsens* into a bad state (it
-  alerts on the transition, not every cycle, with a cooldown backstop).
+- Surfaces a live **dashboard chip** (Overall + every check) in the Diagnostics
+  sub-tab, worst-first, with reasons and last-check time.
+- Sends a **Pushover alert** when *any* check *worsens* into a bad state (on the
+  transition, not every cycle, with a cooldown backstop). Active attacks
+  (hijack / injection / poisoning / coercion / VLAN-hop / root-hijack …) page as
+  **compromised**; posture/deviation findings (weak-auth, SMBv1, unsigned SMB,
+  name-exposure …) as **suspicious**.
+
+**Extended monitoring** (on by default alongside the monitor) additionally
+**rotates the whole passive-scanner suite** through the background poller —
+STP · DTP · IGMP · IPv6 first-hop · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
+Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
+`tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
+cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
+several cycles, and each scanner self-noops cheaply when its protocol isn't on
+the segment. The dashboard shows every scanner's last-known verdict even on
+cycles it didn't run. Each scanner **learns its baseline on first sight**, so
+run the monitor on a trusted network first (or use each card's "Trust current").
 
 **Off by default**, because it makes outbound DNS/DoH calls each cycle — opt in
-with the toggle. When you first enable it, be on a trusted network: the first
-cycle learns the gateway ARP baseline. **Check now** runs both checks
-immediately (works even while the monitor is off).
+with the toggle. **Check now** runs the fast core immediately (works even while
+the monitor is off); the extended scanners run on the background rotation.
 
 - Endpoint: `GET /api/net/integrity` · config: `net_integrity_monitor_enabled`,
   `net_integrity_interval_min`, `net_integrity_check_dhcp`,
+  `net_integrity_extended_enabled`, `net_integrity_batch_size`,
   `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`
 
 ### Path MTU / Black-hole
@@ -406,6 +443,213 @@ TWAMP/OWAMP SLA testing is a natural next step but needs a cooperating reflector
 on the far end.)
 
 - Endpoint: `POST /api/net/ptp` `{interface, seconds}` · binary: `tcpdump`
+
+### IPv6 RA Guard
+The **defence** half of IPv6 first-hop security. Where
+[IPv6 First-Hop Watch](#ipv6-first-hop-watch) (Switch & L2/L3) **detects** a rogue
+RA / DHCPv6 / ICMPv6-Redirect on the wire, RA Guard audits **this host's own IPv6
+settings** so a rogue first-hop can't take effect even if it reaches you — and can
+**harden** them in one click. It is active but sends **no packets**: it reads
+`/proc/sys/net/ipv6/conf/*` and the routing table. It grades every IPv6 interface
+(physical NICs first, container/VPN virtuals collapsed) on:
+
+- **`accept_redirects`** — accepting an **ICMPv6 Redirect** lets any on-link host
+  reroute your traffic (a Layer-3 MITM). A host should never accept them.
+  → verdict **redirect-open**.
+- **`accept_ra_rtr_pref`** — honouring the RA **Router-Preference** field lets a rogue
+  **`pref high`** RA jump ahead of the real router. → verdict **ra-pref-open**.
+- **`accept_ra`** — accepting RAs (SLAAC) at all. Normal, but only safe if the switch
+  enforces RA-Guard. → verdict **ra-open** (advisory).
+- Fully closed → **hardened**; IPv6 off on the interface → **ipv6-off**.
+
+It also shows **which IPv6 default gateway the host has actually accepted** right now
+(and whether it came from an RA). The **Harden** action sets the two safe sysctls —
+`accept_redirects=0` and `accept_ra_rtr_pref=0` — for `all`/`default` and every IPv6
+interface, applies them live, and persists them to
+`/etc/sysctl.d/99-ragnar-raguard.conf` so they survive a reboot. **`accept_ra` is
+deliberately left untouched** — turning it off would drop IPv6 connectivity on a
+legitimate SLAAC network; that trade-off is surfaced as advice (pair with a switch
+RA-Guard) rather than forced.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py raguard              # audit only
+python3 network_diagnostics.py raguard --harden     # apply + persist safe sysctls
+python3 network_diagnostics.py raguard-selftest     # self-test the grader, no root
+```
+
+`raguard-selftest` drives the grader with synthetic posture dicts
+(hardened / redirect-open / ra-pref-open / ra-open / ipv6-off / all-scope override /
+multi-interface roll-up) plus a read-only live leg that grades the real host.
+
+- Endpoint: `GET /api/net/raguard` (check), `POST /api/net/raguard` `{action: harden}`
+
+### NTP Watch
+NTP (**UDP/123**) is the network's **clock of record**. It touches every layer, but
+the attack surface is **Layer-7**: a rogue NTP server that answers clients — or
+**broadcasts** — with the **wrong time** silently poisons every downstream
+timestamp. Wrong time breaks **TLS / Kerberos validity windows**, invalidates
+**MFA/TOTP** codes, corrupts **audit logs**, and — in a precision-critical shop
+(medical lab, finance, industrial control) — falsifies **lab-result and
+chain-of-custody records**, where a few seconds of skew is a real incident. Yet
+almost nobody watches 123. This scanner is **passive and detection-only**: it never
+sends an NTP query. One short `tcpdump` window over `udp port 123` (captured with a
+per-packet Unix timestamp via `-tt`) is parsed and classified:
+
+- **Time injection** — a source whose served **transmit timestamp** disagrees with
+  the **segment consensus** (the median of all sources) — or, when only one source
+  is seen, with the **local clock** — beyond a threshold (default **2 s**; honest
+  sources agree to well under a second passively). This is the core attack: someone
+  is serving a skewed clock. If *every* source agrees but all disagree with the
+  local clock, that's flagged too (the host clock is wrong, or all sources shifted).
+- **Rogue server** — an NTP server answering on the segment that **isn't in the
+  learned baseline**. Clients may silently prefer it.
+- **Kiss-o'-Death** — a **stratum-0** reply (RFC 5905 KoD, e.g. `RATE` / `DENY`). A
+  rogue uses KoD to make clients **back off legitimate time sources** — a time-sync
+  DoS that softens them up for a rogue server.
+- **Stratum spoof** — a source claiming **Stratum 1** (primary / GPS reference) it
+  shouldn't, or a known server **lowering its stratum** to win client preference.
+- **Broadcast** — a **mode-Broadcast** time source: hosts in broadcast client mode
+  accept it blindly, a classic injection vector on modern unicast networks.
+- **Recon** — NTP **mode 6/7** (`ntpq` control / `monlist`) traffic: reconnaissance
+  or amplification abuse.
+- **Anomaly** — an implausible **root dispersion**, a **leap-alarm** (unsynchronized)
+  source, or a **reference-ID loop** (refid equals the source's own address).
+
+The **first scan learns** the trusted time source(s) + their stratum into
+`data/ntp_watch.json`; after a legitimate NTP change, click **Trust current** to
+re-learn. Every result carries a **mitigation advisory**: pin clients to known
+servers (prefer authenticated **NTS** or symmetric keys), restrict UDP 123 to
+expected hosts, and disable `monitor` (mode 6/7) on servers.
+
+> Passive over a capture window, NTP Watch catches **gross time injection, rogue and
+> broadcast sources, KoD, and stratum/mode abuse** — not sub-millisecond clock
+> *discipline* accuracy (that needs an active, round-trip measurement). It answers
+> "**is something on this segment serving the wrong time, or trying to?**"
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py ntp-watch [--iface eth0] [--seconds 15] [--json]
+python3 network_diagnostics.py ntp-selftest    # self-test the detectors, no root
+```
+
+`ntp-selftest` drives the real parser + classifier with synthetic captures (clean /
+time-injection / rogue-server / kod / stratum-spoof / broadcast / recon / anomaly /
+parse), and — when [Scapy](https://scapy.net) is installed — crafts a real NTP
+server reply into a pcap and parses it back through `tcpdump`, exercising the
+capture→parse path end to end.
+
+- Endpoint: `GET /api/net/ntp-watch` `{interface, seconds}`,
+  `POST /api/net/ntp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### SNMP Watch
+SNMP **v1 and v2c** authenticate with a plaintext **community string** — effectively
+a device password carried in the clear on *every* request. Anyone passively sniffing
+the segment harvests it: the **read** community (very often the default `public`)
+exposes the full device config / MIB, and a **write** community — revealed the moment
+a `SetRequest` crosses the wire — lets an attacker who captured it **reconfigure the
+device**: change routes, ACLs, SNMP itself, or bounce interfaces. **v3** fixes this
+with the User Security Model (authentication + privacy/encryption). This scanner is
+**passive and detection-only**: one short `tcpdump` window over UDP **161/162**,
+parsed and classified. It never sends an SNMP request. What it flags:
+
+- **Write-exposed** — a `SetRequest` in v1/v2c: a **write community is on the wire**,
+  i.e. sniff it and you own the device. The most severe finding.
+- **Cleartext** — any v1/v2c traffic: the community string is exposed. Worse when
+  it's a **well-known default** (`public`, `private`, `community`, `cisco`, …) —
+  trivially guessable even without a sniffer. The community strings actually seen are
+  listed so you know exactly what leaked.
+- **Amplification** — a `GetBulk` with a large **max-repetitions**: the SNMP
+  reflection / amplification DDoS vector (a small request eliciting a huge response).
+- **Enumeration** — one host issuing many `GetNext` / `GetBulk` requests: walking the
+  MIB (SNMP reconnaissance).
+- **Clean** — only **SNMPv3** (authenticated/encrypted), or no SNMP at all.
+
+The parser reads tcpdump's SNMP decode, including its convention of **omitting
+`C="…"` for the default `public` community** (so a v1/v2c message with no community
+shown is correctly treated as `public`). The first scan learns the segment's SNMP
+**agents + community strings** into `data/snmp_watch.json` so later scans can
+highlight **new** exposure (a new insecure agent or a new community appearing);
+**Trust current** re-learns. The verdict always reflects the cleartext reality —
+v1/v2c is insecure regardless of baseline. Every result carries a **mitigation
+advisory**: migrate to **SNMPv3 (authPriv, SHA + AES)**; if v1/v2c must remain,
+confine SNMP to a management VLAN with ACLs, use unique non-default read-only
+community strings, and disable SNMP on devices that don't need it.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py snmp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py snmp-selftest    # self-test the detectors, no root
+```
+
+`snmp-selftest` drives the real parser + classifier with synthetic captures (clean /
+cleartext / write-exposed / amplification / enumeration / parse), and — when
+[Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set messages into
+a pcap and parses them back through `tcpdump`, confirming the `public`-hidden
+inference and write-community detection end to end.
+
+- Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
+  `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### TLS Watch
+Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
+hypervisors, printers, IoT — with certificates **nobody audits**: long expired,
+self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive
+scanners in this guide, a certificate checker is inherently **active** — it must
+complete a TLS handshake to read the cert, and **TLS 1.3 encrypts the Certificate
+message**, so passive sniffing can't read modern certs at all. It therefore lives in
+the **Diagnostics** tab with the other active tools (ping / traceroute / speed test),
+and runs in two phases:
+
+- **Passive discovery** (optional, tick *Discover*) — one short `tcpdump` window over
+  TLS **ClientHellos** to find the TLS servers active on the segment (server
+  **IP:port + SNI**), so you don't have to type them. Best-effort; the SNI is still in
+  the clear in the ClientHello even under TLS 1.3. Needs Scapy's TLS layer for SNI,
+  else falls back to server IP:port.
+- **Active grading** — connect to each target (typed as `host` / `host:port`, and/or
+  discovered), fetch the presented certificate **even when it fails validation** (an
+  unverified fallback fetch), and grade it. Chain trust is checked against the system
+  CA store; hostname matching (wildcard-aware, SAN then CN) is done independently so
+  *why* a cert is bad is unambiguous.
+
+Per-target verdicts, worst first: **expired** · **not-yet-valid** · **self-signed** ·
+**untrusted** (chain doesn't build to a trusted CA — private CA or missing
+intermediate) · **hostname-mismatch** · **weak-crypto** (SHA-1/MD5 signature,
+RSA < 2048, or a weak/anon/NULL/RC4/DES cipher) · **deprecated-tls** (SSLv3 / TLS 1.0 /
+TLS 1.1 negotiated) · **expiring** (valid but < 21 days left) · **valid**. Each result
+carries the subject / issuer / SAN, validity dates + days-remaining, key type + size,
+signature algorithm, and the negotiated protocol + cipher. A learned **fingerprint
+baseline** (`data/tls_watch.json`, per `host:port`) flags a certificate that
+**changed** between scans — a rotation, or a possible **MITM** — and *Trust current*
+re-learns. Targets are always explicit (typed, or discovered on your own segment), and
+runs are capped — this is device-hygiene auditing of your own network, not a scanner.
+
+Uses Python's `ssl` + the `cryptography` library (no external binary for grading;
+`tcpdump` is only needed for the optional discovery phase). Every result carries a
+**mitigation advisory**: re-issue from a trusted internal CA (or ACME/Let's Encrypt
+for internet-facing services), put every hostname/IP in the SAN, use RSA ≥ 2048 or
+ECDSA P-256 with SHA-256+, disable TLS 1.0/1.1, and automate renewal.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py tls-watch router.local 192.168.1.1:443 nas:5001
+python3 network_diagnostics.py tls-watch --discover --iface eth0    # find + grade
+python3 network_diagnostics.py tls-selftest    # self-test the grader, no root
+```
+
+`tls-selftest` drives the real classifier with synthetic certs built by
+`cryptography` (valid / expired / not-yet-valid / self-signed / untrusted /
+hostname-mismatch / weak-crypto / deprecated-tls / expiring / wildcard-match), then
+runs an **end-to-end** leg that starts a local TLS server with a self-signed cert and
+grades it through the real handshake path — no root, no network.
+
+- Endpoint: `POST /api/net/tls-watch` `{targets, discover, interface, seconds}`,
+  `POST /api/net/tls-baseline` `{action: reset}` · Python: `cryptography` ·
+  binary: `tcpdump` (discovery only)
 
 ## 🔌 Switch & L2/L3
 
@@ -602,6 +846,345 @@ capture→parse path end to end.
 
 - Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
   `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### IPv6 First-Hop Watch
+The **most-overlooked LAN attack today**, and a genuine gap in most toolkits. Every
+modern OS ships with **IPv6 enabled and _preferred_** over IPv4 — even on networks
+where "nobody deploys IPv6" and nobody's watching it. So an attacker who broadcasts
+a rogue **Router Advertisement** (ICMPv6 type 134) or stands up a rogue **DHCPv6**
+server silently becomes the segment's **default gateway and/or DNS** — the classic
+**SLAAC attack** and **mitm6** — while a tech staring at IPv4 / ARP / DHCP sees
+nothing wrong. This scanner is **passive and detection-only**: it never sends an RA,
+never answers a solicit, never touches routing. One short `tcpdump` window over
+ICMPv6 RA/RS/Redirect + DHCPv6 (udp 546/547) is parsed and classified:
+
+- **Rogue RA** — a Router Advertisement from a router **not in the learned baseline**
+  (a new default gateway), a **second, conflicting** router, an RA that **injects a
+  DNS server** (RDNSS option) or a new prefix, an RA with **`pref high`** (an
+  attacker biasing host router-selection), or **router-lifetime 0** (an RA that
+  *deprecates* the real router — the RA "kill" / DoS trick).
+- **Rogue DHCPv6** — a DHCPv6 **ADVERTISE / REPLY / RECONFIGURE** from a server not
+  in the baseline. This is **mitm6's signature**: it answers DHCPv6 solicits handing
+  out the attacker as **DNS** (no gateway — it pairs with WPAD) to relay and
+  NTLM-capture.
+- **Rogue redirect** — an **ICMPv6 Redirect** (type 137) from a source that isn't a
+  known router: the IPv6 twin of the ICMP-redirect MITM, steering your IPv6 traffic
+  through an attacker's next-hop. (Harden the host against these with
+  [IPv6 RA Guard](#ipv6-ra-guard).)
+- **Storm** — a Router Advertisement **flood** (e.g. THC `fake_router6`), by rate.
+- **Anomaly** — first-hop IPv6 seen where the baseline expected none, or a
+  managed/other-flag change that alters how hosts get addresses.
+
+The **first scan learns** the trusted router(s) + DHCPv6 server(s) into
+`data/ipv6_watch.json`; after a legitimate IPv6 change, click **Trust current** to
+re-learn. Because RAs are intrinsically rare, a healthy segment reads clean. Every
+result carries a **mitigation advisory**: enable switch **RA-Guard** (RFC 6105) and
+DHCPv6 snooping on access ports; if IPv6 is genuinely unused, filter ICMPv6 RA /
+DHCPv6 or disable IPv6 on hosts to remove the vector entirely.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py ipv6-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py ipv6-selftest    # self-test the detectors, no root
+```
+
+`ipv6-selftest` drives the real parser + classifier with synthetic captures
+(clean / rogue-ra / rogue-dhcpv6 / storm / anomaly / multi-line RA parse), and —
+when [Scapy](https://scapy.net) is installed — crafts a real Router Advertisement
+(with prefix + RDNSS options) into a pcap and parses it back through `tcpdump`,
+exercising the capture→parse path end to end.
+
+- Endpoint: `GET /api/net/ipv6-watch` `{interface, seconds}`,
+  `POST /api/net/ipv6-baseline` `{action: reset}` · binary: `tcpdump`
+
+### ICMP Watch
+The **ICMP Redirect** (type 5) is the classic **Layer-3 man-in-the-middle**. Any
+host on the segment can forge a Redirect that appears to come from the real gateway
+and tell a victim *"for destination X, use next-hop Y instead"* — steering that
+traffic **through the attacker**. It needs **no ARP poisoning and no gateway
+compromise**, and historically most hosts honoured redirects by default, so it's an
+easy, quiet insertion. Related L3 ICMP abuses ride the same wire. This scanner is
+**passive and detection-only**: one short `tcpdump` window over IPv4 `icmp`, parsed
+and classified against the host's **authoritative default gateway** (never learned
+from redirect sources — those could be the attacker). It never sends an ICMP packet.
+What it flags:
+
+- **Redirect** — an ICMP Redirect steering traffic to a **next-hop that isn't a
+  known gateway** (attacker insertion), or **from a source that isn't the gateway**
+  (spoofed). The headline MITM. On a modern switched network redirects are rare
+  enough that even a "benign-looking" one (gateway → another known router) is
+  surfaced as an **anomaly** to verify.
+- **Rogue IRDP** — an ICMP **Router Advertisement** (type 9) from a non-gateway
+  host: the ICMP Router Discovery Protocol gateway-injection MITM (IRDP is
+  effectively obsolete, so any type-9 from a non-router is suspect).
+- **Flood** — an ICMP storm (**ping-flood / smurf**, or a redirect flood) by rate.
+- **Tunnel** — ICMP **echo** packets with **oversized payloads** (normal ping is
+  ~64 B): the ICMP-tunnelling / data-exfiltration covert-channel tell.
+- **Recon** — ICMP **timestamp / address-mask / information** requests that
+  enumerate hosts and leak facts.
+
+The host's default gateway is **always trusted**, plus any gateway learned into
+`data/icmp_watch.json` on the first scan; after a legitimate router change click
+**Trust current** to re-seed. Every result carries a **mitigation advisory**:
+ignore redirects on hosts (`net.ipv4.conf.all.accept_redirects=0`) and stop sending
+them on the gateway (`send_redirects=0`), disable IRDP, and rate-limit / filter the
+recon ICMP types at the edge. **ICMPv6 Redirects (type 137)** are covered separately
+by [IPv6 First-Hop Watch](#ipv6-first-hop-watch).
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py icmp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py icmp-selftest    # self-test the detectors, no root
+```
+
+`icmp-selftest` drives the real parser + classifier with synthetic captures (clean /
+redirect / rogue-irdp / flood / tunnel / recon / anomaly / redirect parse), and —
+when [Scapy](https://scapy.net) is installed — crafts a real ICMP Redirect into a
+pcap and parses it back through `tcpdump`, exercising the capture→parse path end to
+end.
+
+- Endpoint: `GET /api/net/icmp-watch` `{interface, seconds}`,
+  `POST /api/net/icmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### STP/BPDU Watch
+A **passive** spanning-tree security scanner covering **802.1D STP / 802.1w RSTP /
+802.1s MSTP** (IEEE group MAC `01:80:c2:00:00:00`) and **Cisco PVST+ / Rapid-PVST+**
+(per-VLAN, group MAC `01:00:0c:cc:cc:cd`). **Detection-only** — it never sends a BPDU.
+
+Spanning tree prevents L2 loops by electing a **root bridge** (the switch with the
+numerically lowest Bridge ID = priority + MAC) and blocking redundant paths back
+toward it. BPDUs carry the election and are multicast in the clear with **no
+authentication**, so an attacker who injects a BPDU claiming a **superior root**
+(priority 0 — the Yersinia "claim root role" move) wins the election, becomes the
+root bridge, and the tree reconverges to pull traffic through them (subnet-wide L2
+MITM). BPDU/TCN floods force constant reconvergence (DoS) and MAC-table flushing
+(which turns the switch into a hub — an aid to sniffing). What it flags:
+
+- **root-hijack** — a BPDU advertising a root **superior** to the baseline root
+  (lower priority, or equal priority + lower MAC): a root-bridge takeover. This is
+  the top finding — an active L2 MITM.
+- **rogue-bridge** — a new bridge (Bridge-ID MAC) participating in spanning tree that
+  isn't in the baseline (an unexpected switch, or a spoofed bridge).
+- **bpdu-flood** — an elevated BPDU rate: a reconvergence-storm DoS.
+- **topology-change** — TCN / TC-flag churn: repeated topology changes flushing the
+  MAC tables (instability, or a TCN-flood attack).
+
+The BPF is `(ether dst 01:80:c2:00:00:00) or (ether dst 01:00:0c:cc:cc:cd)`, captured
+with `tcpdump -e` for the sender MAC. For PVST+ the per-VLAN root is carried in the
+Bridge-ID's extended system-id, so the scanner tracks a root **per VLAN/instance**.
+The first scan **learns** the current root(s) and legitimate bridges as the baseline
+(`data/stp_watch.json`); after a legitimate topology change, click "Trust current".
+The real hardening — which this tool exists to nudge you toward — is **BPDU Guard**
+(+ PortFast) on edge/access ports and **Root Guard** on ports toward downstream
+switches, plus pinning your real root/backup-root to priority 0/4096. **API:**
+`GET /api/net/stp-watch`, `POST /api/net/stp-baseline`. **CLI:** `stp-watch`,
+`stp-selftest`.
+
+### SMB Watch
+A **passive** Windows-endpoint attack-surface scanner in two parts (one capture),
+**detection-only**. It targets the two most common internal-network findings, which
+share one kill chain (**Responder → NTLM → SMB relay**).
+
+**Part 1 — SMBv1.** SMBv1 is the deprecated (2014) SMB dialect and the **EternalBlue /
+WannaCry / NotPetya (MS17-010)** vector — disabled by default on modern Windows but
+still lurking on legacy NAS, printers and old hosts. SMBv1 frames carry the magic
+`\xffSMB` (SMB2/3 use `\xfeSMB`), so they're identified on the wire; from the SMB
+**command byte + response flag** the scanner separates a *real* SMBv1 session
+(tree-connect / session-setup, or a server negotiate-**response**) from a harmless
+multi-dialect negotiate **offer**, so a modern client that merely lists SMBv1 in its
+dialects isn't a false positive.
+
+**Part 2 — LLMNR / NBT-NS / mDNS poisoning.** When DNS fails, Windows falls back to
+these broadcast/multicast name-resolution protocols (LLMNR udp/5355, NBT-NS udp/137,
+mDNS udp/5353). **Responder / Inveigh** answer those queries with the attacker's IP;
+the victim then authenticates to the attacker and leaks **NTLMv2 hashes** (offline
+crack or relay). Nothing legitimate *answers* LLMNR/NBT-NS, so a host that does is a
+poisoner. What it flags:
+
+- **poisoning** — a host answering LLMNR/NBT-NS (Responder/Inveigh), or an mDNS host
+  claiming foreign / high-value names. **WPAD** and ISATAP targeting is called out.
+- **spoof-conflict** — one name answered by two hosts with different IPs (a poisoner
+  racing the real owner).
+- **smbv1-active** / **smbv1-offered** — SMBv1 in use, or merely offered.
+- **name-exposure** — LLMNR/NBT-NS queries present at all: hosts are one Responder
+  away from credential theft; disable via GPO.
+
+Capture is done by `tcpdump -w` into a pcap (SMB tcp/445+139, LLMNR/NBT-NS/mDNS) and
+**dissected with Scapy** — modern tcpdump no longer decodes SMB and never decoded
+LLMNR/NBT-NS, so Scapy is required (Detector Self-Test → **Install Scapy**). The first
+scan **learns** the accepted mDNS responders (printers/Macs announcing themselves) and
+any SMBv1 hosts as the baseline (`data/smb_watch.json`); LLMNR/NBT-NS answers are
+**never** baselined away. The hardening it nudges toward: disable SMBv1, turn off
+LLMNR (GPO) and NBT-NS (per-adapter / DHCP option 001), and enforce **SMB signing** so
+captured NTLM can't be relayed. **API:** `GET /api/net/smb-watch`,
+`POST /api/net/smb-baseline`. **CLI:** `smb-watch`, `smb-selftest`.
+
+### Relay/Coercion Watch
+A **passive** NTLM-relay + authentication-coercion scanner — the **defensive
+counterpart** to [SMB Watch](#smb-watch). Where SMB Watch catches the *harvest* (a host
+answering LLMNR/NBT-NS), this catches the *relay* and the *coercion* that feed it.
+NTLM has no channel binding by default, so an attacker who obtains an NTLM
+authentication — by poisoning, or by **coercing** a host to authenticate — can relay
+it to another service and act as the victim (`ntlmrelayx`). **Detection-only**
+(tcpdump → pcap → Scapy). What it flags:
+
+- **coercion-attempt** — an MSRPC call over 445/135 that forces a host to
+  authenticate, identified by the interface UUID in the RPC bind (matched by its
+  DCE/RPC little-endian wire encoding): **PetitPotam** (MS-EFSRPC), **PrinterBug /
+  SpoolSample** (MS-RPRN, plus the coercion opnum 65/66 to avoid flagging legit
+  printing), **DFSCoerce** (MS-DFSNM), **ShadowCoerce** (MS-FSRVP).
+- **relay-suspected** — the *same* NTLMSSP server challenge seen from **two different
+  servers**: a captured challenge being replayed through a relay.
+- **signing-not-required** — a server that negotiated SMB without signing *required*
+  (read from the SMB2 NEGOTIATE `SecurityMode`): the posture that makes captured NTLM
+  relayable in the first place.
+
+The BPF is `tcp port 445 or tcp port 139 or tcp port 135`, captured at snaplen 1024 so
+the RPC bind/opnum and NTLMSSP messages stay intact; **Scapy** dissects it. The first
+scan **learns** the accepted unsigned servers as the baseline
+(`data/relay_watch.json`); coercion and relay signals are **never** baselined away.
+The hardening it drives: enforce **SMB signing** everywhere, enable **LDAP signing +
+channel binding** on DCs, turn on **Extended Protection for Authentication (EPA)**,
+disable the Print Spooler on DCs, and patch (or RPC-filter) the coercion vectors.
+**API:** `GET /api/net/relay-watch`, `POST /api/net/relay-baseline`. **CLI:**
+`relay-watch`, `relay-selftest`.
+
+### DTP Watch
+A **passive** VLAN-hopping / switch-spoofing scanner for Cisco's **Dynamic Trunking
+Protocol** (proprietary; group MAC `01:00:0c:cc:cc:cc`, SNAP OUI `0x00000c`, PID
+`0x2004`). **Detection-only** — it never transmits a DTP frame.
+
+DTP auto-negotiates whether a switch port becomes an 802.1Q/ISL **trunk**. A port
+left in the default `dynamic auto` / `dynamic desirable` mode will form a trunk with
+*anything* that sends DTP "desirable" frames — so an attacker plugs into an access
+port, forges DTP desirable (Yersinia's "enable trunking"), the port trunks to them,
+and they can now see and inject into **every VLAN** on the switch. This is the
+classic VLAN hop. DTP should never appear on an access segment; the fix is
+`switchport mode access` + `switchport nonegotiate` on every user port. What it flags:
+
+- **vlan-hop** — trunk-forming DTP (on/desirable/auto) from a **new** speaker not in
+  the baseline: an active switch-spoofing attempt.
+- **trunk-negotiation** — trunk-forming DTP present at all (the port isn't
+  `nonegotiate`, so it's exploitable) even from a known switch.
+- **dtp-enabled** — DTP frames present but not negotiating a trunk. Advisory / learn.
+
+The scan uses `tcpdump -e` (to capture the sender's MAC) with the BPF
+`ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2004`, which isolates DTP from the
+other protocols sharing that Cisco group MAC (CDP/VTP/UDLD/PAgP). DTP hellos are ~30s
+apart, so the default window is longer (30s). The first scan **learns** the current
+DTP speakers (the real switches) as the baseline (`data/dtp_watch.json`); "Trust
+current" re-learns. **API:** `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline`.
+**CLI:** `dtp-watch`, `dtp-selftest`.
+
+### FHRP Watch
+A **passive** hijack scanner for the **First Hop Redundancy Protocols** — **HSRP**
+(Cisco, UDP 1985), **VRRP** (RFC 5798, IP proto 112), **GLBP** (Cisco, UDP 3222)
+and **CARP** (BSD, IP proto 112). **Detection-only** — it never sends an FHRP
+packet or joins an election; it captures one short window of the multicast hellos
+and classifies them against a learned baseline.
+
+FHRP is how two or more routers share a single **virtual gateway** (one virtual
+IP + MAC that floats to whichever router is *active*), so hosts keep working when a
+router dies. The active router is chosen by **priority**, and the hellos are
+multicast in the clear with weak or no authentication (HSRP's default is the
+plaintext string `cisco`; VRRPv3 has none). That makes FHRP a classic MITM target:
+an attacker who can see the hellos injects a forged hello with **priority 255 +
+preempt**, wins the election, and becomes everyone's default gateway — all
+off-subnet traffic now flows through them (Yersinia, Loki, `scapy`). What it flags:
+
+- **Hijack** — a speaker that isn't in the baseline advertising a **winning**
+  priority (≥ the current active, or ≥ 250/255), or an **HSRP Coup** (an active
+  takeover message). This is a live gateway takeover.
+- **Rogue speaker** — a new speaker in a group that isn't (yet) winning: FHRP
+  injection in progress; watch for a following priority rise.
+- **Priority change** — a *known* speaker whose priority jumped up. Could be a
+  legitimate reconfiguration or the pre-stage of a takeover.
+- **Weak / no auth** — plaintext HSRP auth or VRRP `authtype none/simple`. This is
+  the enabler; the fix is MD5/HMAC (HSRP key-chains, VRRP AH) plus filtering FHRP
+  multicast off access ports.
+
+The first scan **learns** the current groups and their active speakers/priorities
+as the trusted baseline (`data/fhrp_watch.json`); after a legitimate router or
+priority change, click **Trust current** to re-learn. HSRP and VRRP are fully
+decoded (priority-based detection); GLBP and CARP are best-effort (new-speaker
+presence, since `tcpdump` doesn't dissect GLBP). The BPF is
+`(udp and (port 1985 or port 3222)) or (ip proto 112) or (ip6 proto 112)`. Put the
+Pi on the routed VLAN or a SPAN/mirror to see the hellos. **API:**
+`GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline`. **CLI:** `fhrp-watch`,
+`fhrp-selftest`.
+
+### EIGRP Watch
+A **passive** routing-security scanner for Cisco's **EIGRP** — its interior gateway
+protocol and the Cisco-world alternative to OSPF (mechanically it's an *advanced
+distance-vector* protocol rather than link-state, but it fills the same IGP role).
+EIGRP runs over **IP proto 88**, multicast **224.0.0.10** (and `ff02::a` for IPv6).
+**Detection-only** — it never forms an adjacency, sends a hello, or injects a route.
+
+Like OSPF, EIGRP is unprotected on the wire unless an **HMAC-MD5/SHA authentication
+key-chain** is configured, so any host on the segment can peer and inject **Update**
+packets with attractive metrics to blackhole or MITM traffic. The advantage here:
+unlike OSPF (whose LSA internals `tcpdump` leaves opaque), `tcpdump` **fully decodes
+EIGRP's route TLVs** — the advertised prefix, next-hop and metrics are visible — so
+this scanner sees route injection directly. What it flags:
+
+- **injection** — a prefix that isn't in the baseline being advertised, or a known
+  prefix now pointing at a **different next-hop** (route / next-hop hijack). This is
+  the money finding — a forged route steering traffic.
+- **rogue-router** — a new EIGRP speaker (source / AS) not in the baseline
+  (adjacency spoofing).
+- **storm** — an EIGRP flood (hello / query storm) by rate.
+- **anomaly** — a **K-value** or **AS-number** mismatch between speakers (a misconfig
+  that blocks peering, or a crafted hello probing the segment).
+- **weak-auth** — EIGRP packets with **no Authentication TLV** (the enabler for
+  every injection attack).
+
+The BPF is `ip proto 88 or ip6 proto 88`. IPv4 route TLVs (internal + external, with
+next-hop, origin-router/AS and metrics) are fully decoded; **IPv6 EIGRP** yields the
+speaker, AS, auth state and K-values but not per-prefix detail (this `tcpdump` build
+prints the v6 route TLV as `Unknown TLV (0x0402)`). Put the Pi on the routed VLAN or
+a SPAN/mirror to see EIGRP. The first scan **learns** the current routers and the
+advertised prefix→next-hop map as the baseline (`data/eigrp_watch.json`); after a
+legitimate topology change, click "Trust current". **API:** `GET /api/net/eigrp-watch`,
+`POST /api/net/eigrp-baseline`. **CLI:** `eigrp-watch`, `eigrp-selftest`.
+
+### IS-IS Watch
+A **passive** routing-security scanner for **IS-IS** (ISO/IEC 10589) — the third
+interior gateway protocol alongside OSPF and EIGRP, and the one that dominates
+**ISP / service-provider and data-center cores**. **Detection-only** — it never forms
+an adjacency, sends a hello, or injects an LSP.
+
+IS-IS is architecturally unusual: it runs **directly on L2** (ISO CLNS, LLC DSAP
+`0xFE`) — *not* over IP — so IP ACLs never touch it, and its only real protection is
+the **TLV-10 authentication** (a cleartext password or HMAC-MD5). On a broadcast LAN
+its PDUs go to the AllL1ISs (`01:80:c2:00:00:14`) and AllL2ISs (`01:80:c2:00:00:15`)
+multicast MACs: **IIH** (Hello) forms adjacencies, **LSP** (Link State PDU) carries
+the topology and reachable prefixes, and **CSNP/PSNP** sync the database. Without
+authentication, any host on the segment can peer and inject LSPs with attractive
+metrics to blackhole or MITM traffic (the IS-IS analogue of OSPF LSA injection).
+`tcpdump` fully decodes IS-IS — including the reachable prefixes in LSPs and the
+**dynamic-hostname TLV (#137)** that maps a system-id to a router name — so this
+scanner sees injection directly and can name the routers. What it flags:
+
+- **injection** — an LSP from a system-id **not** in the baseline, or a **new /
+  re-homed** reachable prefix (an LSP hijack steering traffic). The money finding.
+- **rogue-router** — a new IS-IS speaker (system-id) sending hellos, not in baseline
+  (adjacency spoofing).
+- **storm** — an IIH/LSP flood by rate.
+- **anomaly** — a **duplicate system-id** seen from two MACs (a spoof), or a **new
+  area address** on a known router.
+- **weak-auth** — a PDU with **no Authentication TLV** or a **cleartext** password
+  (the injection enabler).
+
+The BPF is the two IS-IS multicast MACs, captured with `tcpdump -e` for the sender.
+The first scan **learns** the current routers (resolved to hostnames via TLV 137),
+their areas, and the advertised prefix→originator map as the baseline
+(`data/isis_watch.json`); after a legitimate topology change, click "Trust current".
+Because IS-IS rides directly on L2, the hardening is HMAC authentication at both
+levels plus restricting which access ports may carry it. **API:**
+`GET /api/net/isis-watch`, `POST /api/net/isis-baseline`. **CLI:** `isis-watch`,
+`isis-selftest`.
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
@@ -967,4 +1550,4 @@ alone would miss".
 
 ---
 
-*Network Tools co-authored by [Solarflere](https://www.instagram.com/solarflere).*
+*Authority Verification suite co-authored by [Solarflere](https://www.instagram.com/solarflere).*

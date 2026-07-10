@@ -26,9 +26,10 @@ import os
 import threading
 import time
 import socket
+import ssl
 import tempfile
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import bgp_speaker
 import path_asymmetry
@@ -3494,6 +3495,6035 @@ def _igmp_selftest():
 
 
 # --------------------------------------------------------------------------
+# IPv6 First-Hop Watch: rogue Router Advertisement / DHCPv6 scanner (passive)
+# --------------------------------------------------------------------------
+# The most-overlooked LAN attack today. Every modern OS ships with IPv6 on and
+# *prefers* it, even on "IPv4-only" networks nobody manages. So a rogue Router
+# Advertisement (ICMPv6 type 134) or a rogue DHCPv6 server silently becomes the
+# default gateway and/or DNS for the whole segment — the SLAAC / mitm6 attack —
+# and a tech watching only IPv4/ARP/DHCP never sees it. This scanner is PASSIVE:
+# one short tcpdump window over RA/RS/Redirect + DHCPv6, parsed and classified.
+# It never sends an RA, never answers a solicit, never touches routing. What it
+# flags:
+#   * rogue-ra      — a Router Advertisement from a router not in the learned
+#     baseline (new default gateway), a *second* conflicting router, an RA that
+#     injects a DNS server (RDNSS option) or prefix you didn't have, an RA with
+#     'pref high' (attacker biasing host selection), or router-lifetime 0 (an RA
+#     that deprecates the real router — the RA "kill" / DoS trick).
+#   * rogue-dhcpv6  — a DHCPv6 ADVERTISE/REPLY/RECONFIGURE from a server not in
+#     the baseline. mitm6's signature: it answers DHCPv6 solicits handing out the
+#     attacker as DNS (no gateway, pairs with WPAD) to relay/NTLM-capture.
+#   * storm         — an RA flood (THC fake_router6 / RA-flood DoS) by rate.
+#   * anomaly       — first-hop IPv6 seen where the baseline expected none, or a
+#     managed/other-flag flip that changes host addressing behaviour.
+# First run learns the trusted router(s) + DHCPv6 server(s) into
+# data/ipv6_watch.json; "Trust current" re-learns after a legitimate change.
+# Mitigation advisory points at switch RA-Guard (RFC 6105) / DHCPv6 snooping.
+
+_IPV6_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'ipv6_watch.json')
+_ipv6_watch_lock = threading.Lock()
+
+# Router Advertisements are intrinsically rare (every ~200s per router). A
+# sustained rate at/above this is a flood (fake_router6 / RA storm DoS).
+_IPV6_RA_FLOOD_RATE = 5.0
+# Keep at most this many anomaly events in the store (newest wins).
+_IPV6_EVENTS_CAP = 200
+
+# DHCPv6 message types sent by *servers* (a client should never see these from a
+# peer that isn't a real DHCPv6 server) — the rogue-server tell.
+_IPV6_DHCP6_SERVER_MSGS = ('advertise', 'reply', 'reconfigure', 'relay-reply')
+
+_IPV6_ADDR_RE = r'([0-9A-Fa-f:]+(?:%\w+)?)'
+
+
+def _parse_ipv6_capture(output):
+    """Parse `tcpdump -nn -t -v` text (RA/RS/Redirect + DHCPv6) into events.
+
+    tcpdump prints one packet as a non-indented header line followed by indented
+    option lines, so we group by packet block first, then read each block. Each
+    event is a dict with a 'kind':
+      ra    : {src, dst, lifetime, pref, managed, other, prefixes[], rdnss[],
+               mac, mtu}
+      rs    : {src}                      (router solicitation — normal from hosts)
+      redirect: {src}
+      dhcp6 : {src, msgtype, dns[], is_server}
+    """
+    events = []
+    # --- group lines into per-packet blocks ---
+    blocks, cur = [], []
+    hdr_re = re.compile(r'^\S.*\s>\s\S')
+    for raw in output.splitlines():
+        if not raw.strip():
+            continue
+        if not raw[0].isspace() and hdr_re.match(raw):
+            if cur:
+                blocks.append(cur)
+            cur = [raw]
+        elif cur:
+            cur.append(raw)
+    if cur:
+        blocks.append(cur)
+
+    src_re = re.compile(r'^' + _IPV6_ADDR_RE + r'\s*>\s*' + _IPV6_ADDR_RE)
+    for block in blocks:
+        text = '\n'.join(block)
+        low = text.lower()
+        m = src_re.match(block[0].strip())
+        src = m.group(1) if m else None
+        dst = m.group(2) if m else None
+
+        if 'router advertisement' in low:
+            ev = {'kind': 'ra', 'src': src, 'dst': dst,
+                  'lifetime': None, 'pref': 'medium', 'managed': False,
+                  'other': False, 'prefixes': [], 'rdnss': [], 'mac': None,
+                  'mtu': None}
+            lt = re.search(r'router lifetime\s+(\d+)s', low)
+            if lt:
+                ev['lifetime'] = int(lt.group(1))
+            pf = re.search(r'pref\s+(low|medium|high)', low)
+            if pf:
+                ev['pref'] = pf.group(1)
+            # RA-level flags line (managed/other) — the one with 'router lifetime'
+            for line in block:
+                ll = line.lower()
+                if 'router lifetime' in ll or 'hop limit' in ll:
+                    fl = re.search(r'flags\s+\[([^\]]*)\]', ll)
+                    if fl:
+                        flags = fl.group(1)
+                        ev['managed'] = 'managed' in flags
+                        ev['other'] = 'other' in flags
+                    break
+            ev['prefixes'] = re.findall(r'prefix info option.*?:\s*'
+                                        r'([0-9A-Fa-f:]+/\d+)', low)
+            for line in block:
+                if 'rdnss' in line.lower():
+                    ev['rdnss'].extend(re.findall(r'addr:\s*([0-9A-Fa-f:]+)',
+                                                  line.lower()))
+            mac = re.search(r'source link-address option.*?:\s*'
+                            r'([0-9a-f]{2}(?::[0-9a-f]{2}){5})', low)
+            if mac:
+                ev['mac'] = mac.group(1)
+            mtu = re.search(r'mtu option.*?:\s*(\d+)', low)
+            if mtu:
+                ev['mtu'] = int(mtu.group(1))
+            events.append(ev)
+        elif 'router solicitation' in low:
+            events.append({'kind': 'rs', 'src': src})
+        elif 'redirect' in low:
+            events.append({'kind': 'redirect', 'src': src})
+        elif 'dhcp6' in low:
+            mt = re.search(r'dhcp6\s+([a-z-]+)', low)
+            msgtype = mt.group(1) if mt else 'unknown'
+            dns = re.findall(r'dns[- ]server[^0-9A-Fa-f]*'
+                             r'([0-9A-Fa-f:]+)', low)
+            events.append({'kind': 'dhcp6', 'src': src, 'msgtype': msgtype,
+                           'dns': dns,
+                           'is_server': msgtype in _IPV6_DHCP6_SERVER_MSGS})
+    return events
+
+
+def _ipv6_watch_load():
+    try:
+        with open(_IPV6_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ipv6_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_IPV6_WATCH_PATH), exist_ok=True)
+        tmp = _IPV6_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _IPV6_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ipv6_baseline(action='get'):
+    """Manage the learned IPv6 first-hop baseline (trusted RA router(s) + their
+    RDNSS/prefixes, trusted DHCPv6 server(s)). action='reset' re-learns the
+    current segment on the next scan (use after a legitimate IPv6 change)."""
+    with _ipv6_watch_lock:
+        if action == 'reset':
+            _ipv6_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ipv6_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted((b.get('routers') or {}).keys()),
+            'dhcp6_servers': sorted(b.get('dhcp6_servers') or []),
+        }}
+
+
+def _ipv6_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed IPv6 first-hop events. Returns the result
+    payload (minus interface). Separated from capture so the self-test can drive
+    it with synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    ra_events = [e for e in events if e['kind'] == 'ra']
+    dhcp6_srv = [e for e in events if e['kind'] == 'dhcp6' and e.get('is_server')]
+    ra_count = len(ra_events)
+    ra_rate = round(ra_count / seconds, 2)
+
+    known_routers = dict(baseline.get('routers') or {})
+    known_servers = set(baseline.get('dhcp6_servers') or [])
+    had_baseline = bool(known_routers or known_servers)
+
+    # Aggregate observed routers (by link-local source).
+    routers = {}
+    for e in ra_events:
+        r = routers.setdefault(e['src'], {
+            'src': e['src'], 'lifetime': e['lifetime'], 'pref': e['pref'],
+            'managed': e['managed'], 'other': e['other'],
+            'prefixes': set(), 'rdnss': set(), 'mac': e.get('mac'), 'count': 0})
+        r['count'] += 1
+        r['prefixes'].update(e['prefixes'])
+        r['rdnss'].update(e['rdnss'])
+        if e['pref'] == 'high':
+            r['pref'] = 'high'
+        if e['lifetime'] is not None:
+            r['lifetime'] = e['lifetime']
+
+    servers = {}
+    for e in dhcp6_srv:
+        s = servers.setdefault(e['src'], {'src': e['src'], 'msgtypes': set(),
+                                          'dns': set()})
+        s['msgtypes'].add(e['msgtype'])
+        s['dns'].update(e['dns'])
+
+    # Learn-on-first-run: adopt whatever's on the wire as the trusted baseline.
+    learned = False
+    if learn and not had_baseline and (routers or servers):
+        baseline['routers'] = {src: {'prefixes': sorted(r['prefixes']),
+                                     'rdnss': sorted(r['rdnss'])}
+                               for src, r in routers.items()}
+        baseline['dhcp6_servers'] = sorted(servers.keys())
+        learned = True
+        known_routers = dict(baseline['routers'])
+        known_servers = set(baseline['dhcp6_servers'])
+
+    reasons = []
+    verdict = 'clean'
+
+    # --- storm: RA flood ---
+    if ra_rate >= _IPV6_RA_FLOOD_RATE and ra_count >= _IPV6_RA_FLOOD_RATE * seconds:
+        verdict = 'storm'
+        reasons.append(f"Router Advertisement flood: {ra_count} RAs in {seconds}s "
+                       f"({ra_rate}/s) — RA-flood DoS (e.g. fake_router6)")
+
+    rogue_routers = [src for src in routers if src not in known_routers]
+    rogue_servers = [src for src in servers if src not in known_servers]
+
+    # --- rogue RA (highest single-host severity) ---
+    if verdict == 'clean' and rogue_routers:
+        verdict = 'rogue-ra'
+        for src in rogue_routers:
+            r = routers[src]
+            extra = []
+            if r['rdnss']:
+                extra.append(f"DNS {', '.join(sorted(r['rdnss']))}")
+            if r['prefixes']:
+                extra.append(f"prefix {', '.join(sorted(r['prefixes']))}")
+            if r['pref'] == 'high':
+                extra.append("pref HIGH")
+            tail = (' — ' + '; '.join(extra)) if extra else ''
+            reasons.append(f"Rogue Router Advertisement from {src}"
+                           f"{' (MAC ' + r['mac'] + ')' if r['mac'] else ''}"
+                           f"{tail} — becomes a default gateway/DNS via SLAAC")
+        if not had_baseline:
+            reasons.append("No IPv6 router was known for this segment — first-hop "
+                           "IPv6 appeared where a tech would never look (classic "
+                           "overlooked attack vector)")
+
+    # --- rogue DHCPv6 (mitm6) ---
+    if verdict in ('clean', 'rogue-ra') and rogue_servers:
+        if verdict == 'clean':
+            verdict = 'rogue-dhcpv6'
+        for src in rogue_servers:
+            s = servers[src]
+            dns = f" handing out DNS {', '.join(sorted(s['dns']))}" if s['dns'] else ''
+            reasons.append(f"Rogue DHCPv6 server {src} "
+                           f"({'/'.join(sorted(s['msgtypes']))}){dns} — the mitm6 "
+                           f"DNS-takeover / NTLM-relay signature")
+
+    # --- anomalies (lower severity, don't override a rogue verdict) ---
+    if verdict == 'clean':
+        # >1 distinct router where the baseline knew <=1 = conflicting RAs.
+        if len(routers) > 1 and len(known_routers) <= 1:
+            verdict = 'anomaly'
+            reasons.append(f"{len(routers)} routers advertising on one segment: "
+                           f"{', '.join(sorted(routers))} — RA conflict/spoof")
+        # RA that deprecates a router (lifetime 0) from a known router.
+        for src, r in routers.items():
+            if r['lifetime'] == 0:
+                verdict = 'anomaly' if verdict == 'clean' else verdict
+                reasons.append(f"RA from {src} with router-lifetime 0 — deprecates "
+                               f"the IPv6 default route (RA 'kill' / DoS)")
+        # A known router that started injecting a brand-new RDNSS DNS server.
+        for src, r in routers.items():
+            if src in known_routers:
+                base_dns = set(known_routers[src].get('rdnss') or [])
+                new_dns = set(r['rdnss']) - base_dns
+                if new_dns:
+                    verdict = 'rogue-ra'
+                    reasons.append(f"Known router {src} now advertising new DNS "
+                                   f"{', '.join(sorted(new_dns))} (RDNSS) — DNS "
+                                   f"hijack via RA")
+
+    # --- rogue ICMPv6 Redirect (type 137): the IPv6 twin of the ICMP redirect
+    # MITM. A legitimate Redirect only comes from the host's first-hop router, so a
+    # Redirect from any source that isn't a known router steers IPv6 traffic through
+    # an attacker. (Captured all along; now classified.)
+    redirect_srcs = sorted({e['src'] for e in events
+                            if e['kind'] == 'redirect' and e.get('src')})
+    rogue_redirects = [s for s in redirect_srcs if s not in known_routers]
+    if rogue_redirects and verdict in ('clean', 'anomaly'):
+        verdict = 'rogue-redirect'
+    for src in rogue_redirects:
+        reasons.append(f"ICMPv6 Redirect from {src} (not a known router) — steers "
+                       f"IPv6 traffic through a rogue next-hop (Layer-3 MITM). Harden "
+                       f"hosts with net.ipv6.conf.*.accept_redirects=0 (see RA Guard).")
+
+    advisories = []
+    if routers or servers or redirect_srcs:
+        advisories.append("Enable switch RA-Guard (RFC 6105) and DHCPv6 snooping on "
+                          "access ports; if IPv6 is unused, filter ICMPv6 RA/"
+                          "DHCPv6 or disable IPv6 on hosts to remove the vector.")
+
+    def _pub_router(r):
+        return {'src': r['src'], 'lifetime': r['lifetime'], 'pref': r['pref'],
+                'managed': r['managed'], 'other': r['other'], 'mac': r['mac'],
+                'prefixes': sorted(r['prefixes']), 'rdnss': sorted(r['rdnss']),
+                'count': r['count'], 'baseline': r['src'] in known_routers}
+
+    def _pub_server(s):
+        return {'src': s['src'], 'msgtypes': sorted(s['msgtypes']),
+                'dns': sorted(s['dns']), 'baseline': s['src'] in known_servers}
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': reasons or (['No IPv6 first-hop traffic seen — segment quiet']
+                               if not (routers or servers) else
+                               ['All routers/servers match the trusted baseline']),
+        'learned': learned,
+        'ra_count': ra_count,
+        'dhcp6_count': len([e for e in events if e['kind'] == 'dhcp6']),
+        'redirect_count': len([e for e in events if e['kind'] == 'redirect']),
+        'rate': ra_rate,
+        'routers': [_pub_router(routers[s]) for s in sorted(routers)],
+        'dhcp6_servers': [_pub_server(servers[s]) for s in sorted(servers)],
+        'advisories': advisories,
+    }
+
+
+def _ipv6_capture(interface, seconds):
+    """Run one passive tcpdump window over IPv6 first-hop traffic (RA/RS/Redirect
+    + DHCPv6) and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    # ICMPv6 RA(134)/RS(133)/Redirect(137) + DHCPv6 (udp 546/547). ip6[40] is the
+    # ICMPv6 type when there are no extension headers, which RAs never carry.
+    bpf = ('(icmp6 and (ip6[40] == 134 or ip6[40] == 133 or ip6[40] == 137)) '
+           'or (udp and (port 547 or port 546))')
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ipv6_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive IPv6 first-hop security scanner (detection-only). Captures RA /
+    DHCPv6 for a few seconds and classifies the segment: storm / rogue-ra /
+    rogue-dhcpv6 / anomaly / clean. Learns the trusted router(s)+server(s) on
+    first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _ipv6_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_ipv6_capture(text)
+
+    with _ipv6_watch_lock:
+        baseline = _ipv6_watch_load()
+        result = _ipv6_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _ipv6_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ipv6_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_IPV6_EVENTS_CAP:]
+            _ipv6_watch_save(b)
+
+    result['interface'] = iface
+    return result
+
+
+def _ipv6_selftest():
+    """Self-test the IPv6 first-hop detectors with synthetic captures (no root, no
+    live traffic). Feeds crafted tcpdump text through the real parser + classifier,
+    and — if Scapy is available — builds a real RA into a pcap and parses it back
+    through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_ipv6_capture(text)
+        res = _ipv6_analyze(events, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    # A realistic multi-line RA block from tcpdump -v.
+    def ra(src, lifetime=1800, pref='medium', prefix='2001:db8:1::/64',
+           rdnss=None, mac='00:11:22:33:44:55'):
+        lines = [f"{src} > ff02::1: ICMP6, router advertisement, length 88",
+                 f"\thop limit 64, Flags [other stateful], pref {pref}, "
+                 f"router lifetime {lifetime}s, reachable time 0ms, retrans timer 0ms",
+                 f"\t  source link-address option (1), length 8 (1): {mac}",
+                 f"\t  prefix info option (3), length 32 (4): {prefix}, "
+                 f"Flags [onlink, auto], valid time 2592000s, pref. time 604800s"]
+        if rdnss:
+            lines.append(f"\t  rdnss option (25), length 24 (3):  lifetime 1800s, "
+                         f"addr: {rdnss}")
+        return "\n".join(lines)
+
+    base_one = {'routers': {'fe80::1': {'prefixes': ['2001:db8:1::/64'],
+                                        'rdnss': ['2001:db8:1::53']}},
+                'dhcp6_servers': []}
+
+    # 1. clean: the known router re-advertising the same prefix/DNS.
+    run('clean', ra('fe80::1', rdnss='2001:db8:1::53'), 12, base_one, 'clean')
+
+    # 2. rogue-ra: an unknown router advertises itself as gateway + DNS.
+    run('rogue-ra', ra('fe80::bad', pref='high', prefix='2001:db8:66::/64',
+                       rdnss='2001:db8:66::53'), 12, base_one, 'rogue-ra')
+
+    # 3. rogue-dhcpv6 (mitm6): an unknown DHCPv6 server hands out DNS.
+    mitm6 = ("fe80::evil > fe80::a: dhcp6 advertise (xid=0x112233 "
+             "(client-ID ...) (server-ID ...) (DNS-server 2001:db8:66::53) "
+             "(IA_NA ...))")
+    run('rogue-dhcpv6', mitm6, 12, base_one, 'rogue-dhcpv6')
+
+    # 4. storm: an RA flood.
+    flood = "\n".join(ra(f"fe80::{i}") for i in range(80))
+    run('storm', flood, 5, base_one, 'storm')
+
+    # 5. anomaly: a known router deprecates the default route (lifetime 0).
+    run('anomaly', ra('fe80::1', lifetime=0, rdnss='2001:db8:1::53'), 12,
+        base_one, 'anomaly')
+
+    # 5b. rogue-redirect: an ICMPv6 Redirect from a host that isn't a known router.
+    run('rogue-redirect',
+        "fe80::bad > fe80::a: ICMP6, redirect, length 88", 12, base_one,
+        'rogue-redirect')
+
+    # 6. parse: multi-line RA extracts prefix + RDNSS + MAC.
+    pev = _parse_ipv6_capture(ra('fe80::1', rdnss='2001:db8:1::53'))
+    p_ok = (len(pev) == 1 and pev[0]['kind'] == 'ra'
+            and '2001:db8:1::/64' in pev[0]['prefixes']
+            and '2001:db8:1::53' in pev[0]['rdnss']
+            and pev[0]['mac'] == '00:11:22:33:44:55')
+    scenarios.append({'name': 'ra-parse', 'expect': 'prefix+rdnss+mac',
+                      'got': str(pev[0] if pev else None)[:80], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real RA -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, wrpcap
+        from scapy.layers.inet6 import (IPv6, ICMPv6ND_RA, ICMPv6NDOptPrefixInfo,
+                                        ICMPv6NDOptRDNSS)
+        if _have('tcpdump'):
+            ra_pkt = (Ether() / IPv6(src='fe80::dead', dst='ff02::1') /
+                      ICMPv6ND_RA(routerlifetime=1800) /
+                      ICMPv6NDOptPrefixInfo(prefix='2001:db8:99::', prefixlen=64) /
+                      ICMPv6NDOptRDNSS(dns=['2001:db8:99::53']))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [ra_pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_ipv6_capture(res['out'])
+            ra_evs = [e for e in evs if e['kind'] == 'ra']
+            got_pref = ra_evs[0]['prefixes'] if ra_evs else []
+            scapy_result = {'ran': True, 'routers': [e['src'] for e in ra_evs],
+                            'prefixes': got_pref,
+                            'pass': any('2001:db8:99' in p for p in got_pref),
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# IPv6 RA Guard: host first-hop posture check + hardening (active, local)
+# --------------------------------------------------------------------------
+# Where IPv6 First-Hop Watch *detects* a rogue RA / DHCPv6 / ICMPv6-Redirect on the
+# wire, RA Guard is the *defence*: it audits THIS host's own IPv6 knobs and can
+# harden them so a rogue first-hop can't take effect even if it reaches the host.
+# It never sends a packet — it reads /proc/sys/net/ipv6/conf and the routing table.
+# The knobs that matter for first-hop security:
+#   * accept_redirects      — accepting an ICMPv6 Redirect lets any on-link host
+#     reroute your traffic (L3 MITM). A host should never accept them -> harden to 0.
+#   * accept_ra_rtr_pref     — honouring the RA Router-Preference lets a rogue
+#     "pref high" RA jump ahead of the real router -> harden to 0.
+#   * accept_ra              — accepting RAs at all (SLAAC). Left ALONE by harden:
+#     turning it off would drop IPv6 connectivity on legit SLAAC networks; it is
+#     only safe with upstream switch RA-Guard, which we surface as advice.
+# Hardening writes the two safe sysctls live and persists them so they survive a
+# reboot; accept_ra is deliberately untouched.
+_RAGUARD_SYSCTL_FILE = '/etc/sysctl.d/99-ragnar-raguard.conf'
+_RAGUARD_KEYS = ('accept_ra', 'accept_ra_defrtr', 'accept_ra_rtr_pref',
+                 'accept_ra_pinfo', 'accept_redirects', 'autoconf', 'forwarding',
+                 'disable_ipv6', 'use_tempaddr')
+# (key, target) pairs applied by Harden — safe, do not break SLAAC connectivity.
+_RAGUARD_HARDEN = (('accept_redirects', 0), ('accept_ra_rtr_pref', 0))
+_RAGUARD_PRIORITY = ['redirect-open', 'ra-pref-open', 'ra-open', 'hardened',
+                     'ipv6-off']
+# Virtual / container / VPN interfaces — hardened by the same all-scope sysctl, but
+# not the untrusted-facing NICs, so the UI collapses them.
+_RAGUARD_VIRTUAL_RE = re.compile(
+    r'^(veth|br-|docker|virbr|vmnet|vnet|tap|tun|wg\d|zt|tailscale|cni|flannel|'
+    r'cali|kube|nomad|dummy|bond|team|ifb|gre|sit|ip6tnl|erspan)', re.IGNORECASE)
+
+
+def _raguard_read_conf(iface):
+    """Read the relevant net.ipv6.conf.<iface>.* knobs from /proc (None if absent)."""
+    base = f'/proc/sys/net/ipv6/conf/{iface}'
+    out = {}
+    for k in _RAGUARD_KEYS:
+        try:
+            with open(f'{base}/{k}') as f:
+                out[k] = int(f.read().strip())
+        except (OSError, ValueError):
+            out[k] = None
+    return out
+
+
+def _raguard_ifaces():
+    """Real IPv6-capable interfaces (exclude the all/default templates and lo)."""
+    try:
+        names = sorted(os.listdir('/proc/sys/net/ipv6/conf'))
+    except OSError:
+        return []
+    return [n for n in names if n not in ('all', 'default', 'lo')]
+
+
+def _raguard_accepted_gateways():
+    """The IPv6 default route(s) the host has actually installed — the first hop it
+    trusts right now — and whether each came from an RA (proto ra)."""
+    res = _run(['ip', '-6', 'route', 'show', 'default'], timeout=5)
+    gws = []
+    for line in (res.get('out') or '').splitlines():
+        m = re.search(r'default\s+via\s+(\S+)\s+dev\s+(\S+)', line)
+        if m:
+            gws.append({'gw': m.group(1), 'dev': m.group(2),
+                        'from_ra': 'proto ra' in line})
+    return gws
+
+
+def _raguard_analyze(all_conf, ifaces_conf, gateways=None):
+    """Pure classifier over the host's IPv6 first-hop posture. Grades each interface
+    (worst-case: a knob is 'on' if either the interface OR the all-scope has it set),
+    rolls up the worst, and builds the harden plan. Separated for the self-test."""
+    all_conf = all_conf or {}
+    gateways = gateways or []
+
+    def on(c, key):
+        return c.get(key) == 1 or all_conf.get(key) == 1
+
+    per = []
+    for iface in sorted(ifaces_conf):
+        c = ifaces_conf[iface]
+        ipv6_off = c.get('disable_ipv6') == 1
+        redirect_open = on(c, 'accept_redirects')
+        ra_on = c.get('accept_ra') not in (0, None)
+        rtr_pref_on = on(c, 'accept_ra_rtr_pref')
+        if ipv6_off:
+            v, why = 'ipv6-off', 'IPv6 disabled on this interface'
+        elif redirect_open:
+            v, why = ('redirect-open',
+                      'accepts ICMPv6 Redirects (accept_redirects=1) — open to a '
+                      'redirect MITM')
+        elif ra_on and rtr_pref_on:
+            v, why = ('ra-pref-open',
+                      'honours RA Router-Preference (accept_ra_rtr_pref=1) — a rogue '
+                      '"pref high" RA can hijack the default route')
+        elif ra_on:
+            v, why = ('ra-open',
+                      'accepts Router Advertisements (SLAAC) — safe only if the '
+                      'switch enforces RA-Guard')
+        else:
+            v, why = 'hardened', 'ignores RAs and ICMPv6 Redirects'
+        per.append({'iface': iface, 'verdict': v, 'reason': why,
+                    'virtual': bool(_RAGUARD_VIRTUAL_RE.match(iface)),
+                    'accept_ra': c.get('accept_ra'),
+                    'accept_ra_rtr_pref': c.get('accept_ra_rtr_pref'),
+                    'accept_redirects': c.get('accept_redirects'),
+                    'forwarding': c.get('forwarding'),
+                    'disable_ipv6': c.get('disable_ipv6'),
+                    'redirect_open': redirect_open, 'rtr_pref_on': rtr_pref_on})
+
+    # Physical/untrusted-facing NICs first, then virtuals.
+    per.sort(key=lambda p: (p['virtual'], p['iface']))
+    # Overall reflects the worst *physical* interface when there is one (virtuals are
+    # covered by the same all-scope harden but aren't the exposed surface).
+    phys = [p['verdict'] for p in per if not p['virtual']]
+    verdicts = phys or [p['verdict'] for p in per] or ['ipv6-off']
+    overall = min(verdicts, key=_RAGUARD_PRIORITY.index)
+
+    # Does anything need hardening? (redirect or rtr-pref open anywhere, incl. all-scope)
+    needs = any(p['redirect_open'] or p['rtr_pref_on'] for p in per) \
+        or on({}, 'accept_redirects') or on({}, 'accept_ra_rtr_pref')
+
+    reasons = []
+    for p in per:
+        if not p['virtual'] and p['verdict'] not in ('hardened', 'ipv6-off'):
+            reasons.append(f"{p['iface']}: {p['reason']}")
+    virt_exposed = sum(1 for p in per if p['virtual']
+                       and p['verdict'] not in ('hardened', 'ipv6-off'))
+    if virt_exposed:
+        reasons.append(f"…and {virt_exposed} virtual/container interface(s) with the "
+                       f"same exposure (covered by the same all-scope harden)")
+    if not reasons:
+        reasons = ['Host ignores ICMPv6 Redirects and rogue RA preferences — '
+                   'first-hop hardened' if overall != 'ipv6-off'
+                   else 'IPv6 is disabled on all interfaces — no IPv6 first-hop surface']
+
+    remediation = []
+    if needs:
+        for scope in ('all', 'default'):
+            for key, val in _RAGUARD_HARDEN:
+                remediation.append(f'net.ipv6.conf.{scope}.{key} = {val}')
+
+    advisories = []
+    if any(p['verdict'] == 'ra-open' or p['verdict'] == 'ra-pref-open' for p in per):
+        advisories.append('This host accepts Router Advertisements (SLAAC). That is '
+                          'only safe if the access switch enforces RA-Guard (RFC '
+                          '6105); otherwise a rogue RA can still add a gateway/DNS. '
+                          'Pair this with IPv6 First-Hop Watch to catch it on the wire.')
+
+    return {
+        'success': True,
+        'verdict': overall,
+        'reasons': reasons,
+        'interfaces': per,
+        'gateways': gateways,
+        'needs_hardening': needs,
+        'remediation': remediation,
+        'advisories': advisories,
+    }
+
+
+def _raguard_apply():
+    """Harden: set the safe sysctls live for all/default + every IPv6 interface, and
+    persist them. Leaves accept_ra untouched. Returns what changed."""
+    live, errors = [], []
+    scopes = ['all', 'default'] + _raguard_ifaces()
+    for scope in scopes:
+        for key, val in _RAGUARD_HARDEN:
+            name = f'net.ipv6.conf.{scope}.{key}'
+            res = _run(['sysctl', '-w', f'{name}={val}'], timeout=5)
+            if res.get('rc', 0) == 0 and 'error' not in (res.get('err') or '').lower():
+                live.append(name)
+            else:
+                errors.append(f"{name}: {(res.get('err') or 'failed').strip()[:80]}")
+    # Persist (all/default cover interfaces created later; explicit per-if too).
+    body = ["# Ragnar IPv6 RA-Guard hardening — closes the ICMPv6-redirect and rogue",
+            "# RA-preference holes. accept_ra is intentionally left untouched so SLAAC",
+            "# connectivity keeps working. Managed by Ragnar; edit via the RA Guard tool.",
+            ""]
+    for scope in scopes:
+        for key, val in _RAGUARD_HARDEN:
+            body.append(f'net.ipv6.conf.{scope}.{key} = {val}')
+    persisted = None
+    try:
+        with open(_RAGUARD_SYSCTL_FILE, 'w') as f:
+            f.write("\n".join(body) + "\n")
+        persisted = _RAGUARD_SYSCTL_FILE
+    except OSError as e:
+        errors.append(f"persist {_RAGUARD_SYSCTL_FILE}: {e}")
+    return {'live': live, 'persisted': persisted, 'errors': errors}
+
+
+def do_raguard(action='check'):
+    """IPv6 RA Guard: audit (and optionally harden) the host's IPv6 first-hop
+    posture. action='check' reads only; action='harden' applies the safe sysctls
+    (accept_redirects=0, accept_ra_rtr_pref=0) live + persisted, then re-checks."""
+    applied = None
+    if action == 'harden':
+        applied = _raguard_apply()
+    all_conf = _raguard_read_conf('all')
+    ifaces = _raguard_ifaces()
+    ifaces_conf = {i: _raguard_read_conf(i) for i in ifaces}
+    if not ifaces_conf:
+        return {'success': True, 'verdict': 'ipv6-off', 'interfaces': [],
+                'reasons': ['No IPv6-capable interfaces found'], 'gateways': [],
+                'needs_hardening': False, 'remediation': [], 'advisories': [],
+                'applied': applied, 'all': all_conf}
+    result = _raguard_analyze(all_conf, ifaces_conf, _raguard_accepted_gateways())
+    result['all'] = all_conf
+    result['applied'] = applied
+    result['persist_file'] = _RAGUARD_SYSCTL_FILE
+    return result
+
+
+def _raguard_selftest():
+    """Self-test the RA Guard grader with synthetic posture dicts (no root, no host
+    change), plus a read-only live 'check' leg that exercises the /proc path."""
+    scenarios = []
+    allz = {k: 0 for k in _RAGUARD_KEYS}    # all-scope neutral (nothing forced on)
+
+    def conf(**kw):
+        c = {k: 0 for k in _RAGUARD_KEYS}
+        c.update(kw)
+        return c
+
+    def run(name, ifaces_conf, expect, all_conf=None):
+        res = _raguard_analyze(all_conf or allz, ifaces_conf)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'pass': ok})
+        return res
+
+    # hardened: accept_ra off, redirects off.
+    run('hardened', {'eth0': conf(accept_ra=0, accept_redirects=0)}, 'hardened')
+    # redirect-open: accepts ICMPv6 redirects.
+    run('redirect-open', {'eth0': conf(accept_ra=1, accept_redirects=1)},
+        'redirect-open')
+    # ra-pref-open: SLAAC + honours router preference.
+    run('ra-pref-open',
+        {'eth0': conf(accept_ra=1, accept_ra_rtr_pref=1, accept_redirects=0)},
+        'ra-pref-open')
+    # ra-open: SLAAC but ignores router preference + redirects.
+    run('ra-open',
+        {'eth0': conf(accept_ra=1, accept_ra_rtr_pref=0, accept_redirects=0)},
+        'ra-open')
+    # ipv6-off.
+    run('ipv6-off', {'eth0': conf(disable_ipv6=1)}, 'ipv6-off')
+    # all-scope redirect on overrides a clean interface (worst-case OR).
+    run('all-scope-redirect', {'eth0': conf(accept_ra=0, accept_redirects=0)},
+        'redirect-open', all_conf=conf(accept_redirects=1))
+    # worst-of-many rolls up.
+    r = run('rollup',
+            {'eth0': conf(accept_ra=1, accept_redirects=0, accept_ra_rtr_pref=0),
+             'eth1': conf(accept_ra=1, accept_redirects=1)}, 'redirect-open')
+    scenarios.append({'name': 'rollup-needs-harden', 'expect': 'True',
+                      'got': str(r['needs_hardening']), 'pass': r['needs_hardening']})
+
+    # Live read-only leg: the real host posture check must succeed and grade ifaces.
+    e2e = {'ran': False, 'reason': 'skipped'}
+    try:
+        live = do_raguard('check')
+        ok = live.get('success') and 'verdict' in live
+        e2e = {'ran': True, 'verdict': live.get('verdict'),
+               'interfaces': len(live.get('interfaces', [])), 'pass': bool(ok)}
+    except Exception as e:
+        e2e = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not e2e.get('ran')
+                                                    or e2e.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'e2e': e2e}
+
+
+# --------------------------------------------------------------------------
+# NTP Watch: passive rogue-NTP / time-injection scanner (detection-only)
+# --------------------------------------------------------------------------
+# NTP (UDP/123) is the network's clock of record. It touches every layer, but the
+# attack surface is Layer-7: a rogue NTP server that answers clients (or broadcasts)
+# with the *wrong* time silently poisons every downstream timestamp — audit logs,
+# TLS/Kerberos validity windows, MFA/TOTP, lab-result and chain-of-custody records.
+# In a precision-critical shop (medical, finance, industrial) a few seconds of skew
+# is a real-world incident, yet nobody watches 123. This scanner is PASSIVE: one
+# short tcpdump window, parsed and classified against a learned baseline of the
+# segment's trusted time sources. It never sends an NTP query. What it looks for:
+#   * time-injection — a server whose transmit timestamp disagrees with the segment
+#     consensus (or, with one source, the local clock) beyond a threshold: the core
+#     attack — someone is serving a shifted clock.
+#   * rogue-server   — an NTP server answering that isn't in the trusted baseline.
+#   * kod            — a Kiss-o'-Death (stratum 0) reply; a rogue can use KoD
+#     RATE/DENY to make clients back off legitimate sources (time-sync DoS).
+#   * stratum-spoof  — a source claiming Stratum 1 (primary/GPS) it shouldn't, or a
+#     known server lowering its stratum to win client preference.
+#   * broadcast      — a mode-Broadcast time source (hosts in broadcast client mode
+#     accept it blindly — a classic injection vector on modern unicast networks).
+#   * recon          — NTP mode 6/7 (ntpq control / monlist) traffic: reconnaissance
+#     or amplification abuse.
+#   * anomaly        — implausible root dispersion, a leap-alarm (unsynced) source,
+#     or a reference-ID loop.
+_NTP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'ntp_watch.json')
+_ntp_watch_lock = threading.Lock()
+
+# Seconds between the NTP timestamp epoch (1900-01-01) and the Unix epoch.
+_NTP_UNIX_DELTA = 2208988800
+# A server whose served time differs from consensus/local by more than this many
+# seconds is injecting a skewed clock. Honest LAN/WAN sources agree to well under a
+# second passively (offset ~ one-way delay), so this is far above the noise floor.
+_NTP_OFFSET_THRESHOLD = 2.0
+# Root dispersion above this (seconds) is implausible for a usable time source.
+_NTP_DISP_ALARM = 4.0
+_NTP_EVENTS_CAP = 200
+# tcpdump mode labels for a *time source* (something a client would sync to).
+_NTP_SERVER_MODES = ('Server', 'Broadcast', 'Symmetric Active', 'Symmetric Passive')
+# Non-standard modes on 123 = ntpq control (6) / private-monlist (7); some tcpdump
+# builds print both as 'Reserved'. Either way it's query/recon/amplification, never
+# normal client<->server time exchange.
+_NTP_CONTROL_MODES = ('Control Message', 'Private', 'Reserved')
+# RFC 5905 Kiss-o'-Death codes (stratum-0 refid as 4 ASCII chars).
+_NTP_KOD_CODES = frozenset(('DENY', 'RSTR', 'RATE', 'ACST', 'AUTH', 'AUTO', 'BCST',
+                            'CRYP', 'DROP', 'MCST', 'NKEY', 'RMOT', 'INIT', 'STEP'))
+
+_NTP_HDR_RE = re.compile(r'^(\d+\.\d+)\s+IP6?\b')
+_NTP_SRC_RE = re.compile(
+    r'(\d+\.\d+\.\d+\.\d+)\.(\d+)\s*>\s*(\d+\.\d+\.\d+\.\d+)\.(\d+):\s*'
+    r'NTPv(\d+),\s*([^,]+?),\s*length')
+
+
+def _parse_ntp_capture(output):
+    """Parse `tcpdump -nn -tt -v 'udp port 123'` text into per-packet NTP records.
+
+    tcpdump prints one packet as an epoch header line (`<epoch> IP (tos ...)`)
+    followed by an indented `SRC.port > DST.port: NTPvN, <Mode>, length` line and
+    tab-indented field lines. We group by packet block (new block at each epoch
+    header), then read each block. Each record is a dict:
+      {rx_epoch, src, dst, sport, dport, ver, mode, stratum, sdesc, refid, disp,
+       leap, xmit_unix, offset}
+    `offset` is (server transmit time - local capture time); on a healthy source it
+    is ~ -(one-way delay), i.e. near zero. `-tt` gives a per-packet Unix epoch so
+    the offset is immune to how long the capture window ran.
+    """
+    records = []
+    blocks, cur = [], []
+    for raw in output.splitlines():
+        if _NTP_HDR_RE.match(raw):
+            if cur:
+                blocks.append(cur)
+            cur = [raw]
+        elif cur:
+            cur.append(raw)
+    if cur:
+        blocks.append(cur)
+
+    for block in blocks:
+        head = _NTP_HDR_RE.match(block[0])
+        try:
+            rx_epoch = float(head.group(1))
+        except (TypeError, ValueError):
+            continue
+        text = '\n'.join(block)
+        sm = _NTP_SRC_RE.search(text)
+        if not sm:
+            continue  # not a decodable NTP packet (or truncated non-NTP)
+        rec = {'rx_epoch': rx_epoch, 'src': sm.group(1), 'sport': int(sm.group(2)),
+               'dst': sm.group(3), 'dport': int(sm.group(4)),
+               'ver': int(sm.group(5)), 'mode': sm.group(6).strip(),
+               'stratum': None, 'sdesc': '', 'refid': '', 'disp': 0.0,
+               'leap': None, 'xmit_unix': None, 'offset': None}
+
+        st = re.search(r'Stratum\s+(\d+)\s*\(([^)]*)\)', text)
+        if st:
+            rec['stratum'] = int(st.group(1))
+            rec['sdesc'] = st.group(2).strip()
+        rid = re.search(r'Reference-ID:\s*(\S.*?)\s*$', text, re.MULTILINE)
+        if rid:
+            rec['refid'] = rid.group(1).strip()
+        dp = re.search(r'Root dispersion:\s*([\d.]+)', text)
+        if dp:
+            try:
+                rec['disp'] = float(dp.group(1))
+            except ValueError:
+                pass
+        li = re.search(r'Leap indicator:\s*[^(]*\((\d+)\)', text)
+        if li:
+            rec['leap'] = int(li.group(1))
+        xm = re.search(r'(?<!- )Transmit Timestamp:\s*([\d.]+)', text)
+        if xm:
+            try:
+                ntp_secs = float(xm.group(1))
+                if ntp_secs > _NTP_UNIX_DELTA:  # sane, post-1970 timestamp
+                    rec['xmit_unix'] = ntp_secs - _NTP_UNIX_DELTA
+                    rec['offset'] = round(rec['xmit_unix'] - rx_epoch, 3)
+            except ValueError:
+                pass
+        records.append(rec)
+    return records
+
+
+def _ntp_watch_load():
+    try:
+        with open(_NTP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ntp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_NTP_WATCH_PATH), exist_ok=True)
+        tmp = _NTP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _NTP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ntp_baseline(action='get'):
+    """Manage the learned NTP baseline (trusted time source(s) + their stratum).
+    action='reset' re-learns the current segment's servers on the next scan (use
+    after a legitimate NTP change)."""
+    with _ntp_watch_lock:
+        if action == 'reset':
+            _ntp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ntp_watch_load()
+        return {'success': True, 'baseline': {
+            'servers': sorted((b.get('servers') or {}).keys()),
+        }}
+
+
+def _ntp_median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if not n:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _ntp_analyze(records, seconds, baseline, learn=True, threshold=None):
+    """Pure classifier over parsed NTP records. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with synthetic
+    packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    threshold = _NTP_OFFSET_THRESHOLD if threshold is None else threshold
+
+    server_recs = [r for r in records if r['mode'] in _NTP_SERVER_MODES]
+    client_recs = [r for r in records if r['mode'] == 'Client']
+    control_recs = [r for r in records if r['mode'] in _NTP_CONTROL_MODES]
+
+    # Aggregate time sources by address.
+    servers = {}
+    for r in server_recs:
+        s = servers.setdefault(r['src'], {
+            'src': r['src'], 'modes': set(), 'strata': set(), 'refids': set(),
+            'offsets': [], 'disp_max': 0.0, 'leaps': set(), 'broadcast': False,
+            'count': 0, 'kod': False, 'kod_codes': set()})
+        s['count'] += 1
+        s['modes'].add(r['mode'])
+        if r['stratum'] is not None:
+            s['strata'].add(r['stratum'])
+        if r['refid']:
+            s['refids'].add(r['refid'])
+        if r['offset'] is not None:
+            s['offsets'].append(r['offset'])
+        s['disp_max'] = max(s['disp_max'], r['disp'])
+        if r['leap'] is not None:
+            s['leaps'].add(r['leap'])
+        if r['mode'] == 'Broadcast':
+            s['broadcast'] = True
+        # A *server* reply at stratum 0 is by definition a Kiss-o'-Death.
+        if r['stratum'] == 0:
+            s['kod'] = True
+            code = re.sub(r'[^A-Za-z]', '', r['refid']).upper()
+            if code in _NTP_KOD_CODES:
+                s['kod_codes'].add(code)
+
+    known = dict(baseline.get('servers') or {})
+    had_baseline = bool(known)
+
+    # Learn-on-first-run: adopt the segment's current time sources as trusted.
+    learned = False
+    if learn and not had_baseline and servers:
+        baseline['servers'] = {
+            src: {'stratum': (min(s['strata']) if s['strata'] else None),
+                  'refid': (sorted(s['refids'])[0] if s['refids'] else ''),
+                  'broadcast': s['broadcast']}
+            for src, s in servers.items()}
+        learned = True
+        known = dict(baseline['servers'])
+        had_baseline = True
+
+    PRIORITY = ['time-injection', 'rogue-server', 'kod', 'stratum-spoof',
+                'broadcast', 'recon', 'anomaly', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Representative (median) offset per source.
+    offsets_by_server = {src: round(_ntp_median(s['offsets']), 3)
+                         for src, s in servers.items() if s['offsets']}
+
+    # --- time-injection: someone is serving a shifted clock ---
+    if len(offsets_by_server) >= 2:
+        consensus = round(_ntp_median(list(offsets_by_server.values())), 3)
+        offenders = {src: off for src, off in offsets_by_server.items()
+                     if abs(off - consensus) > threshold}
+        if offenders:
+            for src, off in sorted(offenders.items()):
+                bump('time-injection')
+                reasons.append(
+                    f"NTP server {src} is serving time {off:+.3f}s vs the segment "
+                    f"consensus ({consensus:+.3f}s) — active time injection "
+                    f"(poisons logs, TLS/Kerberos windows, MFA and audit records)")
+        elif abs(consensus) > threshold:
+            bump('time-injection')
+            reasons.append(
+                f"All {len(offsets_by_server)} NTP sources agree but disagree with "
+                f"the local clock by {consensus:+.3f}s — the local clock is wrong or "
+                f"every source is serving a shifted time")
+    elif len(offsets_by_server) == 1:
+        src, off = next(iter(offsets_by_server.items()))
+        if abs(off) > threshold:
+            bump('time-injection')
+            reasons.append(
+                f"NTP server {src}'s time is off by {off:+.3f}s from the local clock "
+                f"— possible time injection (only one source seen, cannot cross-check)")
+
+    # --- rogue-server: a source not in the trusted baseline ---
+    if had_baseline:
+        for src in sorted(servers):
+            if src not in known:
+                bump('rogue-server')
+                reasons.append(
+                    f"Unexpected NTP server {src} answering on the segment (not in "
+                    f"the trusted baseline) — clients may silently sync to it")
+
+    # --- kod: Kiss-o'-Death (stratum 0) reply ---
+    for src in sorted(servers):
+        s = servers[src]
+        if s['kod']:
+            bump('kod')
+            codes = ', '.join(sorted(s['kod_codes'])) or 'stratum-0'
+            reasons.append(
+                f"Kiss-o'-Death from {src} ({codes}) — a rogue server uses KoD "
+                f"RATE/DENY to make clients back off legitimate time (sync DoS)")
+
+    # --- stratum-spoof: forged/lowered stratum to win client preference ---
+    for src in sorted(servers):
+        s = servers[src]
+        good_strata = {n for n in s['strata'] if n and n < 16}
+        if not good_strata:
+            continue
+        claimed = min(good_strata)
+        base_stratum = (known.get(src) or {}).get('stratum')
+        if src not in known:
+            if claimed == 1:
+                bump('stratum-spoof')
+                reasons.append(
+                    f"NTP server {src} claims Stratum 1 (primary/GPS reference) — "
+                    f"verify it is a real reference clock; a forged low stratum makes "
+                    f"clients prefer this source")
+        elif base_stratum and claimed < base_stratum:
+            bump('stratum-spoof')
+            reasons.append(
+                f"Known NTP server {src} now advertises Stratum {claimed} "
+                f"(baseline {base_stratum}) — stratum manipulation to win preference")
+
+    # --- broadcast: a mode-Broadcast time source ---
+    for src in sorted(servers):
+        s = servers[src]
+        base_bcast = bool((known.get(src) or {}).get('broadcast'))
+        if s['broadcast'] and not base_bcast:
+            bump('broadcast')
+            reasons.append(
+                f"NTP broadcast/multicast server {src} on the segment — hosts in "
+                f"broadcast client mode accept it blindly (classic rogue-time vector)")
+
+    # --- recon: mode 6/7 control / monlist ---
+    if control_recs:
+        srcs = sorted({r['src'] for r in control_recs})
+        bump('recon')
+        reasons.append(
+            f"NTP mode 6/7 (ntpq control / monlist) traffic from {', '.join(srcs)} "
+            f"— reconnaissance or amplification abuse; disable 'monitor' and restrict "
+            f"mode 6/7")
+
+    # --- anomaly: unusable / forged time source ---
+    for src in sorted(servers):
+        s = servers[src]
+        if s['disp_max'] > _NTP_DISP_ALARM:
+            bump('anomaly')
+            reasons.append(
+                f"NTP server {src} root dispersion {s['disp_max']:.3f}s is "
+                f"implausibly large — unreliable/forged time")
+        if 3 in s['leaps']:
+            bump('anomaly')
+            reasons.append(
+                f"NTP server {src} leap indicator = alarm (unsynchronized) — "
+                f"serving unusable time")
+        if src in s['refids']:
+            bump('anomaly')
+            reasons.append(
+                f"NTP server {src} reference-ID equals its own address — reference "
+                f"loop / forged sync chain")
+
+    advisories = []
+    if servers or control_recs:
+        advisories.append(
+            "Pin clients to known NTP servers (prefer authenticated NTS or symmetric "
+            "keys), restrict inbound/outbound UDP 123 to expected hosts, and disable "
+            "mode 6/7 (monlist) on servers. On precision-critical segments "
+            "(lab/medical/finance/industrial) alert on any new time source or skew.")
+
+    def _pub(s):
+        off = offsets_by_server.get(s['src'])
+        return {'src': s['src'], 'modes': sorted(s['modes']),
+                'strata': sorted(s['strata']), 'refids': sorted(s['refids']),
+                'offset': off, 'disp': round(s['disp_max'], 3), 'count': s['count'],
+                'kod': s['kod'], 'broadcast': s['broadcast'],
+                'baseline': s['src'] in known}
+
+    if reasons:
+        summary = reasons
+    elif not (servers or control_recs):
+        summary = ['No NTP traffic seen — segment quiet on UDP/123']
+    else:
+        summary = ['All time sources match the trusted baseline and agree on time']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'server_count': len(servers),
+        'packet_count': len(records),
+        'client_count': len(client_recs),
+        'control_count': len(control_recs),
+        'rate': round(len(records) / seconds, 2),
+        'servers': [_pub(servers[s]) for s in sorted(servers)],
+        'advisories': advisories,
+    }
+
+
+def _ntp_capture(interface, seconds):
+    """Run one passive tcpdump window over NTP (UDP/123) and return (raw, error).
+    Uses -tt (per-packet Unix epoch) so the served-vs-local time offset is exact."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-tt', '-v', '-s', '512', '-c', '20000', 'udp port 123'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ntp_watch(interface=None, seconds=15, learn=True, quick=False):
+    """Passive NTP security scanner (detection-only). Captures NTP for a few
+    seconds and classifies the segment's time sources: time-injection / rogue-server
+    / kod / stratum-spoof / broadcast / recon / anomaly / clean. Learns the trusted
+    time source(s) on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _ntp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    records = _parse_ntp_capture(text)
+
+    with _ntp_watch_lock:
+        baseline = _ntp_watch_load()
+        result = _ntp_analyze(records, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _ntp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ntp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_NTP_EVENTS_CAP:]
+            _ntp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _ntp_selftest():
+    """Self-test the NTP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -tt -v` text through the real parser +
+    classifier, and — if Scapy is available — builds a real NTP server reply into a
+    pcap and parses it back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+    BASE = 1780000000.0  # fixed capture epoch for deterministic offsets
+
+    def block(src, mode='Server', stratum=2, refid='17.253.14.125', xmit_off=0.0,
+              disp='0.020000', leap=0, ver=4, rx=BASE, dst='192.168.1.50'):
+        """Craft one tcpdump -tt -v NTP packet block. xmit_off is how far the
+        server's transmit time is from the capture time (the injected skew)."""
+        ntp_secs = rx + xmit_off + _NTP_UNIX_DELTA
+        sdesc = {0: 'unspecified', 1: 'primary reference'}.get(
+            stratum, 'secondary reference')
+        return "\n".join([
+            f"{rx:.6f} IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], "
+            f"proto UDP (17), length 76)",
+            f"    {src}.123 > {dst}.123: NTPv{ver}, {mode}, length 48",
+            f"\tLeap indicator:  ({leap}), Stratum {stratum} ({sdesc}), "
+            f"poll 10 (1024s), precision -23",
+            f"\tRoot Delay: 0.000000, Root dispersion: {disp}, "
+            f"Reference-ID: {refid}",
+            f"\t  Reference Timestamp:  {ntp_secs - 60:.9f} (2026-05-28T20:00:00Z)",
+            f"\t  Originator Timestamp: {ntp_secs - 1:.9f} (2026-05-28T20:26:39Z)",
+            f"\t  Receive Timestamp:    {ntp_secs:.9f} (2026-05-28T20:26:40Z)",
+            f"\t  Transmit Timestamp:   {ntp_secs:.9f} (2026-05-28T20:26:40Z)",
+            f"\t    Originator - Receive Timestamp:  +1.000000000",
+            f"\t    Originator - Transmit Timestamp: +1.000000000",
+        ])
+
+    def run(name, text, seconds, baseline, expect):
+        recs = _parse_ntp_capture(text)
+        res = _ntp_analyze(recs, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'records': len(recs), 'pass': ok})
+        return res
+
+    base = {'servers': {
+        '10.0.0.1': {'stratum': 2, 'refid': '17.253.14.125', 'broadcast': False},
+        '10.0.0.2': {'stratum': 2, 'refid': '132.163.96.1', 'broadcast': False},
+        '10.0.0.3': {'stratum': 2, 'refid': '17.253.14.125', 'broadcast': False}}}
+
+    # 1. clean: three known servers, all agreeing on time.
+    run('clean',
+        "\n".join([block('10.0.0.1'), block('10.0.0.2'), block('10.0.0.3')]),
+        15, base, 'clean')
+
+    # 2. time-injection: a known server now serves time an hour off; two others agree.
+    run('time-injection',
+        "\n".join([block('10.0.0.1'), block('10.0.0.2'),
+                   block('10.0.0.3', xmit_off=3600.0)]),
+        15, base, 'time-injection')
+
+    # 3. rogue-server: an unknown server answers with correct time.
+    run('rogue-server',
+        "\n".join([block('10.0.0.1'), block('10.0.0.9')]),
+        15, base, 'rogue-server')
+
+    # 4. kod: a known server sends a stratum-0 Kiss-o'-Death (RATE).
+    run('kod', block('10.0.0.1', stratum=0, refid='RATE'), 15, base, 'kod')
+
+    # 5. stratum-spoof: a known secondary now claims Stratum 1 (primary/GPS).
+    run('stratum-spoof', block('10.0.0.1', stratum=1, refid='GPS'), 15, base,
+        'stratum-spoof')
+
+    # 6. broadcast: a known server now broadcasts time (mode Broadcast).
+    run('broadcast', block('10.0.0.1', mode='Broadcast', dst='224.0.1.1'), 15,
+        base, 'broadcast')
+
+    # 7. recon: an ntpq/monlist mode-6/7 (Reserved) query on 123.
+    recon = ("1780000000.100000 IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], "
+             "proto UDP (17), length 40)\n"
+             "    10.0.0.66.45000 > 10.0.0.1.123: NTPv2, Reserved, length 12\n"
+             "\tLeap indicator:  (0)")
+    run('recon', recon, 15, base, 'recon')
+
+    # 8. anomaly: a known server with an implausible root dispersion.
+    run('anomaly', block('10.0.0.1', disp='9.500000'), 15, base, 'anomaly')
+
+    # 9. parse: a server block yields stratum, refid and a ~0 offset.
+    pr = _parse_ntp_capture(block('10.0.0.1'))
+    p_ok = (len(pr) == 1 and pr[0]['mode'] == 'Server' and pr[0]['stratum'] == 2
+            and pr[0]['refid'] == '17.253.14.125' and pr[0]['offset'] is not None
+            and abs(pr[0]['offset']) < 0.001)
+    scenarios.append({'name': 'ntp-parse', 'expect': 'stratum2+refid+offset~0',
+                      'got': str(pr[0] if pr else None)[:90], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real NTP reply -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import struct
+        import tempfile
+        import time as _time
+        from scapy.all import Ether, IP, UDP, Raw, wrpcap
+        if _have('tcpdump'):
+            now = _time.time()
+            ntp = now + _NTP_UNIX_DELTA
+
+            def _ts(u):
+                s = int(u)
+                return struct.pack('!II', s, int((u - s) * (1 << 32)))
+            payload = (struct.pack('!BBBb', 0x24, 2, 10, -23)  # LI0 VN4 Mode4, str2
+                       + struct.pack('!ii', 0, 1310)           # root delay/disp
+                       + bytes((17, 253, 14, 125))             # refid
+                       + _ts(ntp - 3) + _ts(ntp - 1) + _ts(ntp) + _ts(ntp))
+            pkt = (Ether() / IP(src='192.0.2.123', dst='192.0.2.9')
+                   / UDP(sport=123, dport=123) / Raw(payload))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-tt', '-v', '-r', pcap_path], timeout=10)
+            recs = _parse_ntp_capture(res['out'])
+            srv = [r for r in recs if r['src'] == '192.0.2.123']
+            ok = bool(srv) and srv[0]['stratum'] == 2 and srv[0]['offset'] is not None
+            scapy_result = {'ran': True, 'servers': [r['src'] for r in recs],
+                            'stratum': srv[0]['stratum'] if srv else None,
+                            'offset': srv[0]['offset'] if srv else None, 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# ICMP Watch: passive ICMP-redirect / L3-injection scanner (detection-only)
+# --------------------------------------------------------------------------
+# The ICMP Redirect (type 5) is the classic Layer-3 gateway-injection MITM: any
+# host on the segment can forge a Redirect that appears to come from the real
+# gateway and tell a victim "for destination X, use next-hop Y instead" — steering
+# that traffic through the attacker. It needs no ARP poisoning and no gateway
+# compromise, and most hosts historically honoured redirects by default. Related
+# L3 ICMP abuses live on the same wire: rogue ICMP Router Discovery (IRDP, type 9)
+# advertisements that inject a default gateway, ICMP echo floods (ping-flood /
+# smurf DoS), ICMP tunnelling / covert channels (oversized echo payloads used to
+# exfiltrate data), and host reconnaissance (timestamp / address-mask / information
+# requests that leak host facts). This scanner is PASSIVE: one short tcpdump window
+# over IPv4 `icmp`, parsed and classified against the host's authoritative default
+# gateway. It never sends an ICMP packet. (ICMPv6 Redirects, type 137, are covered
+# by IPv6 First-Hop Watch.) What it flags:
+#   * redirect    — an ICMP Redirect steering traffic to a next-hop that isn't a
+#     known gateway (attacker insertion), or from a source that isn't the gateway
+#     (spoofed) — the headline MITM.
+#   * rogue-irdp  — an ICMP Router Advertisement (type 9) from a non-gateway host
+#     (IRDP default-gateway injection).
+#   * flood       — an ICMP storm (echo-flood / smurf, or a redirect flood) by rate.
+#   * tunnel      — echo packets with oversized payloads (ICMP covert channel/exfil).
+#   * recon       — ICMP timestamp / address-mask / information requests (host recon).
+#   * anomaly     — a redirect/IRDP that matches known gateways (rare but benign),
+#     or a deprecated type (source quench).
+_ICMP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'icmp_watch.json')
+_icmp_watch_lock = threading.Lock()
+
+# ICMP is intrinsically low-volume passively; a sustained rate at/above this is a
+# flood (ping-flood / smurf / redirect storm).
+_ICMP_FLOOD_RATE = 50.0
+# A normal ping is ~64 bytes of ICMP. An echo whose ICMP length exceeds this is
+# carrying a payload no ping needs — the ICMP-tunnel / exfil tell.
+_ICMP_TUNNEL_LEN = 1024
+_ICMP_EVENTS_CAP = 200
+
+_ICMP_LINE_RE = re.compile(
+    r'^\s*(\d+\.\d+\.\d+\.\d+)\s*>\s*(\d+\.\d+\.\d+\.\d+):\s*ICMP\s+(.+)$')
+_ICMP_REDIR_RE = re.compile(r'redirect\s+(\S+)\s+to\s+(?:host|net)\s+([\d.]+)')
+_ICMP_LEN_RE = re.compile(r'length\s+(\d+)\s*$')
+
+
+def _parse_icmp_capture(output):
+    """Parse `tcpdump -nn -t -v icmp` text into ICMP events. Each ICMP message
+    prints a `<src> > <dst>: ICMP <detail>, length N` line (a Redirect carries a
+    quoted inner IP packet on following lines, which never matches this pattern
+    because it has no `: ICMP`). Each event is a dict with a 'kind':
+      redirect  : {src, dst, redirected, new_gw, length}
+      echo      : {src, dst, length}
+      irdp      : {src, dst}                 (router advertisement, type 9)
+      irdp_sol  : {src, dst}                 (router solicitation, type 10)
+      recon     : {src, dst, what}           (timestamp / address-mask / information)
+      other     : {src, dst, what}           (unreachable / time-exceeded / quench …)
+    """
+    events = []
+    for raw in output.splitlines():
+        m = _ICMP_LINE_RE.match(raw)
+        if not m:
+            continue
+        src, dst, rest = m.group(1), m.group(2), m.group(3).strip()
+        low = rest.lower()
+        lm = _ICMP_LEN_RE.search(rest)
+        length = int(lm.group(1)) if lm else None
+
+        if low.startswith('redirect'):
+            rm = _ICMP_REDIR_RE.search(rest)
+            events.append({'kind': 'redirect', 'src': src, 'dst': dst,
+                           'redirected': rm.group(1) if rm else None,
+                           'new_gw': rm.group(2) if rm else None, 'length': length})
+        elif 'echo' in low:
+            events.append({'kind': 'echo', 'src': src, 'dst': dst, 'length': length})
+        elif 'router advertisement' in low:
+            events.append({'kind': 'irdp', 'src': src, 'dst': dst})
+        elif 'router solicitation' in low:
+            events.append({'kind': 'irdp_sol', 'src': src, 'dst': dst})
+        elif 'time stamp' in low or 'timestamp' in low:
+            events.append({'kind': 'recon', 'src': src, 'dst': dst,
+                           'what': 'timestamp'})
+        elif 'address mask' in low:
+            events.append({'kind': 'recon', 'src': src, 'dst': dst,
+                           'what': 'address-mask'})
+        elif 'information' in low:
+            events.append({'kind': 'recon', 'src': src, 'dst': dst,
+                           'what': 'information'})
+        else:
+            events.append({'kind': 'other', 'src': src, 'dst': dst,
+                           'what': rest.split(',')[0][:40]})
+    return events
+
+
+def _icmp_watch_load():
+    try:
+        with open(_ICMP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _icmp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_ICMP_WATCH_PATH), exist_ok=True)
+        tmp = _ICMP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _ICMP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_icmp_baseline(action='get'):
+    """Manage the trusted gateway baseline the ICMP-redirect check compares against
+    (the legitimate router(s) allowed to redirect / advertise). action='reset'
+    re-seeds from the host's default gateway on the next scan."""
+    with _icmp_watch_lock:
+        if action == 'reset':
+            _icmp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _icmp_watch_load()
+        return {'success': True, 'baseline': {
+            'gateways': sorted(b.get('gateways') or []),
+        }}
+
+
+def _icmp_analyze(events, seconds, baseline, sys_gateway=None, learn=True):
+    """Pure classifier over parsed ICMP events. The host's authoritative default
+    gateway (sys_gateway) is always trusted, plus any learned gateways. Separated
+    from capture so the self-test can drive it with synthetic packets. May
+    mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    # Learn-on-first-run: seed the trusted-gateway baseline from the host's own
+    # default gateway (authoritative — never from redirect sources, which could be
+    # the attacker).
+    learned = False
+    if learn and not (baseline.get('gateways')) and sys_gateway:
+        baseline['gateways'] = [sys_gateway]
+        learned = True
+    # The live default gateway is always trusted, on top of the stored baseline.
+    known_gw = set(baseline.get('gateways') or [])
+    if sys_gateway:
+        known_gw.add(sys_gateway)
+    had_gw = bool(known_gw)
+
+    redirects = [e for e in events if e['kind'] == 'redirect']
+    echoes = [e for e in events if e['kind'] == 'echo']
+    irdp = [e for e in events if e['kind'] == 'irdp']
+    recon = [e for e in events if e['kind'] == 'recon']
+    rate = round(len(events) / seconds, 2)
+
+    PRIORITY = ['redirect', 'rogue-irdp', 'flood', 'tunnel', 'recon', 'anomaly',
+                'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # --- redirect: the headline L3 MITM ---
+    redir_rows = []
+    malicious_redir = False
+    for e in redirects:
+        spoofed = had_gw and e['src'] not in known_gw
+        # steering traffic to a next-hop that isn't a known router = attacker insert
+        insert = bool(e['new_gw']) and (not had_gw or e['new_gw'] not in known_gw)
+        mal = spoofed or insert or not had_gw
+        malicious_redir = malicious_redir or mal
+        redir_rows.append({'src': e['src'], 'dst': e['dst'],
+                           'redirected': e['redirected'], 'new_gw': e['new_gw'],
+                           'malicious': mal})
+    if redirects:
+        if malicious_redir:
+            bump('redirect')
+        elif verdict == 'clean':
+            verdict = 'anomaly'
+        for r in redir_rows:
+            if r['malicious']:
+                why = []
+                if had_gw and r['src'] not in known_gw:
+                    why.append(f"source {r['src']} is not the gateway (spoofed)")
+                if r['new_gw'] and (not had_gw or r['new_gw'] not in known_gw):
+                    why.append(f"steers traffic for {r['redirected'] or '?'} to "
+                               f"non-gateway {r['new_gw']} (attacker next-hop)")
+                if not had_gw:
+                    why.append("no trusted gateway baseline — treat any redirect as "
+                               "suspect")
+                reasons.append(
+                    f"ICMP Redirect from {r['src']} to {r['dst']}: "
+                    f"{'; '.join(why)} — L3 man-in-the-middle (route injection)")
+            else:
+                reasons.append(
+                    f"ICMP Redirect from gateway {r['src']} to {r['dst']} "
+                    f"(→ {r['new_gw']}) — benign-looking but redirects are rare on "
+                    f"switched networks; verify it is expected")
+
+    # --- rogue-irdp: type-9 router advertisement injecting a gateway ---
+    for e in irdp:
+        if had_gw and e['src'] in known_gw:
+            if verdict == 'clean':
+                verdict = 'anomaly'
+            reasons.append(f"ICMP Router Advertisement (IRDP) from gateway {e['src']} "
+                           f"— unusual on modern networks; verify")
+        else:
+            bump('rogue-irdp')
+            reasons.append(
+                f"ICMP Router Advertisement (IRDP) from {e['src']} (not a known "
+                f"gateway) — injects itself as a default gateway (IRDP spoofing MITM)")
+
+    # --- flood: ICMP storm ---
+    if rate >= _ICMP_FLOOD_RATE and len(events) >= _ICMP_FLOOD_RATE * seconds:
+        bump('flood')
+        talkers = {}
+        for e in events:
+            talkers[e['src']] = talkers.get(e['src'], 0) + 1
+        top = max(talkers, key=talkers.get)
+        reasons.append(
+            f"ICMP flood: {len(events)} packets in {seconds}s ({rate}/s), mostly "
+            f"echo — ping-flood / smurf DoS; top source {top} ({talkers[top]})")
+
+    # --- tunnel: oversized echo payloads (covert channel / exfil) ---
+    big = [e for e in echoes if (e['length'] or 0) > _ICMP_TUNNEL_LEN]
+    if big:
+        bump('tunnel')
+        pairs = sorted({f"{e['src']}→{e['dst']}" for e in big})
+        maxlen = max(e['length'] for e in big)
+        reasons.append(
+            f"{len(big)} ICMP echo packet(s) with oversized payloads (up to "
+            f"{maxlen}B, normal ping ~64B) between {', '.join(pairs[:4])} — ICMP "
+            f"tunnelling / data exfiltration over a covert channel")
+
+    # --- recon: info-leak request types ---
+    if recon:
+        kinds = sorted({e['what'] for e in recon})
+        srcs = sorted({e['src'] for e in recon})
+        bump('recon')
+        reasons.append(
+            f"ICMP {', '.join(kinds)} request(s) from {', '.join(srcs[:4])} — host "
+            f"reconnaissance / information leak; block these ICMP types at the edge")
+
+    advisories = []
+    if events:
+        advisories.append(
+            "Ignore ICMP redirects on hosts (net.ipv4.conf.all.accept_redirects=0, "
+            "secure_redirects=0) and on the gateway "
+            "(send_redirects=0); disable IRDP; rate-limit ICMP and block timestamp/"
+            "address-mask/information types at the network edge.")
+
+    counts = {'redirect': len(redirects), 'echo': len(echoes), 'irdp': len(irdp),
+              'recon': len(recon),
+              'other': len([e for e in events if e['kind'] == 'other'])}
+
+    if reasons:
+        summary = reasons
+    elif not events:
+        summary = ['No ICMP traffic seen — segment quiet']
+    else:
+        summary = ['ICMP traffic seen but no redirects / injections / floods — clean']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'icmp_count': len(events),
+        'rate': rate,
+        'counts': counts,
+        'redirects': redir_rows,
+        'gateways': sorted(known_gw),
+        'advisories': advisories,
+    }
+
+
+def _icmp_capture(interface, seconds):
+    """Run one passive tcpdump window over IPv4 ICMP and return (raw_text, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '128', '-c', '20000', 'icmp'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_icmp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive ICMP L3-security scanner (detection-only). Captures ICMP for a few
+    seconds and classifies the segment: redirect / rogue-irdp / flood / tunnel /
+    recon / anomaly / clean. Trusts the host's default gateway; learns it on first
+    run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _icmp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_icmp_capture(text)
+    sys_gw = _default_gateway()
+
+    with _icmp_watch_lock:
+        baseline = _icmp_watch_load()
+        result = _icmp_analyze(events, seconds, baseline, sys_gateway=sys_gw,
+                               learn=learn)
+        if result.get('learned'):
+            _icmp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _icmp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_ICMP_EVENTS_CAP:]
+            _icmp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _icmp_selftest():
+    """Self-test the ICMP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -t -v icmp` text through the real parser +
+    classifier, and — if Scapy is available — builds a real ICMP Redirect into a
+    pcap and parses it back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+    GW = '192.168.1.1'
+
+    def redirect(src, dst='192.168.1.50', dest='8.8.8.8', newgw='192.168.1.66'):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto ICMP "
+                f"(1), length 56)\n"
+                f"    {src} > {dst}: ICMP redirect {dest} to host {newgw}, length 36\n"
+                f"\tIP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto TCP "
+                f"(6), length 40)\n"
+                f"    {dst} > {dest}: tcp 0")
+
+    def echo(src, dst, length=64):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto ICMP "
+                f"(1), length {length + 20})\n"
+                f"    {src} > {dst}: ICMP echo request, id 1, seq 1, length {length}")
+
+    def simple(src, dst, detail):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto ICMP "
+                f"(1), length 40)\n    {src} > {dst}: ICMP {detail}")
+
+    def run(name, text, seconds, expect, gw=GW, baseline=None):
+        events = _parse_icmp_capture(text)
+        res = _icmp_analyze(events, seconds, dict(baseline or {}),
+                            sys_gateway=gw, learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'gateways': ['192.168.1.1']}
+
+    # 1. clean: ordinary echo request/reply between hosts, no redirects.
+    run('clean', echo('192.168.1.50', '8.8.8.8') + "\n" +
+        echo('8.8.8.8', '192.168.1.50'), 12, 'clean', baseline=base)
+
+    # 2. redirect: a spoofed Redirect steering traffic to a non-gateway next-hop.
+    run('redirect', redirect('192.168.1.66'), 12, 'redirect', baseline=base)
+
+    # 3. rogue-irdp: an ICMP Router Advertisement from a non-gateway host.
+    run('rogue-irdp',
+        simple('192.168.1.66', '224.0.0.1',
+               'router advertisement lifetime 1800 1: {192.168.1.66 128}, length 16'),
+        12, 'rogue-irdp', baseline=base)
+
+    # 4. flood: an ICMP echo storm.
+    flood = "\n".join(echo(f"10.0.0.{i % 250}", '192.168.1.50')
+                      for i in range(700))
+    run('flood', flood, 5, 'flood', baseline=base)
+
+    # 5. tunnel: echo packets with oversized payloads (covert channel).
+    run('tunnel', echo('192.168.1.50', '10.0.0.9', length=1400) + "\n" +
+        echo('192.168.1.50', '10.0.0.9', length=1400), 12, 'tunnel', baseline=base)
+
+    # 6. recon: ICMP timestamp + address-mask requests.
+    run('recon', simple('192.168.1.66', '192.168.1.50',
+                        'time stamp query id 0 seq 0, length 20') + "\n" +
+        simple('192.168.1.66', '192.168.1.51', 'address mask request, length 12'),
+        12, 'recon', baseline=base)
+
+    # 7. anomaly: a benign redirect from the real gateway to another known gateway.
+    run('anomaly', redirect('192.168.1.1', newgw='192.168.1.1'), 12, 'anomaly',
+        baseline=base)
+
+    # 8. parse: a redirect yields src, redirected-dest and the new next-hop.
+    pev = _parse_icmp_capture(redirect('192.168.1.66'))
+    p_ok = (len(pev) == 1 and pev[0]['kind'] == 'redirect'
+            and pev[0]['src'] == '192.168.1.66'
+            and pev[0]['redirected'] == '8.8.8.8'
+            and pev[0]['new_gw'] == '192.168.1.66')
+    scenarios.append({'name': 'redirect-parse', 'expect': 'src+dest+newgw',
+                      'got': str(pev[0] if pev else None)[:90], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real Redirect -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, ICMP, Raw, wrpcap
+        if _have('tcpdump'):
+            pkt = (Ether() / IP(src='192.168.1.1', dst='192.168.1.50')
+                   / ICMP(type=5, code=1, gw='192.168.1.66')
+                   / IP(src='192.168.1.50', dst='8.8.8.8') / Raw(b'\x00' * 8))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_icmp_capture(res['out'])
+            reds = [e for e in evs if e['kind'] == 'redirect']
+            ok = bool(reds) and reds[0]['new_gw'] == '192.168.1.66'
+            scapy_result = {'ran': True, 'redirects': len(reds),
+                            'new_gw': reds[0]['new_gw'] if reds else None,
+                            'pass': ok, 'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# SNMP Watch: passive cleartext-SNMP (v1/v2c) exposure scanner (detection-only)
+# --------------------------------------------------------------------------
+# SNMP v1 and v2c authenticate with a plaintext "community string" — effectively a
+# device password carried in the clear on every request. Anyone passively sniffing
+# the segment harvests it: the read community (often the default "public") exposes
+# the full device config/MIB, and a write community (seen on a SetRequest) lets an
+# attacker who captured it *reconfigure* the device — change routes, ACLs, SNMP
+# itself, or bounce interfaces. v3 fixes this with the User Security Model
+# (authentication + privacy/encryption). This scanner is PASSIVE: one short tcpdump
+# window over UDP 161/162, parsed and classified. It never sends an SNMP request.
+# What it flags:
+#   * write-exposed — a SetRequest in v1/v2c: a *write* community is on the wire,
+#     i.e. sniff it and you own the device.
+#   * cleartext     — any v1/v2c traffic: the community string is exposed (worse
+#     when it's a well-known default like "public"/"private").
+#   * amplification — a GetBulk with a large max-repetitions: the SNMP reflection/
+#     amplification DDoS vector.
+#   * enumeration   — one host walking the MIB (many GetNext/GetBulk): SNMP recon.
+#   * clean         — only SNMPv3 (or no SNMP) seen.
+# A first scan learns the segment's SNMP agents + community strings into
+# data/snmp_watch.json so later scans can highlight *new* exposure; the verdict
+# always reflects the cleartext reality (v1/v2c is insecure regardless of baseline).
+_SNMP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'snmp_watch.json')
+_snmp_watch_lock = threading.Lock()
+
+# A GetBulk requesting at least this many repetitions is an amplification/DoS-grade
+# request (a normal snmpbulkwalk uses ~10).
+_SNMP_BULK_AMP = 50
+# One source issuing at least this many GetNext/GetBulk in the window is walking the
+# MIB (enumeration / recon).
+_SNMP_WALK_COUNT = 20
+_SNMP_EVENTS_CAP = 200
+
+# Well-known / default community strings — trivially guessable even without a
+# sniffer, and the first thing every scanner tries.
+_SNMP_DEFAULT_COMMUNITIES = frozenset((
+    'public', 'private', 'community', 'cisco', 'manager', 'admin', 'snmp',
+    'default', 'write', 'read', 'monitor', 'netman', 'ilo', 'secret', 'password',
+    'security', 'router', 'switch', 'test', 'guest', 'tivoli', 'openview', '0', ''))
+
+_SNMP_LINE_RE = re.compile(
+    r'^\s*(\d+\.\d+\.\d+\.\d+)\.(\d+)\s*>\s*(\d+\.\d+\.\d+\.\d+)\.(\d+):\s*'
+    r'\{\s*SNMP(v1|v2c|v3)\b(.*)$')
+_SNMP_COMMUNITY_RE = re.compile(r'C="([^"]*)"')
+_SNMP_PDU_RE = re.compile(
+    r'\b(GetNextRequest|GetResponse|GetBulk|GetRequest|SetRequest|InformRequest|'
+    r'V2Trap|Trap|Response)\b')
+_SNMP_MAXREP_RE = re.compile(r'\bM=(\d+)')
+
+
+def _parse_snmp_capture(output):
+    """Parse `tcpdump -nn -t -v 'udp port 161 or 162'` text into SNMP events.
+
+    tcpdump prints each SNMP message on one line as `<src>.<p> > <dst>.<p>:
+    { SNMPvN [C="community"] { PDU(..) ... } }`. It *omits* `C="..."` when the
+    community is the default "public", so a v1/v2c line with no community is treated
+    as "public". v3 uses the USM (no cleartext community). Each event:
+      {src, sport, dst, dport, version, community, pdu, max_rep}
+    """
+    events = []
+    for raw in output.splitlines():
+        m = _SNMP_LINE_RE.match(raw)
+        if not m:
+            continue
+        src, sport, dst, dport = (m.group(1), int(m.group(2)),
+                                  m.group(3), int(m.group(4)))
+        version = m.group(5)   # 'v1' | 'v2c' | 'v3'
+        rest = m.group(6)
+        cm = _SNMP_COMMUNITY_RE.search(rest)
+        if cm:
+            community = cm.group(1)
+        elif version in ('v1', 'v2c'):
+            community = 'public'   # tcpdump hides the default community
+        else:
+            community = None       # v3 — USM, no cleartext community
+        pm = _SNMP_PDU_RE.search(rest)
+        pdu = pm.group(1) if pm else None
+        rp = _SNMP_MAXREP_RE.search(rest)
+        max_rep = int(rp.group(1)) if rp else None
+        events.append({'src': src, 'sport': sport, 'dst': dst, 'dport': dport,
+                       'version': version, 'community': community, 'pdu': pdu,
+                       'max_rep': max_rep})
+    return events
+
+
+def _snmp_watch_load():
+    try:
+        with open(_SNMP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _snmp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_SNMP_WATCH_PATH), exist_ok=True)
+        tmp = _SNMP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _SNMP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_snmp_baseline(action='get'):
+    """Manage the learned SNMP baseline (known agents + community strings). Used to
+    highlight *new* exposure on later scans. action='reset' re-learns the segment's
+    current SNMP inventory on the next scan."""
+    with _snmp_watch_lock:
+        if action == 'reset':
+            _snmp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _snmp_watch_load()
+        return {'success': True, 'baseline': {
+            'agents': sorted((b.get('agents') or {}).keys()),
+            'communities': sorted(b.get('communities') or []),
+        }}
+
+
+def _snmp_endpoints(e):
+    """Return (agent_ip, manager_ip) for an SNMP event by port role: the agent is
+    the SNMP-service side (161), or the device sending a trap (to 162)."""
+    if e['dport'] == 161:
+        return e['dst'], e['src']       # query -> agent
+    if e['sport'] == 161:
+        return e['src'], e['dst']       # response from agent
+    if e['dport'] == 162:
+        return e['src'], e['dst']       # trap/inform from device -> manager
+    if e['sport'] == 162:
+        return e['dst'], e['src']       # inform response
+    return e['dst'], e['src']
+
+
+def _snmp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed SNMP events. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with synthetic
+    packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    agents = {}          # agent ip -> aggregate
+    managers = set()
+    communities = {}     # community -> aggregate (v1/v2c only)
+    walk_by_src = {}     # source -> count of GetNext/GetBulk
+    bulk_max = 0
+    insecure = False     # any v1/v2c seen
+    write_seen = []      # (community, agent, manager)
+
+    for e in events:
+        agent_ip, mgr_ip = _snmp_endpoints(e)
+        a = agents.setdefault(agent_ip, {
+            'ip': agent_ip, 'versions': set(), 'communities': set(),
+            'pdus': set(), 'writes': False})
+        a['versions'].add(e['version'])
+        if e['pdu']:
+            a['pdus'].add(e['pdu'])
+        managers.add(mgr_ip)
+
+        if e['version'] in ('v1', 'v2c'):
+            insecure = True
+            comm = e['community'] if e['community'] is not None else 'public'
+            a['communities'].add(comm)
+            c = communities.setdefault(comm, {
+                'community': comm, 'versions': set(), 'count': 0, 'writes': False})
+            c['versions'].add(e['version'])
+            c['count'] += 1
+            if e['pdu'] == 'SetRequest':
+                a['writes'] = True
+                c['writes'] = True
+                write_seen.append((comm, agent_ip, mgr_ip))
+
+        if e['pdu'] in ('GetNextRequest', 'GetBulk'):
+            walk_by_src[e['src']] = walk_by_src.get(e['src'], 0) + 1
+        if e['pdu'] == 'GetBulk' and e['max_rep']:
+            bulk_max = max(bulk_max, e['max_rep'])
+
+    known_agents = dict(baseline.get('agents') or {})
+    known_comms = set(baseline.get('communities') or [])
+    had_baseline = bool(known_agents or known_comms)
+
+    learned = False
+    if learn and not had_baseline and (agents or communities):
+        baseline['agents'] = {ip: {'versions': sorted(a['versions']),
+                                   'communities': sorted(a['communities'])}
+                              for ip, a in agents.items()}
+        baseline['communities'] = sorted(communities.keys())
+        learned = True
+        known_agents = dict(baseline['agents'])
+        known_comms = set(baseline['communities'])
+
+    PRIORITY = ['write-exposed', 'cleartext', 'amplification', 'enumeration',
+                'anomaly', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    default_comms = sorted(c for c in communities
+                           if c.lower() in _SNMP_DEFAULT_COMMUNITIES)
+    custom_comms = sorted(c for c in communities
+                          if c.lower() not in _SNMP_DEFAULT_COMMUNITIES)
+
+    # --- write-exposed: a SetRequest in cleartext = write community on the wire ---
+    if write_seen:
+        bump('write-exposed')
+        for comm, agent_ip, mgr_ip in write_seen[:6]:
+            reasons.append(
+                f"SNMP SetRequest (write) in cleartext from {mgr_ip} to agent "
+                f"{agent_ip} with community \"{comm}\" — capturing that community "
+                f"grants write access to reconfigure the device (takeover)")
+
+    # --- cleartext: any v1/v2c community exposure ---
+    if insecure:
+        bump('cleartext')
+        vers = sorted({v for a in agents.values() for v in a['versions']
+                       if v in ('v1', 'v2c')})
+        reasons.append(
+            f"SNMP {'/'.join(vers)} in use — the community string is sent in "
+            f"cleartext; anyone sniffing this segment captures it and gains that "
+            f"level of device access. Migrate to SNMPv3 (authPriv).")
+        if default_comms:
+            reasons.append(
+                f"Default/well-known community string(s) exposed: "
+                f"{', '.join(chr(34) + c + chr(34) for c in default_comms)} — "
+                f"trivially guessable even without a sniffer")
+        if custom_comms:
+            reasons.append(
+                f"Custom community string(s) exposed in cleartext: "
+                f"{', '.join(chr(34) + c + chr(34) for c in custom_comms)}")
+        new_comms = [c for c in communities if c not in known_comms]
+        if had_baseline and new_comms and not learned:
+            reasons.append(
+                f"NEW community string(s) since baseline: "
+                f"{', '.join(chr(34) + c + chr(34) for c in sorted(new_comms))}")
+
+    # --- amplification: GetBulk with large max-repetitions ---
+    if bulk_max >= _SNMP_BULK_AMP:
+        bump('amplification')
+        reasons.append(
+            f"SNMP GetBulk with max-repetitions {bulk_max} — the SNMP reflection/"
+            f"amplification DDoS vector; restrict/rate-limit SNMP and disable it on "
+            f"internet-facing interfaces")
+
+    # --- enumeration: a host walking the MIB ---
+    walkers = sorted((s for s, n in walk_by_src.items() if n >= _SNMP_WALK_COUNT),
+                     key=lambda s: -walk_by_src[s])
+    if walkers:
+        bump('enumeration')
+        for s in walkers[:4]:
+            reasons.append(
+                f"{s} issued {walk_by_src[s]} GetNext/GetBulk requests — walking the "
+                f"MIB (SNMP enumeration / reconnaissance)")
+
+    advisories = []
+    if agents or communities:
+        advisories.append(
+            "Migrate to SNMPv3 with authPriv (SHA + AES). If v1/v2c must remain, "
+            "confine SNMP to a management VLAN with ACLs, use unique non-default "
+            "read-only community strings, and never carry it over shared/user "
+            "segments. Disable SNMP on devices that don't need it.")
+
+    def _pub_agent(a):
+        return {'ip': a['ip'], 'versions': sorted(a['versions']),
+                'communities': sorted(a['communities']), 'writes': a['writes'],
+                'pdus': sorted(a['pdus']),
+                'secure': a['versions'] == {'v3'},
+                'baseline': a['ip'] in known_agents}
+
+    def _pub_comm(c):
+        return {'community': c['community'], 'versions': sorted(c['versions']),
+                'count': c['count'], 'writes': c['writes'],
+                'default': c['community'].lower() in _SNMP_DEFAULT_COMMUNITIES,
+                'baseline': c['community'] in known_comms}
+
+    if reasons:
+        summary = reasons
+    elif not events:
+        summary = ['No SNMP traffic seen — segment quiet on UDP 161/162']
+    else:
+        summary = ['Only SNMPv3 seen — SNMP traffic is authenticated/encrypted (secure)']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'snmp_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'insecure': insecure,
+        'agents': [_pub_agent(agents[a]) for a in sorted(agents)],
+        'communities': [_pub_comm(communities[c]) for c in sorted(communities)],
+        'managers': sorted(managers),
+        'advisories': advisories,
+    }
+
+
+def _snmp_capture(interface, seconds):
+    """Run one passive tcpdump window over SNMP (UDP 161/162), return (raw, error)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000',
+                'udp and (port 161 or port 162)'],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_snmp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive SNMP exposure scanner (detection-only). Captures SNMP for a few
+    seconds and classifies the segment: write-exposed / cleartext / amplification /
+    enumeration / clean. Learns the segment's SNMP agents + community strings on
+    first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _snmp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_snmp_capture(text)
+
+    with _snmp_watch_lock:
+        baseline = _snmp_watch_load()
+        result = _snmp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _snmp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _snmp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_SNMP_EVENTS_CAP:]
+            _snmp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _snmp_selftest():
+    """Self-test the SNMP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -t -v` text through the real parser +
+    classifier, and — if Scapy is available — builds real SNMP v2c messages into a
+    pcap and parses them back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def line(src, dst, sport, dport, ver, pdu, community=None, maxrep=None):
+        cs = f' C="{community}"' if community is not None else ''
+        body = f'{pdu}(25) R=0'
+        if maxrep is not None:
+            body = f'GetBulk(22) R=0  N=0 M={maxrep}'
+        return (f"    {src}.{sport} > {dst}.{dport}:  {{ SNMP{ver}{cs} "
+                f"{{ {body}  .1.3.6.1.2.1.1.5.0 }} }}")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_snmp_capture(text)
+        res = _snmp_analyze(events, seconds, dict(baseline or {}),
+                            learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'agents': {'192.168.1.1': {'versions': ['v2c'],
+                                       'communities': ['public']}},
+            'communities': ['public']}
+
+    # 1. clean: only SNMPv3 (authenticated/encrypted).
+    run('clean', line('192.168.1.50', '192.168.1.1', 42000, 161, 'v3',
+                      'GetRequest'), 12, base, 'clean')
+
+    # 2. cleartext: a v2c GetRequest with the hidden default "public" community.
+    run('cleartext', line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c',
+                          'GetRequest'), 12, base, 'cleartext')
+
+    # 3. write-exposed: a v2c SetRequest exposes a write community.
+    run('write-exposed', line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c',
+                              'SetRequest', community='private'), 12, base,
+        'write-exposed')
+
+    # 4. amplification: a GetBulk with a large max-repetitions (v3, so not cleartext).
+    run('amplification', line('10.0.0.9', '192.168.1.1', 42000, 161, 'v3',
+                              'GetBulk', maxrep=200), 12, base, 'amplification')
+
+    # 5. enumeration: one host walking the MIB (v3 GetNext flood).
+    walk = "\n".join(line('10.0.0.9', '192.168.1.1', 42000 + i, 161, 'v3',
+                          'GetNextRequest') for i in range(25))
+    run('enumeration', walk, 12, base, 'enumeration')
+
+    # 6. parse: hidden-public + explicit community + v3 (no community).
+    pev = _parse_snmp_capture(
+        line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c', 'GetRequest') + "\n" +
+        line('192.168.1.50', '192.168.1.1', 42001, 161, 'v2c', 'GetRequest',
+             community='secret') + "\n" +
+        line('192.168.1.50', '192.168.1.1', 42002, 161, 'v3', 'GetRequest'))
+    p_ok = (len(pev) == 3 and pev[0]['community'] == 'public'
+            and pev[1]['community'] == 'secret' and pev[2]['community'] is None
+            and pev[2]['version'] == 'v3')
+    scenarios.append({'name': 'snmp-parse', 'expect': 'public/secret/v3-none',
+                      'got': str([e['community'] for e in pev]), 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft real SNMP v2c -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, UDP, wrpcap
+        from scapy.layers.snmp import SNMP, SNMPget, SNMPset, SNMPvarbind
+        from scapy.asn1.asn1 import ASN1_OID, ASN1_STRING
+        if _have('tcpdump'):
+            oid = ASN1_OID('1.3.6.1.2.1.1.5.0')
+            pkts = [
+                Ether() / IP(src='192.168.1.50', dst='192.168.1.1')
+                / UDP(sport=42000, dport=161)
+                / SNMP(version=1, community='public',
+                       PDU=SNMPget(varbindlist=[SNMPvarbind(oid=oid)])),
+                Ether() / IP(src='192.168.1.50', dst='192.168.1.1')
+                / UDP(sport=42001, dport=161)
+                / SNMP(version=1, community='rwsecret',
+                       PDU=SNMPset(varbindlist=[SNMPvarbind(
+                           oid=oid, value=ASN1_STRING('x'))])),
+            ]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_snmp_capture(res['out'])
+            comms = {e['community'] for e in evs}
+            wrote = any(e['pdu'] == 'SetRequest' for e in evs)
+            ok = ('public' in comms and 'rwsecret' in comms and wrote)
+            scapy_result = {'ran': True, 'events': len(evs),
+                            'communities': sorted(c for c in comms if c),
+                            'write': wrote, 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# TLS Watch: TLS / certificate hygiene checker (active grade + passive discovery)
+# --------------------------------------------------------------------------
+# Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
+# hypervisors, printers, IoT — with certificates nobody audits: long expired,
+# self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive
+# "Watch" scanners, a certificate checker is inherently ACTIVE: it must complete a
+# TLS handshake to read the cert, and TLS 1.3 encrypts the Certificate message, so
+# passive sniffing can't read modern certs at all. So this tool has two phases:
+#   * passive discovery — one short tcpdump window over TLS ClientHellos to find the
+#     TLS servers on the segment (server IP:port + SNI), so you don't have to type
+#     them. Best-effort; TLS 1.3 SNI is still in the clear in the ClientHello.
+#   * active grading — connect to each target, fetch the presented cert even when it
+#     fails validation (unverified fallback), and grade it for the full range of
+#     TLS/cert hygiene problems.
+# Verdicts (worst first): expired / not-yet-valid / self-signed / untrusted /
+# hostname-mismatch / weak-crypto / deprecated-tls / expiring / valid. A learned
+# fingerprint baseline flags a certificate that *changed* between scans (rotation or
+# a possible MITM). Targets are explicit (typed or discovered on the local segment)
+# — this is device-hygiene auditing of your own network, not a scanner.
+_TLS_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'tls_watch.json')
+_tls_watch_lock = threading.Lock()
+
+_TLS_EXPIRING_DAYS = 21          # a valid cert with fewer days left is "expiring"
+_TLS_WEAK_RSA_BITS = 2048        # RSA below this is weak
+_TLS_CONNECT_TIMEOUT = 6         # per-target TLS connect/handshake timeout (s)
+_TLS_MAX_TARGETS = 32            # cap graded targets per run (this is not a scanner)
+_TLS_POOL = 8                    # parallel handshakes
+_TLS_DEPRECATED_PROTOS = ('SSLv2', 'SSLv3', 'TLSv1', 'TLSv1.1')
+_TLS_WEAK_CIPHER_RE = re.compile(r'RC4|RC2|(?<![A-Z0-9])DES|3DES|NULL|EXPORT|MD5|'
+                                 r'ANON|_anon', re.IGNORECASE)
+# Severity order used for the per-target verdict and the overall roll-up.
+_TLS_PRIORITY = ['expired', 'not-yet-valid', 'self-signed', 'untrusted',
+                 'hostname-mismatch', 'weak-crypto', 'deprecated-tls', 'expiring',
+                 'valid']
+
+
+def _tls_is_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _tls_parse_targets(text):
+    """Parse a free-form string of `host[:port]` targets (comma / space / newline
+    separated) into a de-duplicated list of (host, port). Default port 443. Strips
+    an accidental scheme/path (https://host/…)."""
+    out, seen = [], set()
+    for tok in re.split(r'[\s,]+', (text or '').strip()):
+        if not tok:
+            continue
+        tok = re.sub(r'^[a-zA-Z]+://', '', tok)   # drop scheme
+        tok = tok.split('/')[0]                    # drop path
+        host, port = tok, 443
+        # [v6]:port or host:port (but not bare IPv6 with colons)
+        m = re.match(r'^\[(.+)\]:(\d+)$', tok)
+        if m:
+            host, port = m.group(1), int(m.group(2))
+        elif tok.count(':') == 1:
+            h, p = tok.rsplit(':', 1)
+            if p.isdigit():
+                host, port = h, int(p)
+        if not host or not (1 <= port <= 65535):
+            continue
+        key = (host.lower(), port)
+        if key not in seen:
+            seen.add(key)
+            out.append((host, port))
+    return out
+
+
+def _tls_watch_load():
+    try:
+        with open(_TLS_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _tls_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_TLS_WATCH_PATH), exist_ok=True)
+        tmp = _TLS_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _TLS_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_tls_baseline(action='get'):
+    """Manage the learned certificate-fingerprint baseline (per host:port). Used to
+    flag a cert that *changed* between scans. action='reset' forgets it."""
+    with _tls_watch_lock:
+        if action == 'reset':
+            _tls_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _tls_watch_load()
+        return {'success': True, 'baseline': {
+            'certs': sorted((b.get('certs') or {}).keys()),
+        }}
+
+
+def _tls_name_cn(name):
+    """Best-effort Common Name from an x509 Name."""
+    try:
+        from cryptography.x509.oid import NameOID
+        attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
+        return attrs[0].value if attrs else name.rfc4514_string()
+    except Exception:
+        try:
+            return name.rfc4514_string()
+        except Exception:
+            return ''
+
+
+def _tls_get_san(cert):
+    """Return (dns_names, ip_strings) from the SubjectAltName extension."""
+    try:
+        from cryptography import x509
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAltName).value
+        dns = ext.get_values_for_type(x509.DNSName)
+        ips = [str(ip) for ip in ext.get_values_for_type(x509.IPAddress)]
+        return dns, ips
+    except Exception:
+        return [], []
+
+
+def _tls_name_matches(name, dns_names, ip_names, cn):
+    """Does `name` (the host/SNI we connected to) match the certificate's names?
+    Wildcard-aware for DNS; exact for IPs; falls back to CN when no SAN."""
+    if not name:
+        return True
+    candidates = list(dns_names)
+    if not candidates and cn:
+        candidates = [cn]
+    if _tls_is_ip(name):
+        try:
+            target = ipaddress.ip_address(name)
+        except ValueError:
+            target = None
+        for ip in ip_names:
+            try:
+                if target is not None and ipaddress.ip_address(ip) == target:
+                    return True
+            except ValueError:
+                continue
+        # a few certs put the IP in a DNS SAN / CN as a literal
+        return name in candidates
+    name = name.lower().rstrip('.')
+    for c in candidates:
+        c = (c or '').lower().rstrip('.')
+        if c == name:
+            return True
+        if c.startswith('*.'):
+            # wildcard matches exactly one left-most label
+            if name.split('.', 1)[1:] == [c[2:]] and '.' in name:
+                return True
+    return False
+
+
+def _tls_key_desc(cert):
+    """Return (description, weak_bool) for the certificate's public key."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import rsa, ec, dsa
+        pub = cert.public_key()
+        if isinstance(pub, rsa.RSAPublicKey):
+            return f'RSA-{pub.key_size}', pub.key_size < _TLS_WEAK_RSA_BITS
+        if isinstance(pub, dsa.DSAPublicKey):
+            return f'DSA-{pub.key_size}', True          # DSA is deprecated
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            return f'EC-{pub.curve.name}', pub.key_size < 256
+        return type(pub).__name__.replace('PublicKey', ''), False
+    except Exception:
+        return '?', False
+
+
+def _tls_classify(der, check_name, trusted, verify_reason, proto, cipher, now):
+    """Pure classifier over one presented certificate + connection facts. Returns a
+    per-target result dict. Separated from the network I/O so the self-test can drive
+    it with synthetic certs. `check_name` is the host/SNI we connected to."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    cert = x509.load_der_x509_certificate(der)
+
+    not_before = cert.not_valid_before_utc
+    not_after = cert.not_valid_after_utc
+    subject_cn = _tls_name_cn(cert.subject)
+    issuer_cn = _tls_name_cn(cert.issuer)
+    san_dns, san_ip = _tls_get_san(cert)
+    self_signed = cert.subject == cert.issuer
+    key_desc, weak_key = _tls_key_desc(cert)
+    try:
+        sig = (cert.signature_hash_algorithm.name
+               if cert.signature_hash_algorithm else 'none')
+    except Exception:
+        sig = 'unknown'
+    fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+
+    expired = now > not_after
+    not_yet = now < not_before
+    days_left = (not_after - now).days
+    hostname_ok = _tls_name_matches(check_name, san_dns, san_ip, subject_cn)
+    weak_sig = sig in ('md5', 'sha1')
+    deprecated = proto in _TLS_DEPRECATED_PROTOS
+    weak_cipher = bool(cipher and _TLS_WEAK_CIPHER_RE.search(cipher))
+
+    names = san_dns + san_ip or ([subject_cn] if subject_cn else [])
+    findings = []   # (verdict_key, reason)
+    if expired:
+        findings.append(('expired', f"certificate EXPIRED {(now - not_after).days} "
+                         f"days ago (notAfter {not_after:%Y-%m-%d})"))
+    if not_yet:
+        findings.append(('not-yet-valid', f"certificate not valid until "
+                         f"{not_before:%Y-%m-%d} — clock skew or premature deploy"))
+    if not trusted:
+        if self_signed:
+            findings.append(('self-signed', "self-signed certificate "
+                             "(issuer == subject; not anchored to any CA)"))
+        else:
+            findings.append(('untrusted', "not trusted by the system CA store"
+                             + (f": {verify_reason}" if verify_reason else
+                                " (incomplete chain or private CA)")))
+    if not hostname_ok:
+        shown = ', '.join(names[:4]) or '(no names)'
+        findings.append(('hostname-mismatch', f"hostname mismatch: certificate is "
+                         f"for {shown}, you connected to {check_name}"))
+    if weak_sig:
+        findings.append(('weak-crypto', f"weak signature algorithm {sig.upper()}"))
+    if weak_key:
+        findings.append(('weak-crypto', f"weak key {key_desc}"))
+    if weak_cipher:
+        findings.append(('weak-crypto', f"weak cipher {cipher}"))
+    if deprecated:
+        findings.append(('deprecated-tls', f"deprecated protocol {proto} negotiated"))
+    if not expired and days_left <= _TLS_EXPIRING_DAYS:
+        findings.append(('expiring', f"expires in {days_left} days "
+                         f"(notAfter {not_after:%Y-%m-%d})"))
+
+    if findings:
+        verdict = min((k for k, _ in findings), key=_TLS_PRIORITY.index)
+        reasons = [r for _, r in findings]
+    else:
+        verdict = 'valid'
+        reasons = [f"valid — trusted chain, hostname matches, {days_left} days left"]
+
+    return {
+        'verdict': verdict, 'reasons': reasons,
+        'subject': subject_cn, 'issuer': issuer_cn,
+        'san': san_dns + san_ip, 'self_signed': self_signed, 'trusted': trusted,
+        'not_before': not_before.strftime('%Y-%m-%d'),
+        'not_after': not_after.strftime('%Y-%m-%d'),
+        'days_left': days_left, 'sig_alg': sig, 'key': key_desc,
+        'proto': proto, 'cipher': cipher, 'fingerprint': fingerprint,
+    }
+
+
+def _tls_grade_connection(host, port, sni, timeout):
+    """Do the TLS handshake(s) for one target and return the connection facts:
+    reachability, chain-trust result, and the presented cert (DER) + negotiated
+    protocol/cipher — fetched even when the cert fails validation."""
+    res = {'reachable': False, 'error': None, 'trusted': False,
+           'verify_reason': None, 'der': None, 'proto': None, 'cipher': None}
+    server_name = sni or host
+    if _tls_is_ip(server_name):
+        server_name = None   # SNI must not be an IP literal
+
+    # 1. Verifying connection (chain only; hostname is checked separately). On a
+    #    healthy cert this is the single round trip and also yields the cert.
+    vctx = ssl.create_default_context()
+    vctx.check_hostname = False
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with vctx.wrap_socket(raw, server_hostname=server_name) as ss:
+                res.update(reachable=True, trusted=True,
+                           der=ss.getpeercert(binary_form=True),
+                           proto=ss.version(),
+                           cipher=ss.cipher()[0] if ss.cipher() else None)
+                return res
+    except ssl.SSLCertVerificationError as e:
+        res['reachable'] = True
+        res['verify_reason'] = getattr(e, 'verify_message', None) or 'verify failed'
+    except ssl.SSLError as e:
+        res['reachable'] = True
+        res['error'] = f'TLS handshake error: {str(e)[:120]}'
+    except (socket.timeout, TimeoutError):
+        res['error'] = 'connection timed out'
+        return res
+    except (ConnectionRefusedError, OSError) as e:
+        res['error'] = f'{type(e).__name__}: {str(e)[:80]}'
+        return res
+
+    # 2. Cert failed validation (or handshake hiccup) — fetch it unverified so we can
+    #    say *why* it's invalid.
+    uctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    uctx.check_hostname = False
+    uctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with uctx.wrap_socket(raw, server_hostname=server_name) as ss:
+                res.update(reachable=True, der=ss.getpeercert(binary_form=True),
+                           proto=ss.version(),
+                           cipher=ss.cipher()[0] if ss.cipher() else None)
+    except Exception as e:
+        if not res.get('error'):
+            res['error'] = f'{type(e).__name__}: {str(e)[:80]}'
+    return res
+
+
+def _tls_check_target(host, port, sni, now):
+    """Grade one target end to end: connect, then classify the presented cert."""
+    base = {'target': f'{host}:{port}', 'host': host, 'port': port, 'sni': sni}
+    try:
+        conn = _tls_grade_connection(host, port, sni, _TLS_CONNECT_TIMEOUT)
+    except Exception as e:                       # never let one target crash the run
+        return {**base, 'verdict': 'unreachable', 'status': 'unreachable',
+                'reasons': [f'{type(e).__name__}: {str(e)[:100]}']}
+    if not conn.get('der'):
+        return {**base, 'verdict': 'unreachable', 'status': 'unreachable',
+                'reasons': [conn.get('error') or 'no TLS handshake / no certificate']}
+    try:
+        graded = _tls_classify(conn['der'], sni or host, conn['trusted'],
+                               conn.get('verify_reason'), conn.get('proto'),
+                               conn.get('cipher'), now)
+    except Exception as e:
+        return {**base, 'verdict': 'unreachable', 'status': 'unreachable',
+                'reasons': [f'certificate parse error: {str(e)[:100]}']}
+    return {**base, 'status': 'graded', **graded}
+
+
+def _tls_discover(interface, seconds):
+    """Passive discovery: one tcpdump window capturing TLS ClientHellos, parsed for
+    the server IP:port + SNI. Returns (targets, error). Best-effort — needs Scapy's
+    TLS layer for SNI; without it, falls back to server IP:port from tcpdump text."""
+    if not _have('tcpdump'):
+        return [], 'tcpdump is not installed. Click Install to add it.'
+    # BPF: a TCP segment whose first payload byte is 0x16 (TLS handshake record) and
+    # whose handshake message type (5 bytes in) is 0x01 (ClientHello).
+    bpf = ('tcp and (tcp[((tcp[12:1]&0xf0)>>2)]=0x16) and '
+           '(tcp[((tcp[12:1]&0xf0)>>2)+5]=0x01)')
+    pcap_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+            pcap_path = tf.name
+        res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn',
+                    '-s', '0', '-c', '2000', '-w', pcap_path, bpf],
+                   timeout=seconds + 8)
+        err = res.get('err', '')
+        if (not os.path.getsize(pcap_path)) and err and (
+                'permission' in err.lower() or "couldn't" in err.lower()
+                or 'no such device' in err.lower() or 'syntax' in err.lower()):
+            return [], err.strip()[:200]
+        found = {}
+        try:
+            from scapy.all import rdpcap, IP, IPv6, TCP
+            from scapy.layers.tls.extensions import TLS_Ext_ServerName
+            for p in rdpcap(pcap_path):
+                if TCP not in p:
+                    continue
+                ip = p[IP].dst if IP in p else (p[IPv6].dst if IPv6 in p else None)
+                if not ip:
+                    continue
+                key = (ip, int(p[TCP].dport))
+                sni = found.get(key)
+                if TLS_Ext_ServerName in p:
+                    for sn in p[TLS_Ext_ServerName].servernames:
+                        try:
+                            sni = sn.servername.decode('idna', 'ignore') or sni
+                        except Exception:
+                            sni = sn.servername.decode('latin-1', 'ignore') or sni
+                found[key] = sni
+        except Exception:
+            # Scapy TLS layer unavailable — fall back to server IP:port from text.
+            res2 = _run(['tcpdump', '-nn', '-r', pcap_path], timeout=15)
+            for line in res2.get('out', '').splitlines():
+                m = re.search(r'>\s*(\d+\.\d+\.\d+\.\d+)\.(\d+):', line)
+                if m:
+                    found[(m.group(1), int(m.group(2)))] = None
+        targets = [{'host': ip, 'port': port, 'sni': sni}
+                   for (ip, port), sni in sorted(found.items())]
+        return targets, None
+    finally:
+        if pcap_path:
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+
+
+def do_tls_watch(targets='', interface=None, seconds=8, discover=False, learn=True):
+    """Active TLS/certificate hygiene checker with optional passive discovery.
+    Grades each target host:port (typed and/or discovered on the segment) for
+    expired / not-yet-valid / self-signed / untrusted / hostname-mismatch /
+    weak-crypto / deprecated-tls / expiring certs, and flags a cert that changed
+    since the learned fingerprint baseline."""
+    try:
+        import cryptography  # noqa: F401
+    except Exception:
+        return {'success': False,
+                'error': 'the Python "cryptography" package is required for TLS '
+                         'grading (pip install cryptography)'}
+    now = datetime.now(timezone.utc)
+
+    # Merge explicit targets with passively-discovered ones (SNI carried along).
+    order, sni_of = [], {}
+    for host, port in _tls_parse_targets(targets):
+        k = (host, port)
+        if k not in sni_of:
+            sni_of[k] = None
+            order.append(k)
+
+    discovered_n, disc_err = 0, None
+    if discover:
+        iface = interface if _valid_iface(interface or '') else _default_route_iface()
+        if not iface or iface not in _list_iface_names(include_virtual=True):
+            disc_err = 'no interface to capture on for discovery'
+        else:
+            found, disc_err = _tls_discover(iface, _clamp_int(seconds, 8, 4, 30))
+            discovered_n = len(found or [])
+            for d in (found or []):
+                k = (d['host'], d['port'])
+                if k not in sni_of:
+                    sni_of[k] = d.get('sni')
+                    order.append(k)
+                elif d.get('sni') and not sni_of[k]:
+                    sni_of[k] = d['sni']
+
+    order = order[:_TLS_MAX_TARGETS]
+    if not order:
+        return {'success': True, 'verdict': 'clean', 'targets': [], 'counts': {},
+                'reasons': [disc_err or 'No TLS targets given or discovered'],
+                'discovered': discovered_n, 'discover_error': disc_err,
+                'advisories': [], 'interface': interface}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = []
+    with ThreadPoolExecutor(max_workers=min(_TLS_POOL, len(order))) as ex:
+        futs = [ex.submit(_tls_check_target, h, p, sni_of[(h, p)], now)
+                for (h, p) in order]
+        for fut in as_completed(futs):
+            results.append(fut.result())
+
+    # Fingerprint baseline: flag changed certs, then learn.
+    with _tls_watch_lock:
+        base = _tls_watch_load()
+        certs = base.get('certs') or {}
+        for r in results:
+            fp = r.get('fingerprint')
+            if not fp:
+                continue
+            prev = certs.get(r['target'])
+            if prev and prev != fp:
+                r['cert_changed'] = True
+                r['reasons'] = ['certificate CHANGED since baseline '
+                                '(rotation or possible MITM)'] + r.get('reasons', [])
+            if learn:
+                certs[r['target']] = fp
+        if learn:
+            base['certs'] = certs
+            _tls_watch_save(base)
+
+    # Sort worst-first; roll up an overall verdict from graded targets.
+    def sev(r):
+        v = r.get('verdict', 'valid')
+        return _TLS_PRIORITY.index(v) if v in _TLS_PRIORITY else len(_TLS_PRIORITY) + 1
+    results.sort(key=sev)
+    counts = {}
+    for r in results:
+        counts[r['verdict']] = counts.get(r['verdict'], 0) + 1
+    graded = [r for r in results if r.get('status') == 'graded']
+    bad = [r for r in graded if r['verdict'] != 'valid']
+    if not graded:
+        overall = 'unreachable'
+    elif not bad:
+        overall = 'clean'
+    else:
+        overall = bad[0]['verdict']
+
+    n_bad = len(bad)
+    summary = ([f"{n_bad} of {len(graded)} TLS service(s) have certificate/TLS "
+                f"problems — worst: {overall}"] if bad else
+               ([f"All {len(graded)} TLS service(s) present valid, trusted, "
+                 f"in-date certificates"] if graded else
+                ['No TLS service could be graded']))
+    if counts.get('unreachable'):
+        summary.append(f"{counts['unreachable']} target(s) unreachable / not TLS")
+
+    advisories = []
+    if bad:
+        advisories.append(
+            "Replace expired/weak certs and re-issue from a trusted internal CA "
+            "(or a public ACME/Let's Encrypt cert for internet-facing services); "
+            "include every hostname/IP in the SAN, use RSA≥2048 or ECDSA P-256 "
+            "with SHA-256+, and disable TLS 1.0/1.1. Automate renewal so nothing "
+            "silently expires.")
+
+    return {
+        'success': True,
+        'verdict': overall,
+        'reasons': summary,
+        'counts': counts,
+        'targets': results,
+        'discovered': discovered_n,
+        'discover_error': disc_err,
+        'graded': len(graded),
+        'learned': bool(learn),
+        'advisories': advisories,
+        'interface': interface,
+    }
+
+
+def _tls_selftest():
+    """Self-test the TLS/cert grader (no root, no network for the classifier legs).
+    Builds synthetic certs with `cryptography` and drives the real classifier, then
+    — as an end-to-end leg — starts a local TLS server with a self-signed cert and
+    grades it through the real handshake path. Returns a results dict."""
+    scenarios = []
+    now = datetime.now(timezone.utc)
+
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except Exception as e:
+        return {'success': False, 'scenarios': [],
+                'error': f'cryptography unavailable: {e}',
+                'scapy': {'ran': False, 'reason': 'n/a'}}
+
+    def make(cn, d_from, d_to, bits=2048, sans=None, issuer_cn=None):
+        key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+        issuer = (x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn)])
+                  if issuer_cn else subject)
+        b = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+             .public_key(key.public_key()).serial_number(x509.random_serial_number())
+             .not_valid_before(now + timedelta(days=d_from))
+             .not_valid_after(now + timedelta(days=d_to)))
+        if sans:
+            b = b.add_extension(x509.SubjectAlternativeName(
+                [x509.DNSName(s) for s in sans]), critical=False)
+        cert = b.sign(key, hashes.SHA256())
+        return key, cert.public_bytes(serialization.Encoding.DER)
+
+    def run(name, der, check, trusted, expect, proto='TLSv1.3',
+            cipher='TLS_AES_256_GCM_SHA384', reason=None):
+        res = _tls_classify(der, check, trusted, reason, proto, cipher, now)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'pass': ok})
+        return res
+
+    # 1. valid: trusted, in-date, hostname matches.
+    _, d = make('host.test', -2, 200, sans=['host.test'])
+    run('valid', d, 'host.test', True, 'valid')
+    # 2. expired.
+    _, d = make('host.test', -400, -5, sans=['host.test'])
+    run('expired', d, 'host.test', True, 'expired')
+    # 3. not-yet-valid.
+    _, d = make('host.test', 5, 200, sans=['host.test'])
+    run('not-yet-valid', d, 'host.test', True, 'not-yet-valid')
+    # 4. self-signed (untrusted + issuer==subject).
+    _, d = make('host.test', -2, 200, sans=['host.test'])
+    run('self-signed', d, 'host.test', False, 'self-signed',
+        reason='self-signed certificate')
+    # 5. untrusted (untrusted + issuer != subject = private CA).
+    _, d = make('host.test', -2, 200, sans=['host.test'], issuer_cn='Corp Root CA')
+    run('untrusted', d, 'host.test', False, 'untrusted',
+        reason='unable to get local issuer certificate')
+    # 6. hostname-mismatch: trusted cert for other.test, connect to host.test.
+    _, d = make('other.test', -2, 200, sans=['other.test'])
+    run('hostname-mismatch', d, 'host.test', True, 'hostname-mismatch')
+    # 7. weak-crypto: 1024-bit RSA key.
+    _, d = make('host.test', -2, 200, bits=1024, sans=['host.test'])
+    run('weak-crypto', d, 'host.test', True, 'weak-crypto')
+    # 8. deprecated-tls: fine cert but TLS 1.0 negotiated.
+    _, d = make('host.test', -2, 200, sans=['host.test'])
+    run('deprecated-tls', d, 'host.test', True, 'deprecated-tls', proto='TLSv1')
+    # 9. expiring: valid but < 21 days left.
+    _, d = make('host.test', -2, 10, sans=['host.test'])
+    run('expiring', d, 'host.test', True, 'expiring')
+    # 10. wildcard SAN matches sub-domain -> valid.
+    _, d = make('*.lan', -2, 200, sans=['*.lan'])
+    run('wildcard-match', d, 'nas.lan', True, 'valid')
+
+    # End-to-end: real local TLS server with a self-signed cert, graded live.
+    e2e = {'ran': False, 'reason': 'skipped'}
+    try:
+        import threading as _thr
+        skey, sder = make('localhost', -1, 60, sans=['localhost', '127.0.0.1'])
+        from cryptography.hazmat.primitives import serialization as _ser
+        from cryptography import x509 as _x509
+        scert = _x509.load_der_x509_certificate(sder)
+        tmpd = tempfile.mkdtemp()
+        cp = os.path.join(tmpd, 'c.pem')
+        kp = os.path.join(tmpd, 'k.pem')
+        with open(cp, 'wb') as f:
+            f.write(scert.public_bytes(_ser.Encoding.PEM))
+        with open(kp, 'wb') as f:
+            f.write(skey.private_bytes(_ser.Encoding.PEM,
+                                       _ser.PrivateFormat.TraditionalOpenSSL,
+                                       _ser.NoEncryption()))
+        sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.load_cert_chain(cp, kp)
+        lsock = socket.socket()
+        lsock.bind(('127.0.0.1', 0))
+        lsock.listen(2)
+        lport = lsock.getsockname()[1]
+
+        def _serve():
+            while True:
+                try:
+                    conn, _ = lsock.accept()
+                except OSError:
+                    return
+                try:
+                    with sctx.wrap_socket(conn, server_side=True) as s:
+                        s.recv(16)
+                except Exception:
+                    pass
+        _thr.Thread(target=_serve, daemon=True).start()
+        r = _tls_check_target('127.0.0.1', lport, 'localhost', now)
+        lsock.close()
+        try:
+            os.remove(cp)
+            os.remove(kp)
+            os.rmdir(tmpd)
+        except OSError:
+            pass
+        ok = (r.get('status') == 'graded' and r['verdict'] == 'self-signed'
+              and r.get('proto', '').startswith('TLS'))
+        e2e = {'ran': True, 'verdict': r.get('verdict'), 'proto': r.get('proto'),
+               'trusted': r.get('trusted'), 'pass': ok}
+    except Exception as e:
+        e2e = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not e2e.get('ran')
+                                                    or e2e.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'e2e': e2e}
+
+
+# --------------------------------------------------------------------------
+# Relay/Coercion Watch: passive NTLM-relay + authentication-coercion scanner
+# --------------------------------------------------------------------------
+# The defensive counterpart to Responder-style credential theft (see [[SMB Watch]]):
+# SMB Watch catches the *harvest* (a host answering LLMNR/NBT-NS), this catches the
+# *relay* and the *coercion* that feed it. NTLM has no channel binding by default, so
+# an attacker who obtains an NTLM authentication (via poisoning, or by *coercing* a
+# host to authenticate) can relay it to another service and act as the victim. This
+# scanner is PASSIVE (tcpdump -> pcap -> Scapy dissect) and flags:
+#   * coercion-attempt   — an MSRPC call over 445/135 that forces a host to
+#     authenticate: PetitPotam (MS-EFSRPC), PrinterBug/SpoolSample (MS-RPRN opnum
+#     65/66), DFSCoerce (MS-DFSNM), ShadowCoerce (MS-FSRVP). Detected by the interface
+#     UUID in the RPC bind (and, for the printer bug, the coercion opnum).
+#   * relay-suspected    — the *same* NTLMSSP server challenge seen from two different
+#     servers: a captured challenge being replayed through a relay.
+#   * signing-not-required — a server that negotiated SMB without signing *required*:
+#     the posture that makes captured NTLM relayable in the first place.
+# Interface UUIDs are matched by their DCE/RPC little-endian wire encoding.
+_RELAY_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'data', 'relay_watch.json')
+_relay_watch_lock = threading.Lock()
+_RELAY_EVENTS_CAP = 200
+_RELAY_COERCION = {
+    bytes.fromhex('88d481c650d8d0118c5200c04fd90f7e'): ('PetitPotam', 'MS-EFSRPC'),
+    bytes.fromhex('c54119df89fe794ebf10463657acf44d'): ('PetitPotam', 'MS-EFSR'),
+    bytes.fromhex('785634123412cdabef000123456789ab'): ('PrinterBug', 'MS-RPRN'),
+    bytes.fromhex('e042c74f104acf11827300aa004ae673'): ('DFSCoerce', 'MS-DFSNM'),
+    bytes.fromhex('3c65e0a844278943a61d7373df8b2292'): ('ShadowCoerce', 'MS-FSRVP'),
+}
+# These interfaces are coercion-only in practice — a bind alone is the signal. MS-RPRN
+# (spoolss) is also used for legit printing, so it additionally needs the coercion opnum.
+_RELAY_STRONG_IFACE = {'MS-EFSRPC', 'MS-EFSR', 'MS-DFSNM', 'MS-FSRVP'}
+_RELAY_RPRN_OPNUMS = {65, 66}   # RpcRemoteFindFirstPrinterChangeNotification[Ex]
+
+
+def _relay_scan_payload(raw):
+    """Scan one TCP payload for relay/coercion signals. Returns
+    (coercion_ifaces, opnums, ntlm_challenge, smb2_signing_required)."""
+    ifaces = []
+    for sig, (tech, iface) in _RELAY_COERCION.items():
+        if sig in raw:
+            ifaces.append((tech, iface))
+
+    opnums = set()
+    start = 0
+    while True:
+        k = raw.find(b'\x05\x00\x00', start)      # DCE/RPC v5.0, ptype at +2
+        if k < 0 or k + 24 > len(raw):
+            break
+        if raw[k + 1] == 0x00 and raw[k + 2] == 0x00:   # minor 0, ptype 0 = request
+            op = int.from_bytes(raw[k + 22:k + 24], 'little')
+            if op < 1000:
+                opnums.add(op)
+        start = k + 3
+
+    challenge = None
+    i = raw.find(b'NTLMSSP\x00')
+    if i >= 0 and i + 32 <= len(raw) and int.from_bytes(raw[i + 8:i + 12], 'little') == 2:
+        ch = raw[i + 24:i + 32]
+        if ch != b'\x00' * 8:
+            challenge = ch.hex()
+
+    signing = None
+    j = raw.find(b'\xfeSMB')
+    if j >= 0 and len(raw) >= j + 67 and int.from_bytes(raw[j + 12:j + 14], 'little') == 0:
+        signing = bool(raw[j + 64 + 2] & 0x02)   # SMB2 NEGOTIATE SecurityMode: REQUIRED
+
+    return ifaces, opnums, challenge, signing
+
+
+def _parse_relay_packets(packets):
+    """Dissect scapy packets into (coercion_findings, challenge_map, signing_map).
+    Shared by the live path and the self-test."""
+    from scapy.all import IP, IPv6, TCP
+    streams = {}
+    challenges = {}
+    signing = {}
+    for pk in packets:
+        ipl = pk.getlayer(IP) or pk.getlayer(IPv6)
+        if ipl is None or not pk.haslayer(TCP):
+            continue
+        raw = bytes(pk.getlayer(TCP).payload)
+        if not raw:
+            continue
+        src, dst = ipl.src, ipl.dst
+        ifaces, opnums, chal, sign = _relay_scan_payload(raw)
+        st = streams.setdefault((src, dst), {'ifaces': set(), 'opnums': set()})
+        for ti in ifaces:
+            st['ifaces'].add(ti)
+        st['opnums'] |= opnums
+        if chal:
+            challenges.setdefault(chal, set()).add(src)
+        if sign is not None:
+            # The server sends the NEGOTIATE response; False (any unsigned) wins.
+            signing[src] = False if signing.get(src) is False else sign
+
+    coercion = []
+    for (src, dst), st in streams.items():
+        seen = set()
+        for (tech, iface) in st['ifaces']:
+            if iface in _RELAY_STRONG_IFACE:
+                seen.add((tech, iface))
+            elif iface == 'MS-RPRN' and (st['opnums'] & _RELAY_RPRN_OPNUMS):
+                seen.add((tech, iface))
+        for (tech, iface) in sorted(seen):
+            coercion.append({'attacker': src, 'victim': dst, 'technique': tech,
+                             'interface': iface})
+    return coercion, challenges, signing
+
+
+def _relay_watch_load():
+    try:
+        with open(_RELAY_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _relay_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_RELAY_WATCH_PATH), exist_ok=True)
+        tmp = _RELAY_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _RELAY_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_relay_baseline(action='get'):
+    """Manage the learned Relay/Coercion baseline (accepted servers that negotiate
+    without signing required). Coercion + relay are never baselined away."""
+    with _relay_watch_lock:
+        if action == 'reset':
+            _relay_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _relay_watch_load()
+        return {'success': True, 'baseline': {
+            'unsigned_servers': b.get('unsigned_servers') or []}}
+
+
+def _relay_analyze(coercion, challenges, signing, seconds, baseline, learn=True):
+    """Pure classifier over parsed relay/coercion signals. Separated from capture for
+    the self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    unsigned = sorted(ip for ip, req in signing.items() if req is False)
+    signed = sorted(ip for ip, req in signing.items() if req is True)
+    relays = [{'challenge': c, 'servers': sorted(s)}
+              for c, s in sorted(challenges.items()) if len(s) > 1]
+
+    known_unsigned = set(baseline.get('unsigned_servers') or [])
+    had_baseline = bool(known_unsigned) or bool(baseline)
+
+    learned = False
+    if learn and not had_baseline and (unsigned or signed or coercion):
+        baseline['unsigned_servers'] = unsigned
+        learned = True
+        known_unsigned = set(unsigned)
+
+    PRIORITY = ['coercion-attempt', 'relay-suspected', 'signing-not-required', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    for c in coercion:
+        bump('coercion-attempt')
+        reasons.append(
+            f"COERCION: {c['attacker']} is coercing {c['victim']} to authenticate via "
+            f"{c['technique']} ({c['interface']}) — the forced NTLM auth can be relayed "
+            f"to a DC/host. Patch the vector, block the RPC interface, and require SMB/"
+            f"LDAP signing + channel binding (EPA)")
+
+    for r in relays:
+        bump('relay-suspected')
+        reasons.append(
+            f"RELAY SUSPECTED: NTLM server challenge {r['challenge']} appeared from "
+            f"{len(r['servers'])} servers ({', '.join(r['servers'])}) — the same "
+            f"challenge relayed through an attacker (NTLM relay in progress)")
+
+    for ip in unsigned:
+        bump('signing-not-required')
+        tag = ' (known)' if ip in known_unsigned else ''
+        reasons.append(
+            f"SMB signing NOT required on {ip}{tag} — captured/coerced NTLM can be "
+            f"relayed to it. Set RequireSecuritySignature=1 (GPO 'Microsoft network "
+            f"server: Digitally sign communications (always)')")
+
+    advisories = []
+    if coercion or relays or unsigned or signed:
+        advisories.append(
+            "Break NTLM relay: enforce SMB signing everywhere, enable LDAP signing + "
+            "LDAP channel binding on DCs, turn on Extended Protection for Authentication "
+            "(EPA) on HTTP/LDAPS, disable the Print Spooler on DCs, and apply the "
+            "PetitPotam/EFS + DFSCoerce patches (or RPC-filter the interfaces).")
+
+    if reasons:
+        summary = reasons
+    elif not (coercion or relays or signing):
+        summary = ['No coercion, NTLM relay, or unsigned-SMB negotiation seen']
+    else:
+        summary = ['No coercion or relay detected; SMB signing looks enforced']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'coercion': coercion,
+        'relays': relays,
+        'signing': {'unsigned': [{'ip': ip, 'known': ip in known_unsigned}
+                                 for ip in unsigned],
+                    'signed': signed},
+        'advisories': advisories,
+    }
+
+
+def _relay_capture(interface, seconds):
+    """Capture SMB/MSRPC traffic to a temp pcap via tcpdump -w -> (pcap_path, error).
+    Scapy dissects it; snaplen 1024 to keep the RPC bind/opnum + NTLMSSP intact."""
+    if not _have('tcpdump'):
+        return None, 'tcpdump is not installed. Click Install to add it.'
+    if not _have_scapy():
+        return None, ('python3-scapy is required to parse MSRPC / NTLM traffic — '
+                      'install Scapy (Detector Self-Test → Install Scapy).')
+    bpf = 'tcp port 445 or tcp port 139 or tcp port 135'
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn', '-p',
+                '-s', '1024', '-c', '20000', '-w', path, bpf], timeout=seconds + 8)
+    if (os.path.getsize(path) <= 24 and res['err']
+            and ('permission' in res['err'].lower() or "couldn't" in res['err'].lower()
+                 or 'no such device' in res['err'].lower()
+                 or 'syntax error' in res['err'].lower())):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None, res['err'].strip()[:200]
+    return path, None
+
+
+def do_relay_watch(interface=None, seconds=20, learn=True):
+    """Passive NTLM-relay + coercion scanner (detection-only). One capture; classifies
+    coercion attempts (PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce), suspected relays,
+    and SMB-signing-not-required posture. Learns accepted unsigned servers on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    path, err = _relay_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    try:
+        from scapy.all import rdpcap
+        packets = rdpcap(path)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': f'could not read capture: {type(e).__name__}'}
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    coercion, challenges, signing = _parse_relay_packets(packets)
+
+    with _relay_watch_lock:
+        baseline = _relay_watch_load()
+        result = _relay_analyze(coercion, challenges, signing, seconds, baseline,
+                                learn=learn)
+        if result.get('learned'):
+            _relay_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _relay_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_RELAY_EVENTS_CAP:]
+            _relay_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    result['packet_count'] = len(packets)
+    return result
+
+
+def _relay_selftest():
+    """Self-test Relay/Coercion Watch by building real attack packets into a pcap,
+    reading them back through the same Scapy parser, and asserting verdicts."""
+    scenarios = []
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, TCP, Raw, wrpcap, rdpcap
+    except Exception as e:
+        return {'success': True, 'scenarios': [],
+                'scapy': {'ran': False, 'reason': f'{type(e).__name__}: {e}'}}
+
+    def pkt(src, dst, raw, sport=50000, dport=445):
+        return Ether() / IP(src=src, dst=dst) / TCP(sport=sport, dport=dport,
+                                                    flags='PA') / Raw(raw)
+
+    def rpc_bind(uuid_hex):
+        return b'\x05\x00\x0b\x03' + b'\x00' * 20 + bytes.fromhex(uuid_hex)
+
+    def rpc_request(opnum):
+        return (bytes([5, 0, 0, 3]) + b'\x10\x00\x00\x00' + b'\x00\x00' + b'\x00\x00'
+                + b'\x01\x00\x00\x00' + b'\x00\x00\x00\x00' + b'\x00\x00'
+                + opnum.to_bytes(2, 'little'))
+
+    def ntlm_challenge(ch):
+        return (b'NTLMSSP\x00' + (2).to_bytes(4, 'little') + b'\x00' * 12 + ch
+                + b'\x00' * 8)
+
+    def smb2_negotiate_resp(secmode):
+        hdr = b'\xfeSMB' + b'\x00' * 8 + (0).to_bytes(2, 'little') + b'\x00' * 50
+        body = (65).to_bytes(2, 'little') + secmode.to_bytes(2, 'little') + b'\x00' * 32
+        return b'\x00\x00\x00\x00' + hdr + body
+
+    def run(name, pkts, baseline, expect):
+        with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+            path = tf.name
+        wrpcap(path, pkts)
+        try:
+            co, ch, sg = _parse_relay_packets(rdpcap(path))
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        res = _relay_analyze(co, ch, sg, 20, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'pass': ok})
+        return res
+
+    base = {'unsigned_servers': ['10.0.0.7']}
+
+    # 1. clean: an SMB2 negotiate with signing required.
+    run('clean', [pkt('10.0.0.5', '10.0.0.9', smb2_negotiate_resp(0x03),
+                      sport=445, dport=50000)], base, 'clean')
+    # 2. coercion (PetitPotam): EFSRPC interface bind.
+    run('coercion-petitpotam',
+        [pkt('10.0.0.66', '10.0.0.5', rpc_bind('88d481c650d8d0118c5200c04fd90f7e'))],
+        base, 'coercion-attempt')
+    # 3. coercion (DFSCoerce): DFSNM interface bind.
+    run('coercion-dfscoerce',
+        [pkt('10.0.0.66', '10.0.0.5', rpc_bind('e042c74f104acf11827300aa004ae673'))],
+        base, 'coercion-attempt')
+    # 4. coercion (PrinterBug): RPRN bind + opnum-65 request in the same stream.
+    run('coercion-printerbug',
+        [pkt('10.0.0.66', '10.0.0.5', rpc_bind('785634123412cdabef000123456789ab')),
+         pkt('10.0.0.66', '10.0.0.5', rpc_request(65))], base, 'coercion-attempt')
+    # 4b. RPRN bind WITHOUT the coercion opnum must NOT trigger (legit printing).
+    r = run('printer-legit',
+            [pkt('10.0.0.9', '10.0.0.5', rpc_bind('785634123412cdabef000123456789ab'))],
+            base, 'clean')
+    # 5. relay-suspected: same NTLM challenge from two servers.
+    ch = b'\x11\x22\x33\x44\x55\x66\x77\x88'
+    run('relay-suspected',
+        [pkt('10.0.0.5', '10.0.0.9', ntlm_challenge(ch), sport=445, dport=50000),
+         pkt('10.0.0.66', '10.0.0.9', ntlm_challenge(ch), sport=445, dport=50001)],
+        base, 'relay-suspected')
+    # 6. signing-not-required: a server negotiating signing enabled-only.
+    run('signing-not-required',
+        [pkt('10.0.0.8', '10.0.0.9', smb2_negotiate_resp(0x01), sport=445, dport=50000)],
+        base, 'signing-not-required')
+
+    # 7. parse: fields land.
+    with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+        path = tf.name
+    wrpcap(path, [pkt('10.0.0.66', '10.0.0.5',
+                      rpc_bind('88d481c650d8d0118c5200c04fd90f7e')),
+                  pkt('10.0.0.8', '10.0.0.9', smb2_negotiate_resp(0x01),
+                      sport=445, dport=50000)])
+    co, ch2, sg = _parse_relay_packets(rdpcap(path))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    p_ok = (any(c['technique'] == 'PetitPotam' for c in co)
+            and sg.get('10.0.0.8') is False)
+    scenarios.append({'name': 'relay-parse', 'expect': 'petitpotam+unsigned',
+                      'got': f"coercion={len(co)} unsigned={sg.get('10.0.0.8')}",
+                      'pass': p_ok})
+
+    passed = all(s['pass'] for s in scenarios)
+    return {'success': passed, 'scenarios': scenarios,
+            'scapy': {'ran': True, 'pass': passed, 'scenarios_run': len(scenarios)}}
+
+
+# --------------------------------------------------------------------------
+# SMB Watch: passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning scanner (Windows attack surface)
+# --------------------------------------------------------------------------
+# Two related Windows-endpoint findings that share one kill chain (Responder → NTLM →
+# SMB relay), detection-only, one passive capture:
+#   Part 1 — SMBv1: the deprecated (2014) SMB dialect and the EternalBlue / WannaCry /
+#     NotPetya (MS17-010) vector. Disabled by default on modern Windows but still
+#     lurking on legacy NAS/printers/old hosts. SMBv1 frames carry the magic \xffSMB
+#     (SMB2/3 use \xfeSMB), so we tell them apart on the wire and, from the SMB command
+#     byte + response flag, separate a *real* SMBv1 session (tree-connect/session-setup,
+#     or a server negotiate-response) from a harmless multi-dialect negotiate offer.
+#   Part 2 — LLMNR / NBT-NS / mDNS poisoning: when DNS fails, Windows falls back to
+#     these broadcast/multicast name-resolution protocols (LLMNR udp/5355, NBT-NS
+#     udp/137, mDNS udp/5353). Responder / Inveigh answer those queries with the
+#     attacker's IP; the victim then authenticates to the attacker and leaks NTLMv2
+#     hashes (offline crack or relay). Nothing legitimate *answers* LLMNR/NBT-NS, so a
+#     host that does is a poisoner. We flag: an active poisoner, a spoof-conflict (two
+#     hosts answering one name differently), WPAD targeting, and mere exposure
+#     (LLMNR/NBT-NS in use at all). Capture is done by tcpdump into a pcap; Scapy
+#     dissects it (tcpdump no longer decodes SMB, and never decoded LLMNR/NBT-NS).
+_SMB_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'smb_watch.json')
+_smb_watch_lock = threading.Lock()
+_SMB_EVENTS_CAP = 200
+_SMB_SERVER_PORTS = {445, 139}
+# High-value names an attacker loves to poison (proxy auto-config, ISATAP, etc.).
+_SMB_HIGHVALUE = {'wpad', 'isatap'}
+# Multicast/broadcast destinations that mark a name-resolution *query*.
+_SMB_MCAST = {'224.0.0.252', 'ff02::1:3', '224.0.0.251', 'ff02::fb'}
+
+
+def _smb_find_magic(raw):
+    """Locate the SMB header in a TCP payload. Returns (version, command, response?)
+    or None. version is 'v1' (\\xffSMB) or 'v2' (\\xfeSMB)."""
+    i = raw.find(b'SMB')
+    if i < 1:
+        return None
+    magic = raw[i - 1]
+    if magic == 0xFF:
+        cmd = raw[i + 3] if len(raw) > i + 3 else None
+        flags = raw[i + 8] if len(raw) > i + 8 else 0
+        return ('v1', cmd, bool(flags & 0x80))
+    if magic == 0xFE:
+        return ('v2', None, None)
+    return None
+
+
+def _nbns_parse(payload):
+    """Force-parse a NetBIOS-NS (udp/137) payload -> (is_response, name, answer_ips).
+    tcpdump/scapy don't auto-bind NBT-NS, so we read the header flag and layer by
+    hand."""
+    if len(payload) < 12:
+        return None
+    is_resp = bool(int.from_bytes(payload[2:4], 'big') & 0x8000)
+    name, answers = None, []
+    try:
+        from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse
+        nb = (NBNSQueryResponse if is_resp else NBNSQueryRequest)(payload)
+        raw = getattr(nb, 'RR_NAME', None) or getattr(nb, 'QUESTION_NAME', None)
+        if isinstance(raw, bytes):
+            name = raw.decode('latin1', 'replace').strip().strip('\x00').strip()
+        elif raw is not None:
+            name = str(raw).strip()
+        for ent in (getattr(nb, 'ADDR_ENTRY', None) or []):
+            a = getattr(ent, 'NB_ADDRESS', None)
+            if a:
+                answers.append(a)
+    except Exception:
+        pass
+    return is_resp, name, answers
+
+
+def _smb_parse_packets(packets):
+    """Classify a sequence of scapy packets into (smb_events, nameres_events).
+    Shared by the live path (rdpcap of a tcpdump pcap) and the self-test."""
+    from scapy.all import IP, IPv6, UDP, TCP, Raw, DNS
+    try:
+        from scapy.layers.llmnr import LLMNRQuery, LLMNRResponse
+    except Exception:
+        LLMNRQuery = LLMNRResponse = None
+
+    smb_events, nameres = [], []
+    for pk in packets:
+        ipl = pk.getlayer(IP) or pk.getlayer(IPv6)
+        if ipl is None:
+            continue
+        src, dst = ipl.src, ipl.dst
+
+        if pk.haslayer(TCP) and pk.haslayer(Raw):
+            t = pk.getlayer(TCP)
+            if t.sport in _SMB_SERVER_PORTS or t.dport in _SMB_SERVER_PORTS:
+                found = _smb_find_magic(bytes(pk.getlayer(Raw).load))
+                if found:
+                    ver, cmd, resp = found
+                    from_server = t.sport in _SMB_SERVER_PORTS
+                    server = src if from_server else dst
+                    smb_events.append({'server': server, 'client': dst if from_server else src,
+                                       'version': ver, 'command': cmd, 'response': resp,
+                                       'from_server': from_server})
+            continue
+
+        if not pk.haslayer(UDP):
+            continue
+        u = pk.getlayer(UDP)
+        to_mcast = dst in _SMB_MCAST or str(dst).endswith('.255')
+
+        if u.dport == 5355 or u.sport == 5355:            # LLMNR
+            if LLMNRResponse is not None and pk.haslayer(LLMNRResponse):
+                r = pk.getlayer(LLMNRResponse)
+                nm = _dns_qname(r)
+                ans = _dns_answer_ip(r)
+                nameres.append({'proto': 'llmnr', 'kind': 'response', 'src': src,
+                                'dst': dst, 'name': nm, 'answer': ans})
+            elif LLMNRQuery is not None and pk.haslayer(LLMNRQuery):
+                nameres.append({'proto': 'llmnr', 'kind': 'query', 'src': src,
+                                'dst': dst, 'name': _dns_qname(pk.getlayer(LLMNRQuery)),
+                                'answer': None})
+        elif u.dport == 5353 or u.sport == 5353:          # mDNS
+            if pk.haslayer(DNS):
+                d = pk.getlayer(DNS)
+                is_resp = int(getattr(d, 'qr', 0)) == 1 or int(getattr(d, 'ancount', 0)) > 0
+                nameres.append({'proto': 'mdns', 'kind': 'response' if is_resp else 'query',
+                                'src': src, 'dst': dst, 'name': _dns_qname(d),
+                                'answer': _dns_answer_ip(d) if is_resp else None})
+        elif u.dport == 137 or u.sport == 137:            # NBT-NS
+            parsed = _nbns_parse(bytes(u.payload))
+            if parsed:
+                is_resp, nm, answers = parsed
+                # Queries are broadcast; a reply from :137 to a unicast host (not the
+                # broadcast group) is a response even if the header flag is unset.
+                if not is_resp and u.sport == 137 and not to_mcast:
+                    is_resp = True
+                nameres.append({'proto': 'nbtns', 'kind': 'response' if is_resp else 'query',
+                                'src': src, 'dst': dst, 'name': nm,
+                                'answer': answers[0] if answers else None})
+    return smb_events, nameres
+
+
+def _dns_qname(layer):
+    try:
+        qd = getattr(layer, 'qd', None)
+        if qd and getattr(qd, 'qname', None):
+            n = qd.qname
+            return (n.decode('latin1', 'replace') if isinstance(n, bytes) else str(n)).rstrip('.')
+    except Exception:
+        pass
+    return None
+
+
+def _dns_answer_ip(layer):
+    try:
+        an = getattr(layer, 'an', None)
+        if an and getattr(an, 'rdata', None):
+            rd = an.rdata
+            return rd.decode('latin1', 'replace') if isinstance(rd, bytes) else str(rd)
+    except Exception:
+        pass
+    return None
+
+
+def _smb_watch_load():
+    try:
+        with open(_SMB_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _smb_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_SMB_WATCH_PATH), exist_ok=True)
+        tmp = _SMB_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _SMB_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_smb_baseline(action='get'):
+    """Manage the learned SMB Watch baseline (accepted mDNS responders + known SMBv1
+    hosts). LLMNR/NBT-NS responders are never baselined away — nothing should answer
+    them."""
+    with _smb_watch_lock:
+        if action == 'reset':
+            _smb_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _smb_watch_load()
+        return {'success': True, 'baseline': {
+            'mdns_responders': b.get('mdns_responders') or [],
+            'smbv1_hosts': b.get('smbv1_hosts') or []}}
+
+
+def _smb_analyze(smb_events, nameres, seconds, baseline, learn=True):
+    """Pure classifier over parsed SMB + name-resolution events. Separated from
+    capture for the self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    # ---- Part 1: SMBv1 ----
+    servers = {}
+    v2_count = 0
+    for e in smb_events:
+        if e['version'] == 'v2':
+            v2_count += 1
+            continue
+        s = servers.setdefault(e['server'], {
+            'ip': e['server'], 'active': False, 'offered': False, 'count': 0})
+        s['count'] += 1
+        # A v1 command other than negotiate (0x72), or a server negotiate *response*,
+        # means SMBv1 is really being spoken; a client's negotiate request only offers it.
+        if (e['command'] not in (0x72, None)) or (e['command'] == 0x72 and e['response']):
+            s['active'] = True
+        else:
+            s['offered'] = True
+
+    # ---- Part 2: LLMNR/NBT-NS/mDNS poisoning ----
+    responders = {}
+    q_llmnr = q_nbtns = q_mdns = 0
+    name_answers = {}
+    for e in nameres:
+        if e['kind'] == 'query':
+            if e['proto'] == 'llmnr':
+                q_llmnr += 1
+            elif e['proto'] == 'nbtns':
+                q_nbtns += 1
+            else:
+                q_mdns += 1
+            continue
+        r = responders.setdefault(e['src'], {
+            'ip': e['src'], 'protos': set(), 'names': set(), 'highvalue': set(),
+            'foreign': False, 'count': 0})
+        r['count'] += 1
+        r['protos'].add(e['proto'])
+        if e['name']:
+            r['names'].add(e['name'])
+            base = e['name'].split('.')[0].lower()
+            if base in _SMB_HIGHVALUE:
+                r['highvalue'].add(e['name'])
+            name_answers.setdefault(e['name'].lower(), set())
+            if e['answer']:
+                name_answers[e['name'].lower()].add(e['answer'])
+        # mDNS is legit when a host announces *itself* (answer == its own IP); a reply
+        # pointing elsewhere is a host claiming another identity.
+        if e['answer'] and e['answer'] != e['src']:
+            r['foreign'] = True
+
+    known_mdns = set(baseline.get('mdns_responders') or [])
+    known_v1 = set(baseline.get('smbv1_hosts') or [])
+    had_baseline = bool(known_mdns) or bool(known_v1) or bool(baseline)
+
+    learned = False
+    if learn and not had_baseline and (servers or responders):
+        baseline['mdns_responders'] = sorted(
+            ip for ip, r in responders.items() if r['protos'] == {'mdns'} and not r['foreign'])
+        baseline['smbv1_hosts'] = sorted(servers.keys())
+        learned = True
+        known_mdns = set(baseline['mdns_responders'])
+        known_v1 = set(baseline['smbv1_hosts'])
+
+    PRIORITY = ['poisoning', 'smbv1-active', 'spoof-conflict', 'smbv1-offered',
+                'name-exposure', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Poisoning: any host answering LLMNR/NBT-NS, or an mDNS host claiming foreign
+    # identities / high-value names.
+    for ip in sorted(responders):
+        r = responders[ip]
+        poisons = r['protos'] & {'llmnr', 'nbtns'}
+        mdns_bad = ('mdns' in r['protos']
+                    and (r['highvalue'] or (r['foreign'] and len(r['names']) > 4)))
+        if poisons or mdns_bad:
+            bump('poisoning')
+            protos = ', '.join(sorted(poisons or {'mdns'})).upper()
+            names = ', '.join(sorted(r['names'])[:5]) or '(unnamed)'
+            hv = ' incl. WPAD/ISATAP' if r['highvalue'] else ''
+            reasons.append(
+                f"POISONING: {ip} is answering {protos} name queries "
+                f"(Responder/Inveigh) — replied for {names}{hv}. Victims that trust "
+                f"the reply authenticate to it and leak NTLMv2 hashes. Disable "
+                f"LLMNR/NBT-NS via GPO and enable SMB signing to block relay")
+
+    # Spoof conflict: one name answered by 2+ different IPs.
+    for name in sorted(name_answers):
+        ips = name_answers[name]
+        if len(ips) > 1:
+            bump('spoof-conflict')
+            reasons.append(
+                f"Name '{name}' is answered with conflicting IPs ({', '.join(sorted(ips))}) "
+                f"— a poisoner racing the real owner of the name")
+
+    # SMBv1.
+    for ip in sorted(servers):
+        s = servers[ip]
+        tag = ' (known legacy host)' if ip in known_v1 else ''
+        if s['active']:
+            bump('smbv1-active')
+            reasons.append(
+                f"SMBv1 in ACTIVE use by {ip}{tag} — SMBv1 is deprecated and the "
+                f"EternalBlue/WannaCry (MS17-010) vector. Disable it "
+                f"(Set-SmbServerConfiguration -EnableSMB1Protocol $false) and patch")
+        elif s['offered']:
+            bump('smbv1-offered')
+            reasons.append(
+                f"SMBv1 offered by {ip}{tag} in dialect negotiation (may still upgrade "
+                f"to SMB2/3) — disable SMBv1 to remove the downgrade/fallback path")
+
+    # Exposure: LLMNR/NBT-NS queries present but nobody (yet) answering.
+    if (q_llmnr or q_nbtns) and verdict in ('clean', 'name-exposure'):
+        bump('name-exposure')
+        reasons.append(
+            f"LLMNR/NBT-NS queries seen ({q_llmnr} LLMNR, {q_nbtns} NBT-NS) with no "
+            f"responder — hosts fall back to these poisonable protocols; disable them "
+            f"via GPO before a Responder shows up on the segment")
+
+    advisories = []
+    if servers or responders or q_llmnr or q_nbtns:
+        advisories.append(
+            "Windows hardening: disable SMBv1 everywhere, turn off LLMNR (GPO: Turn off "
+            "multicast name resolution) and NBT-NS (per-adapter / DHCP option 001=2), "
+            "and enforce SMB signing so captured NTLM can't be relayed.")
+
+    if reasons:
+        summary = reasons
+    elif not (smb_events or nameres):
+        summary = ['No SMB or LLMNR/NBT-NS/mDNS traffic seen on this segment']
+    else:
+        summary = ['No SMBv1 and no name-resolution poisoning detected '
+                   '(SMB2/3 + legit mDNS only)']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'smb': {
+            'v1_servers': [{'ip': s['ip'],
+                            'mode': 'active' if s['active'] else 'offered',
+                            'known': s['ip'] in known_v1} for s in
+                           (servers[i] for i in sorted(servers))],
+            'v1_count': sum(s['count'] for s in servers.values()),
+            'v2_count': v2_count},
+        'nameres': {
+            'responders': [{'ip': r['ip'], 'protos': sorted(r['protos']),
+                            'names': sorted(r['names'])[:12],
+                            'highvalue': sorted(r['highvalue']),
+                            'foreign': r['foreign'],
+                            'known': r['ip'] in known_mdns} for r in
+                           (responders[i] for i in sorted(responders))],
+            'queries': {'llmnr': q_llmnr, 'nbtns': q_nbtns, 'mdns': q_mdns},
+            'conflicts': [{'name': n, 'answers': sorted(name_answers[n])}
+                          for n in sorted(name_answers) if len(name_answers[n]) > 1]},
+        'advisories': advisories,
+    }
+
+
+def _smb_capture(interface, seconds):
+    """Capture SMB + name-resolution traffic to a temp pcap via tcpdump -w, and return
+    (pcap_path, error). Scapy then dissects it (tcpdump can't decode these)."""
+    if not _have('tcpdump'):
+        return None, 'tcpdump is not installed. Click Install to add it.'
+    if not _have_scapy():
+        return None, ('python3-scapy is required to parse SMB / name-resolution '
+                      'traffic — install Scapy (Detector Self-Test → Install Scapy).')
+    bpf = ('(tcp port 445 or tcp port 139) or (udp port 5355 or udp port 5353 or '
+           'udp port 137)')
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn', '-p',
+                '-s', '512', '-c', '20000', '-w', path, bpf], timeout=seconds + 8)
+    if (os.path.getsize(path) <= 24 and res['err']
+            and ('permission' in res['err'].lower() or "couldn't" in res['err'].lower()
+                 or 'no such device' in res['err'].lower()
+                 or 'syntax error' in res['err'].lower())):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None, res['err'].strip()[:200]
+    return path, None
+
+
+def do_smb_watch(interface=None, seconds=20, learn=True):
+    """Passive SMBv1 + LLMNR/NBT-NS/mDNS-poisoning scanner (detection-only). One
+    capture; classifies SMBv1 use and Responder-style name-resolution poisoning.
+    Learns accepted mDNS responders + known SMBv1 hosts on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    path, err = _smb_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    try:
+        from scapy.all import rdpcap
+        packets = rdpcap(path)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': f'could not read capture: {type(e).__name__}'}
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    smb_events, nameres = _smb_parse_packets(packets)
+
+    with _smb_watch_lock:
+        baseline = _smb_watch_load()
+        result = _smb_analyze(smb_events, nameres, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _smb_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _smb_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_SMB_EVENTS_CAP:]
+            _smb_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    result['packet_count'] = len(smb_events) + len(nameres)
+    return result
+
+
+def _smb_selftest():
+    """Self-test SMB Watch by building real attack packets into a pcap, reading them
+    back through the same Scapy parser, and asserting the verdicts (this is the
+    end-to-end leg — the tool is Scapy-parsed by construction)."""
+    scenarios = []
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import (Ether, IP, UDP, TCP, Raw, wrpcap, rdpcap, DNS, DNSQR,
+                               DNSRR)
+        from scapy.layers.llmnr import LLMNRQuery, LLMNRResponse
+        from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse
+    except Exception as e:
+        return {'success': True, 'scenarios': [],
+                'scapy': {'ran': False, 'reason': f'{type(e).__name__}: {e}'}}
+
+    def smb1(cmd, response, server='10.0.0.5'):
+        flags = 0x80 if response else 0x00
+        body = b'\xffSMB' + bytes([cmd]) + b'\x00\x00\x00\x00' + bytes([flags]) + b'\x00' * 20
+        sport, dport = (445, 50000) if response or cmd != 0x72 else (50000, 445)
+        # server side uses port 445; client request uses dport 445
+        if response:
+            ip = IP(src=server, dst='10.0.0.9'); tcp = TCP(sport=445, dport=50000, flags='PA')
+        elif cmd == 0x72:
+            ip = IP(src='10.0.0.9', dst=server); tcp = TCP(sport=50000, dport=445, flags='PA')
+        else:
+            ip = IP(src=server, dst='10.0.0.9'); tcp = TCP(sport=445, dport=50000, flags='PA')
+        return Ether() / ip / tcp / Raw(b'\x00\x00\x00' + bytes([len(body)]) + body)
+
+    def llmnr_resp(src, name, ip):
+        return (Ether() / IP(src=src, dst='10.0.0.9') / UDP(sport=5355, dport=50000)
+                / LLMNRResponse(qd=DNSQR(qname=name),
+                                an=DNSRR(rrname=name, rdata=ip)))
+
+    def llmnr_query(name):
+        return (Ether() / IP(src='10.0.0.9', dst='224.0.0.252')
+                / UDP(sport=50000, dport=5355) / LLMNRQuery(qd=DNSQR(qname=name)))
+
+    def nbns_resp(src, name):
+        return (Ether() / IP(src=src, dst='10.0.0.9') / UDP(sport=137, dport=137)
+                / NBNSQueryResponse(RR_NAME=name))
+
+    def mdns_self(src, name):
+        return (Ether() / IP(src=src, dst='224.0.0.251') / UDP(sport=5353, dport=5353)
+                / DNS(qr=1, qd=DNSQR(qname=name), an=DNSRR(rrname=name, rdata=src)))
+
+    def run(name, pkts, baseline, expect):
+        with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+            path = tf.name
+        wrpcap(path, pkts)
+        try:
+            smb_e, nr = _smb_parse_packets(rdpcap(path))
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        res = _smb_analyze(smb_e, nr, 20, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(smb_e) + len(nr), 'pass': ok})
+        return res
+
+    base = {'mdns_responders': ['10.0.0.20'], 'smbv1_hosts': []}
+
+    # 1. clean: legit mDNS host announcing itself + SMB2 traffic.
+    run('clean', [mdns_self('10.0.0.20', 'printer.local'),
+                  Ether() / IP(src='10.0.0.5', dst='10.0.0.9')
+                  / TCP(sport=445, dport=50000, flags='PA')
+                  / Raw(b'\x00\x00\x00\x20\xfeSMB' + b'\x00' * 20)], base, 'clean')
+    # 2. poisoning: a host answering LLMNR (Responder) incl. WPAD.
+    run('poisoning', [llmnr_resp('10.0.0.66', 'fileserver', '10.0.0.66'),
+                      llmnr_resp('10.0.0.66', 'wpad', '10.0.0.66')], base, 'poisoning')
+    # 3. poisoning via NBT-NS response.
+    run('poisoning-nbtns', [nbns_resp('10.0.0.66', 'FILESERVER')], base, 'poisoning')
+    # 4. spoof-conflict: two hosts answer the same LLMNR name differently.
+    run('spoof-conflict', [llmnr_resp('10.0.0.5', 'app01', '10.0.0.5'),
+                           llmnr_resp('10.0.0.66', 'app01', '10.0.0.66')], base,
+        'poisoning')  # both are LLMNR responders -> poisoning outranks conflict
+    # 5. smbv1-active: a real SMBv1 tree-connect (cmd 0x75).
+    run('smbv1-active', [smb1(0x75, False)], base, 'smbv1-active')
+    # 6. smbv1-offered: only a client SMBv1 negotiate request (cmd 0x72, no response).
+    run('smbv1-offered', [smb1(0x72, False)], base, 'smbv1-offered')
+    # 7. name-exposure: LLMNR queries only, nobody answering.
+    run('name-exposure', [llmnr_query('fileserver'), llmnr_query('wpad')], base,
+        'name-exposure')
+
+    # 8. parse: fields land correctly.
+    with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+        path = tf.name
+    wrpcap(path, [llmnr_resp('10.0.0.66', 'wpad', '10.0.0.66'), smb1(0x72, True)])
+    smb_e, nr = _smb_parse_packets(rdpcap(path))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    llmnr_ev = next((e for e in nr if e['proto'] == 'llmnr'), {})
+    smb_ev = smb_e[0] if smb_e else {}
+    p_ok = (llmnr_ev.get('kind') == 'response' and llmnr_ev.get('name') == 'wpad'
+            and llmnr_ev.get('answer') == '10.0.0.66'
+            and smb_ev.get('version') == 'v1' and smb_ev.get('response') is True)
+    scenarios.append({'name': 'smb-parse', 'expect': 'llmnr-wpad/smbv1-resp',
+                      'got': f"name={llmnr_ev.get('name')} v={smb_ev.get('version')}",
+                      'pass': p_ok})
+
+    passed = all(s['pass'] for s in scenarios)
+    scapy_result = {'ran': True, 'pass': passed,
+                    'scenarios_run': len(scenarios)}
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# IS-IS Watch: passive IS-IS routing-security scanner (detection-only)
+# --------------------------------------------------------------------------
+# IS-IS (ISO/IEC 10589) is the third interior gateway protocol alongside OSPF and
+# EIGRP, and the one that dominates ISP / service-provider and data-center cores. It
+# is architecturally unusual: it runs *directly on L2* (ISO CLNS, LLC DSAP 0xFE) — not
+# over IP — so IP ACLs don't touch it, and its only real protection is the TLV-10
+# authentication (cleartext password or HMAC-MD5). On a broadcast LAN its PDUs go to
+# the AllL1ISs (01:80:c2:00:00:14) and AllL2ISs (01:80:c2:00:00:15) multicast MACs:
+#   IIH  (Hello, PDU 15/16/17)  — forms adjacencies
+#   LSP  (Link State PDU 18/20) — carries the topology + reachable prefixes
+#   CSNP/PSNP (24-27)           — database sync
+# Without authentication any host on the segment can form an adjacency and inject LSPs
+# with attractive metrics to blackhole or MITM traffic (the IS-IS analogue of OSPF LSA
+# injection). tcpdump fully decodes IS-IS — system-ids, areas, the Authentication TLV,
+# the reachable prefixes in LSPs, and the dynamic-hostname TLV (#137) that maps a
+# system-id to a router name — so this passive scanner sees injection directly and can
+# name the routers. It never sends an IS-IS PDU. What it flags:
+#   * injection    — an LSP from a system-id not in the baseline, or a new / re-homed
+#     reachable prefix (topology poisoning).
+#   * rogue-router — a new IS-IS speaker (system-id) sending hellos, not in baseline.
+#   * storm        — an IIH/LSP flood by rate.
+#   * anomaly      — a duplicate system-id from two MACs (spoof), or a new area address.
+#   * weak-auth    — a PDU with no Authentication TLV, or a cleartext password.
+_ISIS_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'isis_watch.json')
+_isis_watch_lock = threading.Lock()
+_ISIS_EVENTS_CAP = 200
+_ISIS_STORM_RATE = 25           # IS-IS PDUs/s above this (with volume) == flood
+_ISIS_SRC_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*'
+                          r'(01:80:c2:00:00:1[45])')
+_ISIS_PDU_RE = re.compile(r'\b(L1|L2|p2p)\s+(Lan IIH|IIH|LSP|CSNP|PSNP)')
+_ISIS_SRCID_RE = re.compile(r'source-id:\s*([0-9a-fA-F.]+)')
+_ISIS_LSPID_RE = re.compile(r'lsp-id:\s*([0-9a-fA-F.\-]+),\s*seq:\s*(0x[0-9a-fA-F]+)')
+_ISIS_AREA_RE = re.compile(r'Area address \(length: \d+\):\s*([0-9a-fA-F.]+)')
+_ISIS_HOST_RE = re.compile(r'Hostname:\s*(\S+)')
+_ISIS_PFX_RE = re.compile(r'IP(?:v4|v6) prefix:\s*([0-9a-fA-F:.]+/\d+),.*?Metric:\s*(\d+)')
+
+
+def _isis_sysid_of_lsp(lspid):
+    """System-id (first three dotted groups) of an LSP-ID like 0000.0000.0001.00-00."""
+    return '.'.join((lspid or '').split('.')[:3]) or None
+
+
+def _parse_isis_capture(output):
+    """Parse `tcpdump -e -t -v` text over IS-IS into per-PDU events. Block-structured:
+    a header line (`<src> > <AllISs-mac>, 802.3, ... IS-IS (0x83)`) starts a PDU whose
+    type line (`L1 Lan IIH` / `L2 LSP` / ...) and TLVs (area/auth/hostname/prefix)
+    follow indented."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _ISIS_SRC_RE.match(line)
+        if m and 'IS-IS' in line:
+            if cur:
+                events.append(cur)
+            cur = {'src_mac': m.group(1).lower(), 'dst': m.group(2),
+                   'level': None, 'kind': None, 'source_id': None, 'lsp_id': None,
+                   'seq': None, 'areas': [], 'auth_present': False, 'auth': None,
+                   'hostname': None, 'prefixes': []}
+            continue
+        if cur is None:
+            continue
+        p = _ISIS_PDU_RE.search(line)
+        if p and cur['kind'] is None:
+            lvl = p.group(1)
+            cur['level'] = 1 if lvl == 'L1' else (2 if lvl == 'L2' else None)
+            t = p.group(2)
+            cur['kind'] = ('iih' if 'IIH' in t else 'lsp' if t == 'LSP'
+                           else 'csnp' if t == 'CSNP' else 'psnp' if t == 'PSNP'
+                           else 'unknown')
+        sid = _ISIS_SRCID_RE.search(line)
+        if sid:
+            cur['source_id'] = sid.group(1)
+        lsp = _ISIS_LSPID_RE.search(line)
+        if lsp:
+            cur['lsp_id'] = lsp.group(1)
+            cur['seq'] = lsp.group(2)
+        ar = _ISIS_AREA_RE.search(line)
+        if ar and ar.group(1) not in cur['areas']:
+            cur['areas'].append(ar.group(1))
+        if 'Authentication TLV' in line:
+            cur['auth_present'] = True
+        elif 'simple text password' in line:
+            cur['auth'] = 'cleartext'
+        elif 'HMAC' in line:
+            cur['auth'] = 'hmac'
+        hn = _ISIS_HOST_RE.search(line)
+        if hn:
+            cur['hostname'] = hn.group(1)
+        pf = _ISIS_PFX_RE.search(line)
+        if pf:
+            cur['prefixes'].append({'pfx': pf.group(1), 'metric': int(pf.group(2))})
+    if cur:
+        events.append(cur)
+    # Attribute a stable system-id to every event (LSPs carry it in the lsp-id).
+    for e in events:
+        e['system_id'] = e['source_id'] or _isis_sysid_of_lsp(e['lsp_id'])
+    return [e for e in events if e['system_id']]
+
+
+def _isis_watch_load():
+    try:
+        with open(_ISIS_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _isis_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_ISIS_WATCH_PATH), exist_ok=True)
+        tmp = _ISIS_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _ISIS_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_isis_baseline(action='get'):
+    """Manage the learned IS-IS baseline (trusted routers + advertised prefixes)."""
+    with _isis_watch_lock:
+        if action == 'reset':
+            _isis_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _isis_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted((b.get('routers') or {}).keys()),
+            'prefixes': sorted((b.get('prefixes') or {}).keys())}}
+
+
+def _isis_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed IS-IS events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    routers = {}
+    prefixes = {}
+    noauth_any = False
+    for e in events:
+        sid = e['system_id']
+        r = routers.setdefault(sid, {
+            'system_id': sid, 'hostname': None, 'areas': set(), 'levels': set(),
+            'macs': set(), 'kinds': set(), 'auth': set(), 'count': 0})
+        r['count'] += 1
+        if e['hostname']:
+            r['hostname'] = e['hostname']
+        for a in e['areas']:
+            r['areas'].add(a)
+        if e['level']:
+            r['levels'].add(e['level'])
+        if e['src_mac']:
+            r['macs'].add(e['src_mac'])
+        if e['kind']:
+            r['kinds'].add(e['kind'])
+        # An IIH/LSP with no Authentication TLV, or a cleartext password, is weak.
+        if e['kind'] in ('iih', 'lsp'):
+            if not e['auth_present'] or e['auth'] == 'cleartext':
+                r['auth'].add(e['auth'] or 'none')
+                noauth_any = True
+            else:
+                r['auth'].add(e['auth'])
+        if e['kind'] == 'lsp':
+            for p in e['prefixes']:
+                prefixes.setdefault(p['pfx'], {
+                    'pfx': p['pfx'], 'origin': sid, 'metric': p['metric']})
+
+    known = dict(baseline.get('routers') or {})
+    base_prefixes = dict(baseline.get('prefixes') or {})
+    had_baseline = bool(known) or bool(base_prefixes)
+
+    def _name(sid):
+        r = routers.get(sid)
+        hn = (r['hostname'] if r else None) or (known.get(sid) or {}).get('hostname')
+        return f"{hn} ({sid})" if hn else sid
+
+    learned = False
+    if learn and not had_baseline and routers:
+        baseline['routers'] = {
+            s: {'areas': sorted(r['areas']), 'hostname': r['hostname'],
+                'levels': sorted(r['levels'])}
+            for s, r in routers.items()}
+        baseline['prefixes'] = {
+            p: {'origin': d['origin']} for p, d in prefixes.items()}
+        learned = True
+        known = dict(baseline['routers'])
+        base_prefixes = dict(baseline['prefixes'])
+        had_baseline = True
+
+    PRIORITY = ['injection', 'rogue-router', 'storm', 'anomaly', 'weak-auth', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # LSP injection: new prefix, or a known prefix re-homed to a different originator.
+    if had_baseline:
+        for p in sorted(prefixes):
+            d = prefixes[p]
+            base = base_prefixes.get(p)
+            if base is None:
+                bump('injection')
+                reasons.append(
+                    f"IS-IS LSP INJECTION: prefix {p} advertised by {_name(d['origin'])} "
+                    f"is not in the baseline — a forged LSP that can blackhole or MITM "
+                    f"traffic to it")
+            elif base.get('origin') and d['origin'] != base['origin']:
+                bump('injection')
+                reasons.append(
+                    f"IS-IS PREFIX RE-HOMED: {p} is now originated by "
+                    f"{_name(d['origin'])} (was {_name(base['origin'])}) — an LSP "
+                    f"hijack steering traffic to {p}")
+
+    # Rogue routers (new system-ids sending hellos/LSPs).
+    for sid in sorted(routers):
+        if had_baseline and sid not in known:
+            bump('rogue-router')
+            r = routers[sid]
+            area = ', '.join(sorted(r['areas'])) or '?'
+            reasons.append(
+                f"Rogue IS-IS speaker {_name(sid)} (area {area}, "
+                f"L{'/'.join(str(x) for x in sorted(r['levels'])) or '?'}) — not in "
+                f"the baseline; a new router forming adjacencies on this segment")
+
+    # Anomalies: duplicate system-id across MACs (spoof), or a new area on a known router.
+    for sid in sorted(routers):
+        r = routers[sid]
+        if len(r['macs']) > 1:
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS system-id {_name(sid)} seen from {len(r['macs'])} different "
+                f"MACs ({', '.join(sorted(r['macs']))}) — a duplicate system-id / "
+                f"adjacency spoof")
+        base = known.get(sid)
+        if base:
+            new_areas = [a for a in r['areas'] if a not in (base.get('areas') or [])]
+            if new_areas:
+                bump('anomaly')
+                reasons.append(
+                    f"IS-IS router {_name(sid)} is advertising a new area address "
+                    f"{', '.join(new_areas)} (baseline: "
+                    f"{', '.join(base.get('areas') or []) or 'none'}) — area/topology "
+                    f"change or a crafted hello")
+
+    # Weak / no authentication.
+    if noauth_any:
+        bump('weak-auth')
+        reasons.append(
+            "IS-IS PDUs seen with no Authentication TLV or a cleartext password — no "
+            "HMAC protection. This is what lets a forged LSP win; configure IS-IS "
+            "authentication (key-chain / hmac-md5) at both levels on every interface")
+
+    # Flooding.
+    rate = round(len(events) / seconds, 2)
+    if len(events) > 100 and rate > _ISIS_STORM_RATE:
+        bump('storm')
+        reasons.append(
+            f"IS-IS flood: {rate} PDUs/s — a hello/LSP storm (churn or a DoS against "
+            f"the routing process)")
+
+    advisories = []
+    if routers:
+        advisories.append(
+            "Authenticate IS-IS (hmac-md5 key-chain at both L1 and L2), set edge "
+            "interfaces passive, and — because IS-IS rides directly on L2 — restrict "
+            "which access ports may carry it. Alert on any new system-id, new area, or "
+            "new/re-homed prefix.")
+
+    def _pub_router(r):
+        return {'system_id': r['system_id'], 'hostname': r['hostname'],
+                'areas': sorted(r['areas']),
+                'levels': sorted(r['levels']), 'kinds': sorted(r['kinds']),
+                'macs': sorted(r['macs']),
+                'auth': ('hmac' if r['auth'] == {'hmac'} else
+                         ('none/cleartext' if (r['auth'] & {'none', 'cleartext'})
+                          else (sorted(r['auth'])[0] if r['auth'] else 'n/a'))),
+                'count': r['count'], 'baseline': r['system_id'] in known}
+
+    def _pub_prefix(p, d):
+        base = base_prefixes.get(p)
+        status = 'known' if base else ('new' if had_baseline else 'learned')
+        if base and base.get('origin') and d['origin'] != base['origin']:
+            status = 're-homed'
+        return {'pfx': p, 'origin': d['origin'], 'origin_name': _name(d['origin']),
+                'metric': d['metric'], 'status': status}
+
+    if reasons:
+        summary = reasons
+    elif not routers:
+        summary = ['No IS-IS traffic seen — no IS-IS on this segment']
+    else:
+        summary = ['All IS-IS routers and advertised prefixes match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'router_count': len(routers),
+        'prefix_count': len(prefixes),
+        'packet_count': len(events),
+        'rate': rate,
+        'routers': [_pub_router(routers[s]) for s in sorted(routers)],
+        'prefixes': [_pub_prefix(p, prefixes[p]) for p in sorted(prefixes)],
+        'advisories': advisories,
+    }
+
+
+def _isis_capture(interface, seconds):
+    """One passive tcpdump window over IS-IS PDUs -> (raw, error). Uses -e for the
+    sender MAC; the BPF covers the AllL1ISs + AllL2ISs multicast MACs."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:80:c2:00:00:14 or ether dst 01:80:c2:00:00:15'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_isis_watch(interface=None, seconds=20, learn=True):
+    """Passive IS-IS routing-security scanner (detection-only). Captures IS-IS for a
+    few seconds and classifies: injection / rogue-router / storm / anomaly / weak-auth
+    / clean. Learns the trusted routers + advertised prefixes on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    text, err = _isis_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_isis_capture(text)
+
+    with _isis_watch_lock:
+        baseline = _isis_watch_load()
+        result = _isis_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _isis_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _isis_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_ISIS_EVENTS_CAP:]
+            _isis_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _isis_selftest():
+    """Self-test the IS-IS detectors with synthetic captures, plus a Scapy end-to-end
+    leg (craft a real IIH + LSP-with-prefix -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def _hdr(srcmac, level, length=54):
+        mac = '14' if level == 1 else '15'
+        return (f"{srcmac} > 01:80:c2:00:00:{mac}, 802.3, length {length + 3}: LLC, "
+                f"dsap OSI (0xfe) Individual, ssap OSI (0xfe) Command, ctrl 0x03: "
+                f"OSI NLPID IS-IS (0x83): length {length}")
+
+    def _auth(kind):
+        if kind == 'hmac':
+            return ["\t    Authentication TLV #10, length: 17",
+                    "\t      HMAC-MD5 password: <redacted>"]
+        if kind == 'cleartext':
+            return ["\t    Authentication TLV #10, length: 7",
+                    "\t      simple text password: secret"]
+        return []
+
+    def iih(srcmac, sysid, level=2, area='49.0001', auth='hmac', hostname=None):
+        lines = [_hdr(srcmac, level),
+                 f"\tL{level} Lan IIH, hlen: 27, v: 1, pdu-v: 1, sys-id-len: 6 (0), "
+                 f"max-area: 3 (0)",
+                 f"\t  source-id: {sysid},  holding time: 30s, Flags: [Level {level}]",
+                 f"\t  lan-id:    {sysid}.01, Priority: 64, PDU length: 54",
+                 f"\t    Area address(es) TLV #1, length: 4",
+                 f"\t      Area address (length: 3): {area}"]
+        lines += _auth(auth)
+        if hostname:
+            lines += [f"\t    Hostname TLV #137, length: {len(hostname)}",
+                      f"\t      Hostname: {hostname}"]
+        return "\n".join(lines)
+
+    def lsp(srcmac, sysid, level=2, prefixes=(), auth='hmac', hostname=None, seq=0x10):
+        lines = [_hdr(srcmac, level),
+                 f"\tL{level} LSP, hlen: 27, v: 1, pdu-v: 1, sys-id-len: 6 (0), "
+                 f"max-area: 3 (0)",
+                 f"\t  lsp-id: {sysid}.00-00, seq: {seq:#010x}, lifetime:  1199s",
+                 f"\t  chksum: 0x1771 (correct), PDU length: 49, Flags: [ L{level} IS ]"]
+        lines += _auth(auth)
+        for (pfx, metric) in prefixes:
+            lines += [f"\t    Extended IPv4 Reachability TLV #135, length: 8",
+                      f"\t      IPv4 prefix:      {pfx}, Distribution: up, "
+                      f"Metric: {metric}"]
+        if hostname:
+            lines += [f"\t    Hostname TLV #137, length: {len(hostname)}",
+                      f"\t      Hostname: {hostname}"]
+        return "\n".join(lines)
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_isis_capture(text)
+        res = _isis_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'routers': {'0000.0000.0001': {'areas': ['49.0001'],
+                                           'hostname': 'core-rtr-1', 'levels': [2]}},
+            'prefixes': {'10.1.0.0/24': {'origin': '0000.0000.0001'}}}
+
+    # 1. clean: known router (hmac) re-advertising the known prefix.
+    run('clean', iih('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                     hostname='core-rtr-1') + "\n"
+        + lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+              prefixes=[('10.1.0.0/24', 10)]), 20, base, 'clean')
+    # 2. injection: known router advertises a NEW prefix.
+    run('injection', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                         prefixes=[('10.66.66.0/24', 10)]), 20, base, 'injection')
+    # 3. injection via re-home: known prefix now from a different originator.
+    run('re-home', iih('de:ad:be:ef:00:01', '0000.0000.0009', auth='hmac') + "\n"
+        + lsp('de:ad:be:ef:00:01', '0000.0000.0009', auth='hmac',
+              prefixes=[('10.1.0.0/24', 5)]), 20, base, 'injection')
+    # 4. rogue-router: a brand-new system-id speaking IS-IS (authed, no LSP).
+    run('rogue-router', iih('de:ad:be:ef:00:02', '0000.0000.0666', auth='hmac'), 20,
+        base, 'rogue-router')
+    # 5. anomaly: duplicate system-id from two different MACs.
+    run('anomaly-dup', iih('00:11:22:33:44:55', '0000.0000.0001', auth='hmac') + "\n"
+        + iih('de:ad:be:ef:00:03', '0000.0000.0001', auth='hmac'), 20, base, 'anomaly')
+    # 6. weak-auth: known router + prefix, but no Authentication TLV.
+    run('weak-auth', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='none',
+                         prefixes=[('10.1.0.0/24', 10)]), 20, base, 'weak-auth')
+    # 7. parse: source-id, area, cleartext auth, hostname, LSP prefix.
+    pev = _parse_isis_capture(
+        iih('00:11:22:33:44:55', '0000.0000.0001', area='49.0001', auth='cleartext',
+            hostname='core-rtr-1') + "\n"
+        + lsp('00:11:22:33:44:55', '0000.0000.0001', prefixes=[('10.66.66.0/24', 10)]))
+    iih_ev = next((e for e in pev if e['kind'] == 'iih'), {})
+    lsp_ev = next((e for e in pev if e['kind'] == 'lsp'), {})
+    p_ok = (iih_ev.get('system_id') == '0000.0000.0001'
+            and iih_ev.get('areas') == ['49.0001']
+            and iih_ev.get('auth') == 'cleartext'
+            and iih_ev.get('hostname') == 'core-rtr-1'
+            and lsp_ev.get('prefixes') == [{'pfx': '10.66.66.0/24', 'metric': 10}])
+    scenarios.append({'name': 'isis-parse', 'expect': 'sysid/area/cleartext/host/pfx',
+                      'got': f"auth={iih_ev.get('auth')} host={iih_ev.get('hostname')}",
+                      'pass': p_ok})
+
+    # Scapy end-to-end: real IIH (no auth) + LSP with a prefix -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, wrpcap
+        import scapy.contrib.isis as ISIS
+        if _have('tcpdump'):
+            pkts = [
+                (Dot3(dst='01:80:c2:00:00:15', src='de:ad:be:ef:00:01')
+                 / LLC(dsap=0xfe, ssap=0xfe, ctrl=3) / ISIS.ISIS_CommonHdr()
+                 / ISIS.ISIS_L2_LAN_Hello(
+                     sourceid='0000.0000.0009', lanid='0000.0000.0009.01',
+                     tlvs=[ISIS.ISIS_AreaTlv(
+                         areas=[ISIS.ISIS_AreaEntry(areaid='49.0009')])])),
+                (Dot3(dst='01:80:c2:00:00:15', src='de:ad:be:ef:00:01')
+                 / LLC(dsap=0xfe, ssap=0xfe, ctrl=3) / ISIS.ISIS_CommonHdr()
+                 / ISIS.ISIS_L2_LSP(
+                     lspid='0000.0000.0009.00-00', seqnum=0x10,
+                     tlvs=[ISIS.ISIS_ExtendedIpReachabilityTlv(
+                         pfxs=[ISIS.ISIS_ExtendedIpPrefix(pfx='10.66.66.0/24',
+                                                          metric=10)])]))]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_isis_capture(res['out'])
+            base2 = {'routers': {'0000.0000.0001': {'areas': ['49.0001'],
+                                                    'hostname': None, 'levels': [2]}},
+                     'prefixes': {'10.1.0.0/24': {'origin': '0000.0000.0001'}}}
+            cls = _isis_analyze(evs, 20, dict(base2), learn=False)
+            hostm = next((e for e in evs if e['kind'] == 'iih'), {})
+            lspm = next((e for e in evs if e['kind'] == 'lsp'), {})
+            ok = (hostm.get('system_id') == '0000.0000.0009'
+                  and lspm.get('prefixes') == [{'pfx': '10.66.66.0/24', 'metric': 10}]
+                  and cls['verdict'] == 'injection')
+            scapy_result = {'ran': True, 'sysid': hostm.get('system_id'),
+                            'prefix': (lspm.get('prefixes') or [{}])[0].get('pfx'),
+                            'verdict': cls['verdict'], 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# STP/BPDU Watch: passive spanning-tree security scanner (detection-only)
+# --------------------------------------------------------------------------
+# Spanning Tree (802.1D STP / 802.1w RSTP / 802.1s MSTP, and Cisco PVST+/Rapid-PVST+)
+# prevents L2 loops by electing a *root bridge* — the switch with the numerically
+# lowest Bridge ID (priority + MAC) — and blocking redundant links back toward it.
+# BPDUs (Bridge Protocol Data Units) carry the election; they are multicast in the
+# clear (IEEE 01:80:c2:00:00:00 / PVST+ 01:00:0c:cc:cc:cd) with no authentication. So
+# an attacker who sends a BPDU claiming a *superior* root (priority 0 — the Yersinia
+# "claim root role" attack) wins the election, becomes the root bridge, and the tree
+# reconverges to pull traffic through them (subnet-wide MITM). BPDU/TCN floods force
+# constant reconvergence (DoS) and MAC-table flushing (which aids sniffing). The
+# defenses are BPDU Guard (kill the port on any BPDU) on edge ports and Root Guard
+# toward downstream switches. This scanner is PASSIVE: one short capture of the BPDUs,
+# classified against a learned baseline of the root(s) and legitimate bridges. It
+# never sends a BPDU. What it flags:
+#   * root-hijack      — a BPDU advertising a root superior to the baseline root
+#     (lower priority, or equal priority + lower MAC): a root-bridge takeover.
+#   * rogue-bridge     — a new bridge (Bridge-ID MAC) speaking STP, not in the baseline.
+#   * bpdu-flood       — an elevated BPDU rate: a reconvergence-storm DoS.
+#   * topology-change  — TCN / TC-flag churn: forced MAC-table flushing / instability.
+_STP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'stp_watch.json')
+_stp_watch_lock = threading.Lock()
+_STP_EVENTS_CAP = 200
+_STP_FLOOD_RATE = 30            # BPDUs/s above this (with volume) == flood
+_STP_TCN_CHURN = 3              # TCN/TC events in a window above this == instability
+_STP_SRC_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*'
+                         r'(01:80:c2:00:00:00|01:00:0c:cc:cc:cd)')
+_STP_TYPE_RE = re.compile(r'STP 802\.1(\w)')
+_STP_BRIDGE_RE = re.compile(r'bridge-id ([0-9a-fA-F]{4})\.([0-9a-fA-F:]{17})')
+_STP_ROOT_RE = re.compile(r'root-id ([0-9a-fA-F]{4})\.([0-9a-fA-F:]{17}),'
+                          r'\s*root-pathcost (\d+)')
+_STP_FLAGS_RE = re.compile(r'Flags \[([^\]]*)\]')
+
+
+def _mac_int(mac):
+    try:
+        return int(mac.replace(':', ''), 16)
+    except (ValueError, AttributeError):
+        return 0
+
+
+def _parse_stp_capture(output):
+    """Parse `tcpdump -e -t -v` text over BPDUs into events. Each BPDU is a header
+    line (`<src> > <group-mac>, 802.3, ... STP 802.1d, Config, Flags [...], bridge-id
+    PRIO.MAC.PORT`) optionally followed by a `root-id PRIO.MAC, root-pathcost N` line.
+    TCN BPDUs are a single `STP 802.1d, Topology Change` line."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if 'STP 802.1' in line:
+            if cur:
+                events.append(cur)
+            src = _STP_SRC_RE.match(line)
+            t = _STP_TYPE_RE.search(line)
+            tletter = t.group(1).lower() if t else 'd'
+            is_pvst = ('pid PVST' in line
+                       or (src and src.group(2) == '01:00:0c:cc:cc:cd'))
+            if is_pvst:
+                proto = 'pvst+'
+            elif tletter == 'w':
+                proto = 'rstp'
+            elif tletter == 's':
+                proto = 'mstp'
+            else:
+                proto = 'stp'
+            is_tcn = 'Topology Change' in line and 'Config' not in line
+            fl = _STP_FLAGS_RE.search(line)
+            flagset = ([f.strip() for f in fl.group(1).split(',') if f.strip()]
+                       if fl else [])
+            br = _STP_BRIDGE_RE.search(line)
+            cur = {'src': src.group(1).lower() if src else None,
+                   'dst': src.group(2) if src else None,
+                   'proto': proto, 'kind': 'tcn' if is_tcn else 'config',
+                   'tc': 'Topology change' in flagset, 'flags': flagset,
+                   'bridge_prio': int(br.group(1), 16) if br else None,
+                   'bridge_mac': br.group(2).lower() if br else None,
+                   'root_prio': None, 'root_mac': None, 'pathcost': None,
+                   'port_role': None, 'vlan': None}
+            continue
+        if cur is None:
+            continue
+        rm = _STP_ROOT_RE.search(line)
+        if rm:
+            cur['root_prio'] = int(rm.group(1), 16)
+            cur['root_mac'] = rm.group(2).lower()
+            cur['pathcost'] = int(rm.group(3))
+            cur['vlan'] = cur['root_prio'] & 0x0FFF
+            pr = re.search(r'port-role (\w+)', line)
+            if pr:
+                cur['port_role'] = pr.group(1)
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _stp_watch_load():
+    try:
+        with open(_STP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _stp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_STP_WATCH_PATH), exist_ok=True)
+        tmp = _STP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _STP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_stp_baseline(action='get'):
+    """Manage the learned STP baseline (per-instance root bridge + legitimate bridges)."""
+    with _stp_watch_lock:
+        if action == 'reset':
+            _stp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _stp_watch_load()
+        return {'success': True, 'baseline': {
+            'roots': b.get('roots') or {}, 'bridges': b.get('bridges') or []}}
+
+
+def _stp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed BPDU events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    instances = {}
+    bridges = {}
+    tcn_count = 0
+    tc_count = 0
+    for e in events:
+        if e['bridge_mac']:
+            b = bridges.setdefault(e['bridge_mac'], {
+                'mac': e['bridge_mac'], 'proto': e['proto'], 'count': 0,
+                'roles': set()})
+            b['count'] += 1
+            if e['port_role']:
+                b['roles'].add(e['port_role'])
+        if e['kind'] == 'tcn':
+            tcn_count += 1
+        if e['tc']:
+            tc_count += 1
+        if e['root_prio'] is not None:
+            key = str(e['vlan'] if e['vlan'] is not None else 0)
+            inst = instances.setdefault(key, {
+                'vlan': int(key), 'proto': e['proto'], 'best': None,
+                'claimer': None, 'root_macs': set()})
+            inst['root_macs'].add(e['root_mac'])
+            cand = (e['root_prio'], _mac_int(e['root_mac']))
+            if inst['best'] is None or cand < inst['best']:
+                inst['best'] = cand
+                inst['claimer'] = {'prio': e['root_prio'], 'mac': e['root_mac'],
+                                   'by': e['bridge_mac'] or e['src']}
+
+    known_roots = dict(baseline.get('roots') or {})
+    known_bridges = set(baseline.get('bridges') or [])
+    had_baseline = bool(known_roots) or bool(known_bridges)
+
+    learned = False
+    if learn and not had_baseline and (instances or bridges):
+        baseline['roots'] = {
+            k: {'prio': inst['claimer']['prio'], 'mac': inst['claimer']['mac']}
+            for k, inst in instances.items() if inst['claimer']}
+        baseline['bridges'] = sorted(bridges.keys())
+        learned = True
+        known_roots = dict(baseline['roots'])
+        known_bridges = set(baseline['bridges'])
+        had_baseline = True
+
+    PRIORITY = ['root-hijack', 'rogue-bridge', 'bpdu-flood', 'topology-change', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Root hijack: an advertised root superior to (or displacing) the baseline root.
+    if had_baseline:
+        for k in sorted(instances, key=lambda x: int(x)):
+            inst = instances[k]
+            base = known_roots.get(k)
+            if not base or not inst['claimer']:
+                continue
+            cand = inst['best']
+            base_t = (base['prio'], _mac_int(base['mac']))
+            if cand < base_t:
+                bump('root-hijack')
+                c = inst['claimer']
+                where = f"VLAN {inst['vlan']}" if inst['proto'] == 'pvst+' else \
+                    (f"instance {inst['vlan']}" if inst['vlan'] else "the CIST")
+                reasons.append(
+                    f"ROOT HIJACK on {where}: {c['by']} is advertising root "
+                    f"{c['prio']}.{c['mac']} — superior to the baseline root "
+                    f"{base['prio']}.{base['mac']}. It wins the election and becomes "
+                    f"the root bridge, pulling traffic through it (L2 MITM). Enable "
+                    f"Root Guard / BPDU Guard")
+
+    # Rogue bridges (new senders).
+    if had_baseline:
+        for mac in sorted(bridges):
+            if mac not in known_bridges:
+                bump('rogue-bridge')
+                reasons.append(
+                    f"New STP bridge {mac} ({bridges[mac]['proto'].upper()}) — not in "
+                    f"the baseline; an unexpected switch (or a spoofed bridge) is "
+                    f"participating in spanning tree on this segment")
+
+    # BPDU flood (reconvergence-storm DoS).
+    rate = round(len(events) / seconds, 2)
+    if len(events) > 100 and rate > _STP_FLOOD_RATE:
+        bump('bpdu-flood')
+        reasons.append(
+            f"BPDU flood: {rate} BPDUs/s (normal is ~1 per bridge every 2s) — a "
+            f"spanning-tree storm forcing constant reconvergence (DoS)")
+
+    # Topology-change churn (MAC-table flushing).
+    if (tcn_count + tc_count) > _STP_TCN_CHURN:
+        bump('topology-change')
+        reasons.append(
+            f"Topology-change churn: {tcn_count} TCN + {tc_count} TC-flagged BPDUs in "
+            f"{seconds}s — repeated topology changes flush the MAC tables (traffic "
+            f"floods, which aids sniffing) and can be a TCN-flood attack")
+
+    advisories = []
+    if instances or bridges:
+        advisories.append(
+            "Harden spanning tree: BPDU Guard + PortFast on every edge/access port "
+            "(any BPDU there err-disables the port), Root Guard on ports toward "
+            "downstream switches (rejects superior BPDUs), and set your real root/backup "
+            "root to a low priority (0/4096) so a rogue can't outbid them.")
+
+    def _pub_inst(k, inst):
+        base = known_roots.get(k)
+        c = inst['claimer'] or {}
+        status = 'known'
+        if base:
+            if (c.get('prio'), _mac_int(c.get('mac', ''))) < (base['prio'],
+                                                              _mac_int(base['mac'])):
+                status = 'hijacked'
+        elif had_baseline:
+            status = 'new'
+        else:
+            status = 'learned'
+        return {'vlan': inst['vlan'], 'proto': inst['proto'],
+                'root_prio': c.get('prio'), 'root_mac': c.get('mac'),
+                'advertised_by': c.get('by'),
+                'baseline_root': (f"{base['prio']}.{base['mac']}" if base else None),
+                'status': status}
+
+    if reasons:
+        summary = reasons
+    elif not (instances or bridges):
+        summary = ['No BPDUs seen — no spanning tree on this segment (an access port '
+                   'with BPDU Guard, or an isolated link)']
+    else:
+        summary = ['Spanning-tree root(s) and bridges match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'bridge_count': len(bridges),
+        'instance_count': len(instances),
+        'packet_count': len(events),
+        'rate': rate,
+        'tcn_count': tcn_count,
+        'tc_count': tc_count,
+        'instances': [_pub_inst(k, instances[k])
+                      for k in sorted(instances, key=lambda x: int(x))],
+        'bridges': [{'mac': m, 'proto': bridges[m]['proto'],
+                     'roles': sorted(bridges[m]['roles']), 'count': bridges[m]['count'],
+                     'baseline': m in known_bridges} for m in sorted(bridges)],
+        'advisories': advisories,
+    }
+
+
+def _stp_capture(interface, seconds):
+    """One passive tcpdump window over BPDUs -> (raw, error). Uses -e for the sender
+    MAC; the BPF covers IEEE (01:80:c2:00:00:00) and Cisco PVST+ (01:00:0c:cc:cc:cd)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = '(ether dst 01:80:c2:00:00:00) or (ether dst 01:00:0c:cc:cc:cd)'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '128', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_stp_watch(interface=None, seconds=20, learn=True):
+    """Passive spanning-tree / BPDU security scanner (detection-only). BPDUs are ~2s
+    apart, so a slightly longer window. Learns the root(s) + legitimate bridges on
+    first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    text, err = _stp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_stp_capture(text)
+
+    with _stp_watch_lock:
+        baseline = _stp_watch_load()
+        result = _stp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _stp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _stp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_STP_EVENTS_CAP:]
+            _stp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _stp_selftest():
+    """Self-test the STP/BPDU detectors with synthetic captures, plus a Scapy
+    end-to-end leg (craft a real superior-root BPDU -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def cfg(src, root_prio, root_mac, bridge_prio=None, bridge_mac=None, flags='none',
+            pathcost=0, pvst=False):
+        bridge_prio = bridge_prio if bridge_prio is not None else root_prio
+        bridge_mac = bridge_mac or src
+        dst = '01:00:0c:cc:cc:cd' if pvst else '01:80:c2:00:00:00'
+        pid = 'oui Cisco (0x00000c), pid PVST (0x010b), length 41: ' if pvst else ''
+        return (f"{src} > {dst}, 802.3, length 49: LLC, dsap STP (0x42) Individual, "
+                f"ssap STP (0x42) Command, ctrl 0x03: {pid}STP 802.1d, Config, "
+                f"Flags [{flags}], bridge-id {bridge_prio:04x}.{bridge_mac}.0000, "
+                f"length 35\n"
+                f"\tmessage-age 1.00s, max-age 20.00s, hello-time 2.00s, "
+                f"forwarding-delay 15.00s\n"
+                f"\troot-id {root_prio:04x}.{root_mac}, root-pathcost {pathcost}")
+
+    def tcn(src):
+        return (f"{src} > 01:80:c2:00:00:00, 802.3, length 7: LLC, dsap STP (0x42) "
+                f"Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1d, "
+                f"Topology Change")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_stp_capture(text)
+        res = _stp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    # Baseline: root of the CIST is 8000.00:11:22:33:44:55 (priority 32768), one bridge.
+    base = {'roots': {'0': {'prio': 0x8000, 'mac': '00:11:22:33:44:55'}},
+            'bridges': ['00:11:22:33:44:55']}
+
+    # 1. clean: the known root re-advertising itself.
+    run('clean', cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55'), 20, base,
+        'clean')
+    # 2. root-hijack: a new bridge claims root with priority 0 (superior).
+    run('root-hijack', cfg('de:ad:be:ef:00:01', 0x0000, 'de:ad:be:ef:00:01'), 20, base,
+        'root-hijack')
+    # 3. rogue-bridge: a new bridge advertising the *existing* root (not superior).
+    run('rogue-bridge', cfg('de:ad:be:ef:00:02', 0x8000, '00:11:22:33:44:55',
+                            bridge_mac='de:ad:be:ef:00:02'), 20, base, 'rogue-bridge')
+    # 4. topology-change: known bridge + several TCNs (MAC-flush churn).
+    run('topology-change',
+        cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55') + "\n"
+        + "\n".join(tcn('00:11:22:33:44:55') for _ in range(4)), 20, base,
+        'topology-change')
+    # 5. bpdu-flood: a burst of BPDUs from the known root.
+    run('bpdu-flood',
+        "\n".join(cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55')
+                  for _ in range(200)), 3, base, 'bpdu-flood')
+    # 6. pvst+ parse: per-VLAN BPDU, VLAN encoded in the priority low bits.
+    pev = _parse_stp_capture(cfg('00:11:22:33:44:55', 0x8064, '00:11:22:33:44:55',
+                                 bridge_prio=0x8064, pvst=True))
+    p_ok = (len(pev) == 1 and pev[0]['proto'] == 'pvst+' and pev[0]['vlan'] == 100
+            and pev[0]['root_prio'] == 0x8064)
+    scenarios.append({'name': 'pvst-parse', 'expect': 'pvst+/vlan100',
+                      'got': f"{pev[0]['proto'] if pev else '-'}/vlan"
+                             f"{pev[0]['vlan'] if pev else '?'}", 'pass': p_ok})
+    # 7. parse: TC flag + fields.
+    fev = _parse_stp_capture(cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55',
+                                 flags='Topology change, Topology change ACK'))
+    f_ok = (len(fev) == 1 and fev[0]['tc'] is True
+            and fev[0]['root_mac'] == '00:11:22:33:44:55'
+            and fev[0]['bridge_prio'] == 0x8000)
+    scenarios.append({'name': 'flags-parse', 'expect': 'tc=True',
+                      'got': f"tc={fev[0]['tc'] if fev else '?'}", 'pass': f_ok})
+
+    # Scapy end-to-end: craft a real superior-root (priority 0) BPDU.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, STP, wrpcap
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:80:c2:00:00:00', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0x42, ssap=0x42, ctrl=3)
+                   / STP(rootid=0, rootmac='de:ad:be:ef:00:01', bridgeid=0,
+                         bridgemac='de:ad:be:ef:00:01', pathcost=0))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_stp_capture(res['out'])
+            e = evs[0] if evs else {}
+            base2 = {'roots': {'0': {'prio': 0x8000, 'mac': '00:11:22:33:44:55'}},
+                     'bridges': ['00:11:22:33:44:55']}
+            cls = _stp_analyze(evs, 20, dict(base2), learn=False)
+            ok = (e.get('root_prio') == 0 and e.get('src') == 'de:ad:be:ef:00:01'
+                  and cls['verdict'] == 'root-hijack')
+            scapy_result = {'ran': True, 'root_prio': e.get('root_prio'),
+                            'src': e.get('src'), 'verdict': cls['verdict'], 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# DTP Watch: passive Dynamic Trunking Protocol / VLAN-hopping scanner (Cisco)
+# --------------------------------------------------------------------------
+# DTP (Cisco proprietary, group MAC 01:00:0c:cc:cc:cc, SNAP OUI 0x00000c PID 0x2004)
+# auto-negotiates whether a switch port becomes an 802.1Q/ISL *trunk*. A port left in
+# the default `dynamic auto`/`dynamic desirable` mode will happily form a trunk with
+# anything that sends DTP "desirable" frames — so an attacker plugs in, forges DTP
+# desirable (Yersinia "enable trunking"), the access port trunks to them, and they now
+# see and inject into *every VLAN* (the classic switch-spoofing VLAN hop). The fix is
+# `switchport nonegotiate` + hard `access`/`trunk` on every port; DTP should never be
+# seen on an access segment. This scanner is PASSIVE: one short capture of the DTP
+# frames, no DTP is ever transmitted. It flags:
+#   * vlan-hop           — trunk-forming DTP (on/desirable/auto) from a NEW speaker:
+#     an active switch-spoofing / VLAN-hop attempt.
+#   * trunk-negotiation  — trunk-forming DTP present (port isn't `nonegotiate`, so it
+#     is exploitable) even from a known speaker.
+#   * dtp-enabled        — DTP frames present at all (DTP not disabled). Advisory.
+_DTP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'dtp_watch.json')
+_dtp_watch_lock = threading.Lock()
+_DTP_EVENTS_CAP = 200
+# DTP Trunk Administrative Status (low 3 bits of the Status octet). on/desirable/auto
+# all mean the port will form (or force) a trunk; off means it won't.
+_DTP_TAS = {1: 'on', 2: 'off', 3: 'desirable', 4: 'auto'}
+_DTP_FORMING = {1, 3, 4}
+_DTP_HDR_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*01:00:0c:cc:cc:cc')
+
+
+def _dtp_status(byte):
+    """(label, forming?) for a DTP Status octet."""
+    if byte is None:
+        return ('unknown', False)
+    tas = byte & 0x07
+    return (_DTP_TAS.get(tas, f'0x{byte:02x}'), tas in _DTP_FORMING)
+
+
+def _parse_dtp_capture(output):
+    """Parse `tcpdump -e -t -v` text over DTP frames into events. Each DTP frame is a
+    header line (`<src-mac> > 01:00:0c:cc:cc:cc, 802.3, ... DTPv1`) followed by
+    indented Domain/Status/DTP type/Neighbor TLV lines."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _DTP_HDR_RE.match(line)
+        if m and 'DTPv' in line:
+            if cur:
+                events.append(cur)
+            ver = re.search(r'DTPv(\d+)', line)
+            cur = {'src': m.group(1).lower(),
+                   'version': int(ver.group(1)) if ver else None,
+                   'domain': None, 'status': None, 'dtptype': None, 'neighbor': None}
+            continue
+        if cur is None:
+            continue
+        if line.startswith('Domain'):
+            d = re.search(r'length \d+,\s*(.*)$', line)
+            cur['domain'] = (d.group(1).strip() or None) if d else None
+        elif line.startswith('Status'):
+            s = re.search(r'0x([0-9a-fA-F]+)\s*$', line)
+            cur['status'] = int(s.group(1), 16) if s else None
+        elif line.startswith('DTP type'):
+            s = re.search(r'0x([0-9a-fA-F]+)\s*$', line)
+            cur['dtptype'] = int(s.group(1), 16) if s else None
+        elif line.startswith('Neighbor'):
+            s = re.search(r'([0-9a-fA-F:]{17})\s*$', line)
+            cur['neighbor'] = s.group(1).lower() if s else None
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _dtp_watch_load():
+    try:
+        with open(_DTP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _dtp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_DTP_WATCH_PATH), exist_ok=True)
+        tmp = _DTP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _DTP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_dtp_baseline(action='get'):
+    """Manage the learned DTP baseline (trusted DTP speaker MACs — the real switches)."""
+    with _dtp_watch_lock:
+        if action == 'reset':
+            _dtp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _dtp_watch_load()
+        return {'success': True, 'baseline': {'speakers': b.get('speakers') or []}}
+
+
+def _dtp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed DTP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    speakers = {}
+    for e in events:
+        sp = speakers.setdefault(e['src'], {
+            'src': e['src'], 'count': 0, 'status': 'unknown', 'forming': False,
+            'domain': None, 'neighbor': None})
+        sp['count'] += 1
+        label, forming = _dtp_status(e['status'])
+        sp['status'] = label
+        if forming:
+            sp['forming'] = True
+        if e.get('domain'):
+            sp['domain'] = e['domain']
+        if e.get('neighbor'):
+            sp['neighbor'] = e['neighbor']
+
+    known = set(baseline.get('speakers') or [])
+    had_baseline = bool(known)
+
+    learned = False
+    if learn and not had_baseline and speakers:
+        baseline['speakers'] = sorted(speakers.keys())
+        learned = True
+        known = set(speakers.keys())
+        had_baseline = True
+
+    PRIORITY = ['vlan-hop', 'trunk-negotiation', 'dtp-enabled', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # First (learning) run: surface that DTP exists here so the user knows, but a
+    # known non-forming switch on later runs is clean (legit trunk infrastructure).
+    if learned and speakers:
+        bump('dtp-enabled')
+    for src in sorted(speakers):
+        sp = speakers[src]
+        is_new = had_baseline and src not in known
+        if sp['forming'] and is_new:
+            bump('vlan-hop')
+            reasons.append(
+                f"VLAN HOP: DTP '{sp['status']}' (trunk-forming) from a NEW speaker "
+                f"{src} — a switch-spoofing attempt; if an access port answers this it "
+                f"trunks and exposes every VLAN. Set `switchport nonegotiate` + hard "
+                f"access mode on that port")
+        elif sp['forming']:
+            bump('trunk-negotiation')
+            reasons.append(
+                f"DTP '{sp['status']}' (trunk-forming) from {src} — this segment is "
+                f"negotiating trunks; a rogue host could VLAN-hop. Disable DTP with "
+                f"`switchport nonegotiate` on access ports")
+        elif is_new:
+            bump('dtp-enabled')
+            reasons.append(
+                f"New DTP speaker {src} (status '{sp['status']}') not in the baseline "
+                f"— unexpected device speaking DTP on this segment")
+    if learned and verdict == 'dtp-enabled' and not reasons:
+        reasons.append(
+            "DTP is present on this segment — learned the current speaker(s) as the "
+            "baseline. DTP should be disabled (`switchport nonegotiate`) on access "
+            "ports; only switch↔switch trunk links should speak it")
+
+    if speakers:
+        advisories = [
+            "Harden against VLAN hopping: `switchport mode access` + `switchport "
+            "nonegotiate` on every access port, prune unused VLANs off trunks, and "
+            "never use VLAN 1 / the native VLAN for data. DTP should not appear on any "
+            "access segment."]
+    else:
+        advisories = []
+
+    if reasons:
+        summary = reasons
+    elif not speakers:
+        summary = ['No DTP seen — no Dynamic Trunking Protocol on this segment (good; '
+                   'means ports are not negotiating trunks here)']
+    else:
+        summary = ['DTP speakers all match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'speaker_count': len(speakers),
+        'packet_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'speakers': [{
+            'src': s, 'status': sp['status'], 'forming': sp['forming'],
+            'domain': sp['domain'], 'neighbor': sp['neighbor'], 'count': sp['count'],
+            'baseline': s in known,
+        } for s, sp in sorted(speakers.items())],
+        'advisories': advisories,
+    }
+
+
+def _dtp_capture(interface, seconds):
+    """One passive tcpdump window over DTP frames -> (raw, error). Uses -e so we get
+    the sending switch/host MAC; the BPF isolates DTP (PID 0x2004) from the other
+    protocols that share the Cisco group MAC (CDP/VTP/UDLD/PAgP)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2004'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '128', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_dtp_watch(interface=None, seconds=30, learn=True):
+    """Passive DTP / VLAN-hopping scanner (detection-only). DTP hellos are ~30s apart,
+    so the default window is longer. Learns the trusted DTP speakers on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 30, 5, 65)
+
+    text, err = _dtp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_dtp_capture(text)
+
+    with _dtp_watch_lock:
+        baseline = _dtp_watch_load()
+        result = _dtp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _dtp_watch_save(baseline)
+        if result['verdict'] not in ('clean', 'dtp-enabled'):
+            b = _dtp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_DTP_EVENTS_CAP:]
+            _dtp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _dtp_selftest():
+    """Self-test the DTP detector with synthetic captures, plus a Scapy end-to-end leg
+    (craft a real DTP desirable frame -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def frame(src, status=0x03, dtptype=0xa5, neighbor=None):
+        neighbor = neighbor or src
+        return (f"{src} > 01:00:0c:cc:cc:cc, 802.3, length 33: LLC, dsap SNAP (0xaa) "
+                f"Individual, ssap SNAP (0xaa) Command, ctrl 0x03: oui Cisco "
+                f"(0x00000c), pid DTP (0x2004), length 25: DTPv1, length 25\n"
+                f"\tDomain (0x0001) TLV, length 4, \n"
+                f"\tStatus (0x0002) TLV, length 5, 0x{status:x}\n"
+                f"\tDTP type (0x0003) TLV, length 5, 0x{dtptype:x}\n"
+                f"\tNeighbor (0x0004) TLV, length 10, {neighbor}")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_dtp_capture(text)
+        res = _dtp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'speakers': ['00:11:22:33:44:55']}
+
+    # 1. clean: known switch, DTP 'off' (not forming a trunk).
+    run('clean', frame('00:11:22:33:44:55', status=0x02), 30, base, 'clean')
+    # 2. vlan-hop: a NEW speaker sending 'desirable' (trunk-forming) — switch spoofing.
+    run('vlan-hop', frame('de:ad:be:ef:00:01', status=0x03), 30, base, 'vlan-hop')
+    # 3. trunk-negotiation: the known switch is in 'auto' (forming) — port not nonegotiate.
+    run('trunk-negotiation', frame('00:11:22:33:44:55', status=0x04), 30, base,
+        'trunk-negotiation')
+    # 4. dtp-enabled: known switch, DTP 'off' but present — first-run learn (no baseline).
+    run('dtp-enabled', frame('00:11:22:33:44:55', status=0x02), 30, None, 'dtp-enabled')
+    # 5. parse: fields.
+    pev = _parse_dtp_capture(frame('aa:bb:cc:dd:ee:ff', status=0x03,
+                                   neighbor='aa:bb:cc:dd:ee:ff'))
+    p_ok = (len(pev) == 1 and pev[0]['src'] == 'aa:bb:cc:dd:ee:ff'
+            and pev[0]['status'] == 0x03 and pev[0]['neighbor'] == 'aa:bb:cc:dd:ee:ff'
+            and _dtp_status(pev[0]['status'])[1] is True)
+    scenarios.append({'name': 'dtp-parse', 'expect': 'desirable/forming',
+                      'got': _dtp_status(pev[0]['status'] if pev else None)[0],
+                      'pass': p_ok})
+
+    # Scapy end-to-end.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, SNAP, wrpcap
+        from scapy.contrib.dtp import DTP, DTPDomain, DTPStatus, DTPType, DTPNeighbor
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:00:0c:cc:cc:cc', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0xaa, ssap=0xaa, ctrl=3)
+                   / SNAP(OUI=0x00000c, code=0x2004)
+                   / DTP(ver=1, tlvlist=[DTPDomain(domain=b''),
+                                         DTPStatus(status=b'\x03'),
+                                         DTPType(dtptype=b'\xa5'),
+                                         DTPNeighbor(neighbor='de:ad:be:ef:00:01')]))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_dtp_capture(res['out'])
+            e = evs[0] if evs else {}
+            ok = (e.get('src') == 'de:ad:be:ef:00:01' and e.get('status') == 0x03
+                  and _dtp_status(e.get('status'))[1] is True)
+            scapy_result = {'ran': True, 'src': e.get('src'), 'status': e.get('status'),
+                            'pass': ok, 'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# EIGRP Watch: passive EIGRP routing-security scanner (Cisco; detection-only)
+# --------------------------------------------------------------------------
+# EIGRP is Cisco's interior gateway protocol (the Cisco-world alternative to OSPF;
+# advanced distance-vector, IP proto 88, multicast 224.0.0.10 / ff02::a). Like OSPF
+# it has no protection on the wire unless HMAC-MD5/SHA authentication (key-chains) is
+# configured, so any host on the segment can form an adjacency and inject Update
+# packets with attractive metrics to blackhole or MITM traffic. Unlike OSPF, tcpdump
+# fully decodes EIGRP's route TLVs — the advertised prefix, next-hop and metrics are
+# visible — so this passive scanner can see route injection directly. It flags:
+#   * injection    — a prefix that isn't in the baseline being advertised, or a known
+#     prefix now originated by a different router / pointing at a different next-hop
+#     (route/next-hop hijack).
+#   * rogue-router — a new EIGRP speaker (source/AS) not in the baseline.
+#   * storm        — an EIGRP flood (hello/query storm) by rate.
+#   * anomaly      — K-value or AS-number mismatch between speakers (misconfig / probe).
+#   * weak-auth    — EIGRP packets with no Authentication TLV (the injection enabler).
+# Detection-only: it never forms an adjacency, sends a hello, or injects a route.
+_EIGRP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'data', 'eigrp_watch.json')
+_eigrp_watch_lock = threading.Lock()
+_EIGRP_EVENTS_CAP = 200
+_EIGRP_STORM_RATE = 25          # EIGRP pkts/s above this (with volume) == flood
+_EIGRP_OPCODES = {1: 'update', 2: 'request', 3: 'query', 4: 'reply', 5: 'hello',
+                  10: 'siaquery', 11: 'siareply'}
+_EIGRP_V4HDR_RE = re.compile(r'^(\d+\.\d+\.\d+\.\d+)\s*>\s*(\S+):\s*$')
+_EIGRP_V6HDR_RE = re.compile(r'next-header EIGRP \(88\).*?\)\s+(\S+)\s*>\s*(\S+):')
+_EIGRP_OP_RE = re.compile(r'EIGRP v(\d+), opcode:\s*(\w+)\s*\((\d+)\)')
+
+
+def _parse_eigrp_capture(output):
+    """Parse `tcpdump -t -v` text over EIGRP into per-packet events. Block-structured:
+    an IP/IP6 header line sets the current src/dst, then an `EIGRP v2, opcode:` line
+    starts a packet whose TLVs (params/auth/routes) follow indented."""
+    events = []
+    cur = None
+    cur_src = cur_dst = None
+    last_kind = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m6 = _EIGRP_V6HDR_RE.search(line)
+        if m6:
+            cur_src, cur_dst = m6.group(1), m6.group(2)
+            continue
+        m4 = _EIGRP_V4HDR_RE.match(line)
+        if m4:
+            cur_src, cur_dst = m4.group(1), m4.group(2)
+            continue
+        mo = _EIGRP_OP_RE.search(line)
+        if mo:
+            if cur:
+                events.append(cur)
+            op = int(mo.group(3))
+            cur = {'src': cur_src, 'dst': cur_dst,
+                   'af': 'ipv6' if (cur_dst and ':' in str(cur_dst)) else 'ipv4',
+                   'opcode': _EIGRP_OPCODES.get(op, mo.group(2).lower()),
+                   'opcode_num': op, 'asn': None, 'auth': False, 'kvals': None,
+                   'holdtime': None, 'routes': []}
+            last_kind = None
+            continue
+        if cur is None:
+            continue
+        a = re.search(r'\bAS:\s*(\d+)', line)
+        if a:
+            cur['asn'] = int(a.group(1))
+        if 'Authentication TLV' in line:
+            cur['auth'] = True
+        if 'Internal routes TLV' in line:
+            last_kind = 'internal'
+        elif 'External routes TLV' in line:
+            last_kind = 'external'
+        k = re.search(r'holdtime:\s*(\d+)s,\s*k1\s*(\d+),\s*k2\s*(\d+),\s*k3\s*(\d+),'
+                      r'\s*k4\s*(\d+),\s*k5\s*(\d+)', line)
+        if k:
+            cur['holdtime'] = int(k.group(1))
+            cur['kvals'] = tuple(int(k.group(i)) for i in range(2, 7))
+        pr = re.search(r'prefix:\s*([0-9a-fA-F:.]+/\d+),\s*nexthop:\s*([0-9a-fA-F:.]+)',
+                       line)
+        if pr:
+            cur['routes'].append({'prefix': pr.group(1),
+                                  'nexthop': pr.group(2).rstrip(','),
+                                  'kind': last_kind or 'internal',
+                                  'origin_router': None, 'origin_as': None,
+                                  'origin_proto': None, 'delay': None,
+                                  'bandwidth': None})
+        og = re.search(r'origin-router\s*([0-9a-fA-F:.]+),\s*origin-as\s*(\d+),'
+                       r'\s*origin-proto\s*(\w+)', line)
+        if og and cur['routes']:
+            cur['routes'][-1]['origin_router'] = og.group(1).rstrip(',')
+            cur['routes'][-1]['origin_as'] = int(og.group(2))
+            cur['routes'][-1]['origin_proto'] = og.group(3)
+        dl = re.search(r'delay\s*(\d+)\s*ms,\s*bandwidth\s*(\d+)\s*Kbps', line)
+        if dl and cur['routes']:
+            cur['routes'][-1]['delay'] = int(dl.group(1))
+            cur['routes'][-1]['bandwidth'] = int(dl.group(2))
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _eigrp_watch_load():
+    try:
+        with open(_EIGRP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _eigrp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_EIGRP_WATCH_PATH), exist_ok=True)
+        tmp = _EIGRP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _EIGRP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_eigrp_baseline(action='get'):
+    """Manage the learned EIGRP baseline (trusted routers + advertised prefixes)."""
+    with _eigrp_watch_lock:
+        if action == 'reset':
+            _eigrp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _eigrp_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted((b.get('routers') or {}).keys()),
+            'prefixes': sorted((b.get('prefixes') or {}).keys())}}
+
+
+def _eigrp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed EIGRP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    routers = {}
+    prefixes = {}
+    noauth_any = False
+    for e in events:
+        r = routers.setdefault(e['src'], {
+            'src': e['src'], 'af': e['af'], 'as': set(), 'kvals': set(),
+            'opcodes': set(), 'auth': False, 'noauth': False, 'count': 0})
+        r['count'] += 1
+        r['opcodes'].add(e['opcode'])
+        if e['asn'] is not None:
+            r['as'].add(e['asn'])
+        if e.get('kvals'):
+            r['kvals'].add(e['kvals'])
+        if e['auth']:
+            r['auth'] = True
+        else:
+            r['noauth'] = True
+            noauth_any = True
+        for rt in e['routes']:
+            prefixes.setdefault(rt['prefix'], {
+                'prefix': rt['prefix'], 'origin': e['src'],
+                'nexthop': rt['nexthop'], 'kind': rt['kind'], 'af': e['af']})
+
+    known = dict(baseline.get('routers') or {})
+    base_prefixes = dict(baseline.get('prefixes') or {})
+    had_baseline = bool(known) or bool(base_prefixes)
+
+    learned = False
+    if learn and not had_baseline and routers:
+        baseline['routers'] = {
+            s: {'as': sorted(r['as']), 'kvals': [list(k) for k in r['kvals']]}
+            for s, r in routers.items()}
+        baseline['prefixes'] = {
+            p: {'origin': d['origin'], 'nexthop': d['nexthop']}
+            for p, d in prefixes.items()}
+        learned = True
+        known = dict(baseline['routers'])
+        base_prefixes = dict(baseline['prefixes'])
+        had_baseline = True
+
+    PRIORITY = ['injection', 'rogue-router', 'storm', 'anomaly', 'weak-auth', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Route injection / next-hop hijack (only meaningful once a baseline exists).
+    if had_baseline:
+        for p in sorted(prefixes):
+            d = prefixes[p]
+            base = base_prefixes.get(p)
+            if base is None:
+                bump('injection')
+                reasons.append(
+                    f"EIGRP ROUTE INJECTION: prefix {p} advertised by {d['origin']} "
+                    f"(next-hop {d['nexthop']}) is not in the baseline — a forged "
+                    f"route that can blackhole or MITM traffic to it")
+            elif base.get('nexthop') and d['nexthop'] != base['nexthop']:
+                bump('injection')
+                reasons.append(
+                    f"EIGRP NEXT-HOP HIJACK: prefix {p} now points at next-hop "
+                    f"{d['nexthop']} (was {base['nexthop']}) — traffic to {p} is being "
+                    f"steered to a new gateway")
+
+    # Rogue routers.
+    for src in sorted(routers):
+        if had_baseline and src not in known:
+            bump('rogue-router')
+            asn = ', '.join(str(a) for a in sorted(routers[src]['as'])) or '?'
+            reasons.append(
+                f"Rogue EIGRP speaker {src} (AS {asn}) — not in the baseline; a new "
+                f"router forming adjacencies on this segment (adjacency spoofing)")
+
+    # K-value / AS mismatch across speakers.
+    all_as = set()
+    all_kvals = set()
+    for r in routers.values():
+        all_as |= r['as']
+        all_kvals |= r['kvals']
+    if len(all_as) > 1:
+        bump('anomaly')
+        reasons.append(
+            f"Multiple EIGRP AS numbers on one segment ({', '.join(str(a) for a in sorted(all_as))}) "
+            f"— usually one AS per link; a mismatch is a misconfig or a probing router")
+    if len(all_kvals) > 1:
+        bump('anomaly')
+        reasons.append(
+            "EIGRP K-value mismatch between speakers — K-values must match to form an "
+            "adjacency; a mismatch blocks peering (misconfig) or signals a crafted hello")
+
+    # Weak / no authentication.
+    if noauth_any:
+        bump('weak-auth')
+        reasons.append(
+            "EIGRP packets seen without an Authentication TLV — no HMAC-MD5/SHA "
+            "protection. This is what lets a forged Update win; configure an EIGRP "
+            "key-chain (authentication mode md5/hmac-sha-256) on every neighbor")
+
+    # Flooding.
+    rate = round(len(events) / seconds, 2)
+    if len(events) > 100 and rate > _EIGRP_STORM_RATE:
+        bump('storm')
+        reasons.append(
+            f"EIGRP flood: {rate} pkts/s (hellos are normally every 5s) — a "
+            f"hello/query storm (churn or DoS against the routing process)")
+
+    advisories = []
+    if routers:
+        advisories.append(
+            "Authenticate EIGRP with an HMAC-MD5/SHA-256 key-chain on every interface, "
+            "make edge/access ports passive (`passive-interface`), filter proto-88 "
+            "multicast off host ports, and alert on any new neighbor, new prefix or "
+            "next-hop change.")
+
+    def _pub_router(r):
+        return {'src': r['src'], 'af': r['af'], 'as': sorted(r['as']),
+                'opcodes': sorted(r['opcodes']),
+                'auth': r['auth'] and not r['noauth'],
+                'kvals': [list(k) for k in sorted(r['kvals'])], 'count': r['count'],
+                'baseline': r['src'] in known}
+
+    def _pub_prefix(p, d):
+        base = base_prefixes.get(p)
+        status = 'known' if base else ('new' if had_baseline else 'learned')
+        if base and base.get('nexthop') and d['nexthop'] != base['nexthop']:
+            status = 'nexthop-changed'
+        return {'prefix': p, 'origin': d['origin'], 'nexthop': d['nexthop'],
+                'kind': d['kind'], 'af': d['af'], 'status': status}
+
+    if reasons:
+        summary = reasons
+    elif not routers:
+        summary = ['No EIGRP traffic seen — no EIGRP on this segment']
+    else:
+        summary = ['All EIGRP routers and advertised prefixes match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'router_count': len(routers),
+        'prefix_count': len(prefixes),
+        'packet_count': len(events),
+        'rate': rate,
+        'routers': [_pub_router(routers[s]) for s in sorted(routers)],
+        'prefixes': [_pub_prefix(p, prefixes[p]) for p in sorted(prefixes)],
+        'advisories': advisories,
+    }
+
+
+def _eigrp_capture(interface, seconds):
+    """One passive tcpdump window over EIGRP (IPv4 proto 88 + IPv6 proto 88)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ip proto 88 or ip6 proto 88'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_eigrp_watch(interface=None, seconds=15, learn=True):
+    """Passive EIGRP routing-security scanner (detection-only). Captures EIGRP for a
+    few seconds and classifies: injection / rogue-router / storm / anomaly / weak-auth
+    / clean. Learns the trusted routers + advertised prefixes on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _eigrp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_eigrp_capture(text)
+
+    with _eigrp_watch_lock:
+        baseline = _eigrp_watch_load()
+        result = _eigrp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _eigrp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _eigrp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_EIGRP_EVENTS_CAP:]
+            _eigrp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _eigrp_selftest():
+    """Self-test the EIGRP detectors with synthetic captures, plus a Scapy end-to-end
+    leg (craft real EIGRP Hello + Update-with-route -> pcap -> tcpdump -> parse)."""
+    scenarios = []
+
+    def hdr4(src, dst='224.0.0.10'):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto EIGRP "
+                f"(88), length 60)\n    {src} > {dst}: ")
+
+    def eigrp4(src, opcode='Update', opnum=1, asn=100, auth=False, kvals=(1, 0, 1, 0, 0),
+               routes=()):
+        s = hdr4(src) + "\n"
+        s += f"\tEIGRP v2, opcode: {opcode} ({opnum}), chksum: 0x0, Flags: [none]\n"
+        s += f"\tseq: 0x00000000, ack: 0x00000000, VRID: 0, AS: {asn}, length: 20\n"
+        s += (f"\t  General Parameters TLV (0x0001), length: 12\n"
+              f"\t    holdtime: 15s, k1 {kvals[0]}, k2 {kvals[1]}, k3 {kvals[2]}, "
+              f"k4 {kvals[3]}, k5 {kvals[4]}\n")
+        if auth:
+            s += "\t  Authentication TLV (0x0002), length: 40\n"
+        for (pfx, nh) in routes:
+            s += (f"\t  IP Internal routes TLV (0x0102), length: 28\n"
+                  f"\t    IPv4 prefix:      {pfx}, nexthop: {nh}\n"
+                  f"\t      delay 1280 ms, bandwidth 256 Kbps, mtu 1500, hop 0, "
+                  f"reliability 255, load 0\n")
+        return s.rstrip("\n")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_eigrp_capture(text)
+        res = _eigrp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'routers': {'10.0.0.1': {'as': [100], 'kvals': [[1, 0, 1, 0, 0]]}},
+            'prefixes': {'10.1.0.0/24': {'origin': '10.0.0.1', 'nexthop': '10.0.0.1'}}}
+
+    # 1. clean: known router, authed, re-advertising the known prefix with same next-hop.
+    run('clean', eigrp4('10.0.0.1', auth=True,
+                        routes=[('10.1.0.0/24', '10.0.0.1')]), 15, base, 'clean')
+    # 2. injection: a new prefix from the known router.
+    run('injection', eigrp4('10.0.0.1', auth=True,
+                            routes=[('10.66.66.0/24', '10.0.0.1')]), 15, base,
+        'injection')
+    # 3. injection via next-hop hijack: known prefix, new next-hop.
+    run('nexthop-hijack', eigrp4('10.0.0.1', auth=True,
+                                 routes=[('10.1.0.0/24', '10.0.0.66')]), 15, base,
+        'injection')
+    # 4. rogue-router: a new speaker (authed, no new routes) — not in baseline.
+    run('rogue-router', eigrp4('10.0.0.66', opcode='Hello', opnum=5, auth=True), 15,
+        base, 'rogue-router')
+    # 5. anomaly: known router but a second AS appears.
+    run('anomaly-as', eigrp4('10.0.0.1', asn=100, auth=True) + "\n"
+        + eigrp4('10.0.0.1', asn=200, auth=True), 15, base, 'anomaly')
+    # 6. weak-auth: known router + prefix, but no Authentication TLV.
+    run('weak-auth', eigrp4('10.0.0.1', auth=False,
+                            routes=[('10.1.0.0/24', '10.0.0.1')]), 15, base, 'weak-auth')
+    # 7. parse: internal + external routes, auth flag, AS.
+    pev = _parse_eigrp_capture(
+        hdr4('10.0.0.9') + "\n"
+        "\tEIGRP v2, opcode: Update (1), chksum: 0x0, Flags: [none]\n"
+        "\tseq: 0x0, ack: 0x0, VRID: 0, AS: 100, length: 128\n"
+        "\t  Authentication TLV (0x0002), length: 40\n"
+        "\t  IP Internal routes TLV (0x0102), length: 28\n"
+        "\t    IPv4 prefix:      10.66.66.0/24, nexthop: 10.0.0.9\n"
+        "\t      delay 1280 ms, bandwidth 256 Kbps, mtu 1500, hop 0, reliability 255, load 0\n"
+        "\t  IP External routes TLV (0x0103), length: 48\n"
+        "\t    IPv4 prefix:      172.16.9.0/24, nexthop: 10.0.0.9\n"
+        "\t      origin-router 192.168.0.1, origin-as 0, origin-proto Static, flags [0x00], tag 0x0, metric 0\n"
+        "\t      delay 0 ms, bandwidth 256 Kbps, mtu 1500, hop 0, reliability 255, load 0")
+    e0 = pev[0] if pev else {}
+    kinds = {r['kind'] for r in e0.get('routes', [])}
+    p_ok = (e0.get('asn') == 100 and e0.get('auth') is True
+            and len(e0.get('routes', [])) == 2 and kinds == {'internal', 'external'}
+            and e0['routes'][1].get('origin_router') == '192.168.0.1')
+    scenarios.append({'name': 'eigrp-parse', 'expect': 'int+ext/auth/AS100',
+                      'got': f"routes={len(e0.get('routes', []))} auth={e0.get('auth')}",
+                      'pass': p_ok})
+
+    # Scapy end-to-end.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, wrpcap
+        import scapy.contrib.eigrp as E
+        if _have('tcpdump'):
+            upd = (Ether() / IP(src='10.0.0.9', dst='224.0.0.10', proto=88)
+                   / E.EIGRP(opcode=1, asn=100, tlvlist=[
+                       E.EIGRPParam(k1=1, k2=0, k3=1, k4=0, k5=0, holdtime=15),
+                       E.EIGRPIntRoute(dst='10.66.66.0', prefixlen=24,
+                                       nexthop='10.0.0.9')]))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [upd])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_eigrp_capture(res['out'])
+            e = evs[0] if evs else {}
+            rt = e.get('routes', [{}])[0] if e.get('routes') else {}
+            ok = (e.get('src') == '10.0.0.9' and e.get('asn') == 100
+                  and rt.get('prefix') == '10.66.66.0/24'
+                  and rt.get('nexthop') == '10.0.0.9')
+            scapy_result = {'ran': True, 'src': e.get('src'), 'asn': e.get('asn'),
+                            'prefix': rt.get('prefix'), 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# FHRP Watch: passive HSRP/VRRP/GLBP/CARP hijack scanner (detection-only)
+# --------------------------------------------------------------------------
+# First Hop Redundancy Protocols share a *virtual gateway* (one virtual IP+MAC that
+# floats between routers) so hosts keep one default gateway even when a router dies.
+# The active router is picked by PRIORITY, and the hellos are multicast in the clear
+# with weak/no auth (HSRP's default is the plaintext string "cisco"; VRRPv3 has no
+# auth). So an attacker who sees the hellos can inject a forged hello with priority
+# 255 + preempt, win the election, and take over the virtual gateway IP/MAC — every
+# host's off-subnet traffic now flows through them (subnet-wide MITM, e.g. Yersinia /
+# Loki). This scanner is PASSIVE: one short tcpdump window over the FHRP hellos,
+# parsed and classified against a learned baseline of the segment's groups. It never
+# sends an FHRP packet. What it flags:
+#   * hijack        — a speaker that isn't in the baseline advertising a *winning*
+#     priority (>= the active, or 250+/255), or an HSRP Coup — takeover in progress.
+#   * rogue-speaker — a new speaker in a group that isn't (yet) winning.
+#   * priority-change — a known speaker whose priority jumped up (pre-takeover/reconfig).
+#   * weak-auth     — plaintext/no FHRP authentication (the enabler). Advisory.
+# HSRP + VRRP are fully decoded by tcpdump (priority-based detection). GLBP (tcpdump
+# does not dissect it) and CARP are lighter — new-speaker detection, best-effort.
+_FHRP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'fhrp_watch.json')
+_fhrp_watch_lock = threading.Lock()
+_FHRP_EVENTS_CAP = 200
+# A priority at/above this from a source that isn't the baseline active is a takeover
+# attempt (HSRP/VRRP/GLBP max is 255/254; attackers use the top of the range).
+_FHRP_TAKEOVER_PRIO = 250
+
+_FHRP_HSRP_SRC = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.1985\s*>')
+_FHRP_GLBP_SRC = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.3222\s*>')
+_FHRP_L3_SRC = re.compile(r'^\s*(\S+?)\s*>')
+
+
+def _parse_fhrp_capture(output):
+    """Parse `tcpdump -nn -t -v` text over FHRP hellos into events. One hello is one
+    content line (`<src> > <mcast>: HSRPv0-hello ... priority=255 ...` etc.). Each
+    event is a dict with a normalised 'priority' (higher = wins the election):
+      {proto, version, src, group, vip, priority, opcode, state, authtype,
+       auth_weak, advskew}
+    """
+    events = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or '>' not in line:
+            continue
+
+        if 'HSRPv' in line:                                   # HSRP (UDP 1985)
+            m = _FHRP_HSRP_SRC.search(line)
+            op = re.search(r'HSRPv(\d+)-(\w+)', line)
+            grp = re.search(r'group=(\d+)', line)
+            pri = re.search(r'priority=(\d+)', line)
+            auth = re.search(r'auth="([^"]*)"', line)
+            events.append({
+                'proto': 'hsrp', 'version': int(op.group(1)) if op else None,
+                'src': m.group(1) if m else None,
+                'group': int(grp.group(1)) if grp else None,
+                'vip': (re.search(r'addr=([\d.]+)', line) or [None, None])[1]
+                if re.search(r'addr=([\d.]+)', line) else None,
+                'priority': int(pri.group(1)) if pri else None,
+                'opcode': op.group(2) if op else None,
+                'state': (re.search(r'state=(\w+)', line) or [None, None])[1]
+                if re.search(r'state=(\w+)', line) else None,
+                'authtype': 'plaintext' if auth else None,
+                'auth_weak': bool(auth), 'advskew': None})
+
+        elif 'CARP' in line:                                  # CARP (IP proto 112)
+            m = _FHRP_L3_SRC.match(raw)
+            ver = re.search(r'CARPv(\d+)', line)
+            vhid = re.search(r'vhid=(\d+)', line)
+            skew = re.search(r'advskew=(\d+)', line)
+            adv = int(skew.group(1)) if skew else None
+            events.append({
+                'proto': 'carp', 'version': int(ver.group(1)) if ver else None,
+                'src': m.group(1) if m else None,
+                'group': int(vhid.group(1)) if vhid else None, 'vip': None,
+                'priority': (255 - adv) if adv is not None else None,
+                'opcode': 'advertise', 'state': None, 'authtype': 'hmac',
+                'auth_weak': False, 'advskew': adv})
+
+        elif 'VRRP' in line:                                  # VRRP (IP proto 112)
+            m = _FHRP_L3_SRC.match(raw)
+            ver = re.search(r'VRRPv(\d+)', line)
+            vrid = re.search(r'vrid (\d+)', line)
+            pri = re.search(r'prio (\d+)', line)
+            at = re.search(r'authtype (\w+)', line)
+            addrs = re.search(r'addrs:\s*([0-9a-fA-F:., ]+)', line)
+            vip = None
+            if addrs:
+                parts = [a.strip() for a in re.split(r'[,\s]+', addrs.group(1))
+                         if a.strip()]
+                vip = parts[0] if parts else None
+            authtype = at.group(1).lower() if at else None
+            events.append({
+                'proto': 'vrrp', 'version': int(ver.group(1)) if ver else None,
+                'src': m.group(1) if m else None,
+                'group': int(vrid.group(1)) if vrid else None, 'vip': vip,
+                'priority': int(pri.group(1)) if pri else None,
+                'opcode': 'advertise', 'state': None, 'authtype': authtype,
+                'auth_weak': authtype in ('none', 'simple', None), 'advskew': None})
+
+        elif '.3222 >' in line:                               # GLBP (UDP 3222)
+            m = _FHRP_GLBP_SRC.search(line)
+            grp = re.search(r'[Gg]roup[= ](\d+)', line)
+            pri = re.search(r'priority[= ](\d+)', line)
+            events.append({
+                'proto': 'glbp', 'version': None,
+                'src': m.group(1) if m else None,
+                'group': int(grp.group(1)) if grp else None, 'vip': None,
+                'priority': int(pri.group(1)) if pri else None,
+                'opcode': 'hello', 'state': None, 'authtype': None,
+                'auth_weak': False, 'advskew': None})
+    return [e for e in events if e['src']]
+
+
+def _fhrp_watch_load():
+    try:
+        with open(_FHRP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _fhrp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_FHRP_WATCH_PATH), exist_ok=True)
+        tmp = _FHRP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _FHRP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_fhrp_baseline(action='get'):
+    """Manage the learned FHRP baseline (trusted groups + their speakers/priorities).
+    action='reset' re-learns the segment's FHRP groups on the next scan."""
+    with _fhrp_watch_lock:
+        if action == 'reset':
+            _fhrp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _fhrp_watch_load()
+        return {'success': True, 'baseline': {
+            'groups': sorted((b.get('groups') or {}).keys()),
+        }}
+
+
+def _fhrp_gkey(e):
+    return f"{e['proto']}/{e['group']}" if e['group'] is not None else f"{e['proto']}/?"
+
+
+def _fhrp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed FHRP events. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with synthetic
+    packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    groups = {}
+    for e in events:
+        gk = _fhrp_gkey(e)
+        g = groups.setdefault(gk, {
+            'gkey': gk, 'proto': e['proto'], 'group': e['group'], 'vips': set(),
+            'speakers': {}, 'auth_weak': False, 'authtype': e['authtype']})
+        if e['vip']:
+            g['vips'].add(e['vip'])
+        if e['auth_weak']:
+            g['auth_weak'] = True
+        if e['authtype']:
+            g['authtype'] = e['authtype']
+        sp = g['speakers'].setdefault(e['src'], {
+            'src': e['src'], 'prio': None, 'states': set(), 'opcodes': set(),
+            'count': 0})
+        sp['count'] += 1
+        if e['priority'] is not None:
+            sp['prio'] = e['priority'] if sp['prio'] is None else max(sp['prio'],
+                                                                      e['priority'])
+        if e['state']:
+            sp['states'].add(e['state'])
+        if e['opcode']:
+            sp['opcodes'].add(e['opcode'])
+
+    known = dict(baseline.get('groups') or {})
+    had_baseline = bool(known)
+
+    learned = False
+    if learn and not had_baseline and groups:
+        baseline['groups'] = {
+            gk: {'speakers': {s: sp['prio'] for s, sp in g['speakers'].items()},
+                 'vips': sorted(g['vips']),
+                 'max_prio': max([sp['prio'] for sp in g['speakers'].values()
+                                  if sp['prio'] is not None] or [0])}
+            for gk, g in groups.items()}
+        learned = True
+        known = dict(baseline['groups'])
+        had_baseline = True
+
+    PRIORITY = ['hijack', 'rogue-speaker', 'priority-change', 'weak-auth', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    for gk in sorted(groups):
+        g = groups[gk]
+        base = known.get(gk) or {}
+        base_speakers = dict(base.get('speakers') or {})
+        base_max = base.get('max_prio')
+        vip = ', '.join(sorted(g['vips'])) or '?'
+        for src in sorted(g['speakers']):
+            sp = g['speakers'][src]
+            is_new = had_baseline and src not in base_speakers
+            coup = 'coup' in sp['opcodes']
+            prio = sp['prio']
+            winning = (prio is not None and base_max is not None and prio >= base_max)
+            near_max = (prio is not None and prio >= _FHRP_TAKEOVER_PRIO)
+            if is_new and (coup or winning or near_max):
+                bump('hijack')
+                p = f"priority {prio}" if prio is not None else "no priority field"
+                extra = ' (HSRP Coup)' if coup else ''
+                reasons.append(
+                    f"FHRP HIJACK on {g['proto'].upper()} group "
+                    f"{g['group'] if g['group'] is not None else '?'} (gateway "
+                    f"{vip}): new speaker {src} advertising {p}{extra} — it wins the "
+                    f"election and becomes the virtual gateway, MITMing the subnet")
+            elif is_new:
+                bump('rogue-speaker')
+                reasons.append(
+                    f"Unexpected {g['proto'].upper()} speaker {src} in group "
+                    f"{g['group'] if g['group'] is not None else '?'} (gateway {vip}) "
+                    f"— not in the baseline (FHRP injection; watch for a priority rise)")
+            elif (not is_new) and prio is not None:
+                base_prio = base_speakers.get(src)
+                if base_prio is not None and prio > base_prio:
+                    bump('priority-change')
+                    reasons.append(
+                        f"{g['proto'].upper()} speaker {src} in group "
+                        f"{g['group'] if g['group'] is not None else '?'} raised its "
+                        f"priority {base_prio} → {prio} — possible pre-takeover or a "
+                        f"legitimate reconfiguration")
+        if g['auth_weak']:
+            bump('weak-auth')
+            reasons.append(
+                f"{g['proto'].upper()} group "
+                f"{g['group'] if g['group'] is not None else '?'} uses weak/no "
+                f"authentication ({g['authtype'] or 'none'}) — this is what lets a "
+                f"forged higher-priority hello win the election; enable MD5/HMAC auth")
+
+    advisories = []
+    if groups:
+        advisories.append(
+            "Authenticate FHRP (HSRP/VRRP MD5 or key-chain), raise the real routers to "
+            "a high priority with preempt, and filter FHRP multicast on access ports "
+            "(only trunk/router ports should carry HSRP 1985 / GLBP 3222 / VRRP+CARP "
+            "IP-proto-112). Alert on any new speaker or priority change.")
+
+    def _pub(g):
+        return {'gkey': g['gkey'], 'proto': g['proto'], 'group': g['group'],
+                'vips': sorted(g['vips']), 'authtype': g['authtype'],
+                'auth_weak': g['auth_weak'],
+                'speakers': [{
+                    'src': s, 'priority': sp['prio'],
+                    'states': sorted(sp['states']), 'opcodes': sorted(sp['opcodes']),
+                    'baseline': s in ((known.get(g['gkey']) or {}).get('speakers') or {}),
+                } for s, sp in sorted(g['speakers'].items())]}
+
+    if reasons:
+        summary = reasons
+    elif not groups:
+        summary = ['No FHRP traffic seen — no HSRP/VRRP/GLBP/CARP on this segment']
+    else:
+        summary = ['All FHRP groups/speakers match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'group_count': len(groups),
+        'packet_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'groups': [_pub(groups[gk]) for gk in sorted(groups)],
+        'advisories': advisories,
+    }
+
+
+def _fhrp_capture(interface, seconds):
+    """Run one passive tcpdump window over FHRP hellos and return (raw, error).
+    Covers HSRP (udp 1985), GLBP (udp 3222), and VRRP/CARP (IP/IPv6 proto 112)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = ('(udp and (port 1985 or port 3222)) or (ip proto 112) or '
+           '(ip6 proto 112)')
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '256', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_fhrp_watch(interface=None, seconds=15, learn=True, quick=False):
+    """Passive FHRP (HSRP/VRRP/GLBP/CARP) hijack scanner (detection-only). Captures
+    FHRP hellos for a few seconds and classifies the segment: hijack / rogue-speaker /
+    priority-change / weak-auth / clean. Learns the trusted groups on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 4, 40)
+
+    text, err = _fhrp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_fhrp_capture(text)
+
+    with _fhrp_watch_lock:
+        baseline = _fhrp_watch_load()
+        result = _fhrp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _fhrp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _fhrp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_FHRP_EVENTS_CAP:]
+            _fhrp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _fhrp_selftest():
+    """Self-test the FHRP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -t -v` text through the real parser + classifier,
+    and — if Scapy is available — builds real HSRP + VRRP hellos into a pcap and
+    parses them back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def hsrp(src, group=1, prio=100, state='active', op='hello', vip='192.168.1.1',
+             auth='cisco'):
+        a = f' auth="{auth}"' if auth is not None else ''
+        return (f"    {src}.1985 > 224.0.0.2.1985: HSRPv0-{op} 20: state={state} "
+                f"group={group} addr={vip} hellotime=3s holdtime=10s "
+                f"priority={prio}{a}")
+
+    def vrrp(src, vrid=1, prio=100, authtype='none', vip='192.168.1.1'):
+        return (f"    {src} > 224.0.0.18: VRRPv2, Advertisement, (ttl 255), "
+                f"vrid {vrid}, prio {prio}, authtype {authtype}, intvl 1s, "
+                f"length 20, addrs: {vip}")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_fhrp_capture(text)
+        res = _fhrp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    # Baseline: HSRP group 1 active=192.168.1.2 prio 110; VRRP vrid 1 active .3 prio 100.
+    base = {'groups': {
+        'hsrp/1': {'speakers': {'192.168.1.2': 110}, 'vips': ['192.168.1.1'],
+                   'max_prio': 110},
+        'vrrp/1': {'speakers': {'192.168.1.3': 100}, 'vips': ['192.168.1.1'],
+                   'max_prio': 100}}}
+
+    # 1. clean: the known active re-advertising at its known priority (MD5 auth so no
+    #    weak-auth), + known VRRP with AH auth.
+    run('clean', hsrp('192.168.1.2', prio=110, auth=None) + "\n"
+        + vrrp('192.168.1.3', prio=100, authtype='ah'), 15, base, 'clean')
+
+    # 2. hijack: a NEW HSRP speaker advertising priority 255 — wins + becomes gateway.
+    run('hijack', hsrp('192.168.1.66', prio=255, auth=None), 15, base, 'hijack')
+
+    # 3. hijack via Coup from a new speaker.
+    run('coup', hsrp('192.168.1.66', prio=120, op='coup', auth=None), 15, base,
+        'hijack')
+
+    # 4. rogue-speaker: a new speaker but at a losing priority (below the active).
+    run('rogue-speaker', hsrp('192.168.1.66', prio=50, auth=None), 15, base,
+        'rogue-speaker')
+
+    # 5. priority-change: the known active raises its priority.
+    run('priority-change', hsrp('192.168.1.2', prio=200, auth=None), 15, base,
+        'priority-change')
+
+    # 6. weak-auth: known speakers but plaintext HSRP auth + VRRP authtype none.
+    run('weak-auth', hsrp('192.168.1.2', prio=110, auth='cisco') + "\n"
+        + vrrp('192.168.1.3', prio=100, authtype='none'), 15, base, 'weak-auth')
+
+    # 7. vrrp-hijack: a new VRRP speaker at prio 254.
+    run('vrrp-hijack', vrrp('192.168.1.77', vrid=1, prio=254, authtype='ah'), 15,
+        base, 'hijack')
+
+    # 8. parse: HSRP fields + VRRP fields + CARP + GLBP.
+    pev = _parse_fhrp_capture(
+        hsrp('192.168.1.2', prio=255, op='coup') + "\n"
+        + vrrp('192.168.1.3', vrid=7, prio=200) + "\n"
+        + "    10.0.0.9 > 224.0.0.18: CARPv2-advertise 36: vhid=1 advbase=1 advskew=0\n"
+        + "    10.0.0.8.3222 > 224.0.0.102.3222: UDP, length 40")
+    protos = {e['proto'] for e in pev}
+    hsrp_ev = next((e for e in pev if e['proto'] == 'hsrp'), {})
+    p_ok = (protos == {'hsrp', 'vrrp', 'carp', 'glbp'}
+            and hsrp_ev.get('opcode') == 'coup' and hsrp_ev.get('priority') == 255
+            and hsrp_ev.get('auth_weak') is True)
+    scenarios.append({'name': 'fhrp-parse', 'expect': 'hsrp/vrrp/carp/glbp',
+                      'got': str(sorted(protos)), 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft real HSRP + VRRP -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, UDP, wrpcap
+        from scapy.layers.hsrp import HSRP
+        from scapy.layers.vrrp import VRRP
+        if _have('tcpdump'):
+            pkts = [
+                Ether() / IP(src='192.168.1.66', dst='224.0.0.2')
+                / UDP(sport=1985, dport=1985)
+                / HSRP(group=1, priority=255, state=16, virtualIP='192.168.1.1'),
+                Ether() / IP(src='192.168.1.3', dst='224.0.0.18', proto=112)
+                / VRRP(vrid=5, priority=254, ipcount=1, addrlist=['192.168.1.1'],
+                       version=2)]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_fhrp_capture(res['out'])
+            hs = next((e for e in evs if e['proto'] == 'hsrp'), {})
+            vr = next((e for e in evs if e['proto'] == 'vrrp'), {})
+            ok = (hs.get('priority') == 255 and hs.get('src') == '192.168.1.66'
+                  and vr.get('priority') == 254 and vr.get('group') == 5)
+            scapy_result = {'ran': True, 'protos': sorted({e['proto'] for e in evs}),
+                            'hsrp_prio': hs.get('priority'),
+                            'vrrp_prio': vr.get('priority'), 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # OSPF Watch: passive OSPF security scanner (detection-only)
 # --------------------------------------------------------------------------
 # OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
@@ -4753,7 +10783,15 @@ def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
-    suites = {'igmp': _igmp_selftest(), 'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
+    suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
+              'raguard': _raguard_selftest(),
+              'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
+              'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
+              'stp': _stp_selftest(), 'isis': _isis_selftest(),
+              'smb': _smb_selftest(), 'relay': _relay_selftest(),
+              'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
+              'fhrp': _fhrp_selftest(),
+              'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
         'success': all(s['success'] for s in suites.values()),
@@ -4763,7 +10801,7 @@ def do_routing_selftest():
             'passed': sum(1 for s in v['scenarios'] if s['pass']),
             'total': len(v['scenarios']),
             'scenarios': v['scenarios'],
-            'scapy': v.get('scapy'),
+            'scapy': v.get('scapy') or v.get('e2e'),
         } for k, v in suites.items()},
     }
 
@@ -5523,6 +11561,236 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/igmp-baseline {action}")
         return jsonify(do_igmp_baseline(action))
 
+    @app.route('/api/net/ipv6-watch', methods=['GET'])
+    def net_ipv6_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/ipv6-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ipv6_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ipv6-baseline', methods=['GET', 'POST'])
+    def net_ipv6_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ipv6-baseline {action}")
+        return jsonify(do_ipv6_baseline(action))
+
+    @app.route('/api/net/raguard', methods=['GET', 'POST'])
+    def net_raguard():
+        action = 'check'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'harden' if (data.get('action') == 'harden') else 'check'
+        _log(f"net/raguard {action}")
+        return jsonify(do_raguard(action))
+
+    @app.route('/api/net/ntp-watch', methods=['GET'])
+    def net_ntp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        _log(f"net/ntp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ntp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ntp-baseline', methods=['GET', 'POST'])
+    def net_ntp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ntp-baseline {action}")
+        return jsonify(do_ntp_baseline(action))
+
+    @app.route('/api/net/icmp-watch', methods=['GET'])
+    def net_icmp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/icmp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_icmp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/icmp-baseline', methods=['GET', 'POST'])
+    def net_icmp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/icmp-baseline {action}")
+        return jsonify(do_icmp_baseline(action))
+
+    @app.route('/api/net/snmp-watch', methods=['GET'])
+    def net_snmp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/snmp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_snmp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/snmp-baseline', methods=['GET', 'POST'])
+    def net_snmp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/snmp-baseline {action}")
+        return jsonify(do_snmp_baseline(action))
+
+    @app.route('/api/net/tls-watch', methods=['POST'])
+    def net_tls_watch():
+        data = request.get_json(silent=True) or {}
+        targets = (data.get('targets') or '')[:4000]
+        discover = bool(data.get('discover'))
+        iface = (data.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(data.get('seconds'), 8, 4, 30)
+        _log(f"net/tls-watch discover={discover} iface={iface or '-'} "
+             f"targets={len(_tls_parse_targets(targets))}")
+        return jsonify(do_tls_watch(targets=targets, interface=iface, seconds=secs,
+                                    discover=discover))
+
+    @app.route('/api/net/tls-baseline', methods=['GET', 'POST'])
+    def net_tls_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/tls-baseline {action}")
+        return jsonify(do_tls_baseline(action))
+
+    @app.route('/api/net/relay-watch', methods=['GET'])
+    def net_relay_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/relay-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_relay_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/relay-baseline', methods=['GET', 'POST'])
+    def net_relay_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/relay-baseline {action}")
+        return jsonify(do_relay_baseline(action))
+
+    @app.route('/api/net/smb-watch', methods=['GET'])
+    def net_smb_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/smb-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_smb_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/smb-baseline', methods=['GET', 'POST'])
+    def net_smb_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/smb-baseline {action}")
+        return jsonify(do_smb_baseline(action))
+
+    @app.route('/api/net/isis-watch', methods=['GET'])
+    def net_isis_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/isis-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_isis_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/isis-baseline', methods=['GET', 'POST'])
+    def net_isis_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/isis-baseline {action}")
+        return jsonify(do_isis_baseline(action))
+
+    @app.route('/api/net/stp-watch', methods=['GET'])
+    def net_stp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/stp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_stp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/stp-baseline', methods=['GET', 'POST'])
+    def net_stp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/stp-baseline {action}")
+        return jsonify(do_stp_baseline(action))
+
+    @app.route('/api/net/dtp-watch', methods=['GET'])
+    def net_dtp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/dtp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_dtp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/dtp-baseline', methods=['GET', 'POST'])
+    def net_dtp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/dtp-baseline {action}")
+        return jsonify(do_dtp_baseline(action))
+
+    @app.route('/api/net/eigrp-watch', methods=['GET'])
+    def net_eigrp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        _log(f"net/eigrp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_eigrp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/eigrp-baseline', methods=['GET', 'POST'])
+    def net_eigrp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/eigrp-baseline {action}")
+        return jsonify(do_eigrp_baseline(action))
+
+    @app.route('/api/net/fhrp-watch', methods=['GET'])
+    def net_fhrp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 4, 40)
+        _log(f"net/fhrp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_fhrp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/fhrp-baseline', methods=['GET', 'POST'])
+    def net_fhrp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/fhrp-baseline {action}")
+        return jsonify(do_fhrp_baseline(action))
+
     @app.route('/api/net/ospf-watch', methods=['GET'])
     def net_ospf_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -5735,6 +12003,124 @@ def _cli(argv=None):
     st = sub.add_parser('igmp-selftest', help='self-test the IGMP detectors (no root)')
     st.add_argument('--json', action='store_true', help='emit JSON')
 
+    v6 = sub.add_parser('ipv6-watch', help='passive IPv6 first-hop (RA/DHCPv6) scan')
+    v6.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    v6.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    v6.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    v6.add_argument('--json', action='store_true', help='emit JSON')
+
+    v6st = sub.add_parser('ipv6-selftest', help='self-test the IPv6 first-hop detectors (no root)')
+    v6st.add_argument('--json', action='store_true', help='emit JSON')
+
+    rg = sub.add_parser('raguard', help='IPv6 RA Guard: audit (and optionally harden) host first-hop posture')
+    rg.add_argument('--harden', action='store_true', help='apply + persist the safe sysctls')
+    rg.add_argument('--json', action='store_true', help='emit JSON')
+
+    rgst = sub.add_parser('raguard-selftest', help='self-test the RA Guard grader (no root)')
+    rgst.add_argument('--json', action='store_true', help='emit JSON')
+
+    nt = sub.add_parser('ntp-watch', help='passive NTP (rogue time-source) scan')
+    nt.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    nt.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    nt.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    nt.add_argument('--json', action='store_true', help='emit JSON')
+
+    ntst = sub.add_parser('ntp-selftest', help='self-test the NTP detectors (no root)')
+    ntst.add_argument('--json', action='store_true', help='emit JSON')
+
+    ic = sub.add_parser('icmp-watch', help='passive ICMP (redirect/IRDP) L3 scan')
+    ic.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    ic.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    ic.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    ic.add_argument('--json', action='store_true', help='emit JSON')
+
+    icst = sub.add_parser('icmp-selftest', help='self-test the ICMP detectors (no root)')
+    icst.add_argument('--json', action='store_true', help='emit JSON')
+
+    sn = sub.add_parser('snmp-watch', help='passive SNMP (v1/v2c cleartext) scan')
+    sn.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    sn.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    sn.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    sn.add_argument('--json', action='store_true', help='emit JSON')
+
+    snst = sub.add_parser('snmp-selftest', help='self-test the SNMP detectors (no root)')
+    snst.add_argument('--json', action='store_true', help='emit JSON')
+
+    tw = sub.add_parser('tls-watch', help='active TLS/certificate hygiene checker')
+    tw.add_argument('targets', nargs='*', help='host[:port] target(s) to grade')
+    tw.add_argument('--discover', action='store_true',
+                    help='passively discover TLS servers on the segment first')
+    tw.add_argument('--iface', '-i', default=None, help='interface for discovery')
+    tw.add_argument('--seconds', '-s', type=int, default=8, help='discovery window (4-30)')
+    tw.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    tw.add_argument('--json', action='store_true', help='emit JSON')
+
+    twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
+    twst.add_argument('--json', action='store_true', help='emit JSON')
+
+    rl = sub.add_parser('relay-watch', help='passive NTLM-relay + coercion scan')
+    rl.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    rl.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    rl.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    rl.add_argument('--json', action='store_true', help='emit JSON')
+
+    rlst = sub.add_parser('relay-selftest', help='self-test the relay/coercion detectors (no root)')
+    rlst.add_argument('--json', action='store_true', help='emit JSON')
+
+    sm = sub.add_parser('smb-watch', help='passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning scan')
+    sm.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    sm.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    sm.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    sm.add_argument('--json', action='store_true', help='emit JSON')
+
+    smst = sub.add_parser('smb-selftest', help='self-test the SMB Watch detectors (no root)')
+    smst.add_argument('--json', action='store_true', help='emit JSON')
+
+    ii = sub.add_parser('isis-watch', help='passive IS-IS routing-security scan')
+    ii.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    ii.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    ii.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    ii.add_argument('--json', action='store_true', help='emit JSON')
+
+    iist = sub.add_parser('isis-selftest', help='self-test the IS-IS detectors (no root)')
+    iist.add_argument('--json', action='store_true', help='emit JSON')
+
+    st = sub.add_parser('stp-watch', help='passive STP/BPDU spanning-tree security scan')
+    st.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    st.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    st.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    st.add_argument('--json', action='store_true', help='emit JSON')
+
+    stst = sub.add_parser('stp-selftest', help='self-test the STP/BPDU detectors (no root)')
+    stst.add_argument('--json', action='store_true', help='emit JSON')
+
+    dt = sub.add_parser('dtp-watch', help='passive DTP / VLAN-hopping scan (Cisco)')
+    dt.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    dt.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    dt.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    dt.add_argument('--json', action='store_true', help='emit JSON')
+
+    dtst = sub.add_parser('dtp-selftest', help='self-test the DTP detector (no root)')
+    dtst.add_argument('--json', action='store_true', help='emit JSON')
+
+    eg = sub.add_parser('eigrp-watch', help='passive EIGRP routing-security scan (Cisco)')
+    eg.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    eg.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    eg.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    eg.add_argument('--json', action='store_true', help='emit JSON')
+
+    egst = sub.add_parser('eigrp-selftest', help='self-test the EIGRP detectors (no root)')
+    egst.add_argument('--json', action='store_true', help='emit JSON')
+
+    fh = sub.add_parser('fhrp-watch', help='passive FHRP (HSRP/VRRP/GLBP/CARP) hijack scan')
+    fh.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    fh.add_argument('--seconds', '-s', type=int, default=15, help='capture window (4-40)')
+    fh.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    fh.add_argument('--json', action='store_true', help='emit JSON')
+
+    fhst = sub.add_parser('fhrp-selftest', help='self-test the FHRP detectors (no root)')
+    fhst.add_argument('--json', action='store_true', help='emit JSON')
+
     o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
     o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     o.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
@@ -5794,6 +12180,557 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"IGMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ipv6-watch':
+        r = do_ipv6_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"IPv6 First-Hop Watch [{r['interface']}]: {r['verdict'].upper()}  "
+                  f"({r['ra_count']} RA @ {r['rate']}/s, {r['dhcp6_count']} DHCPv6)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for rt in r.get('routers', []):
+                tag = '' if rt['baseline'] else ' *ROGUE*'
+                dns = f" dns={','.join(rt['rdnss'])}" if rt['rdnss'] else ''
+                print(f"  RA router {rt['src']} pref={rt['pref']} "
+                      f"life={rt['lifetime']}{dns}{tag}")
+            for s in r.get('dhcp6_servers', []):
+                tag = '' if s['baseline'] else ' *ROGUE*'
+                dns = f" dns={','.join(s['dns'])}" if s['dns'] else ''
+                print(f"  DHCPv6 {s['src']} ({'/'.join(s['msgtypes'])}){dns}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ipv6-selftest':
+        r = _ipv6_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"prefixes={sc.get('prefixes')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"IPv6 first-hop self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'raguard':
+        r = do_raguard('harden' if args.harden else 'check')
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            print(f"IPv6 RA Guard: {r['verdict'].upper()}")
+            for p in r.get('interfaces', []):
+                print(f"  {p['iface']:10} {p['verdict']:14} "
+                      f"accept_ra={p['accept_ra']} rtr_pref={p['accept_ra_rtr_pref']} "
+                      f"accept_redirects={p['accept_redirects']}")
+            for g in r.get('gateways', []):
+                print(f"  accepted gateway: {g['gw']} dev {g['dev']}"
+                      f"{' (from RA)' if g['from_ra'] else ''}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+            ap = r.get('applied')
+            if ap:
+                print(f"  hardened: set {len(ap['live'])} sysctls, persisted "
+                      f"{ap['persisted'] or '(failed)'}")
+                for e in ap['errors']:
+                    print(f"  ! {e}")
+            elif r.get('needs_hardening'):
+                print("  run with --harden to close these (accept_redirects=0, "
+                      "accept_ra_rtr_pref=0; accept_ra left as-is)")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'raguard-selftest':
+        r = _raguard_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            e = r.get('e2e', {})
+            if e.get('ran'):
+                print(f"  [{'PASS' if e.get('pass') else 'FAIL'}] live-check: "
+                      f"verdict={e.get('verdict')} ifaces={e.get('interfaces')}")
+            else:
+                print(f"  [skip] live-check: {e.get('reason')}")
+            print(f"RA Guard self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ntp-watch':
+        r = do_ntp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"NTP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['server_count']} source(s), {r['packet_count']} pkts @ "
+                  f"{r['rate']}/s)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for s in r.get('servers', []):
+                tag = '' if s['baseline'] else ' *ROGUE*'
+                off = f" off={s['offset']:+.3f}s" if s['offset'] is not None else ''
+                strata = ','.join(str(n) for n in s['strata'])
+                extra = (' KoD' if s['kod'] else '') + (' bcast' if s['broadcast'] else '')
+                print(f"  {s['src']} stratum={strata} {'/'.join(s['modes'])}"
+                      f"{off}{extra}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ntp-selftest':
+        r = _ntp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"stratum={sc.get('stratum')} offset={sc.get('offset')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"NTP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'icmp-watch':
+        r = do_icmp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            c = r['counts']
+            print(f"ICMP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['icmp_count']} pkts @ {r['rate']}/s · "
+                  f"redir {c['redirect']} echo {c['echo']} irdp {c['irdp']} "
+                  f"recon {c['recon']})")
+            if r.get('learned'):
+                print("  (gateway baseline learned this run)")
+            if r.get('gateways'):
+                print(f"  trusted gateways: {', '.join(r['gateways'])}")
+            for rd in r.get('redirects', []):
+                tag = ' *MITM*' if rd['malicious'] else ''
+                print(f"  redirect {rd['src']} → {rd['dst']}: {rd['redirected']} "
+                      f"via {rd['new_gw']}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'icmp-selftest':
+        r = _icmp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"new_gw={sc.get('new_gw')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"ICMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'snmp-watch':
+        r = do_snmp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"SNMP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['snmp_count']} msgs @ {r['rate']}/s, "
+                  f"{'insecure v1/v2c' if r['insecure'] else 'v3-only'})")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for a in r.get('agents', []):
+                tag = ' *NEW*' if not a['baseline'] else ''
+                sec = ' SECURE' if a['secure'] else ''
+                wr = ' WRITE' if a['writes'] else ''
+                comm = (' comm=' + ','.join(a['communities'])) if a['communities'] else ''
+                print(f"  agent {a['ip']} {'/'.join(a['versions'])}{sec}{wr}{comm}{tag}")
+            for c in r.get('communities', []):
+                flags = (' DEFAULT' if c['default'] else '') + (' WRITE' if c['writes'] else '')
+                print(f"  community \"{c['community']}\" ({'/'.join(c['versions'])}, "
+                      f"x{c['count']}){flags}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'snmp-selftest':
+        r = _snmp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"communities={sc.get('communities')} write={sc.get('write')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"SNMP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'tls-watch':
+        r = do_tls_watch(targets=' '.join(args.targets or []), interface=args.iface,
+                         seconds=args.seconds, discover=args.discover,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"TLS Watch: {r['verdict'].upper()}  "
+                  f"({r.get('graded', 0)} graded"
+                  f"{', ' + str(r['discovered']) + ' discovered' if r.get('discovered') else ''})")
+            for t in r.get('targets', []):
+                head = f"  {t['target']}"
+                if t.get('sni'):
+                    head += f" (SNI {t['sni']})"
+                print(f"{head}: {t['verdict'].upper()}")
+                if t.get('status') == 'graded':
+                    print(f"      subject={t.get('subject')} issuer={t.get('issuer')} "
+                          f"{t.get('key')} {t.get('sig_alg')} {t.get('proto')} "
+                          f"valid→{t.get('not_after')} ({t.get('days_left')}d)")
+                for reason in t.get('reasons', []):
+                    print(f"      - {reason}")
+            for reason in r.get('reasons', []):
+                print(f"  {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'tls-selftest':
+        r = _tls_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            if r.get('error'):
+                print(f"  {r['error']}")
+            for s in r.get('scenarios', []):
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            e = r.get('e2e', {})
+            if e.get('ran'):
+                print(f"  [{'PASS' if e.get('pass') else 'FAIL'}] e2e-local-server: "
+                      f"verdict={e.get('verdict')} proto={e.get('proto')}")
+            else:
+                print(f"  [skip] e2e-local-server: {e.get('reason')}")
+            print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'relay-watch':
+        r = do_relay_watch(interface=args.iface, seconds=args.seconds,
+                           learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            sg = r.get('signing', {})
+            print(f"Relay/Coercion Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"(coercion: {len(r.get('coercion', []))}, relays: {len(r.get('relays', []))}, "
+                  f"unsigned servers: {len(sg.get('unsigned', []))})")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for c in r.get('coercion', []):
+                print(f"  COERCION {c['technique']} ({c['interface']}): "
+                      f"{c['attacker']} -> {c['victim']}")
+            for rel in r.get('relays', []):
+                print(f"  RELAY challenge {rel['challenge']} from {', '.join(rel['servers'])}")
+            for u in sg.get('unsigned', []):
+                print(f"  unsigned SMB: {u['ip']}{' (known)' if u['known'] else ''}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'relay-selftest':
+        r = _relay_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy round-trip: "
+                      f"{sc.get('scenarios_run')} scenarios")
+            else:
+                print(f"  [skip] scapy: {sc.get('reason')}")
+            print(f"Relay self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'smb-watch':
+        r = do_smb_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            smb = r.get('smb', {})
+            nr = r.get('nameres', {})
+            print(f"SMB Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"(SMBv1 servers: {len(smb.get('v1_servers', []))}, "
+                  f"SMB2/3 pkts: {smb.get('v2_count', 0)}; "
+                  f"name-res responders: {len(nr.get('responders', []))})")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for s in smb.get('v1_servers', []):
+                print(f"  SMBv1 {s['ip']} [{s['mode']}]{' known' if s['known'] else ''}")
+            for rp in nr.get('responders', []):
+                hv = ' WPAD!' if rp['highvalue'] else ''
+                print(f"  responder {rp['ip']} ({'/'.join(rp['protos'])}){hv} "
+                      f"-> {', '.join(rp['names'][:4]) or '(unnamed)'}")
+            q = nr.get('queries', {})
+            print(f"  queries: LLMNR {q.get('llmnr', 0)}, NBT-NS {q.get('nbtns', 0)}, "
+                  f"mDNS {q.get('mdns', 0)}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'smb-selftest':
+        r = _smb_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy round-trip: "
+                      f"{sc.get('scenarios_run')} scenarios")
+            else:
+                print(f"  [skip] scapy: {sc.get('reason')}")
+            print(f"SMB self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'isis-watch':
+        r = do_isis_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"IS-IS Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} PDUs, {r['router_count']} router(s), "
+                  f"{r['prefix_count']} prefix(es))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for rt in r.get('routers', []):
+                tag = '' if rt['baseline'] else ' *NEW*'
+                name = f"{rt['hostname']} " if rt['hostname'] else ''
+                print(f"  router {name}{rt['system_id']} area={','.join(rt['areas']) or '?'}"
+                      f" L{'/'.join(str(x) for x in rt['levels']) or '?'}"
+                      f" auth={rt['auth']}{tag}")
+            for p in r.get('prefixes', []):
+                mark = '' if p['status'] in ('known', 'learned') else f" [{p['status']}]"
+                print(f"    {p['pfx']} <- {p['origin_name']} (metric {p['metric']}){mark}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'isis-selftest':
+        r = _isis_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"sysid={sc.get('sysid')} prefix={sc.get('prefix')} "
+                      f"verdict={sc.get('verdict')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"IS-IS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'stp-watch':
+        r = do_stp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"STP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} BPDUs, {r['bridge_count']} bridge(s), "
+                  f"{r['instance_count']} instance(s); {r['tcn_count']} TCN)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for inst in r.get('instances', []):
+                mark = '' if inst['status'] in ('known', 'learned') else f" [{inst['status']}]"
+                print(f"  {inst['proto'].upper()} vlan/inst {inst['vlan']}: root "
+                      f"{inst['root_prio']}.{inst['root_mac']} via {inst['advertised_by']}{mark}")
+            for b in r.get('bridges', []):
+                tag = '' if b['baseline'] else ' *NEW*'
+                print(f"    bridge {b['mac']} ({b['proto']}){tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'stp-selftest':
+        r = _stp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"root_prio={sc.get('root_prio')} verdict={sc.get('verdict')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"STP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'dtp-watch':
+        r = do_dtp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"DTP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} frame(s), {r['speaker_count']} speaker(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for sp in r.get('speakers', []):
+                tag = '' if sp['baseline'] else ' *NEW*'
+                print(f"  {sp['src']} status={sp['status']}"
+                      f"{' TRUNK-FORMING' if sp['forming'] else ''}{tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'dtp-selftest':
+        r = _dtp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"src={sc.get('src')} status={sc.get('status')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"DTP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'eigrp-watch':
+        r = do_eigrp_watch(interface=args.iface, seconds=args.seconds,
+                           learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"EIGRP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} pkts, {r['router_count']} router(s), "
+                  f"{r['prefix_count']} prefix(es))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for rt in r.get('routers', []):
+                tag = '' if rt['baseline'] else ' *NEW*'
+                print(f"  router {rt['src']} AS={','.join(str(a) for a in rt['as']) or '?'}"
+                      f" auth={'yes' if rt['auth'] else 'NO'}{tag}")
+            for p in r.get('prefixes', []):
+                mark = '' if p['status'] in ('known', 'learned') else f" [{p['status']}]"
+                print(f"    {p['prefix']} via {p['nexthop']} ({p['kind']}){mark}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'eigrp-selftest':
+        r = _eigrp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"src={sc.get('src')} AS={sc.get('asn')} prefix={sc.get('prefix')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"EIGRP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'fhrp-watch':
+        r = do_fhrp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"FHRP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} pkts, {r['group_count']} group(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for g in r.get('groups', []):
+                print(f"  {g['proto'].upper()} group {g['group']} "
+                      f"(gw {', '.join(g['vips']) or '?'}, "
+                      f"auth {g['authtype'] or 'none'}{' WEAK' if g['auth_weak'] else ''})")
+                for sp in g['speakers']:
+                    tag = '' if sp['baseline'] else ' *NEW*'
+                    print(f"    {sp['src']} prio={sp['priority']}"
+                          f"{' ' + ','.join(sp['opcodes']) if sp['opcodes'] else ''}{tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'fhrp-selftest':
+        r = _fhrp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"protos={sc.get('protos')} hsrp_prio={sc.get('hsrp_prio')} "
+                      f"vrrp_prio={sc.get('vrrp_prio')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"FHRP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ospf-watch':

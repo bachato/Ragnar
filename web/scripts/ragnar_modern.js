@@ -1218,7 +1218,16 @@ function showNetworkSubtab(name) {
         loadLldp();
         _dhcpFillIfaces();
         _igmpFillIfaces();
+        _ipv6FillIfaces();
+        _icmpFillIfaces();
         _ospfFillIfaces();
+        _stpFillIfaces();
+        _smbFillIfaces();
+        _relayFillIfaces();
+        _dtpFillIfaces();
+        _eigrpFillIfaces();
+        _isisFillIfaces();
+        _fhrpFillIfaces();
         _bgpFillIfaces();
         dhcpSnoopStatus();
     } else if (name === 'interfaces') {
@@ -1229,6 +1238,9 @@ function showNetworkSubtab(name) {
         syncNetDiagDisplayFromServer();
         syncNetIntegrityFromServer();
         _macWatchFillIfaces();
+        _ntpFillIfaces();
+        _snmpFillIfaces();
+        _tlsFillIfaces();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
@@ -2290,27 +2302,50 @@ const _NETINT_STYLE = {
     starvation:  ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
     unknown:     ['bg-slate-800 border-slate-700 text-slate-400', '—'],
 };
+// A verdict is clean/informational, an active attack (critical, red), or — anything
+// else non-clean — a suspicious finding (amber). Mirrors the server's _ni_rank so the
+// chips colour every scanner's verdicts without enumerating them all.
+const _NETINT_CLEAN = new Set(['clean', 'unknown', 'ok', 'none', 'hardened', 'learned', 'n/a', 'no-traffic', 'disabled']);
+const _NETINT_CRITICAL = new Set(['hijacked', 'spoofed', 'rogue', 'starvation', 'compromised', 'root-hijack', 'bpdu-flood', 'vlan-hop', 'hijack', 'injection', 'rogue-router', 'poisoning', 'spoof-conflict', 'smbv1-active', 'coercion-attempt', 'relay-suspected', 'rogue-speaker', 'rogue-redirect', 'rogue-ra', 'rogue-irdp']);
+function _netintRank(verdict) {
+    const v = verdict || 'unknown';
+    if (_NETINT_CLEAN.has(v)) return 0;
+    if (_NETINT_CRITICAL.has(v)) return 2;
+    return 1;
+}
+function _netintStyleFor(verdict) {
+    if (_NETINT_STYLE[verdict]) return _NETINT_STYLE[verdict];
+    return [_NETINT_STYLE.clean, _NETINT_STYLE.suspicious, _NETINT_STYLE.compromised][_netintRank(verdict)];
+}
 function _netintChip(label, verdict) {
-    const [cls, icon] = _NETINT_STYLE[verdict] || _NETINT_STYLE.unknown;
+    const [cls, icon] = _netintStyleFor(verdict);
     return `<span class="px-2.5 py-1 rounded border ${cls}">${icon} ${label}: ${escapeHtml(verdict || 'unknown')}</span>`;
 }
 function renderNetIntegrity(d) {
     const out = document.getElementById('netint-status');
     if (!out) return;
     if (!d || d.success === false) { out.innerHTML = ''; return; }
-    const dnsV = (d.dns && d.dns.verdict) || 'unknown';
-    const arpV = (d.arp && d.arp.verdict) || 'unknown';
-    const dhcpV = (d.dhcp && d.dhcp.verdict) || 'unknown';
-    const chips = [_netintChip('Overall', d.overall || 'unknown'),
-                   _netintChip('DNS', dnsV), _netintChip('ARP', arpV),
-                   _netintChip('DHCP', dhcpV)].join(' ');
-    const reasons = [].concat((d.dns && d.dns.reasons) || [], (d.arp && d.arp.reasons) || [],
-                              (d.dhcp && d.dhcp.reasons) || []);
+    // Prefer the full per-check map (extended monitor); fall back to dns/arp/dhcp.
+    let entries;
+    if (d.checks && Object.keys(d.checks).length) {
+        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'igmp', 'ipv6', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'tls'];
+        entries = Object.keys(d.checks).sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99))
+            .map(k => [d.checks[k].label || k.toUpperCase(), d.checks[k].verdict, d.checks[k].reasons || []]);
+    } else {
+        entries = [['DNS', (d.dns && d.dns.verdict), (d.dns && d.dns.reasons) || []],
+                   ['ARP', (d.arp && d.arp.verdict), (d.arp && d.arp.reasons) || []],
+                   ['DHCP', (d.dhcp && d.dhcp.verdict), (d.dhcp && d.dhcp.reasons) || []]];
+    }
+    // Worst-first so bad findings lead.
+    entries.sort((a, b) => _netintRank(b[1]) - _netintRank(a[1]));
+    const chips = [_netintChip('Overall', d.overall || 'unknown')]
+        .concat(entries.map(e => _netintChip(e[0], e[1] || 'unknown'))).join(' ');
+    const reasons = [].concat(...entries.filter(e => _netintRank(e[1]) >= 1).map(e => e[2]));
     const when = d.ts ? new Date(d.ts).toLocaleString() : (d.monitor_enabled ? 'awaiting first check…' : 'monitor off');
-    let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}</span>`;
+    let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}${d.extended_enabled ? ' · extended (rotating passive scanners)' : ''}</span>`;
     if (reasons.length) {
         html += '<ul class="text-xs text-gray-400 w-full list-disc pl-5 mt-1">' +
-            reasons.slice(0, 3).map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+            reasons.slice(0, 4).map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
     }
     out.innerHTML = html;
 }
@@ -2362,9 +2397,13 @@ async function netIntegrityRefresh(force) {
 }
 async function syncNetIntegrityFromServer() {
     const cb = document.getElementById('netint-enabled');
+    const ext = document.getElementById('netint-extended');
+    const batch = document.getElementById('netint-batch');
     try {
         const d = await fetchAPI('/api/net/integrity');
         if (cb) cb.checked = !!d.monitor_enabled;
+        if (ext) ext.checked = d.extended_enabled !== false;
+        if (batch && d.batch_size) batch.value = d.batch_size;
         renderNetIntegrity(d);
     } catch (e) { /* offline */ }
 }
@@ -2378,6 +2417,21 @@ function onNetIntegrityToggled(cb) {
             addConsoleMessage('Failed to toggle integrity monitor: ' + err.message, 'error');
             cb.checked = !cb.checked;
         });
+}
+function onNetIntegrityExtendedToggled(cb) {
+    postAPI('/api/config', { net_integrity_extended_enabled: cb.checked })
+        .then(() => addConsoleMessage('Extended passive-suite monitoring ' + (cb.checked ? 'ON' : 'OFF'), 'info'))
+        .catch(err => {
+            addConsoleMessage('Failed to toggle extended monitoring: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+        });
+}
+function onNetIntegrityBatchChanged(el) {
+    const n = Math.max(1, Math.min(15, parseInt(el.value, 10) || 3));
+    el.value = n;
+    postAPI('/api/config', { net_integrity_batch_size: n })
+        .then(() => addConsoleMessage('Monitor rotation set to ' + n + ' scanner(s)/cycle', 'info'))
+        .catch(err => addConsoleMessage('Failed to set batch size: ' + err.message, 'error'));
 }
 async function netIntegrityTrustGateway() {
     try {
@@ -2629,6 +2683,611 @@ async function igmpTrustBaseline() {
     }
 }
 
+// ---- IPv6 RA Guard (host first-hop posture + hardening, active/local) -------
+const _RAGUARD_VERDICT_STYLE = {
+    hardened:        ['bg-green-950/40 border-green-900 text-green-400', '✓ Host hardened — ignores ICMPv6 Redirects and rogue RA preference'],
+    'ipv6-off':      ['bg-slate-800 border-slate-700 text-slate-400', '— IPv6 disabled — no IPv6 first-hop surface'],
+    'ra-open':       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Accepts RAs (SLAAC) — safe only with switch RA-Guard'],
+    'ra-pref-open':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Honours RA Router-Preference — a "pref high" rogue RA can hijack the route'],
+    'redirect-open': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Accepts ICMPv6 Redirects — open to a Layer-3 MITM'],
+    unknown:         ['bg-slate-800 border-slate-700 text-slate-400', '—'],
+};
+function _raguardRender(d, out) {
+    const [cls, label] = _RAGUARD_VERDICT_STYLE[d.verdict] || _RAGUARD_VERDICT_STYLE.unknown;
+    let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+    if (d.applied) {
+        const a = d.applied;
+        html += `<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-300 text-xs">Hardened: set ${a.live.length} sysctl(s)${a.persisted ? ', persisted to <span class="font-mono">' + escapeHtml(a.persisted) + '</span>' : ''}${(a.errors && a.errors.length) ? ' · <span class="text-red-300">' + a.errors.length + ' error(s)</span>' : ''}.</div>`;
+    }
+    const rows = d.interfaces || [];
+    const phys = rows.filter(r => !r.virtual);
+    const virt = rows.filter(r => r.virtual);
+    const fmt = r => {
+        const [c] = _RAGUARD_VERDICT_STYLE[r.verdict] || _RAGUARD_VERDICT_STYLE.unknown;
+        const badge = `<span class="px-1.5 py-0.5 rounded border text-[10px] ${c}">${escapeHtml(r.verdict)}</span>`;
+        const red = v => v === 1 ? 'text-red-300' : 'text-gray-400';
+        return `<tr class="border-t border-slate-800">
+            <td class="px-2 py-1 font-mono ${r.virtual ? 'text-gray-500' : 'text-gray-200'}">${escapeHtml(r.iface)}</td>
+            <td class="px-2 py-1">${badge}</td>
+            <td class="px-2 py-1 font-mono ${red(r.accept_redirects)}">${r.accept_redirects}</td>
+            <td class="px-2 py-1 font-mono ${red(r.accept_ra_rtr_pref)}">${r.accept_ra_rtr_pref}</td>
+            <td class="px-2 py-1 font-mono text-gray-400">${r.accept_ra}</td>
+        </tr>`;
+    };
+    if (rows.length) {
+        html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+            '<tr class="text-left text-gray-500"><th class="px-2 py-1">Interface</th><th class="px-2 py-1">Grade</th><th class="px-2 py-1">accept_redirects</th><th class="px-2 py-1">rtr_pref</th><th class="px-2 py-1">accept_ra</th></tr>' +
+            '</thead><tbody>' + phys.map(fmt).join('');
+        if (virt.length) {
+            html += `<tr class="border-t border-slate-800"><td colspan="5" class="px-2 py-1"><button onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'" class="text-cyan-400 underline text-xs">${virt.length} virtual/container interface(s) ▸</button><span style="display:none"></span></td></tr>`;
+            html += '<tr style="display:none" class="virt-rows"><td colspan="5" class="p-0"><table class="min-w-full text-xs"><tbody>' + virt.map(fmt).join('') + '</tbody></table></td></tr>';
+        }
+        html += '</tbody></table>';
+    }
+    const gws = d.gateways || [];
+    if (gws.length) {
+        html += '<p class="text-xs text-gray-500 mt-2">Accepted IPv6 gateway(s): ' +
+            gws.map(g => `<span class="font-mono text-gray-300">${escapeHtml(g.gw)}</span> dev ${escapeHtml(g.dev)}${g.from_ra ? ' <span class="text-amber-300">(from RA)</span>' : ''}`).join(', ') + '</p>';
+    }
+    if (d.reasons && d.reasons.length) {
+        html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+            d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+    }
+    if (d.needs_hardening && !d.applied) {
+        html += '<p class="text-xs text-amber-300 mt-2">Click <strong>Harden host</strong> to close these (sets accept_redirects=0 and accept_ra_rtr_pref=0; leaves accept_ra alone).</p>';
+    }
+    if (d.advisories && d.advisories.length) {
+        html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+            d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+    }
+    out.innerHTML = html;
+}
+async function runRaGuard() {
+    const out = document.getElementById('raguard-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, 'Reading…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Reading IPv6 first-hop posture…</p>';
+    try {
+        const d = await fetchAPI('/api/net/raguard');
+        if (!d || d.success === false) { out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>'; return; }
+        _raguardRender(d, out);
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally { _ndBusy(btn, false); }
+}
+async function raGuardHarden() {
+    if (!confirm('Harden this host\'s IPv6 first-hop settings?\n\nSets accept_redirects=0 and accept_ra_rtr_pref=0 (live + persisted to /etc/sysctl.d). accept_ra is left untouched, so SLAAC connectivity keeps working.')) return;
+    const out = document.getElementById('raguard-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    _ndBusy(btn, true, 'Hardening…');
+    out.classList.remove('hidden');
+    try {
+        const d = await postAPI('/api/net/raguard', { action: 'harden' });
+        if (!d || d.success === false) { out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>'; return; }
+        addConsoleMessage('IPv6 RA Guard: host hardened (accept_redirects=0, accept_ra_rtr_pref=0)', 'success');
+        _raguardRender(d, out);
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally { _ndBusy(btn, false); }
+}
+
+// ---- IPv6 First-Hop Watch (rogue RA / DHCPv6, passive) ---------------------
+const _IPV6_VERDICT_STYLE = {
+    clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No rogue IPv6 first-hop activity detected'],
+    anomaly:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ IPv6 first-hop anomaly — conflicting / deprecating RA'],
+    'rogue-dhcpv6': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue DHCPv6 server — mitm6 DNS-takeover signature'],
+    'rogue-redirect':['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue ICMPv6 Redirect — Layer-3 IPv6 MITM'],
+    'rogue-ra':     ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue Router Advertisement — SLAAC gateway/DNS takeover'],
+    storm:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 Router Advertisement flood (RA-flood DoS)'],
+    unknown:        ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _ipv6FillIfaces() {
+    const sel = document.getElementById('ipv6-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runIpv6Watch() {
+    const out = document.getElementById('ipv6-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('ipv6-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('ipv6-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '12';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing RA / DHCPv6 on the segment…</p>';
+    try {
+        _ipv6FillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/ipv6-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runIpv6Watch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _IPV6_VERDICT_STYLE[d.verdict] || _IPV6_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.ra_count} RA (${d.rate}/s) · ${d.dhcp6_count} DHCPv6${d.redirect_count ? ' · ' + d.redirect_count + ' redirect' : ''}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        const routers = d.routers || [];
+        if (routers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">RA routers (' + routers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Router (link-local)</th><th class="px-2 py-1">Pref</th><th class="px-2 py-1">Lifetime</th><th class="px-2 py-1">Prefix</th><th class="px-2 py-1">DNS (RDNSS)</th><th class="px-2 py-1">Trust</th></tr>' +
+                '</thead><tbody>' +
+                routers.map(r => {
+                    const rogue = !r.baseline;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${rogue ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(r.src)}${r.mac ? ' <span class="text-gray-500">' + escapeHtml(r.mac) + '</span>' : ''}</td>
+                        <td class="px-2 py-1 ${r.pref === 'high' ? 'text-amber-300' : 'text-gray-400'}">${escapeHtml(r.pref)}</td>
+                        <td class="px-2 py-1 ${r.lifetime === 0 ? 'text-amber-300' : 'text-gray-400'}">${r.lifetime == null ? '—' : r.lifetime + 's'}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((r.prefixes || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((r.rdnss || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${rogue ? '<span class="text-red-300">ROGUE</span>' : '<span class="text-gray-500">trusted</span>'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        const servers = d.dhcp6_servers || [];
+        if (servers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">DHCPv6 servers (' + servers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Server</th><th class="px-2 py-1">Messages</th><th class="px-2 py-1">DNS offered</th><th class="px-2 py-1">Trust</th></tr>' +
+                '</thead><tbody>' +
+                servers.map(s => {
+                    const rogue = !s.baseline;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${rogue ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(s.src)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((s.msgtypes || []).join(', '))}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((s.dns || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${rogue ? '<span class="text-red-300">ROGUE</span>' : '<span class="text-gray-500">trusted</span>'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function ipv6TrustBaseline() {
+    try {
+        await postAPI('/api/net/ipv6-baseline', { action: 'reset' });
+        addConsoleMessage('IPv6 baseline reset — re-learning current RA router(s) / DHCPv6 server(s)', 'info');
+        await runIpv6Watch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset IPv6 baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- NTP Watch (passive rogue time-source / clock-injection) ---------------
+const _NTP_VERDICT_STYLE = {
+    clean:            ['bg-green-950/40 border-green-900 text-green-400', '✓ No rogue NTP activity — time sources agree'],
+    anomaly:          ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ NTP anomaly — unreliable / forged time source'],
+    recon:            ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ NTP mode 6/7 (ntpq / monlist) recon or amplification'],
+    broadcast:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Rogue NTP broadcast time source on the segment'],
+    'stratum-spoof':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ NTP stratum spoofing — forged Stratum-1 / preference grab'],
+    kod:              ['bg-red-950/60 border-red-800 text-red-300', '🛑 NTP Kiss-o\'-Death — time-sync DoS'],
+    'rogue-server':   ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue NTP server answering on the segment'],
+    'time-injection': ['bg-red-950/60 border-red-800 text-red-300', '🛑 NTP time injection — a source is serving a skewed clock'],
+    unknown:          ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _ntpFillIfaces() {
+    const sel = document.getElementById('ntp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runNtpWatch() {
+    const out = document.getElementById('ntp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('ntp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('ntp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing NTP (UDP/123) on the segment…</p>';
+    try {
+        _ntpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/ntp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runNtpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _NTP_VERDICT_STYLE[d.verdict] || _NTP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.server_count} source(s) · ${d.packet_count} pkts (${d.rate}/s)${d.control_count ? ' · ' + d.control_count + ' mode-6/7' : ''}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        const servers = d.servers || [];
+        if (servers.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Time sources (' + servers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Server</th><th class="px-2 py-1">Mode</th><th class="px-2 py-1">Stratum</th><th class="px-2 py-1">Offset</th><th class="px-2 py-1">Ref-ID</th><th class="px-2 py-1">Trust</th></tr>' +
+                '</thead><tbody>' +
+                servers.map(s => {
+                    const rogue = !s.baseline;
+                    const off = (s.offset == null) ? '—' : (s.offset >= 0 ? '+' : '') + s.offset.toFixed(3) + 's';
+                    const bigOff = (s.offset != null && Math.abs(s.offset) > 2);
+                    const strata = (s.strata || []).join(',') || '—';
+                    const stCls = (s.kod || (s.strata || []).indexOf(0) !== -1) ? 'text-red-300' : ((s.strata || []).indexOf(1) !== -1 ? 'text-amber-300' : 'text-gray-400');
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${rogue ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(s.src)}${s.broadcast ? ' <span class="text-amber-300">bcast</span>' : ''}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((s.modes || []).join(', '))}</td>
+                        <td class="px-2 py-1 ${stCls}">${strata}${s.kod ? ' KoD' : ''}</td>
+                        <td class="px-2 py-1 font-mono ${bigOff ? 'text-red-300' : 'text-gray-400'}">${off}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((s.refids || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${rogue ? '<span class="text-red-300">ROGUE</span>' : '<span class="text-gray-500">trusted</span>'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function ntpTrustBaseline() {
+    try {
+        await postAPI('/api/net/ntp-baseline', { action: 'reset' });
+        addConsoleMessage('NTP baseline reset — re-learning current time source(s)', 'info');
+        await runNtpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset NTP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- ICMP Watch (passive ICMP-redirect / L3 route injection) ---------------
+const _ICMP_VERDICT_STYLE = {
+    clean:         ['bg-green-950/40 border-green-900 text-green-400', '✓ No ICMP redirects / injections / floods detected'],
+    anomaly:       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ ICMP anomaly — a redirect/IRDP from a known gateway (verify)'],
+    recon:         ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ ICMP reconnaissance — timestamp / address-mask / info requests'],
+    tunnel:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ ICMP tunnelling — oversized echo payloads (covert channel / exfil)'],
+    flood:         ['bg-red-950/60 border-red-800 text-red-300', '🛑 ICMP flood — ping-flood / smurf DoS'],
+    'rogue-irdp':  ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue IRDP router advertisement — gateway injection'],
+    redirect:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 ICMP Redirect — Layer-3 man-in-the-middle (route injection)'],
+    unknown:       ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _icmpFillIfaces() {
+    const sel = document.getElementById('icmp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runIcmpWatch() {
+    const out = document.getElementById('icmp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('icmp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('icmp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '12';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing ICMP on the segment…</p>';
+    try {
+        _icmpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/icmp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runIcmpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _ICMP_VERDICT_STYLE[d.verdict] || _ICMP_VERDICT_STYLE.unknown;
+        const c = d.counts || {};
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.icmp_count} pkts (${d.rate}/s) · redirect ${c.redirect || 0} · echo ${c.echo || 0} · IRDP ${c.irdp || 0} · recon ${c.recon || 0}${d.learned ? ' · <span class="text-gray-400">gateway baseline learned now</span>' : ''}</p>`;
+        if ((d.gateways || []).length) {
+            html += `<p class="text-xs text-gray-500 mb-2">Trusted gateway(s): <span class="font-mono text-gray-400">${escapeHtml(d.gateways.join(', '))}</span></p>`;
+        }
+        const redirects = d.redirects || [];
+        if (redirects.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">ICMP redirects (' + redirects.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Source</th><th class="px-2 py-1">Told</th><th class="px-2 py-1">For destination</th><th class="px-2 py-1">Use next-hop</th><th class="px-2 py-1">Verdict</th></tr>' +
+                '</thead><tbody>' +
+                redirects.map(r => {
+                    const mal = r.malicious;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${mal ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(r.src)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(r.dst)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(r.redirected || '—')}</td>
+                        <td class="px-2 py-1 font-mono ${mal ? 'text-red-300' : 'text-gray-400'}">${escapeHtml(r.new_gw || '—')}</td>
+                        <td class="px-2 py-1">${mal ? '<span class="text-red-300">MITM</span>' : '<span class="text-gray-500">benign</span>'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function icmpTrustBaseline() {
+    try {
+        await postAPI('/api/net/icmp-baseline', { action: 'reset' });
+        addConsoleMessage('ICMP baseline reset — re-seeding from the current default gateway', 'info');
+        await runIcmpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset ICMP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- SNMP Watch (passive v1/v2c cleartext-community exposure) --------------
+const _SNMP_VERDICT_STYLE = {
+    clean:           ['bg-green-950/40 border-green-900 text-green-400', '✓ Only SNMPv3 (or no SNMP) — authenticated/encrypted'],
+    enumeration:     ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ SNMP enumeration — a host is walking the MIB (recon)'],
+    amplification:   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ SNMP GetBulk amplification — reflection-DDoS vector'],
+    cleartext:       ['bg-red-950/60 border-red-800 text-red-300', '🛑 SNMP v1/v2c — community string exposed in cleartext'],
+    'write-exposed': ['bg-red-950/60 border-red-800 text-red-300', '🛑 SNMP write community on the wire — device takeover risk'],
+    unknown:         ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _snmpFillIfaces() {
+    const sel = document.getElementById('snmp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runSnmpWatch() {
+    const out = document.getElementById('snmp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('snmp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('snmp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '12';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing SNMP (UDP 161/162) on the segment…</p>';
+    try {
+        _snmpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/snmp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runSnmpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _SNMP_VERDICT_STYLE[d.verdict] || _SNMP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.snmp_count} msgs (${d.rate}/s) · ${d.insecure ? '<span class="text-red-300">insecure v1/v2c present</span>' : 'v3-only'}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        const agents = d.agents || [];
+        if (agents.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">SNMP agents (' + agents.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Agent</th><th class="px-2 py-1">Version</th><th class="px-2 py-1">Community</th><th class="px-2 py-1">Write</th><th class="px-2 py-1">State</th></tr>' +
+                '</thead><tbody>' +
+                agents.map(a => {
+                    const insec = !a.secure;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${insec ? 'text-red-300' : 'text-green-400'}">${escapeHtml(a.ip)}</td>
+                        <td class="px-2 py-1 ${a.secure ? 'text-green-400' : 'text-red-300'}">${escapeHtml((a.versions || []).join(', '))}${a.secure ? ' 🔒' : ''}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((a.communities || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${a.writes ? '<span class="text-red-300">RW</span>' : '<span class="text-gray-500">—</span>'}</td>
+                        <td class="px-2 py-1">${a.baseline ? '<span class="text-gray-500">known</span>' : '<span class="text-amber-300">NEW</span>'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        const comms = d.communities || [];
+        if (comms.length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Community strings exposed (' + comms.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Community</th><th class="px-2 py-1">Version</th><th class="px-2 py-1">Seen</th><th class="px-2 py-1">Notes</th></tr>' +
+                '</thead><tbody>' +
+                comms.map(c => {
+                    const notes = [];
+                    if (c.default) notes.push('<span class="text-amber-300">default/guessable</span>');
+                    if (c.writes) notes.push('<span class="text-red-300">write</span>');
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono text-red-300">"${escapeHtml(c.community)}"</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((c.versions || []).join(', '))}</td>
+                        <td class="px-2 py-1 text-gray-400">×${c.count}</td>
+                        <td class="px-2 py-1">${notes.join(', ') || '—'}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function snmpTrustBaseline() {
+    try {
+        await postAPI('/api/net/snmp-baseline', { action: 'reset' });
+        addConsoleMessage('SNMP baseline reset — re-learning current agents / community strings', 'info');
+        await runSnmpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset SNMP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- TLS Watch (active certificate & TLS hygiene checker) ------------------
+const _TLS_VERDICT_STYLE = {
+    valid:              ['bg-green-950/40 border-green-900 text-green-400', '✓ valid'],
+    clean:              ['bg-green-950/40 border-green-900 text-green-400', '✓ All certificates valid, trusted and in-date'],
+    expiring:           ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ expiring soon'],
+    'deprecated-tls':   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ deprecated TLS'],
+    'weak-crypto':      ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ weak crypto'],
+    'hostname-mismatch':['bg-red-950/60 border-red-800 text-red-300', '🛑 hostname mismatch'],
+    untrusted:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 untrusted chain'],
+    'self-signed':      ['bg-red-950/60 border-red-800 text-red-300', '🛑 self-signed'],
+    'not-yet-valid':    ['bg-red-950/60 border-red-800 text-red-300', '🛑 not yet valid'],
+    expired:            ['bg-red-950/60 border-red-800 text-red-300', '🛑 EXPIRED'],
+    unreachable:        ['bg-slate-800 border-slate-700 text-slate-400', '— unreachable / not TLS'],
+    unknown:            ['bg-slate-800 border-slate-700 text-slate-400', '—'],
+};
+function _tlsBadge(v) {
+    const [cls, label] = _TLS_VERDICT_STYLE[v] || _TLS_VERDICT_STYLE.unknown;
+    return `<span class="px-2 py-0.5 rounded border text-xs ${cls}">${label}</span>`;
+}
+function _tlsFillIfaces() {
+    const sel = document.getElementById('tls-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runTlsWatch() {
+    const out = document.getElementById('tls-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const targets = (document.getElementById('tls-targets') || {}).value || '';
+    const discover = !!(document.getElementById('tls-discover') || {}).checked;
+    const ifaceSel = document.getElementById('tls-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('tls-secs');
+    const secs = secsEl && secsEl.value ? parseInt(secsEl.value, 10) : 8;
+    if (!targets.trim() && !discover) {
+        out.classList.remove('hidden');
+        out.innerHTML = '<p class="text-sm text-amber-300">Enter one or more host[:port] targets, or tick Discover.</p>';
+        return;
+    }
+    _ndBusy(btn, true, discover ? 'Discovering + grading…' : 'Grading…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Completing TLS handshakes and grading certificates…</p>';
+    try {
+        _tlsFillIfaces();
+        const d = await postAPI('/api/net/tls-watch', { targets, discover, interface: iface, seconds: secs });
+        if (!d || d.success === false) {
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
+            return;
+        }
+        const [cls, label] = _TLS_VERDICT_STYLE[d.verdict] || _TLS_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${escapeHtml((d.reasons && d.reasons[0]) || label)}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">${d.graded || 0} graded${d.discovered ? ' · ' + d.discovered + ' discovered passively' : ''}${d.discover_error ? ' · <span class="text-amber-300">discovery: ' + escapeHtml(d.discover_error) + '</span>' : ''}</p>`;
+        const rows = d.targets || [];
+        if (rows.length) {
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Target</th><th class="px-2 py-1">Verdict</th><th class="px-2 py-1">Expires</th><th class="px-2 py-1">Key / Sig</th><th class="px-2 py-1">TLS</th><th class="px-2 py-1">Finding</th></tr>' +
+                '</thead><tbody>' +
+                rows.map(t => {
+                    const graded = t.status === 'graded';
+                    const exp = graded ? `${escapeHtml(t.not_after || '?')} <span class="${t.days_left < 0 ? 'text-red-300' : t.days_left <= 21 ? 'text-amber-300' : 'text-gray-500'}">(${t.days_left}d)</span>` : '—';
+                    const keysig = graded ? `${escapeHtml(t.key || '?')} / ${escapeHtml((t.sig_alg || '').toUpperCase())}` : '—';
+                    const proto = graded ? escapeHtml(t.proto || '?') : '—';
+                    const finding = escapeHtml((t.reasons || [])[0] || '');
+                    const sni = t.sni ? ` <span class="text-gray-500">SNI ${escapeHtml(t.sni)}</span>` : '';
+                    return `<tr class="border-t border-slate-800 align-top">
+                        <td class="px-2 py-1 font-mono text-gray-200">${escapeHtml(t.target)}${sni}${t.cert_changed ? ' <span class="text-red-300">⟳changed</span>' : ''}</td>
+                        <td class="px-2 py-1">${_tlsBadge(t.verdict)}</td>
+                        <td class="px-2 py-1 font-mono">${exp}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${keysig}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${proto}</td>
+                        <td class="px-2 py-1 text-gray-400">${finding}</td>
+                    </tr>`;
+                }).join('') + '</tbody></table>';
+        }
+        if (d.advisories && d.advisories.length) {
+            html += '<ul class="text-xs text-cyan-400/80 mt-2 list-disc pl-5">' +
+                d.advisories.map(a => '<li>' + escapeHtml(a) + '</li>').join('') + '</ul>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function tlsTrustBaseline() {
+    try {
+        await postAPI('/api/net/tls-baseline', { action: 'reset' });
+        addConsoleMessage('TLS cert-fingerprint baseline reset — re-learning on the next scan', 'info');
+        await runTlsWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset TLS baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- OSPF Security Scanner (passive) ---------------------------------------
 const _OSPF_VERDICT_STYLE = {
     clean:     ['bg-green-950/40 border-green-900 text-green-400', '✓ No OSPF anomalies detected'],
@@ -2732,6 +3391,712 @@ async function ospfTrustBaseline() {
         await runOspfWatch();
     } catch (e) {
         addConsoleMessage('Failed to reset OSPF baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- STP/BPDU Watch (passive spanning-tree security scanner) ----------------
+const _STP_VERDICT_STYLE = {
+    clean:              ['bg-green-950/40 border-green-900 text-green-400', '✓ Spanning-tree root(s) and bridges match the baseline'],
+    'topology-change':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Topology-change churn — MAC tables being flushed (instability / TCN flood)'],
+    'bpdu-flood':       ['bg-red-950/60 border-red-800 text-red-300', '🛑 BPDU flood — spanning-tree reconvergence storm (DoS)'],
+    'rogue-bridge':     ['bg-red-950/60 border-red-800 text-red-300', '🛑 New STP bridge on the segment — unexpected switch / spoofed bridge'],
+    'root-hijack':      ['bg-red-950/60 border-red-800 text-red-300', '🛑 ROOT HIJACK — a superior BPDU is taking over the root bridge (L2 MITM)'],
+    unknown:            ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _stpFillIfaces() {
+    const sel = document.getElementById('stp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runStpWatch() {
+    const out = document.getElementById('stp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('stp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('stp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '20';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing BPDUs (hellos are ~2s apart)…</p>';
+    try {
+        _stpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/stp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runStpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _STP_VERDICT_STYLE[d.verdict] || _STP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} BPDUs, ${d.bridge_count} bridge(s), ${d.instance_count} instance(s) @ ${d.rate}/s · ${d.tcn_count} TCN${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.instances || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Root bridge per instance</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Proto</th><th class="px-2 py-1">VLAN/inst</th><th class="px-2 py-1">Advertised root</th><th class="px-2 py-1">By</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.instances.map(i => {
+                    const bad = (i.status === 'hijacked' || i.status === 'new');
+                    const st = bad ? `<span class="text-red-300">${escapeHtml(i.status)}</span>` : `<span class="text-gray-500">${escapeHtml(i.status)}</span>`;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(i.proto)}</td>
+                        <td class="px-2 py-1 font-mono">${i.vlan}</td>
+                        <td class="px-2 py-1 font-mono ${bad ? 'text-red-300' : ''}">${i.root_prio == null ? '—' : i.root_prio}.${escapeHtml(i.root_mac || '?')}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(i.advertised_by || '—')}</td>
+                        <td class="px-2 py-1">${st}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if ((d.bridges || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Bridges seen (' + d.bridges.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Bridge MAC</th><th class="px-2 py-1">Proto</th><th class="px-2 py-1">Role(s)</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.bridges.map(b => {
+                    const badge = b.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${b.baseline ? '' : 'text-amber-300'}">${escapeHtml(b.mac)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(b.proto)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((b.roles || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function stpTrustBaseline() {
+    try {
+        await postAPI('/api/net/stp-baseline', { action: 'reset' });
+        addConsoleMessage('STP baseline reset — re-learning current root(s) & bridges', 'info');
+        await runStpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset STP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- Relay/Coercion Watch (NTLM relay + auth coercion defense) --------------
+const _RELAY_VERDICT_STYLE = {
+    clean:                  ['bg-green-950/40 border-green-900 text-green-400', '✓ No coercion, relay, or unsigned-SMB negotiation'],
+    'signing-not-required': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ SMB signing not required — captured/coerced NTLM is relayable'],
+    'relay-suspected':      ['bg-red-950/60 border-red-800 text-red-300', '🛑 NTLM RELAY suspected — one challenge replayed across servers'],
+    'coercion-attempt':     ['bg-red-950/60 border-red-800 text-red-300', '🛑 COERCION — a host is being forced to authenticate (PetitPotam/PrinterBug/…)'],
+    unknown:                ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _relayFillIfaces() {
+    const sel = document.getElementById('relay-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runRelayWatch() {
+    const out = document.getElementById('relay-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('relay-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('relay-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '20';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing MSRPC/SMB for coercion + relay…</p>';
+    try {
+        _relayFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/relay-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runRelayWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _RELAY_VERDICT_STYLE[d.verdict] || _RELAY_VERDICT_STYLE.unknown;
+        const sg = d.signing || {};
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · coercion: ${(d.coercion || []).length}, relays: ${(d.relays || []).length}, unsigned servers: ${(sg.unsigned || []).length}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.coercion || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Coercion attempts</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Technique</th><th class="px-2 py-1">Interface</th><th class="px-2 py-1">Attacker</th><th class="px-2 py-1">Victim</th></tr>' +
+                '</thead><tbody>' +
+                d.coercion.map(c => `<tr class="border-t border-slate-800">
+                    <td class="px-2 py-1 text-red-300">${escapeHtml(c.technique)}</td>
+                    <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(c.interface)}</td>
+                    <td class="px-2 py-1 font-mono">${escapeHtml(c.attacker)}</td>
+                    <td class="px-2 py-1 font-mono">${escapeHtml(c.victim)}</td>
+                </tr>`).join('') +
+                '</tbody></table>';
+        }
+        (d.relays || []).forEach(r => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-red-300 border-red-800 bg-red-950/40">NTLM challenge <span class="font-mono">${escapeHtml(r.challenge)}</span> seen from <span class="font-mono">${escapeHtml((r.servers || []).join(', '))}</span> — relay in progress</div>`;
+        });
+        if ((sg.unsigned || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">SMB signing not required</p>' +
+                '<div class="text-xs font-mono text-amber-300">' +
+                sg.unsigned.map(u => escapeHtml(u.ip) + (u.known ? ' <span class="text-gray-500">(known)</span>' : '')).join(', ') +
+                '</div>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function relayTrustBaseline() {
+    try {
+        await postAPI('/api/net/relay-baseline', { action: 'reset' });
+        addConsoleMessage('Relay baseline reset — re-learning unsigned SMB servers', 'info');
+        await runRelayWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset relay baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning / Responder) ------------
+const _SMB_VERDICT_STYLE = {
+    clean:            ['bg-green-950/40 border-green-900 text-green-400', '✓ No SMBv1 and no name-resolution poisoning'],
+    'name-exposure':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ LLMNR/NBT-NS in use — hosts are exposed to Responder poisoning'],
+    'smbv1-offered':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ SMBv1 offered in negotiation — disable the fallback'],
+    'spoof-conflict': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Conflicting name answers — a poisoner racing the real owner'],
+    'smbv1-active':   ['bg-red-950/60 border-red-800 text-red-300', '🛑 SMBv1 in active use — EternalBlue/WannaCry (MS17-010) vector'],
+    poisoning:        ['bg-red-950/60 border-red-800 text-red-300', '🛑 NAME POISONING — a host is answering LLMNR/NBT-NS (Responder/Inveigh)'],
+    unknown:          ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _smbFillIfaces() {
+    const sel = document.getElementById('smb-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runSmbWatch() {
+    const out = document.getElementById('smb-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('smb-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('smb-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '20';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing SMB + LLMNR/NBT-NS/mDNS…</p>';
+    try {
+        _smbFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/smb-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runSmbWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _SMB_VERDICT_STYLE[d.verdict] || _SMB_VERDICT_STYLE.unknown;
+        const smb = d.smb || {}, nr = d.nameres || {}, q = nr.queries || {};
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · SMBv1 servers: ${(smb.v1_servers || []).length}, SMB2/3 pkts: ${smb.v2_count || 0} · responders: ${(nr.responders || []).length} · queries L${q.llmnr || 0}/N${q.nbtns || 0}/m${q.mdns || 0}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((smb.v1_servers || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">SMBv1 servers</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Host</th><th class="px-2 py-1">Mode</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                smb.v1_servers.map(s => {
+                    const mode = s.mode === 'active' ? '<span class="text-red-300">active</span>' : '<span class="text-amber-300">offered</span>';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono">${escapeHtml(s.ip)}</td>
+                        <td class="px-2 py-1">${mode}</td>
+                        <td class="px-2 py-1">${s.known ? '<span class="text-gray-500">known legacy</span>' : '<span class="text-amber-300">seen</span>'}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if ((nr.responders || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Name-resolution responders</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Responder</th><th class="px-2 py-1">Proto</th><th class="px-2 py-1">Answered names</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                nr.responders.map(r => {
+                    const poison = (r.protos || []).some(p => p === 'llmnr' || p === 'nbtns') || r.highvalue.length;
+                    const badge = poison ? '<span class="text-red-300">poisoner</span>' : (r.known ? '<span class="text-green-400">known mDNS</span>' : '<span class="text-amber-300">mDNS</span>');
+                    const names = (r.names || []).join(', ') + (r.highvalue.length ? ' ⚠WPAD' : '');
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${poison ? 'text-red-300' : ''}">${escapeHtml(r.ip)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((r.protos || []).join('/').toUpperCase())}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(names || '—')}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        (nr.conflicts || []).forEach(c => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-red-300 border-red-800 bg-red-950/40">Name <span class="font-mono">${escapeHtml(c.name)}</span> answered with conflicting IPs: <span class="font-mono">${escapeHtml((c.answers || []).join(', '))}</span></div>`;
+        });
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function smbTrustBaseline() {
+    try {
+        await postAPI('/api/net/smb-baseline', { action: 'reset' });
+        addConsoleMessage('SMB baseline reset — re-learning mDNS responders & SMBv1 hosts', 'info');
+        await runSmbWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset SMB baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- DTP Watch (passive VLAN-hopping / switch-spoofing scanner) -------------
+const _DTP_VERDICT_STYLE = {
+    clean:               ['bg-green-950/40 border-green-900 text-green-400', '✓ No DTP trunk negotiation — ports are not forming trunks here'],
+    'dtp-enabled':       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ DTP is enabled on this segment — disable with `switchport nonegotiate`'],
+    'trunk-negotiation': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ DTP is negotiating trunks — a rogue host could VLAN-hop'],
+    'vlan-hop':          ['bg-red-950/60 border-red-800 text-red-300', '🛑 VLAN HOP — trunk-forming DTP from a new speaker (switch spoofing)'],
+    unknown:             ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _dtpFillIfaces() {
+    const sel = document.getElementById('dtp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runDtpWatch() {
+    const out = document.getElementById('dtp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('dtp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('dtp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '30';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing DTP frames (hellos are ~30s apart)…</p>';
+    try {
+        _dtpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/dtp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runDtpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _DTP_VERDICT_STYLE[d.verdict] || _DTP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} DTP frame(s), ${d.speaker_count} speaker(s)${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.speakers || []).length) {
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Speaker MAC</th><th class="px-2 py-1">Status</th><th class="px-2 py-1">Trunk?</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.speakers.map(sp => {
+                    const badge = sp.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    const forming = sp.forming ? '<span class="text-red-300">forming</span>' : '<span class="text-gray-500">no</span>';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${sp.baseline ? '' : 'text-amber-300'}">${escapeHtml(sp.src)}</td>
+                        <td class="px-2 py-1 font-mono">${escapeHtml(sp.status)}</td>
+                        <td class="px-2 py-1">${forming}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function dtpTrustBaseline() {
+    try {
+        await postAPI('/api/net/dtp-baseline', { action: 'reset' });
+        addConsoleMessage('DTP baseline reset — re-learning current DTP speakers', 'info');
+        await runDtpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset DTP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- IS-IS Watch (passive IGP routing-security scanner) --------------------
+const _ISIS_VERDICT_STYLE = {
+    clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No IS-IS anomalies detected'],
+    'weak-auth':    ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ IS-IS without HMAC auth (or cleartext) — exposed to LSP injection'],
+    anomaly:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ IS-IS anomaly — duplicate system-id / new area'],
+    storm:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 IS-IS flooding storm detected'],
+    'rogue-router': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue IS-IS speaker — adjacency spoofing'],
+    injection:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 IS-IS LSP / prefix injection detected'],
+    unknown:        ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _isisFillIfaces() {
+    const sel = document.getElementById('isis-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runIsisWatch() {
+    const out = document.getElementById('isis-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('isis-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('isis-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '20';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing IS-IS on the segment…</p>';
+    try {
+        _isisFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/isis-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runIsisWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _ISIS_VERDICT_STYLE[d.verdict] || _ISIS_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} IS-IS PDUs, ${d.router_count} router(s), ${d.prefix_count} prefix(es) @ ${d.rate}/s${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.routers || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">IS-IS routers (' + d.routers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Router</th><th class="px-2 py-1">Area</th><th class="px-2 py-1">Level</th><th class="px-2 py-1">Auth</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.routers.map(r => {
+                    const badge = r.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    const weak = (r.auth === 'none/cleartext' || r.auth === 'cleartext' || r.auth === 'none');
+                    const auth = weak ? `<span class="text-amber-300">${escapeHtml(r.auth)}</span>` : `<span class="text-green-400">${escapeHtml(r.auth)}</span>`;
+                    const name = r.hostname ? `<span class="text-gray-200">${escapeHtml(r.hostname)}</span> <span class="text-gray-500">${escapeHtml(r.system_id)}</span>` : `<span class="font-mono">${escapeHtml(r.system_id)}</span>`;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 ${r.baseline ? '' : 'text-amber-300'}">${name}</td>
+                        <td class="px-2 py-1 font-mono">${(r.areas || []).join(', ') || '?'}</td>
+                        <td class="px-2 py-1 text-gray-400">L${(r.levels || []).join('/') || '?'}</td>
+                        <td class="px-2 py-1">${auth}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if ((d.prefixes || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Advertised prefixes (' + d.prefixes.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Prefix</th><th class="px-2 py-1">Originator</th><th class="px-2 py-1">Metric</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.prefixes.map(p => {
+                    const bad = (p.status === 'new' || p.status === 're-homed');
+                    const st = bad ? `<span class="text-red-300">${escapeHtml(p.status)}</span>` : `<span class="text-gray-500">${escapeHtml(p.status)}</span>`;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${bad ? 'text-red-300' : ''}">${escapeHtml(p.pfx)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(p.origin_name || p.origin)}</td>
+                        <td class="px-2 py-1 font-mono">${p.metric == null ? '—' : p.metric}</td>
+                        <td class="px-2 py-1">${st}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function isisTrustBaseline() {
+    try {
+        await postAPI('/api/net/isis-baseline', { action: 'reset' });
+        addConsoleMessage('IS-IS baseline reset — re-learning current routers & prefixes', 'info');
+        await runIsisWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset IS-IS baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- EIGRP Watch (passive Cisco IGP routing-security scanner) ---------------
+const _EIGRP_VERDICT_STYLE = {
+    clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No EIGRP anomalies detected'],
+    'weak-auth':    ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ EIGRP without HMAC authentication — exposed to route injection'],
+    anomaly:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ EIGRP anomaly — K-value / AS mismatch'],
+    storm:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 EIGRP flooding storm detected'],
+    'rogue-router': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue EIGRP speaker — adjacency spoofing'],
+    injection:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 EIGRP route/next-hop injection detected'],
+    unknown:        ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _eigrpFillIfaces() {
+    const sel = document.getElementById('eigrp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runEigrpWatch() {
+    const out = document.getElementById('eigrp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('eigrp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('eigrp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing EIGRP on the segment…</p>';
+    try {
+        _eigrpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/eigrp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runEigrpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _EIGRP_VERDICT_STYLE[d.verdict] || _EIGRP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} EIGRP pkts, ${d.router_count} router(s), ${d.prefix_count} prefix(es) @ ${d.rate}/s${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.routers || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">EIGRP routers (' + d.routers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Router</th><th class="px-2 py-1">AS</th><th class="px-2 py-1">AF</th><th class="px-2 py-1">Auth</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.routers.map(r => {
+                    const badge = r.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    const auth = r.auth ? '<span class="text-green-400">yes</span>' : '<span class="text-amber-300">none</span>';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${r.baseline ? '' : 'text-amber-300'}">${escapeHtml(r.src)}</td>
+                        <td class="px-2 py-1 font-mono">${(r.as || []).join(', ') || '?'}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(r.af)}</td>
+                        <td class="px-2 py-1">${auth}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if ((d.prefixes || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Advertised prefixes (' + d.prefixes.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Prefix</th><th class="px-2 py-1">Next-hop</th><th class="px-2 py-1">Origin</th><th class="px-2 py-1">Kind</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.prefixes.map(p => {
+                    const bad = (p.status === 'new' || p.status === 'nexthop-changed');
+                    const st = bad ? `<span class="text-red-300">${escapeHtml(p.status)}</span>` : `<span class="text-gray-500">${escapeHtml(p.status)}</span>`;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${bad ? 'text-red-300' : ''}">${escapeHtml(p.prefix)}</td>
+                        <td class="px-2 py-1 font-mono">${escapeHtml(p.nexthop)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(p.origin)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(p.kind)}</td>
+                        <td class="px-2 py-1">${st}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function eigrpTrustBaseline() {
+    try {
+        await postAPI('/api/net/eigrp-baseline', { action: 'reset' });
+        addConsoleMessage('EIGRP baseline reset — re-learning current routers & prefixes', 'info');
+        await runEigrpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset EIGRP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- FHRP Watch (passive HSRP/VRRP/GLBP/CARP hijack scanner) ----------------
+const _FHRP_VERDICT_STYLE = {
+    clean:             ['bg-green-950/40 border-green-900 text-green-400', '✓ FHRP groups/speakers match the trusted baseline'],
+    'weak-auth':       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak / no FHRP authentication — a forged hello can win the election'],
+    'priority-change': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ A known FHRP speaker raised its priority — possible pre-takeover'],
+    'rogue-speaker':   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Unexpected FHRP speaker on the segment — not in the baseline'],
+    hijack:            ['bg-red-950/60 border-red-800 text-red-300', '🛑 FHRP HIJACK — a new speaker is winning the virtual-gateway election'],
+    unknown:           ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _fhrpFillIfaces() {
+    const sel = document.getElementById('fhrp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runFhrpWatch() {
+    const out = document.getElementById('fhrp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('fhrp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('fhrp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing FHRP hellos on the segment…</p>';
+    try {
+        _fhrpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/fhrp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runFhrpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _FHRP_VERDICT_STYLE[d.verdict] || _FHRP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} hello(s), ${d.group_count} group(s) @ ${d.rate}/s${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        (d.groups || []).forEach(g => {
+            const auth = g.auth_weak ? `<span class="text-amber-300">${escapeHtml(g.authtype || 'none')} (weak)</span>` : escapeHtml(g.authtype || '—');
+            html += `<p class="text-xs uppercase text-gray-400 mt-2 mb-1">${escapeHtml(g.proto.toUpperCase())} group ${g.group == null ? '?' : g.group} · gateway ${escapeHtml((g.vips || []).join(', ') || '?')} · auth ${auth}</p>`;
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Speaker</th><th class="px-2 py-1">Priority</th><th class="px-2 py-1">State/Op</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                (g.speakers || []).map(sp => {
+                    const badge = sp.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    const so = (sp.states || []).concat(sp.opcodes || []).join(', ') || '—';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${sp.baseline ? '' : 'text-amber-300'}">${escapeHtml(sp.src)}</td>
+                        <td class="px-2 py-1 font-mono">${sp.priority == null ? '—' : sp.priority}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(so)}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        });
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function fhrpTrustBaseline() {
+    try {
+        await postAPI('/api/net/fhrp-baseline', { action: 'reset' });
+        addConsoleMessage('FHRP baseline reset — re-learning current groups, speakers & priorities', 'info');
+        await runFhrpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset FHRP baseline: ' + e.message, 'error');
     }
 }
 
@@ -2949,8 +4314,8 @@ async function runPathAsymmetry() {
 // ---- Routing-scanner detector self-test (+ optional Scapy) ------------------
 function _scapyLegLabel(sc) {
     if (!sc) return '';
-    if (sc.ran) return sc.pass ? '<span class="text-green-400">scapy e2e ✓</span>' : '<span class="text-red-300">scapy e2e ✗</span>';
-    return '<span class="text-gray-500">scapy e2e skipped</span>';
+    if (sc.ran) return sc.pass ? '<span class="text-green-400">e2e ✓</span>' : '<span class="text-red-300">e2e ✗</span>';
+    return '<span class="text-gray-500">e2e skipped</span>';
 }
 async function runRoutingSelftest() {
     const out = document.getElementById('routing-selftest-results');
@@ -2973,7 +4338,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -2982,7 +4347,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'stp', 'smb', 'relay', 'dtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">
