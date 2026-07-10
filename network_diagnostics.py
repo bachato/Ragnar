@@ -6355,6 +6355,407 @@ def _tls_selftest():
 
 
 # --------------------------------------------------------------------------
+# Relay/Coercion Watch: passive NTLM-relay + authentication-coercion scanner
+# --------------------------------------------------------------------------
+# The defensive counterpart to Responder-style credential theft (see [[SMB Watch]]):
+# SMB Watch catches the *harvest* (a host answering LLMNR/NBT-NS), this catches the
+# *relay* and the *coercion* that feed it. NTLM has no channel binding by default, so
+# an attacker who obtains an NTLM authentication (via poisoning, or by *coercing* a
+# host to authenticate) can relay it to another service and act as the victim. This
+# scanner is PASSIVE (tcpdump -> pcap -> Scapy dissect) and flags:
+#   * coercion-attempt   — an MSRPC call over 445/135 that forces a host to
+#     authenticate: PetitPotam (MS-EFSRPC), PrinterBug/SpoolSample (MS-RPRN opnum
+#     65/66), DFSCoerce (MS-DFSNM), ShadowCoerce (MS-FSRVP). Detected by the interface
+#     UUID in the RPC bind (and, for the printer bug, the coercion opnum).
+#   * relay-suspected    — the *same* NTLMSSP server challenge seen from two different
+#     servers: a captured challenge being replayed through a relay.
+#   * signing-not-required — a server that negotiated SMB without signing *required*:
+#     the posture that makes captured NTLM relayable in the first place.
+# Interface UUIDs are matched by their DCE/RPC little-endian wire encoding.
+_RELAY_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'data', 'relay_watch.json')
+_relay_watch_lock = threading.Lock()
+_RELAY_EVENTS_CAP = 200
+_RELAY_COERCION = {
+    bytes.fromhex('88d481c650d8d0118c5200c04fd90f7e'): ('PetitPotam', 'MS-EFSRPC'),
+    bytes.fromhex('c54119df89fe794ebf10463657acf44d'): ('PetitPotam', 'MS-EFSR'),
+    bytes.fromhex('785634123412cdabef000123456789ab'): ('PrinterBug', 'MS-RPRN'),
+    bytes.fromhex('e042c74f104acf11827300aa004ae673'): ('DFSCoerce', 'MS-DFSNM'),
+    bytes.fromhex('3c65e0a844278943a61d7373df8b2292'): ('ShadowCoerce', 'MS-FSRVP'),
+}
+# These interfaces are coercion-only in practice — a bind alone is the signal. MS-RPRN
+# (spoolss) is also used for legit printing, so it additionally needs the coercion opnum.
+_RELAY_STRONG_IFACE = {'MS-EFSRPC', 'MS-EFSR', 'MS-DFSNM', 'MS-FSRVP'}
+_RELAY_RPRN_OPNUMS = {65, 66}   # RpcRemoteFindFirstPrinterChangeNotification[Ex]
+
+
+def _relay_scan_payload(raw):
+    """Scan one TCP payload for relay/coercion signals. Returns
+    (coercion_ifaces, opnums, ntlm_challenge, smb2_signing_required)."""
+    ifaces = []
+    for sig, (tech, iface) in _RELAY_COERCION.items():
+        if sig in raw:
+            ifaces.append((tech, iface))
+
+    opnums = set()
+    start = 0
+    while True:
+        k = raw.find(b'\x05\x00\x00', start)      # DCE/RPC v5.0, ptype at +2
+        if k < 0 or k + 24 > len(raw):
+            break
+        if raw[k + 1] == 0x00 and raw[k + 2] == 0x00:   # minor 0, ptype 0 = request
+            op = int.from_bytes(raw[k + 22:k + 24], 'little')
+            if op < 1000:
+                opnums.add(op)
+        start = k + 3
+
+    challenge = None
+    i = raw.find(b'NTLMSSP\x00')
+    if i >= 0 and i + 32 <= len(raw) and int.from_bytes(raw[i + 8:i + 12], 'little') == 2:
+        ch = raw[i + 24:i + 32]
+        if ch != b'\x00' * 8:
+            challenge = ch.hex()
+
+    signing = None
+    j = raw.find(b'\xfeSMB')
+    if j >= 0 and len(raw) >= j + 67 and int.from_bytes(raw[j + 12:j + 14], 'little') == 0:
+        signing = bool(raw[j + 64 + 2] & 0x02)   # SMB2 NEGOTIATE SecurityMode: REQUIRED
+
+    return ifaces, opnums, challenge, signing
+
+
+def _parse_relay_packets(packets):
+    """Dissect scapy packets into (coercion_findings, challenge_map, signing_map).
+    Shared by the live path and the self-test."""
+    from scapy.all import IP, IPv6, TCP
+    streams = {}
+    challenges = {}
+    signing = {}
+    for pk in packets:
+        ipl = pk.getlayer(IP) or pk.getlayer(IPv6)
+        if ipl is None or not pk.haslayer(TCP):
+            continue
+        raw = bytes(pk.getlayer(TCP).payload)
+        if not raw:
+            continue
+        src, dst = ipl.src, ipl.dst
+        ifaces, opnums, chal, sign = _relay_scan_payload(raw)
+        st = streams.setdefault((src, dst), {'ifaces': set(), 'opnums': set()})
+        for ti in ifaces:
+            st['ifaces'].add(ti)
+        st['opnums'] |= opnums
+        if chal:
+            challenges.setdefault(chal, set()).add(src)
+        if sign is not None:
+            # The server sends the NEGOTIATE response; False (any unsigned) wins.
+            signing[src] = False if signing.get(src) is False else sign
+
+    coercion = []
+    for (src, dst), st in streams.items():
+        seen = set()
+        for (tech, iface) in st['ifaces']:
+            if iface in _RELAY_STRONG_IFACE:
+                seen.add((tech, iface))
+            elif iface == 'MS-RPRN' and (st['opnums'] & _RELAY_RPRN_OPNUMS):
+                seen.add((tech, iface))
+        for (tech, iface) in sorted(seen):
+            coercion.append({'attacker': src, 'victim': dst, 'technique': tech,
+                             'interface': iface})
+    return coercion, challenges, signing
+
+
+def _relay_watch_load():
+    try:
+        with open(_RELAY_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _relay_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_RELAY_WATCH_PATH), exist_ok=True)
+        tmp = _RELAY_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _RELAY_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_relay_baseline(action='get'):
+    """Manage the learned Relay/Coercion baseline (accepted servers that negotiate
+    without signing required). Coercion + relay are never baselined away."""
+    with _relay_watch_lock:
+        if action == 'reset':
+            _relay_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _relay_watch_load()
+        return {'success': True, 'baseline': {
+            'unsigned_servers': b.get('unsigned_servers') or []}}
+
+
+def _relay_analyze(coercion, challenges, signing, seconds, baseline, learn=True):
+    """Pure classifier over parsed relay/coercion signals. Separated from capture for
+    the self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    unsigned = sorted(ip for ip, req in signing.items() if req is False)
+    signed = sorted(ip for ip, req in signing.items() if req is True)
+    relays = [{'challenge': c, 'servers': sorted(s)}
+              for c, s in sorted(challenges.items()) if len(s) > 1]
+
+    known_unsigned = set(baseline.get('unsigned_servers') or [])
+    had_baseline = bool(known_unsigned) or bool(baseline)
+
+    learned = False
+    if learn and not had_baseline and (unsigned or signed or coercion):
+        baseline['unsigned_servers'] = unsigned
+        learned = True
+        known_unsigned = set(unsigned)
+
+    PRIORITY = ['coercion-attempt', 'relay-suspected', 'signing-not-required', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    for c in coercion:
+        bump('coercion-attempt')
+        reasons.append(
+            f"COERCION: {c['attacker']} is coercing {c['victim']} to authenticate via "
+            f"{c['technique']} ({c['interface']}) — the forced NTLM auth can be relayed "
+            f"to a DC/host. Patch the vector, block the RPC interface, and require SMB/"
+            f"LDAP signing + channel binding (EPA)")
+
+    for r in relays:
+        bump('relay-suspected')
+        reasons.append(
+            f"RELAY SUSPECTED: NTLM server challenge {r['challenge']} appeared from "
+            f"{len(r['servers'])} servers ({', '.join(r['servers'])}) — the same "
+            f"challenge relayed through an attacker (NTLM relay in progress)")
+
+    for ip in unsigned:
+        bump('signing-not-required')
+        tag = ' (known)' if ip in known_unsigned else ''
+        reasons.append(
+            f"SMB signing NOT required on {ip}{tag} — captured/coerced NTLM can be "
+            f"relayed to it. Set RequireSecuritySignature=1 (GPO 'Microsoft network "
+            f"server: Digitally sign communications (always)')")
+
+    advisories = []
+    if coercion or relays or unsigned or signed:
+        advisories.append(
+            "Break NTLM relay: enforce SMB signing everywhere, enable LDAP signing + "
+            "LDAP channel binding on DCs, turn on Extended Protection for Authentication "
+            "(EPA) on HTTP/LDAPS, disable the Print Spooler on DCs, and apply the "
+            "PetitPotam/EFS + DFSCoerce patches (or RPC-filter the interfaces).")
+
+    if reasons:
+        summary = reasons
+    elif not (coercion or relays or signing):
+        summary = ['No coercion, NTLM relay, or unsigned-SMB negotiation seen']
+    else:
+        summary = ['No coercion or relay detected; SMB signing looks enforced']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'coercion': coercion,
+        'relays': relays,
+        'signing': {'unsigned': [{'ip': ip, 'known': ip in known_unsigned}
+                                 for ip in unsigned],
+                    'signed': signed},
+        'advisories': advisories,
+    }
+
+
+def _relay_capture(interface, seconds):
+    """Capture SMB/MSRPC traffic to a temp pcap via tcpdump -w -> (pcap_path, error).
+    Scapy dissects it; snaplen 1024 to keep the RPC bind/opnum + NTLMSSP intact."""
+    if not _have('tcpdump'):
+        return None, 'tcpdump is not installed. Click Install to add it.'
+    if not _have_scapy():
+        return None, ('python3-scapy is required to parse MSRPC / NTLM traffic — '
+                      'install Scapy (Detector Self-Test → Install Scapy).')
+    bpf = 'tcp port 445 or tcp port 139 or tcp port 135'
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn', '-p',
+                '-s', '1024', '-c', '20000', '-w', path, bpf], timeout=seconds + 8)
+    if (os.path.getsize(path) <= 24 and res['err']
+            and ('permission' in res['err'].lower() or "couldn't" in res['err'].lower()
+                 or 'no such device' in res['err'].lower()
+                 or 'syntax error' in res['err'].lower())):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None, res['err'].strip()[:200]
+    return path, None
+
+
+def do_relay_watch(interface=None, seconds=20, learn=True):
+    """Passive NTLM-relay + coercion scanner (detection-only). One capture; classifies
+    coercion attempts (PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce), suspected relays,
+    and SMB-signing-not-required posture. Learns accepted unsigned servers on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    path, err = _relay_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    try:
+        from scapy.all import rdpcap
+        packets = rdpcap(path)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': f'could not read capture: {type(e).__name__}'}
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    coercion, challenges, signing = _parse_relay_packets(packets)
+
+    with _relay_watch_lock:
+        baseline = _relay_watch_load()
+        result = _relay_analyze(coercion, challenges, signing, seconds, baseline,
+                                learn=learn)
+        if result.get('learned'):
+            _relay_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _relay_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_RELAY_EVENTS_CAP:]
+            _relay_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    result['packet_count'] = len(packets)
+    return result
+
+
+def _relay_selftest():
+    """Self-test Relay/Coercion Watch by building real attack packets into a pcap,
+    reading them back through the same Scapy parser, and asserting verdicts."""
+    scenarios = []
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, TCP, Raw, wrpcap, rdpcap
+    except Exception as e:
+        return {'success': True, 'scenarios': [],
+                'scapy': {'ran': False, 'reason': f'{type(e).__name__}: {e}'}}
+
+    def pkt(src, dst, raw, sport=50000, dport=445):
+        return Ether() / IP(src=src, dst=dst) / TCP(sport=sport, dport=dport,
+                                                    flags='PA') / Raw(raw)
+
+    def rpc_bind(uuid_hex):
+        return b'\x05\x00\x0b\x03' + b'\x00' * 20 + bytes.fromhex(uuid_hex)
+
+    def rpc_request(opnum):
+        return (bytes([5, 0, 0, 3]) + b'\x10\x00\x00\x00' + b'\x00\x00' + b'\x00\x00'
+                + b'\x01\x00\x00\x00' + b'\x00\x00\x00\x00' + b'\x00\x00'
+                + opnum.to_bytes(2, 'little'))
+
+    def ntlm_challenge(ch):
+        return (b'NTLMSSP\x00' + (2).to_bytes(4, 'little') + b'\x00' * 12 + ch
+                + b'\x00' * 8)
+
+    def smb2_negotiate_resp(secmode):
+        hdr = b'\xfeSMB' + b'\x00' * 8 + (0).to_bytes(2, 'little') + b'\x00' * 50
+        body = (65).to_bytes(2, 'little') + secmode.to_bytes(2, 'little') + b'\x00' * 32
+        return b'\x00\x00\x00\x00' + hdr + body
+
+    def run(name, pkts, baseline, expect):
+        with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+            path = tf.name
+        wrpcap(path, pkts)
+        try:
+            co, ch, sg = _parse_relay_packets(rdpcap(path))
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        res = _relay_analyze(co, ch, sg, 20, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'pass': ok})
+        return res
+
+    base = {'unsigned_servers': ['10.0.0.7']}
+
+    # 1. clean: an SMB2 negotiate with signing required.
+    run('clean', [pkt('10.0.0.5', '10.0.0.9', smb2_negotiate_resp(0x03),
+                      sport=445, dport=50000)], base, 'clean')
+    # 2. coercion (PetitPotam): EFSRPC interface bind.
+    run('coercion-petitpotam',
+        [pkt('10.0.0.66', '10.0.0.5', rpc_bind('88d481c650d8d0118c5200c04fd90f7e'))],
+        base, 'coercion-attempt')
+    # 3. coercion (DFSCoerce): DFSNM interface bind.
+    run('coercion-dfscoerce',
+        [pkt('10.0.0.66', '10.0.0.5', rpc_bind('e042c74f104acf11827300aa004ae673'))],
+        base, 'coercion-attempt')
+    # 4. coercion (PrinterBug): RPRN bind + opnum-65 request in the same stream.
+    run('coercion-printerbug',
+        [pkt('10.0.0.66', '10.0.0.5', rpc_bind('785634123412cdabef000123456789ab')),
+         pkt('10.0.0.66', '10.0.0.5', rpc_request(65))], base, 'coercion-attempt')
+    # 4b. RPRN bind WITHOUT the coercion opnum must NOT trigger (legit printing).
+    r = run('printer-legit',
+            [pkt('10.0.0.9', '10.0.0.5', rpc_bind('785634123412cdabef000123456789ab'))],
+            base, 'clean')
+    # 5. relay-suspected: same NTLM challenge from two servers.
+    ch = b'\x11\x22\x33\x44\x55\x66\x77\x88'
+    run('relay-suspected',
+        [pkt('10.0.0.5', '10.0.0.9', ntlm_challenge(ch), sport=445, dport=50000),
+         pkt('10.0.0.66', '10.0.0.9', ntlm_challenge(ch), sport=445, dport=50001)],
+        base, 'relay-suspected')
+    # 6. signing-not-required: a server negotiating signing enabled-only.
+    run('signing-not-required',
+        [pkt('10.0.0.8', '10.0.0.9', smb2_negotiate_resp(0x01), sport=445, dport=50000)],
+        base, 'signing-not-required')
+
+    # 7. parse: fields land.
+    with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+        path = tf.name
+    wrpcap(path, [pkt('10.0.0.66', '10.0.0.5',
+                      rpc_bind('88d481c650d8d0118c5200c04fd90f7e')),
+                  pkt('10.0.0.8', '10.0.0.9', smb2_negotiate_resp(0x01),
+                      sport=445, dport=50000)])
+    co, ch2, sg = _parse_relay_packets(rdpcap(path))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    p_ok = (any(c['technique'] == 'PetitPotam' for c in co)
+            and sg.get('10.0.0.8') is False)
+    scenarios.append({'name': 'relay-parse', 'expect': 'petitpotam+unsigned',
+                      'got': f"coercion={len(co)} unsigned={sg.get('10.0.0.8')}",
+                      'pass': p_ok})
+
+    passed = all(s['pass'] for s in scenarios)
+    return {'success': passed, 'scenarios': scenarios,
+            'scapy': {'ran': True, 'pass': passed, 'scenarios_run': len(scenarios)}}
+
+
+# --------------------------------------------------------------------------
 # SMB Watch: passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning scanner (Windows attack surface)
 # --------------------------------------------------------------------------
 # Two related Windows-endpoint findings that share one kill chain (Responder → NTLM →
@@ -10387,7 +10788,7 @@ def do_routing_selftest():
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
-              'smb': _smb_selftest(),
+              'smb': _smb_selftest(), 'relay': _relay_selftest(),
               'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
@@ -11264,6 +11665,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/tls-baseline {action}")
         return jsonify(do_tls_baseline(action))
 
+    @app.route('/api/net/relay-watch', methods=['GET'])
+    def net_relay_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/relay-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_relay_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/relay-baseline', methods=['GET', 'POST'])
+    def net_relay_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/relay-baseline {action}")
+        return jsonify(do_relay_baseline(action))
+
     @app.route('/api/net/smb-watch', methods=['GET'])
     def net_smb_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -11639,6 +12058,15 @@ def _cli(argv=None):
     twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
     twst.add_argument('--json', action='store_true', help='emit JSON')
 
+    rl = sub.add_parser('relay-watch', help='passive NTLM-relay + coercion scan')
+    rl.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    rl.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    rl.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    rl.add_argument('--json', action='store_true', help='emit JSON')
+
+    rlst = sub.add_parser('relay-selftest', help='self-test the relay/coercion detectors (no root)')
+    rlst.add_argument('--json', action='store_true', help='emit JSON')
+
     sm = sub.add_parser('smb-watch', help='passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning scan')
     sm.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     sm.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
@@ -12010,6 +12438,48 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] e2e-local-server: {e.get('reason')}")
             print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'relay-watch':
+        r = do_relay_watch(interface=args.iface, seconds=args.seconds,
+                           learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            sg = r.get('signing', {})
+            print(f"Relay/Coercion Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"(coercion: {len(r.get('coercion', []))}, relays: {len(r.get('relays', []))}, "
+                  f"unsigned servers: {len(sg.get('unsigned', []))})")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for c in r.get('coercion', []):
+                print(f"  COERCION {c['technique']} ({c['interface']}): "
+                      f"{c['attacker']} -> {c['victim']}")
+            for rel in r.get('relays', []):
+                print(f"  RELAY challenge {rel['challenge']} from {', '.join(rel['servers'])}")
+            for u in sg.get('unsigned', []):
+                print(f"  unsigned SMB: {u['ip']}{' (known)' if u['known'] else ''}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'relay-selftest':
+        r = _relay_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy round-trip: "
+                      f"{sc.get('scenarios_run')} scenarios")
+            else:
+                print(f"  [skip] scapy: {sc.get('reason')}")
+            print(f"Relay self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'smb-watch':

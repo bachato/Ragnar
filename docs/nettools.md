@@ -52,6 +52,7 @@ alert.
 | [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
 | [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
+| [Relay/Coercion Watch](#relaycoercion-watch) | Switch & L2/L3 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
 | [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
 | [IS-IS Watch](#is-is-watch) | Switch & L2/L3 | `GET /api/net/isis-watch`, `POST /api/net/isis-baseline` |
@@ -95,7 +96,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **SMB**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -999,6 +1000,36 @@ any SMBv1 hosts as the baseline (`data/smb_watch.json`); LLMNR/NBT-NS answers ar
 LLMNR (GPO) and NBT-NS (per-adapter / DHCP option 001), and enforce **SMB signing** so
 captured NTLM can't be relayed. **API:** `GET /api/net/smb-watch`,
 `POST /api/net/smb-baseline`. **CLI:** `smb-watch`, `smb-selftest`.
+
+### Relay/Coercion Watch
+A **passive** NTLM-relay + authentication-coercion scanner — the **defensive
+counterpart** to [SMB Watch](#smb-watch). Where SMB Watch catches the *harvest* (a host
+answering LLMNR/NBT-NS), this catches the *relay* and the *coercion* that feed it.
+NTLM has no channel binding by default, so an attacker who obtains an NTLM
+authentication — by poisoning, or by **coercing** a host to authenticate — can relay
+it to another service and act as the victim (`ntlmrelayx`). **Detection-only**
+(tcpdump → pcap → Scapy). What it flags:
+
+- **coercion-attempt** — an MSRPC call over 445/135 that forces a host to
+  authenticate, identified by the interface UUID in the RPC bind (matched by its
+  DCE/RPC little-endian wire encoding): **PetitPotam** (MS-EFSRPC), **PrinterBug /
+  SpoolSample** (MS-RPRN, plus the coercion opnum 65/66 to avoid flagging legit
+  printing), **DFSCoerce** (MS-DFSNM), **ShadowCoerce** (MS-FSRVP).
+- **relay-suspected** — the *same* NTLMSSP server challenge seen from **two different
+  servers**: a captured challenge being replayed through a relay.
+- **signing-not-required** — a server that negotiated SMB without signing *required*
+  (read from the SMB2 NEGOTIATE `SecurityMode`): the posture that makes captured NTLM
+  relayable in the first place.
+
+The BPF is `tcp port 445 or tcp port 139 or tcp port 135`, captured at snaplen 1024 so
+the RPC bind/opnum and NTLMSSP messages stay intact; **Scapy** dissects it. The first
+scan **learns** the accepted unsigned servers as the baseline
+(`data/relay_watch.json`); coercion and relay signals are **never** baselined away.
+The hardening it drives: enforce **SMB signing** everywhere, enable **LDAP signing +
+channel binding** on DCs, turn on **Extended Protection for Authentication (EPA)**,
+disable the Print Spooler on DCs, and patch (or RPC-filter) the coercion vectors.
+**API:** `GET /api/net/relay-watch`, `POST /api/net/relay-baseline`. **CLI:**
+`relay-watch`, `relay-selftest`.
 
 ### DTP Watch
 A **passive** VLAN-hopping / switch-spoofing scanner for Cisco's **Dynamic Trunking

@@ -1223,6 +1223,7 @@ function showNetworkSubtab(name) {
         _ospfFillIfaces();
         _stpFillIfaces();
         _smbFillIfaces();
+        _relayFillIfaces();
         _dtpFillIfaces();
         _eigrpFillIfaces();
         _isisFillIfaces();
@@ -3457,6 +3458,100 @@ async function stpTrustBaseline() {
     }
 }
 
+// ---- Relay/Coercion Watch (NTLM relay + auth coercion defense) --------------
+const _RELAY_VERDICT_STYLE = {
+    clean:                  ['bg-green-950/40 border-green-900 text-green-400', '✓ No coercion, relay, or unsigned-SMB negotiation'],
+    'signing-not-required': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ SMB signing not required — captured/coerced NTLM is relayable'],
+    'relay-suspected':      ['bg-red-950/60 border-red-800 text-red-300', '🛑 NTLM RELAY suspected — one challenge replayed across servers'],
+    'coercion-attempt':     ['bg-red-950/60 border-red-800 text-red-300', '🛑 COERCION — a host is being forced to authenticate (PetitPotam/PrinterBug/…)'],
+    unknown:                ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _relayFillIfaces() {
+    const sel = document.getElementById('relay-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runRelayWatch() {
+    const out = document.getElementById('relay-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('relay-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('relay-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '20';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing MSRPC/SMB for coercion + relay…</p>';
+    try {
+        _relayFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/relay-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runRelayWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _RELAY_VERDICT_STYLE[d.verdict] || _RELAY_VERDICT_STYLE.unknown;
+        const sg = d.signing || {};
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · coercion: ${(d.coercion || []).length}, relays: ${(d.relays || []).length}, unsigned servers: ${(sg.unsigned || []).length}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.coercion || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Coercion attempts</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Technique</th><th class="px-2 py-1">Interface</th><th class="px-2 py-1">Attacker</th><th class="px-2 py-1">Victim</th></tr>' +
+                '</thead><tbody>' +
+                d.coercion.map(c => `<tr class="border-t border-slate-800">
+                    <td class="px-2 py-1 text-red-300">${escapeHtml(c.technique)}</td>
+                    <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(c.interface)}</td>
+                    <td class="px-2 py-1 font-mono">${escapeHtml(c.attacker)}</td>
+                    <td class="px-2 py-1 font-mono">${escapeHtml(c.victim)}</td>
+                </tr>`).join('') +
+                '</tbody></table>';
+        }
+        (d.relays || []).forEach(r => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-red-300 border-red-800 bg-red-950/40">NTLM challenge <span class="font-mono">${escapeHtml(r.challenge)}</span> seen from <span class="font-mono">${escapeHtml((r.servers || []).join(', '))}</span> — relay in progress</div>`;
+        });
+        if ((sg.unsigned || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">SMB signing not required</p>' +
+                '<div class="text-xs font-mono text-amber-300">' +
+                sg.unsigned.map(u => escapeHtml(u.ip) + (u.known ? ' <span class="text-gray-500">(known)</span>' : '')).join(', ') +
+                '</div>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function relayTrustBaseline() {
+    try {
+        await postAPI('/api/net/relay-baseline', { action: 'reset' });
+        addConsoleMessage('Relay baseline reset — re-learning unsigned SMB servers', 'info');
+        await runRelayWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset relay baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning / Responder) ------------
 const _SMB_VERDICT_STYLE = {
     clean:            ['bg-green-950/40 border-green-900 text-green-400', '✓ No SMBv1 and no name-resolution poisoning'],
@@ -4201,7 +4296,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -4210,7 +4305,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'stp', 'smb', 'dtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'stp', 'smb', 'relay', 'dtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">
