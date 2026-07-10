@@ -6355,6 +6355,554 @@ def _tls_selftest():
 
 
 # --------------------------------------------------------------------------
+# SMB Watch: passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning scanner (Windows attack surface)
+# --------------------------------------------------------------------------
+# Two related Windows-endpoint findings that share one kill chain (Responder → NTLM →
+# SMB relay), detection-only, one passive capture:
+#   Part 1 — SMBv1: the deprecated (2014) SMB dialect and the EternalBlue / WannaCry /
+#     NotPetya (MS17-010) vector. Disabled by default on modern Windows but still
+#     lurking on legacy NAS/printers/old hosts. SMBv1 frames carry the magic \xffSMB
+#     (SMB2/3 use \xfeSMB), so we tell them apart on the wire and, from the SMB command
+#     byte + response flag, separate a *real* SMBv1 session (tree-connect/session-setup,
+#     or a server negotiate-response) from a harmless multi-dialect negotiate offer.
+#   Part 2 — LLMNR / NBT-NS / mDNS poisoning: when DNS fails, Windows falls back to
+#     these broadcast/multicast name-resolution protocols (LLMNR udp/5355, NBT-NS
+#     udp/137, mDNS udp/5353). Responder / Inveigh answer those queries with the
+#     attacker's IP; the victim then authenticates to the attacker and leaks NTLMv2
+#     hashes (offline crack or relay). Nothing legitimate *answers* LLMNR/NBT-NS, so a
+#     host that does is a poisoner. We flag: an active poisoner, a spoof-conflict (two
+#     hosts answering one name differently), WPAD targeting, and mere exposure
+#     (LLMNR/NBT-NS in use at all). Capture is done by tcpdump into a pcap; Scapy
+#     dissects it (tcpdump no longer decodes SMB, and never decoded LLMNR/NBT-NS).
+_SMB_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'smb_watch.json')
+_smb_watch_lock = threading.Lock()
+_SMB_EVENTS_CAP = 200
+_SMB_SERVER_PORTS = {445, 139}
+# High-value names an attacker loves to poison (proxy auto-config, ISATAP, etc.).
+_SMB_HIGHVALUE = {'wpad', 'isatap'}
+# Multicast/broadcast destinations that mark a name-resolution *query*.
+_SMB_MCAST = {'224.0.0.252', 'ff02::1:3', '224.0.0.251', 'ff02::fb'}
+
+
+def _smb_find_magic(raw):
+    """Locate the SMB header in a TCP payload. Returns (version, command, response?)
+    or None. version is 'v1' (\\xffSMB) or 'v2' (\\xfeSMB)."""
+    i = raw.find(b'SMB')
+    if i < 1:
+        return None
+    magic = raw[i - 1]
+    if magic == 0xFF:
+        cmd = raw[i + 3] if len(raw) > i + 3 else None
+        flags = raw[i + 8] if len(raw) > i + 8 else 0
+        return ('v1', cmd, bool(flags & 0x80))
+    if magic == 0xFE:
+        return ('v2', None, None)
+    return None
+
+
+def _nbns_parse(payload):
+    """Force-parse a NetBIOS-NS (udp/137) payload -> (is_response, name, answer_ips).
+    tcpdump/scapy don't auto-bind NBT-NS, so we read the header flag and layer by
+    hand."""
+    if len(payload) < 12:
+        return None
+    is_resp = bool(int.from_bytes(payload[2:4], 'big') & 0x8000)
+    name, answers = None, []
+    try:
+        from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse
+        nb = (NBNSQueryResponse if is_resp else NBNSQueryRequest)(payload)
+        raw = getattr(nb, 'RR_NAME', None) or getattr(nb, 'QUESTION_NAME', None)
+        if isinstance(raw, bytes):
+            name = raw.decode('latin1', 'replace').strip().strip('\x00').strip()
+        elif raw is not None:
+            name = str(raw).strip()
+        for ent in (getattr(nb, 'ADDR_ENTRY', None) or []):
+            a = getattr(ent, 'NB_ADDRESS', None)
+            if a:
+                answers.append(a)
+    except Exception:
+        pass
+    return is_resp, name, answers
+
+
+def _smb_parse_packets(packets):
+    """Classify a sequence of scapy packets into (smb_events, nameres_events).
+    Shared by the live path (rdpcap of a tcpdump pcap) and the self-test."""
+    from scapy.all import IP, IPv6, UDP, TCP, Raw, DNS
+    try:
+        from scapy.layers.llmnr import LLMNRQuery, LLMNRResponse
+    except Exception:
+        LLMNRQuery = LLMNRResponse = None
+
+    smb_events, nameres = [], []
+    for pk in packets:
+        ipl = pk.getlayer(IP) or pk.getlayer(IPv6)
+        if ipl is None:
+            continue
+        src, dst = ipl.src, ipl.dst
+
+        if pk.haslayer(TCP) and pk.haslayer(Raw):
+            t = pk.getlayer(TCP)
+            if t.sport in _SMB_SERVER_PORTS or t.dport in _SMB_SERVER_PORTS:
+                found = _smb_find_magic(bytes(pk.getlayer(Raw).load))
+                if found:
+                    ver, cmd, resp = found
+                    from_server = t.sport in _SMB_SERVER_PORTS
+                    server = src if from_server else dst
+                    smb_events.append({'server': server, 'client': dst if from_server else src,
+                                       'version': ver, 'command': cmd, 'response': resp,
+                                       'from_server': from_server})
+            continue
+
+        if not pk.haslayer(UDP):
+            continue
+        u = pk.getlayer(UDP)
+        to_mcast = dst in _SMB_MCAST or str(dst).endswith('.255')
+
+        if u.dport == 5355 or u.sport == 5355:            # LLMNR
+            if LLMNRResponse is not None and pk.haslayer(LLMNRResponse):
+                r = pk.getlayer(LLMNRResponse)
+                nm = _dns_qname(r)
+                ans = _dns_answer_ip(r)
+                nameres.append({'proto': 'llmnr', 'kind': 'response', 'src': src,
+                                'dst': dst, 'name': nm, 'answer': ans})
+            elif LLMNRQuery is not None and pk.haslayer(LLMNRQuery):
+                nameres.append({'proto': 'llmnr', 'kind': 'query', 'src': src,
+                                'dst': dst, 'name': _dns_qname(pk.getlayer(LLMNRQuery)),
+                                'answer': None})
+        elif u.dport == 5353 or u.sport == 5353:          # mDNS
+            if pk.haslayer(DNS):
+                d = pk.getlayer(DNS)
+                is_resp = int(getattr(d, 'qr', 0)) == 1 or int(getattr(d, 'ancount', 0)) > 0
+                nameres.append({'proto': 'mdns', 'kind': 'response' if is_resp else 'query',
+                                'src': src, 'dst': dst, 'name': _dns_qname(d),
+                                'answer': _dns_answer_ip(d) if is_resp else None})
+        elif u.dport == 137 or u.sport == 137:            # NBT-NS
+            parsed = _nbns_parse(bytes(u.payload))
+            if parsed:
+                is_resp, nm, answers = parsed
+                # Queries are broadcast; a reply from :137 to a unicast host (not the
+                # broadcast group) is a response even if the header flag is unset.
+                if not is_resp and u.sport == 137 and not to_mcast:
+                    is_resp = True
+                nameres.append({'proto': 'nbtns', 'kind': 'response' if is_resp else 'query',
+                                'src': src, 'dst': dst, 'name': nm,
+                                'answer': answers[0] if answers else None})
+    return smb_events, nameres
+
+
+def _dns_qname(layer):
+    try:
+        qd = getattr(layer, 'qd', None)
+        if qd and getattr(qd, 'qname', None):
+            n = qd.qname
+            return (n.decode('latin1', 'replace') if isinstance(n, bytes) else str(n)).rstrip('.')
+    except Exception:
+        pass
+    return None
+
+
+def _dns_answer_ip(layer):
+    try:
+        an = getattr(layer, 'an', None)
+        if an and getattr(an, 'rdata', None):
+            rd = an.rdata
+            return rd.decode('latin1', 'replace') if isinstance(rd, bytes) else str(rd)
+    except Exception:
+        pass
+    return None
+
+
+def _smb_watch_load():
+    try:
+        with open(_SMB_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _smb_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_SMB_WATCH_PATH), exist_ok=True)
+        tmp = _SMB_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _SMB_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_smb_baseline(action='get'):
+    """Manage the learned SMB Watch baseline (accepted mDNS responders + known SMBv1
+    hosts). LLMNR/NBT-NS responders are never baselined away — nothing should answer
+    them."""
+    with _smb_watch_lock:
+        if action == 'reset':
+            _smb_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _smb_watch_load()
+        return {'success': True, 'baseline': {
+            'mdns_responders': b.get('mdns_responders') or [],
+            'smbv1_hosts': b.get('smbv1_hosts') or []}}
+
+
+def _smb_analyze(smb_events, nameres, seconds, baseline, learn=True):
+    """Pure classifier over parsed SMB + name-resolution events. Separated from
+    capture for the self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    # ---- Part 1: SMBv1 ----
+    servers = {}
+    v2_count = 0
+    for e in smb_events:
+        if e['version'] == 'v2':
+            v2_count += 1
+            continue
+        s = servers.setdefault(e['server'], {
+            'ip': e['server'], 'active': False, 'offered': False, 'count': 0})
+        s['count'] += 1
+        # A v1 command other than negotiate (0x72), or a server negotiate *response*,
+        # means SMBv1 is really being spoken; a client's negotiate request only offers it.
+        if (e['command'] not in (0x72, None)) or (e['command'] == 0x72 and e['response']):
+            s['active'] = True
+        else:
+            s['offered'] = True
+
+    # ---- Part 2: LLMNR/NBT-NS/mDNS poisoning ----
+    responders = {}
+    q_llmnr = q_nbtns = q_mdns = 0
+    name_answers = {}
+    for e in nameres:
+        if e['kind'] == 'query':
+            if e['proto'] == 'llmnr':
+                q_llmnr += 1
+            elif e['proto'] == 'nbtns':
+                q_nbtns += 1
+            else:
+                q_mdns += 1
+            continue
+        r = responders.setdefault(e['src'], {
+            'ip': e['src'], 'protos': set(), 'names': set(), 'highvalue': set(),
+            'foreign': False, 'count': 0})
+        r['count'] += 1
+        r['protos'].add(e['proto'])
+        if e['name']:
+            r['names'].add(e['name'])
+            base = e['name'].split('.')[0].lower()
+            if base in _SMB_HIGHVALUE:
+                r['highvalue'].add(e['name'])
+            name_answers.setdefault(e['name'].lower(), set())
+            if e['answer']:
+                name_answers[e['name'].lower()].add(e['answer'])
+        # mDNS is legit when a host announces *itself* (answer == its own IP); a reply
+        # pointing elsewhere is a host claiming another identity.
+        if e['answer'] and e['answer'] != e['src']:
+            r['foreign'] = True
+
+    known_mdns = set(baseline.get('mdns_responders') or [])
+    known_v1 = set(baseline.get('smbv1_hosts') or [])
+    had_baseline = bool(known_mdns) or bool(known_v1) or bool(baseline)
+
+    learned = False
+    if learn and not had_baseline and (servers or responders):
+        baseline['mdns_responders'] = sorted(
+            ip for ip, r in responders.items() if r['protos'] == {'mdns'} and not r['foreign'])
+        baseline['smbv1_hosts'] = sorted(servers.keys())
+        learned = True
+        known_mdns = set(baseline['mdns_responders'])
+        known_v1 = set(baseline['smbv1_hosts'])
+
+    PRIORITY = ['poisoning', 'smbv1-active', 'spoof-conflict', 'smbv1-offered',
+                'name-exposure', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Poisoning: any host answering LLMNR/NBT-NS, or an mDNS host claiming foreign
+    # identities / high-value names.
+    for ip in sorted(responders):
+        r = responders[ip]
+        poisons = r['protos'] & {'llmnr', 'nbtns'}
+        mdns_bad = ('mdns' in r['protos']
+                    and (r['highvalue'] or (r['foreign'] and len(r['names']) > 4)))
+        if poisons or mdns_bad:
+            bump('poisoning')
+            protos = ', '.join(sorted(poisons or {'mdns'})).upper()
+            names = ', '.join(sorted(r['names'])[:5]) or '(unnamed)'
+            hv = ' incl. WPAD/ISATAP' if r['highvalue'] else ''
+            reasons.append(
+                f"POISONING: {ip} is answering {protos} name queries "
+                f"(Responder/Inveigh) — replied for {names}{hv}. Victims that trust "
+                f"the reply authenticate to it and leak NTLMv2 hashes. Disable "
+                f"LLMNR/NBT-NS via GPO and enable SMB signing to block relay")
+
+    # Spoof conflict: one name answered by 2+ different IPs.
+    for name in sorted(name_answers):
+        ips = name_answers[name]
+        if len(ips) > 1:
+            bump('spoof-conflict')
+            reasons.append(
+                f"Name '{name}' is answered with conflicting IPs ({', '.join(sorted(ips))}) "
+                f"— a poisoner racing the real owner of the name")
+
+    # SMBv1.
+    for ip in sorted(servers):
+        s = servers[ip]
+        tag = ' (known legacy host)' if ip in known_v1 else ''
+        if s['active']:
+            bump('smbv1-active')
+            reasons.append(
+                f"SMBv1 in ACTIVE use by {ip}{tag} — SMBv1 is deprecated and the "
+                f"EternalBlue/WannaCry (MS17-010) vector. Disable it "
+                f"(Set-SmbServerConfiguration -EnableSMB1Protocol $false) and patch")
+        elif s['offered']:
+            bump('smbv1-offered')
+            reasons.append(
+                f"SMBv1 offered by {ip}{tag} in dialect negotiation (may still upgrade "
+                f"to SMB2/3) — disable SMBv1 to remove the downgrade/fallback path")
+
+    # Exposure: LLMNR/NBT-NS queries present but nobody (yet) answering.
+    if (q_llmnr or q_nbtns) and verdict in ('clean', 'name-exposure'):
+        bump('name-exposure')
+        reasons.append(
+            f"LLMNR/NBT-NS queries seen ({q_llmnr} LLMNR, {q_nbtns} NBT-NS) with no "
+            f"responder — hosts fall back to these poisonable protocols; disable them "
+            f"via GPO before a Responder shows up on the segment")
+
+    advisories = []
+    if servers or responders or q_llmnr or q_nbtns:
+        advisories.append(
+            "Windows hardening: disable SMBv1 everywhere, turn off LLMNR (GPO: Turn off "
+            "multicast name resolution) and NBT-NS (per-adapter / DHCP option 001=2), "
+            "and enforce SMB signing so captured NTLM can't be relayed.")
+
+    if reasons:
+        summary = reasons
+    elif not (smb_events or nameres):
+        summary = ['No SMB or LLMNR/NBT-NS/mDNS traffic seen on this segment']
+    else:
+        summary = ['No SMBv1 and no name-resolution poisoning detected '
+                   '(SMB2/3 + legit mDNS only)']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'smb': {
+            'v1_servers': [{'ip': s['ip'],
+                            'mode': 'active' if s['active'] else 'offered',
+                            'known': s['ip'] in known_v1} for s in
+                           (servers[i] for i in sorted(servers))],
+            'v1_count': sum(s['count'] for s in servers.values()),
+            'v2_count': v2_count},
+        'nameres': {
+            'responders': [{'ip': r['ip'], 'protos': sorted(r['protos']),
+                            'names': sorted(r['names'])[:12],
+                            'highvalue': sorted(r['highvalue']),
+                            'foreign': r['foreign'],
+                            'known': r['ip'] in known_mdns} for r in
+                           (responders[i] for i in sorted(responders))],
+            'queries': {'llmnr': q_llmnr, 'nbtns': q_nbtns, 'mdns': q_mdns},
+            'conflicts': [{'name': n, 'answers': sorted(name_answers[n])}
+                          for n in sorted(name_answers) if len(name_answers[n]) > 1]},
+        'advisories': advisories,
+    }
+
+
+def _smb_capture(interface, seconds):
+    """Capture SMB + name-resolution traffic to a temp pcap via tcpdump -w, and return
+    (pcap_path, error). Scapy then dissects it (tcpdump can't decode these)."""
+    if not _have('tcpdump'):
+        return None, 'tcpdump is not installed. Click Install to add it.'
+    if not _have_scapy():
+        return None, ('python3-scapy is required to parse SMB / name-resolution '
+                      'traffic — install Scapy (Detector Self-Test → Install Scapy).')
+    bpf = ('(tcp port 445 or tcp port 139) or (udp port 5355 or udp port 5353 or '
+           'udp port 137)')
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn', '-p',
+                '-s', '512', '-c', '20000', '-w', path, bpf], timeout=seconds + 8)
+    if (os.path.getsize(path) <= 24 and res['err']
+            and ('permission' in res['err'].lower() or "couldn't" in res['err'].lower()
+                 or 'no such device' in res['err'].lower()
+                 or 'syntax error' in res['err'].lower())):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None, res['err'].strip()[:200]
+    return path, None
+
+
+def do_smb_watch(interface=None, seconds=20, learn=True):
+    """Passive SMBv1 + LLMNR/NBT-NS/mDNS-poisoning scanner (detection-only). One
+    capture; classifies SMBv1 use and Responder-style name-resolution poisoning.
+    Learns accepted mDNS responders + known SMBv1 hosts on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    path, err = _smb_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    try:
+        from scapy.all import rdpcap
+        packets = rdpcap(path)
+    except Exception as e:
+        return {'success': False, 'interface': iface,
+                'error': f'could not read capture: {type(e).__name__}'}
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    smb_events, nameres = _smb_parse_packets(packets)
+
+    with _smb_watch_lock:
+        baseline = _smb_watch_load()
+        result = _smb_analyze(smb_events, nameres, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _smb_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _smb_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_SMB_EVENTS_CAP:]
+            _smb_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    result['packet_count'] = len(smb_events) + len(nameres)
+    return result
+
+
+def _smb_selftest():
+    """Self-test SMB Watch by building real attack packets into a pcap, reading them
+    back through the same Scapy parser, and asserting the verdicts (this is the
+    end-to-end leg — the tool is Scapy-parsed by construction)."""
+    scenarios = []
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import (Ether, IP, UDP, TCP, Raw, wrpcap, rdpcap, DNS, DNSQR,
+                               DNSRR)
+        from scapy.layers.llmnr import LLMNRQuery, LLMNRResponse
+        from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse
+    except Exception as e:
+        return {'success': True, 'scenarios': [],
+                'scapy': {'ran': False, 'reason': f'{type(e).__name__}: {e}'}}
+
+    def smb1(cmd, response, server='10.0.0.5'):
+        flags = 0x80 if response else 0x00
+        body = b'\xffSMB' + bytes([cmd]) + b'\x00\x00\x00\x00' + bytes([flags]) + b'\x00' * 20
+        sport, dport = (445, 50000) if response or cmd != 0x72 else (50000, 445)
+        # server side uses port 445; client request uses dport 445
+        if response:
+            ip = IP(src=server, dst='10.0.0.9'); tcp = TCP(sport=445, dport=50000, flags='PA')
+        elif cmd == 0x72:
+            ip = IP(src='10.0.0.9', dst=server); tcp = TCP(sport=50000, dport=445, flags='PA')
+        else:
+            ip = IP(src=server, dst='10.0.0.9'); tcp = TCP(sport=445, dport=50000, flags='PA')
+        return Ether() / ip / tcp / Raw(b'\x00\x00\x00' + bytes([len(body)]) + body)
+
+    def llmnr_resp(src, name, ip):
+        return (Ether() / IP(src=src, dst='10.0.0.9') / UDP(sport=5355, dport=50000)
+                / LLMNRResponse(qd=DNSQR(qname=name),
+                                an=DNSRR(rrname=name, rdata=ip)))
+
+    def llmnr_query(name):
+        return (Ether() / IP(src='10.0.0.9', dst='224.0.0.252')
+                / UDP(sport=50000, dport=5355) / LLMNRQuery(qd=DNSQR(qname=name)))
+
+    def nbns_resp(src, name):
+        return (Ether() / IP(src=src, dst='10.0.0.9') / UDP(sport=137, dport=137)
+                / NBNSQueryResponse(RR_NAME=name))
+
+    def mdns_self(src, name):
+        return (Ether() / IP(src=src, dst='224.0.0.251') / UDP(sport=5353, dport=5353)
+                / DNS(qr=1, qd=DNSQR(qname=name), an=DNSRR(rrname=name, rdata=src)))
+
+    def run(name, pkts, baseline, expect):
+        with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+            path = tf.name
+        wrpcap(path, pkts)
+        try:
+            smb_e, nr = _smb_parse_packets(rdpcap(path))
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        res = _smb_analyze(smb_e, nr, 20, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(smb_e) + len(nr), 'pass': ok})
+        return res
+
+    base = {'mdns_responders': ['10.0.0.20'], 'smbv1_hosts': []}
+
+    # 1. clean: legit mDNS host announcing itself + SMB2 traffic.
+    run('clean', [mdns_self('10.0.0.20', 'printer.local'),
+                  Ether() / IP(src='10.0.0.5', dst='10.0.0.9')
+                  / TCP(sport=445, dport=50000, flags='PA')
+                  / Raw(b'\x00\x00\x00\x20\xfeSMB' + b'\x00' * 20)], base, 'clean')
+    # 2. poisoning: a host answering LLMNR (Responder) incl. WPAD.
+    run('poisoning', [llmnr_resp('10.0.0.66', 'fileserver', '10.0.0.66'),
+                      llmnr_resp('10.0.0.66', 'wpad', '10.0.0.66')], base, 'poisoning')
+    # 3. poisoning via NBT-NS response.
+    run('poisoning-nbtns', [nbns_resp('10.0.0.66', 'FILESERVER')], base, 'poisoning')
+    # 4. spoof-conflict: two hosts answer the same LLMNR name differently.
+    run('spoof-conflict', [llmnr_resp('10.0.0.5', 'app01', '10.0.0.5'),
+                           llmnr_resp('10.0.0.66', 'app01', '10.0.0.66')], base,
+        'poisoning')  # both are LLMNR responders -> poisoning outranks conflict
+    # 5. smbv1-active: a real SMBv1 tree-connect (cmd 0x75).
+    run('smbv1-active', [smb1(0x75, False)], base, 'smbv1-active')
+    # 6. smbv1-offered: only a client SMBv1 negotiate request (cmd 0x72, no response).
+    run('smbv1-offered', [smb1(0x72, False)], base, 'smbv1-offered')
+    # 7. name-exposure: LLMNR queries only, nobody answering.
+    run('name-exposure', [llmnr_query('fileserver'), llmnr_query('wpad')], base,
+        'name-exposure')
+
+    # 8. parse: fields land correctly.
+    with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+        path = tf.name
+    wrpcap(path, [llmnr_resp('10.0.0.66', 'wpad', '10.0.0.66'), smb1(0x72, True)])
+    smb_e, nr = _smb_parse_packets(rdpcap(path))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    llmnr_ev = next((e for e in nr if e['proto'] == 'llmnr'), {})
+    smb_ev = smb_e[0] if smb_e else {}
+    p_ok = (llmnr_ev.get('kind') == 'response' and llmnr_ev.get('name') == 'wpad'
+            and llmnr_ev.get('answer') == '10.0.0.66'
+            and smb_ev.get('version') == 'v1' and smb_ev.get('response') is True)
+    scenarios.append({'name': 'smb-parse', 'expect': 'llmnr-wpad/smbv1-resp',
+                      'got': f"name={llmnr_ev.get('name')} v={smb_ev.get('version')}",
+                      'pass': p_ok})
+
+    passed = all(s['pass'] for s in scenarios)
+    scapy_result = {'ran': True, 'pass': passed,
+                    'scenarios_run': len(scenarios)}
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # IS-IS Watch: passive IS-IS routing-security scanner (detection-only)
 # --------------------------------------------------------------------------
 # IS-IS (ISO/IEC 10589) is the third interior gateway protocol alongside OSPF and
@@ -9839,6 +10387,7 @@ def do_routing_selftest():
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
+              'smb': _smb_selftest(),
               'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
@@ -10715,6 +11264,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/tls-baseline {action}")
         return jsonify(do_tls_baseline(action))
 
+    @app.route('/api/net/smb-watch', methods=['GET'])
+    def net_smb_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/smb-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_smb_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/smb-baseline', methods=['GET', 'POST'])
+    def net_smb_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/smb-baseline {action}")
+        return jsonify(do_smb_baseline(action))
+
     @app.route('/api/net/isis-watch', methods=['GET'])
     def net_isis_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -11071,6 +11638,15 @@ def _cli(argv=None):
 
     twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
     twst.add_argument('--json', action='store_true', help='emit JSON')
+
+    sm = sub.add_parser('smb-watch', help='passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning scan')
+    sm.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    sm.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    sm.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    sm.add_argument('--json', action='store_true', help='emit JSON')
+
+    smst = sub.add_parser('smb-selftest', help='self-test the SMB Watch detectors (no root)')
+    smst.add_argument('--json', action='store_true', help='emit JSON')
 
     ii = sub.add_parser('isis-watch', help='passive IS-IS routing-security scan')
     ii.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -11434,6 +12010,52 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] e2e-local-server: {e.get('reason')}")
             print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'smb-watch':
+        r = do_smb_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            smb = r.get('smb', {})
+            nr = r.get('nameres', {})
+            print(f"SMB Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"(SMBv1 servers: {len(smb.get('v1_servers', []))}, "
+                  f"SMB2/3 pkts: {smb.get('v2_count', 0)}; "
+                  f"name-res responders: {len(nr.get('responders', []))})")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for s in smb.get('v1_servers', []):
+                print(f"  SMBv1 {s['ip']} [{s['mode']}]{' known' if s['known'] else ''}")
+            for rp in nr.get('responders', []):
+                hv = ' WPAD!' if rp['highvalue'] else ''
+                print(f"  responder {rp['ip']} ({'/'.join(rp['protos'])}){hv} "
+                      f"-> {', '.join(rp['names'][:4]) or '(unnamed)'}")
+            q = nr.get('queries', {})
+            print(f"  queries: LLMNR {q.get('llmnr', 0)}, NBT-NS {q.get('nbtns', 0)}, "
+                  f"mDNS {q.get('mdns', 0)}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'smb-selftest':
+        r = _smb_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy round-trip: "
+                      f"{sc.get('scenarios_run')} scenarios")
+            else:
+                print(f"  [skip] scapy: {sc.get('reason')}")
+            print(f"SMB self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'isis-watch':

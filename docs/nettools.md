@@ -51,6 +51,7 @@ alert.
 | [TLS Watch](#tls-watch) | Diagnostics | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
 | [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
+| [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
 | [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
 | [IS-IS Watch](#is-is-watch) | Switch & L2/L3 | `GET /api/net/isis-watch`, `POST /api/net/isis-baseline` |
@@ -94,7 +95,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **SMB**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -959,6 +960,45 @@ The real hardening — which this tool exists to nudge you toward — is **BPDU 
 switches, plus pinning your real root/backup-root to priority 0/4096. **API:**
 `GET /api/net/stp-watch`, `POST /api/net/stp-baseline`. **CLI:** `stp-watch`,
 `stp-selftest`.
+
+### SMB Watch
+A **passive** Windows-endpoint attack-surface scanner in two parts (one capture),
+**detection-only**. It targets the two most common internal-network findings, which
+share one kill chain (**Responder → NTLM → SMB relay**).
+
+**Part 1 — SMBv1.** SMBv1 is the deprecated (2014) SMB dialect and the **EternalBlue /
+WannaCry / NotPetya (MS17-010)** vector — disabled by default on modern Windows but
+still lurking on legacy NAS, printers and old hosts. SMBv1 frames carry the magic
+`\xffSMB` (SMB2/3 use `\xfeSMB`), so they're identified on the wire; from the SMB
+**command byte + response flag** the scanner separates a *real* SMBv1 session
+(tree-connect / session-setup, or a server negotiate-**response**) from a harmless
+multi-dialect negotiate **offer**, so a modern client that merely lists SMBv1 in its
+dialects isn't a false positive.
+
+**Part 2 — LLMNR / NBT-NS / mDNS poisoning.** When DNS fails, Windows falls back to
+these broadcast/multicast name-resolution protocols (LLMNR udp/5355, NBT-NS udp/137,
+mDNS udp/5353). **Responder / Inveigh** answer those queries with the attacker's IP;
+the victim then authenticates to the attacker and leaks **NTLMv2 hashes** (offline
+crack or relay). Nothing legitimate *answers* LLMNR/NBT-NS, so a host that does is a
+poisoner. What it flags:
+
+- **poisoning** — a host answering LLMNR/NBT-NS (Responder/Inveigh), or an mDNS host
+  claiming foreign / high-value names. **WPAD** and ISATAP targeting is called out.
+- **spoof-conflict** — one name answered by two hosts with different IPs (a poisoner
+  racing the real owner).
+- **smbv1-active** / **smbv1-offered** — SMBv1 in use, or merely offered.
+- **name-exposure** — LLMNR/NBT-NS queries present at all: hosts are one Responder
+  away from credential theft; disable via GPO.
+
+Capture is done by `tcpdump -w` into a pcap (SMB tcp/445+139, LLMNR/NBT-NS/mDNS) and
+**dissected with Scapy** — modern tcpdump no longer decodes SMB and never decoded
+LLMNR/NBT-NS, so Scapy is required (Detector Self-Test → **Install Scapy**). The first
+scan **learns** the accepted mDNS responders (printers/Macs announcing themselves) and
+any SMBv1 hosts as the baseline (`data/smb_watch.json`); LLMNR/NBT-NS answers are
+**never** baselined away. The hardening it nudges toward: disable SMBv1, turn off
+LLMNR (GPO) and NBT-NS (per-adapter / DHCP option 001), and enforce **SMB signing** so
+captured NTLM can't be relayed. **API:** `GET /api/net/smb-watch`,
+`POST /api/net/smb-baseline`. **CLI:** `smb-watch`, `smb-selftest`.
 
 ### DTP Watch
 A **passive** VLAN-hopping / switch-spoofing scanner for Cisco's **Dynamic Trunking

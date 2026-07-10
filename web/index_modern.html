@@ -1551,6 +1551,21 @@
                     </div>
                     <div id="dtp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">SMB Watch <span class="text-xs font-normal text-gray-500">(SMBv1 · LLMNR/NBT-NS/mDNS poisoning)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive Windows-endpoint attack-surface scanner — <strong>detection-only</strong>, one capture, two parts. <strong>Part 1 — SMBv1:</strong> the deprecated SMB dialect and the <strong>EternalBlue / WannaCry (MS17-010)</strong> vector; still lurking on legacy NAS/printers. Tells a <em>real</em> SMBv1 session (tree-connect / server negotiate-response) apart from a harmless multi-dialect offer. <strong>Part 2 — LLMNR/NBT-NS/mDNS poisoning:</strong> when DNS fails, Windows falls back to these broadcast/multicast name lookups; <strong>Responder/Inveigh</strong> answer with the attacker's IP and harvest <strong>NTLMv2 hashes</strong> (crack or relay). Nothing legit answers LLMNR/NBT-NS, so a host that does is a poisoner. Flags <strong>poisoning</strong> (an active Responder, incl. WPAD targeting), <strong>spoof-conflict</strong> (two hosts answering one name), <strong>SMBv1</strong> use, and <strong>name-exposure</strong> (LLMNR/NBT-NS in use at all).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture (SMB tcp/445+139, LLMNR udp/5355, NBT-NS udp/137, mDNS udp/5353) — tcpdump captures, Scapy dissects. The first scan learns the accepted mDNS responders (printers/Macs) + any SMBv1 hosts as the baseline (<span class="font-mono">data/smb_watch.json</span>); LLMNR/NBT-NS answers are never trusted. Click "Trust current" after a legitimate change. <span class="text-amber-400">Needs Scapy</span> (Detector Self-Test → Install Scapy).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="smb-iface" title="Interface to audit — pick the LAN/access NIC where Windows clients live" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="smb-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runSmbWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan SMB</button>
+                        <button onclick="smbTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current mDNS responders + SMBv1 hosts as the trusted baseline">Trust current</button>
+                    </div>
+                    <div id="smb-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- OSPF Security Scanner -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">OSPF Security Scanner</h3>
@@ -1672,7 +1687,7 @@
                 <!-- Routing-scanner self-test + Scapy -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · STP · DTP · EIGRP · IS-IS · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
+                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · STP · DTP · SMB · EIGRP · IS-IS · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
                         <div id="scapy-status" class="text-xs text-gray-400"></div>
                     </div>
                     <p class="text-sm text-gray-400 mb-3 mt-1">Validates the IGMP, IPv6 first-hop, NTP, ICMP, SNMP, TLS-cert, OSPF and BGP detectors by running each classifier against crafted attack captures — no root, no live traffic. Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span> (and TLS Watch grades a real local handshake), so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
@@ -5970,7 +5985,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260710-isis"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260710-smb"></script>
 
 </body>
 </html>
