@@ -1536,6 +1536,21 @@
                     </div>
                     <div id="ospf-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- FHRP Watch (HSRP/VRRP/GLBP/CARP) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">FHRP Watch <span class="text-xs font-normal text-gray-500">(HSRP · VRRP · GLBP · CARP)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive First-Hop-Redundancy-Protocol hijack scanner — <strong>detection-only</strong>, never sends an FHRP packet or joins an election. FHRP (HSRP/VRRP/GLBP/CARP) lets routers share one <strong>virtual gateway IP+MAC</strong> and picks the active router by <strong>priority</strong>; the hellos are multicast in the clear with weak/no auth. An attacker who sees them can inject a forged <strong>priority-255 hello + preempt</strong>, win the election, and become everyone's default gateway (subnet-wide MITM, e.g. Yersinia/Loki). Flags <strong>hijack</strong> (a new speaker advertising a winning priority, or an HSRP Coup), <strong>rogue-speaker</strong> (a new speaker not yet winning), <strong>priority-change</strong> (a known speaker's priority jumped) and <strong>weak-auth</strong> (plaintext/no FHRP auth — the enabler).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the routed segment (HSRP udp/1985, GLBP udp/3222, VRRP+CARP IP-proto-112). The first scan learns the current groups and their active speakers/priorities as the trusted baseline (<span class="font-mono">data/fhrp_watch.json</span>); after a legitimate router/priority change, click "Trust current". HSRP+VRRP are fully decoded; GLBP/CARP are best-effort (new-speaker detection).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="fhrp-iface" title="Interface for the FHRP capture — pick the routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="fhrp-secs" type="number" min="4" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runFhrpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan FHRP</button>
+                        <button onclick="fhrpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current groups/speakers/priorities as the trusted baseline — use after a legitimate router or priority change">Trust current</button>
+                    </div>
+                    <div id="fhrp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- BGP Path Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">BGP Path Watch</h3>
@@ -1597,7 +1612,7 @@
                 <!-- Routing-scanner self-test + Scapy -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · NTP · ICMP · SNMP · TLS · OSPF · BGP · speaker · OWD)</span></h3>
+                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
                         <div id="scapy-status" class="text-xs text-gray-400"></div>
                     </div>
                     <p class="text-sm text-gray-400 mb-3 mt-1">Validates the IGMP, IPv6 first-hop, NTP, ICMP, SNMP, TLS-cert, OSPF and BGP detectors by running each classifier against crafted attack captures — no root, no live traffic. Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span> (and TLS Watch grades a real local handshake), so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
@@ -5895,7 +5910,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260709-raguard"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260710-fhrp"></script>
 
 </body>
 </html>

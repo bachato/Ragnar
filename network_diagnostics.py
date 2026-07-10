@@ -6355,6 +6355,464 @@ def _tls_selftest():
 
 
 # --------------------------------------------------------------------------
+# FHRP Watch: passive HSRP/VRRP/GLBP/CARP hijack scanner (detection-only)
+# --------------------------------------------------------------------------
+# First Hop Redundancy Protocols share a *virtual gateway* (one virtual IP+MAC that
+# floats between routers) so hosts keep one default gateway even when a router dies.
+# The active router is picked by PRIORITY, and the hellos are multicast in the clear
+# with weak/no auth (HSRP's default is the plaintext string "cisco"; VRRPv3 has no
+# auth). So an attacker who sees the hellos can inject a forged hello with priority
+# 255 + preempt, win the election, and take over the virtual gateway IP/MAC — every
+# host's off-subnet traffic now flows through them (subnet-wide MITM, e.g. Yersinia /
+# Loki). This scanner is PASSIVE: one short tcpdump window over the FHRP hellos,
+# parsed and classified against a learned baseline of the segment's groups. It never
+# sends an FHRP packet. What it flags:
+#   * hijack        — a speaker that isn't in the baseline advertising a *winning*
+#     priority (>= the active, or 250+/255), or an HSRP Coup — takeover in progress.
+#   * rogue-speaker — a new speaker in a group that isn't (yet) winning.
+#   * priority-change — a known speaker whose priority jumped up (pre-takeover/reconfig).
+#   * weak-auth     — plaintext/no FHRP authentication (the enabler). Advisory.
+# HSRP + VRRP are fully decoded by tcpdump (priority-based detection). GLBP (tcpdump
+# does not dissect it) and CARP are lighter — new-speaker detection, best-effort.
+_FHRP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'fhrp_watch.json')
+_fhrp_watch_lock = threading.Lock()
+_FHRP_EVENTS_CAP = 200
+# A priority at/above this from a source that isn't the baseline active is a takeover
+# attempt (HSRP/VRRP/GLBP max is 255/254; attackers use the top of the range).
+_FHRP_TAKEOVER_PRIO = 250
+
+_FHRP_HSRP_SRC = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.1985\s*>')
+_FHRP_GLBP_SRC = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.3222\s*>')
+_FHRP_L3_SRC = re.compile(r'^\s*(\S+?)\s*>')
+
+
+def _parse_fhrp_capture(output):
+    """Parse `tcpdump -nn -t -v` text over FHRP hellos into events. One hello is one
+    content line (`<src> > <mcast>: HSRPv0-hello ... priority=255 ...` etc.). Each
+    event is a dict with a normalised 'priority' (higher = wins the election):
+      {proto, version, src, group, vip, priority, opcode, state, authtype,
+       auth_weak, advskew}
+    """
+    events = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or '>' not in line:
+            continue
+
+        if 'HSRPv' in line:                                   # HSRP (UDP 1985)
+            m = _FHRP_HSRP_SRC.search(line)
+            op = re.search(r'HSRPv(\d+)-(\w+)', line)
+            grp = re.search(r'group=(\d+)', line)
+            pri = re.search(r'priority=(\d+)', line)
+            auth = re.search(r'auth="([^"]*)"', line)
+            events.append({
+                'proto': 'hsrp', 'version': int(op.group(1)) if op else None,
+                'src': m.group(1) if m else None,
+                'group': int(grp.group(1)) if grp else None,
+                'vip': (re.search(r'addr=([\d.]+)', line) or [None, None])[1]
+                if re.search(r'addr=([\d.]+)', line) else None,
+                'priority': int(pri.group(1)) if pri else None,
+                'opcode': op.group(2) if op else None,
+                'state': (re.search(r'state=(\w+)', line) or [None, None])[1]
+                if re.search(r'state=(\w+)', line) else None,
+                'authtype': 'plaintext' if auth else None,
+                'auth_weak': bool(auth), 'advskew': None})
+
+        elif 'CARP' in line:                                  # CARP (IP proto 112)
+            m = _FHRP_L3_SRC.match(raw)
+            ver = re.search(r'CARPv(\d+)', line)
+            vhid = re.search(r'vhid=(\d+)', line)
+            skew = re.search(r'advskew=(\d+)', line)
+            adv = int(skew.group(1)) if skew else None
+            events.append({
+                'proto': 'carp', 'version': int(ver.group(1)) if ver else None,
+                'src': m.group(1) if m else None,
+                'group': int(vhid.group(1)) if vhid else None, 'vip': None,
+                'priority': (255 - adv) if adv is not None else None,
+                'opcode': 'advertise', 'state': None, 'authtype': 'hmac',
+                'auth_weak': False, 'advskew': adv})
+
+        elif 'VRRP' in line:                                  # VRRP (IP proto 112)
+            m = _FHRP_L3_SRC.match(raw)
+            ver = re.search(r'VRRPv(\d+)', line)
+            vrid = re.search(r'vrid (\d+)', line)
+            pri = re.search(r'prio (\d+)', line)
+            at = re.search(r'authtype (\w+)', line)
+            addrs = re.search(r'addrs:\s*([0-9a-fA-F:., ]+)', line)
+            vip = None
+            if addrs:
+                parts = [a.strip() for a in re.split(r'[,\s]+', addrs.group(1))
+                         if a.strip()]
+                vip = parts[0] if parts else None
+            authtype = at.group(1).lower() if at else None
+            events.append({
+                'proto': 'vrrp', 'version': int(ver.group(1)) if ver else None,
+                'src': m.group(1) if m else None,
+                'group': int(vrid.group(1)) if vrid else None, 'vip': vip,
+                'priority': int(pri.group(1)) if pri else None,
+                'opcode': 'advertise', 'state': None, 'authtype': authtype,
+                'auth_weak': authtype in ('none', 'simple', None), 'advskew': None})
+
+        elif '.3222 >' in line:                               # GLBP (UDP 3222)
+            m = _FHRP_GLBP_SRC.search(line)
+            grp = re.search(r'[Gg]roup[= ](\d+)', line)
+            pri = re.search(r'priority[= ](\d+)', line)
+            events.append({
+                'proto': 'glbp', 'version': None,
+                'src': m.group(1) if m else None,
+                'group': int(grp.group(1)) if grp else None, 'vip': None,
+                'priority': int(pri.group(1)) if pri else None,
+                'opcode': 'hello', 'state': None, 'authtype': None,
+                'auth_weak': False, 'advskew': None})
+    return [e for e in events if e['src']]
+
+
+def _fhrp_watch_load():
+    try:
+        with open(_FHRP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _fhrp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_FHRP_WATCH_PATH), exist_ok=True)
+        tmp = _FHRP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _FHRP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_fhrp_baseline(action='get'):
+    """Manage the learned FHRP baseline (trusted groups + their speakers/priorities).
+    action='reset' re-learns the segment's FHRP groups on the next scan."""
+    with _fhrp_watch_lock:
+        if action == 'reset':
+            _fhrp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _fhrp_watch_load()
+        return {'success': True, 'baseline': {
+            'groups': sorted((b.get('groups') or {}).keys()),
+        }}
+
+
+def _fhrp_gkey(e):
+    return f"{e['proto']}/{e['group']}" if e['group'] is not None else f"{e['proto']}/?"
+
+
+def _fhrp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed FHRP events. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with synthetic
+    packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    groups = {}
+    for e in events:
+        gk = _fhrp_gkey(e)
+        g = groups.setdefault(gk, {
+            'gkey': gk, 'proto': e['proto'], 'group': e['group'], 'vips': set(),
+            'speakers': {}, 'auth_weak': False, 'authtype': e['authtype']})
+        if e['vip']:
+            g['vips'].add(e['vip'])
+        if e['auth_weak']:
+            g['auth_weak'] = True
+        if e['authtype']:
+            g['authtype'] = e['authtype']
+        sp = g['speakers'].setdefault(e['src'], {
+            'src': e['src'], 'prio': None, 'states': set(), 'opcodes': set(),
+            'count': 0})
+        sp['count'] += 1
+        if e['priority'] is not None:
+            sp['prio'] = e['priority'] if sp['prio'] is None else max(sp['prio'],
+                                                                      e['priority'])
+        if e['state']:
+            sp['states'].add(e['state'])
+        if e['opcode']:
+            sp['opcodes'].add(e['opcode'])
+
+    known = dict(baseline.get('groups') or {})
+    had_baseline = bool(known)
+
+    learned = False
+    if learn and not had_baseline and groups:
+        baseline['groups'] = {
+            gk: {'speakers': {s: sp['prio'] for s, sp in g['speakers'].items()},
+                 'vips': sorted(g['vips']),
+                 'max_prio': max([sp['prio'] for sp in g['speakers'].values()
+                                  if sp['prio'] is not None] or [0])}
+            for gk, g in groups.items()}
+        learned = True
+        known = dict(baseline['groups'])
+        had_baseline = True
+
+    PRIORITY = ['hijack', 'rogue-speaker', 'priority-change', 'weak-auth', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    for gk in sorted(groups):
+        g = groups[gk]
+        base = known.get(gk) or {}
+        base_speakers = dict(base.get('speakers') or {})
+        base_max = base.get('max_prio')
+        vip = ', '.join(sorted(g['vips'])) or '?'
+        for src in sorted(g['speakers']):
+            sp = g['speakers'][src]
+            is_new = had_baseline and src not in base_speakers
+            coup = 'coup' in sp['opcodes']
+            prio = sp['prio']
+            winning = (prio is not None and base_max is not None and prio >= base_max)
+            near_max = (prio is not None and prio >= _FHRP_TAKEOVER_PRIO)
+            if is_new and (coup or winning or near_max):
+                bump('hijack')
+                p = f"priority {prio}" if prio is not None else "no priority field"
+                extra = ' (HSRP Coup)' if coup else ''
+                reasons.append(
+                    f"FHRP HIJACK on {g['proto'].upper()} group "
+                    f"{g['group'] if g['group'] is not None else '?'} (gateway "
+                    f"{vip}): new speaker {src} advertising {p}{extra} — it wins the "
+                    f"election and becomes the virtual gateway, MITMing the subnet")
+            elif is_new:
+                bump('rogue-speaker')
+                reasons.append(
+                    f"Unexpected {g['proto'].upper()} speaker {src} in group "
+                    f"{g['group'] if g['group'] is not None else '?'} (gateway {vip}) "
+                    f"— not in the baseline (FHRP injection; watch for a priority rise)")
+            elif (not is_new) and prio is not None:
+                base_prio = base_speakers.get(src)
+                if base_prio is not None and prio > base_prio:
+                    bump('priority-change')
+                    reasons.append(
+                        f"{g['proto'].upper()} speaker {src} in group "
+                        f"{g['group'] if g['group'] is not None else '?'} raised its "
+                        f"priority {base_prio} → {prio} — possible pre-takeover or a "
+                        f"legitimate reconfiguration")
+        if g['auth_weak']:
+            bump('weak-auth')
+            reasons.append(
+                f"{g['proto'].upper()} group "
+                f"{g['group'] if g['group'] is not None else '?'} uses weak/no "
+                f"authentication ({g['authtype'] or 'none'}) — this is what lets a "
+                f"forged higher-priority hello win the election; enable MD5/HMAC auth")
+
+    advisories = []
+    if groups:
+        advisories.append(
+            "Authenticate FHRP (HSRP/VRRP MD5 or key-chain), raise the real routers to "
+            "a high priority with preempt, and filter FHRP multicast on access ports "
+            "(only trunk/router ports should carry HSRP 1985 / GLBP 3222 / VRRP+CARP "
+            "IP-proto-112). Alert on any new speaker or priority change.")
+
+    def _pub(g):
+        return {'gkey': g['gkey'], 'proto': g['proto'], 'group': g['group'],
+                'vips': sorted(g['vips']), 'authtype': g['authtype'],
+                'auth_weak': g['auth_weak'],
+                'speakers': [{
+                    'src': s, 'priority': sp['prio'],
+                    'states': sorted(sp['states']), 'opcodes': sorted(sp['opcodes']),
+                    'baseline': s in ((known.get(g['gkey']) or {}).get('speakers') or {}),
+                } for s, sp in sorted(g['speakers'].items())]}
+
+    if reasons:
+        summary = reasons
+    elif not groups:
+        summary = ['No FHRP traffic seen — no HSRP/VRRP/GLBP/CARP on this segment']
+    else:
+        summary = ['All FHRP groups/speakers match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'group_count': len(groups),
+        'packet_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'groups': [_pub(groups[gk]) for gk in sorted(groups)],
+        'advisories': advisories,
+    }
+
+
+def _fhrp_capture(interface, seconds):
+    """Run one passive tcpdump window over FHRP hellos and return (raw, error).
+    Covers HSRP (udp 1985), GLBP (udp 3222), and VRRP/CARP (IP/IPv6 proto 112)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = ('(udp and (port 1985 or port 3222)) or (ip proto 112) or '
+           '(ip6 proto 112)')
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '256', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_fhrp_watch(interface=None, seconds=15, learn=True, quick=False):
+    """Passive FHRP (HSRP/VRRP/GLBP/CARP) hijack scanner (detection-only). Captures
+    FHRP hellos for a few seconds and classifies the segment: hijack / rogue-speaker /
+    priority-change / weak-auth / clean. Learns the trusted groups on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 4, 40)
+
+    text, err = _fhrp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_fhrp_capture(text)
+
+    with _fhrp_watch_lock:
+        baseline = _fhrp_watch_load()
+        result = _fhrp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _fhrp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _fhrp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_FHRP_EVENTS_CAP:]
+            _fhrp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _fhrp_selftest():
+    """Self-test the FHRP detectors with synthetic captures (no root, no live
+    traffic). Feeds crafted `tcpdump -t -v` text through the real parser + classifier,
+    and — if Scapy is available — builds real HSRP + VRRP hellos into a pcap and
+    parses them back through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def hsrp(src, group=1, prio=100, state='active', op='hello', vip='192.168.1.1',
+             auth='cisco'):
+        a = f' auth="{auth}"' if auth is not None else ''
+        return (f"    {src}.1985 > 224.0.0.2.1985: HSRPv0-{op} 20: state={state} "
+                f"group={group} addr={vip} hellotime=3s holdtime=10s "
+                f"priority={prio}{a}")
+
+    def vrrp(src, vrid=1, prio=100, authtype='none', vip='192.168.1.1'):
+        return (f"    {src} > 224.0.0.18: VRRPv2, Advertisement, (ttl 255), "
+                f"vrid {vrid}, prio {prio}, authtype {authtype}, intvl 1s, "
+                f"length 20, addrs: {vip}")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_fhrp_capture(text)
+        res = _fhrp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    # Baseline: HSRP group 1 active=192.168.1.2 prio 110; VRRP vrid 1 active .3 prio 100.
+    base = {'groups': {
+        'hsrp/1': {'speakers': {'192.168.1.2': 110}, 'vips': ['192.168.1.1'],
+                   'max_prio': 110},
+        'vrrp/1': {'speakers': {'192.168.1.3': 100}, 'vips': ['192.168.1.1'],
+                   'max_prio': 100}}}
+
+    # 1. clean: the known active re-advertising at its known priority (MD5 auth so no
+    #    weak-auth), + known VRRP with AH auth.
+    run('clean', hsrp('192.168.1.2', prio=110, auth=None) + "\n"
+        + vrrp('192.168.1.3', prio=100, authtype='ah'), 15, base, 'clean')
+
+    # 2. hijack: a NEW HSRP speaker advertising priority 255 — wins + becomes gateway.
+    run('hijack', hsrp('192.168.1.66', prio=255, auth=None), 15, base, 'hijack')
+
+    # 3. hijack via Coup from a new speaker.
+    run('coup', hsrp('192.168.1.66', prio=120, op='coup', auth=None), 15, base,
+        'hijack')
+
+    # 4. rogue-speaker: a new speaker but at a losing priority (below the active).
+    run('rogue-speaker', hsrp('192.168.1.66', prio=50, auth=None), 15, base,
+        'rogue-speaker')
+
+    # 5. priority-change: the known active raises its priority.
+    run('priority-change', hsrp('192.168.1.2', prio=200, auth=None), 15, base,
+        'priority-change')
+
+    # 6. weak-auth: known speakers but plaintext HSRP auth + VRRP authtype none.
+    run('weak-auth', hsrp('192.168.1.2', prio=110, auth='cisco') + "\n"
+        + vrrp('192.168.1.3', prio=100, authtype='none'), 15, base, 'weak-auth')
+
+    # 7. vrrp-hijack: a new VRRP speaker at prio 254.
+    run('vrrp-hijack', vrrp('192.168.1.77', vrid=1, prio=254, authtype='ah'), 15,
+        base, 'hijack')
+
+    # 8. parse: HSRP fields + VRRP fields + CARP + GLBP.
+    pev = _parse_fhrp_capture(
+        hsrp('192.168.1.2', prio=255, op='coup') + "\n"
+        + vrrp('192.168.1.3', vrid=7, prio=200) + "\n"
+        + "    10.0.0.9 > 224.0.0.18: CARPv2-advertise 36: vhid=1 advbase=1 advskew=0\n"
+        + "    10.0.0.8.3222 > 224.0.0.102.3222: UDP, length 40")
+    protos = {e['proto'] for e in pev}
+    hsrp_ev = next((e for e in pev if e['proto'] == 'hsrp'), {})
+    p_ok = (protos == {'hsrp', 'vrrp', 'carp', 'glbp'}
+            and hsrp_ev.get('opcode') == 'coup' and hsrp_ev.get('priority') == 255
+            and hsrp_ev.get('auth_weak') is True)
+    scenarios.append({'name': 'fhrp-parse', 'expect': 'hsrp/vrrp/carp/glbp',
+                      'got': str(sorted(protos)), 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft real HSRP + VRRP -> pcap -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, UDP, wrpcap
+        from scapy.layers.hsrp import HSRP
+        from scapy.layers.vrrp import VRRP
+        if _have('tcpdump'):
+            pkts = [
+                Ether() / IP(src='192.168.1.66', dst='224.0.0.2')
+                / UDP(sport=1985, dport=1985)
+                / HSRP(group=1, priority=255, state=16, virtualIP='192.168.1.1'),
+                Ether() / IP(src='192.168.1.3', dst='224.0.0.18', proto=112)
+                / VRRP(vrid=5, priority=254, ipcount=1, addrlist=['192.168.1.1'],
+                       version=2)]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_fhrp_capture(res['out'])
+            hs = next((e for e in evs if e['proto'] == 'hsrp'), {})
+            vr = next((e for e in evs if e['proto'] == 'vrrp'), {})
+            ok = (hs.get('priority') == 255 and hs.get('src') == '192.168.1.66'
+                  and vr.get('priority') == 254 and vr.get('group') == 5)
+            scapy_result = {'ran': True, 'protos': sorted({e['proto'] for e in evs}),
+                            'hsrp_prio': hs.get('priority'),
+                            'vrrp_prio': vr.get('priority'), 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # OSPF Watch: passive OSPF security scanner (detection-only)
 # --------------------------------------------------------------------------
 # OSPF is the interior routing control plane (IP proto 89, multicast 224.0.0.5/6).
@@ -7618,6 +8076,7 @@ def do_routing_selftest():
               'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
+              'fhrp': _fhrp_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
@@ -8492,6 +8951,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/tls-baseline {action}")
         return jsonify(do_tls_baseline(action))
 
+    @app.route('/api/net/fhrp-watch', methods=['GET'])
+    def net_fhrp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 4, 40)
+        _log(f"net/fhrp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_fhrp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/fhrp-baseline', methods=['GET', 'POST'])
+    def net_fhrp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/fhrp-baseline {action}")
+        return jsonify(do_fhrp_baseline(action))
+
     @app.route('/api/net/ospf-watch', methods=['GET'])
     def net_ospf_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -8758,6 +9235,15 @@ def _cli(argv=None):
 
     twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
     twst.add_argument('--json', action='store_true', help='emit JSON')
+
+    fh = sub.add_parser('fhrp-watch', help='passive FHRP (HSRP/VRRP/GLBP/CARP) hijack scan')
+    fh.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    fh.add_argument('--seconds', '-s', type=int, default=15, help='capture window (4-40)')
+    fh.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    fh.add_argument('--json', action='store_true', help='emit JSON')
+
+    fhst = sub.add_parser('fhrp-selftest', help='self-test the FHRP detectors (no root)')
+    fhst.add_argument('--json', action='store_true', help='emit JSON')
 
     o = sub.add_parser('ospf-watch', help='passive OSPF security scan')
     o.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -9076,6 +9562,48 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] e2e-local-server: {e.get('reason')}")
             print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'fhrp-watch':
+        r = do_fhrp_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"FHRP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} pkts, {r['group_count']} group(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for g in r.get('groups', []):
+                print(f"  {g['proto'].upper()} group {g['group']} "
+                      f"(gw {', '.join(g['vips']) or '?'}, "
+                      f"auth {g['authtype'] or 'none'}{' WEAK' if g['auth_weak'] else ''})")
+                for sp in g['speakers']:
+                    tag = '' if sp['baseline'] else ' *NEW*'
+                    print(f"    {sp['src']} prio={sp['priority']}"
+                          f"{' ' + ','.join(sp['opcodes']) if sp['opcodes'] else ''}{tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'fhrp-selftest':
+        r = _fhrp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"protos={sc.get('protos')} hsrp_prio={sc.get('hsrp_prio')} "
+                      f"vrrp_prio={sc.get('vrrp_prio')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"FHRP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'ospf-watch':

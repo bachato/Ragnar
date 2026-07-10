@@ -49,6 +49,7 @@ alert.
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [SNMP Watch](#snmp-watch) | Diagnostics | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
 | [TLS Watch](#tls-watch) | Diagnostics | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
+| [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -89,7 +90,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -920,6 +921,43 @@ end.
 
 - Endpoint: `GET /api/net/icmp-watch` `{interface, seconds}`,
   `POST /api/net/icmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### FHRP Watch
+A **passive** hijack scanner for the **First Hop Redundancy Protocols** — **HSRP**
+(Cisco, UDP 1985), **VRRP** (RFC 5798, IP proto 112), **GLBP** (Cisco, UDP 3222)
+and **CARP** (BSD, IP proto 112). **Detection-only** — it never sends an FHRP
+packet or joins an election; it captures one short window of the multicast hellos
+and classifies them against a learned baseline.
+
+FHRP is how two or more routers share a single **virtual gateway** (one virtual
+IP + MAC that floats to whichever router is *active*), so hosts keep working when a
+router dies. The active router is chosen by **priority**, and the hellos are
+multicast in the clear with weak or no authentication (HSRP's default is the
+plaintext string `cisco`; VRRPv3 has none). That makes FHRP a classic MITM target:
+an attacker who can see the hellos injects a forged hello with **priority 255 +
+preempt**, wins the election, and becomes everyone's default gateway — all
+off-subnet traffic now flows through them (Yersinia, Loki, `scapy`). What it flags:
+
+- **Hijack** — a speaker that isn't in the baseline advertising a **winning**
+  priority (≥ the current active, or ≥ 250/255), or an **HSRP Coup** (an active
+  takeover message). This is a live gateway takeover.
+- **Rogue speaker** — a new speaker in a group that isn't (yet) winning: FHRP
+  injection in progress; watch for a following priority rise.
+- **Priority change** — a *known* speaker whose priority jumped up. Could be a
+  legitimate reconfiguration or the pre-stage of a takeover.
+- **Weak / no auth** — plaintext HSRP auth or VRRP `authtype none/simple`. This is
+  the enabler; the fix is MD5/HMAC (HSRP key-chains, VRRP AH) plus filtering FHRP
+  multicast off access ports.
+
+The first scan **learns** the current groups and their active speakers/priorities
+as the trusted baseline (`data/fhrp_watch.json`); after a legitimate router or
+priority change, click **Trust current** to re-learn. HSRP and VRRP are fully
+decoded (priority-based detection); GLBP and CARP are best-effort (new-speaker
+presence, since `tcpdump` doesn't dissect GLBP). The BPF is
+`(udp and (port 1985 or port 3222)) or (ip proto 112) or (ip6 proto 112)`. Put the
+Pi on the routed VLAN or a SPAN/mirror to see the hellos. **API:**
+`GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline`. **CLI:** `fhrp-watch`,
+`fhrp-selftest`.
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
