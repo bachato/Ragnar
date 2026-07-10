@@ -6355,6 +6355,804 @@ def _tls_selftest():
 
 
 # --------------------------------------------------------------------------
+# DTP Watch: passive Dynamic Trunking Protocol / VLAN-hopping scanner (Cisco)
+# --------------------------------------------------------------------------
+# DTP (Cisco proprietary, group MAC 01:00:0c:cc:cc:cc, SNAP OUI 0x00000c PID 0x2004)
+# auto-negotiates whether a switch port becomes an 802.1Q/ISL *trunk*. A port left in
+# the default `dynamic auto`/`dynamic desirable` mode will happily form a trunk with
+# anything that sends DTP "desirable" frames — so an attacker plugs in, forges DTP
+# desirable (Yersinia "enable trunking"), the access port trunks to them, and they now
+# see and inject into *every VLAN* (the classic switch-spoofing VLAN hop). The fix is
+# `switchport nonegotiate` + hard `access`/`trunk` on every port; DTP should never be
+# seen on an access segment. This scanner is PASSIVE: one short capture of the DTP
+# frames, no DTP is ever transmitted. It flags:
+#   * vlan-hop           — trunk-forming DTP (on/desirable/auto) from a NEW speaker:
+#     an active switch-spoofing / VLAN-hop attempt.
+#   * trunk-negotiation  — trunk-forming DTP present (port isn't `nonegotiate`, so it
+#     is exploitable) even from a known speaker.
+#   * dtp-enabled        — DTP frames present at all (DTP not disabled). Advisory.
+_DTP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'dtp_watch.json')
+_dtp_watch_lock = threading.Lock()
+_DTP_EVENTS_CAP = 200
+# DTP Trunk Administrative Status (low 3 bits of the Status octet). on/desirable/auto
+# all mean the port will form (or force) a trunk; off means it won't.
+_DTP_TAS = {1: 'on', 2: 'off', 3: 'desirable', 4: 'auto'}
+_DTP_FORMING = {1, 3, 4}
+_DTP_HDR_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*01:00:0c:cc:cc:cc')
+
+
+def _dtp_status(byte):
+    """(label, forming?) for a DTP Status octet."""
+    if byte is None:
+        return ('unknown', False)
+    tas = byte & 0x07
+    return (_DTP_TAS.get(tas, f'0x{byte:02x}'), tas in _DTP_FORMING)
+
+
+def _parse_dtp_capture(output):
+    """Parse `tcpdump -e -t -v` text over DTP frames into events. Each DTP frame is a
+    header line (`<src-mac> > 01:00:0c:cc:cc:cc, 802.3, ... DTPv1`) followed by
+    indented Domain/Status/DTP type/Neighbor TLV lines."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _DTP_HDR_RE.match(line)
+        if m and 'DTPv' in line:
+            if cur:
+                events.append(cur)
+            ver = re.search(r'DTPv(\d+)', line)
+            cur = {'src': m.group(1).lower(),
+                   'version': int(ver.group(1)) if ver else None,
+                   'domain': None, 'status': None, 'dtptype': None, 'neighbor': None}
+            continue
+        if cur is None:
+            continue
+        if line.startswith('Domain'):
+            d = re.search(r'length \d+,\s*(.*)$', line)
+            cur['domain'] = (d.group(1).strip() or None) if d else None
+        elif line.startswith('Status'):
+            s = re.search(r'0x([0-9a-fA-F]+)\s*$', line)
+            cur['status'] = int(s.group(1), 16) if s else None
+        elif line.startswith('DTP type'):
+            s = re.search(r'0x([0-9a-fA-F]+)\s*$', line)
+            cur['dtptype'] = int(s.group(1), 16) if s else None
+        elif line.startswith('Neighbor'):
+            s = re.search(r'([0-9a-fA-F:]{17})\s*$', line)
+            cur['neighbor'] = s.group(1).lower() if s else None
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _dtp_watch_load():
+    try:
+        with open(_DTP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _dtp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_DTP_WATCH_PATH), exist_ok=True)
+        tmp = _DTP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _DTP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_dtp_baseline(action='get'):
+    """Manage the learned DTP baseline (trusted DTP speaker MACs — the real switches)."""
+    with _dtp_watch_lock:
+        if action == 'reset':
+            _dtp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _dtp_watch_load()
+        return {'success': True, 'baseline': {'speakers': b.get('speakers') or []}}
+
+
+def _dtp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed DTP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    speakers = {}
+    for e in events:
+        sp = speakers.setdefault(e['src'], {
+            'src': e['src'], 'count': 0, 'status': 'unknown', 'forming': False,
+            'domain': None, 'neighbor': None})
+        sp['count'] += 1
+        label, forming = _dtp_status(e['status'])
+        sp['status'] = label
+        if forming:
+            sp['forming'] = True
+        if e.get('domain'):
+            sp['domain'] = e['domain']
+        if e.get('neighbor'):
+            sp['neighbor'] = e['neighbor']
+
+    known = set(baseline.get('speakers') or [])
+    had_baseline = bool(known)
+
+    learned = False
+    if learn and not had_baseline and speakers:
+        baseline['speakers'] = sorted(speakers.keys())
+        learned = True
+        known = set(speakers.keys())
+        had_baseline = True
+
+    PRIORITY = ['vlan-hop', 'trunk-negotiation', 'dtp-enabled', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # First (learning) run: surface that DTP exists here so the user knows, but a
+    # known non-forming switch on later runs is clean (legit trunk infrastructure).
+    if learned and speakers:
+        bump('dtp-enabled')
+    for src in sorted(speakers):
+        sp = speakers[src]
+        is_new = had_baseline and src not in known
+        if sp['forming'] and is_new:
+            bump('vlan-hop')
+            reasons.append(
+                f"VLAN HOP: DTP '{sp['status']}' (trunk-forming) from a NEW speaker "
+                f"{src} — a switch-spoofing attempt; if an access port answers this it "
+                f"trunks and exposes every VLAN. Set `switchport nonegotiate` + hard "
+                f"access mode on that port")
+        elif sp['forming']:
+            bump('trunk-negotiation')
+            reasons.append(
+                f"DTP '{sp['status']}' (trunk-forming) from {src} — this segment is "
+                f"negotiating trunks; a rogue host could VLAN-hop. Disable DTP with "
+                f"`switchport nonegotiate` on access ports")
+        elif is_new:
+            bump('dtp-enabled')
+            reasons.append(
+                f"New DTP speaker {src} (status '{sp['status']}') not in the baseline "
+                f"— unexpected device speaking DTP on this segment")
+    if learned and verdict == 'dtp-enabled' and not reasons:
+        reasons.append(
+            "DTP is present on this segment — learned the current speaker(s) as the "
+            "baseline. DTP should be disabled (`switchport nonegotiate`) on access "
+            "ports; only switch↔switch trunk links should speak it")
+
+    if speakers:
+        advisories = [
+            "Harden against VLAN hopping: `switchport mode access` + `switchport "
+            "nonegotiate` on every access port, prune unused VLANs off trunks, and "
+            "never use VLAN 1 / the native VLAN for data. DTP should not appear on any "
+            "access segment."]
+    else:
+        advisories = []
+
+    if reasons:
+        summary = reasons
+    elif not speakers:
+        summary = ['No DTP seen — no Dynamic Trunking Protocol on this segment (good; '
+                   'means ports are not negotiating trunks here)']
+    else:
+        summary = ['DTP speakers all match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'speaker_count': len(speakers),
+        'packet_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'speakers': [{
+            'src': s, 'status': sp['status'], 'forming': sp['forming'],
+            'domain': sp['domain'], 'neighbor': sp['neighbor'], 'count': sp['count'],
+            'baseline': s in known,
+        } for s, sp in sorted(speakers.items())],
+        'advisories': advisories,
+    }
+
+
+def _dtp_capture(interface, seconds):
+    """One passive tcpdump window over DTP frames -> (raw, error). Uses -e so we get
+    the sending switch/host MAC; the BPF isolates DTP (PID 0x2004) from the other
+    protocols that share the Cisco group MAC (CDP/VTP/UDLD/PAgP)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2004'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '128', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_dtp_watch(interface=None, seconds=30, learn=True):
+    """Passive DTP / VLAN-hopping scanner (detection-only). DTP hellos are ~30s apart,
+    so the default window is longer. Learns the trusted DTP speakers on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 30, 5, 65)
+
+    text, err = _dtp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_dtp_capture(text)
+
+    with _dtp_watch_lock:
+        baseline = _dtp_watch_load()
+        result = _dtp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _dtp_watch_save(baseline)
+        if result['verdict'] not in ('clean', 'dtp-enabled'):
+            b = _dtp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_DTP_EVENTS_CAP:]
+            _dtp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _dtp_selftest():
+    """Self-test the DTP detector with synthetic captures, plus a Scapy end-to-end leg
+    (craft a real DTP desirable frame -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def frame(src, status=0x03, dtptype=0xa5, neighbor=None):
+        neighbor = neighbor or src
+        return (f"{src} > 01:00:0c:cc:cc:cc, 802.3, length 33: LLC, dsap SNAP (0xaa) "
+                f"Individual, ssap SNAP (0xaa) Command, ctrl 0x03: oui Cisco "
+                f"(0x00000c), pid DTP (0x2004), length 25: DTPv1, length 25\n"
+                f"\tDomain (0x0001) TLV, length 4, \n"
+                f"\tStatus (0x0002) TLV, length 5, 0x{status:x}\n"
+                f"\tDTP type (0x0003) TLV, length 5, 0x{dtptype:x}\n"
+                f"\tNeighbor (0x0004) TLV, length 10, {neighbor}")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_dtp_capture(text)
+        res = _dtp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'speakers': ['00:11:22:33:44:55']}
+
+    # 1. clean: known switch, DTP 'off' (not forming a trunk).
+    run('clean', frame('00:11:22:33:44:55', status=0x02), 30, base, 'clean')
+    # 2. vlan-hop: a NEW speaker sending 'desirable' (trunk-forming) — switch spoofing.
+    run('vlan-hop', frame('de:ad:be:ef:00:01', status=0x03), 30, base, 'vlan-hop')
+    # 3. trunk-negotiation: the known switch is in 'auto' (forming) — port not nonegotiate.
+    run('trunk-negotiation', frame('00:11:22:33:44:55', status=0x04), 30, base,
+        'trunk-negotiation')
+    # 4. dtp-enabled: known switch, DTP 'off' but present — first-run learn (no baseline).
+    run('dtp-enabled', frame('00:11:22:33:44:55', status=0x02), 30, None, 'dtp-enabled')
+    # 5. parse: fields.
+    pev = _parse_dtp_capture(frame('aa:bb:cc:dd:ee:ff', status=0x03,
+                                   neighbor='aa:bb:cc:dd:ee:ff'))
+    p_ok = (len(pev) == 1 and pev[0]['src'] == 'aa:bb:cc:dd:ee:ff'
+            and pev[0]['status'] == 0x03 and pev[0]['neighbor'] == 'aa:bb:cc:dd:ee:ff'
+            and _dtp_status(pev[0]['status'])[1] is True)
+    scenarios.append({'name': 'dtp-parse', 'expect': 'desirable/forming',
+                      'got': _dtp_status(pev[0]['status'] if pev else None)[0],
+                      'pass': p_ok})
+
+    # Scapy end-to-end.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, SNAP, wrpcap
+        from scapy.contrib.dtp import DTP, DTPDomain, DTPStatus, DTPType, DTPNeighbor
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:00:0c:cc:cc:cc', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0xaa, ssap=0xaa, ctrl=3)
+                   / SNAP(OUI=0x00000c, code=0x2004)
+                   / DTP(ver=1, tlvlist=[DTPDomain(domain=b''),
+                                         DTPStatus(status=b'\x03'),
+                                         DTPType(dtptype=b'\xa5'),
+                                         DTPNeighbor(neighbor='de:ad:be:ef:00:01')]))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_dtp_capture(res['out'])
+            e = evs[0] if evs else {}
+            ok = (e.get('src') == 'de:ad:be:ef:00:01' and e.get('status') == 0x03
+                  and _dtp_status(e.get('status'))[1] is True)
+            scapy_result = {'ran': True, 'src': e.get('src'), 'status': e.get('status'),
+                            'pass': ok, 'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# EIGRP Watch: passive EIGRP routing-security scanner (Cisco; detection-only)
+# --------------------------------------------------------------------------
+# EIGRP is Cisco's interior gateway protocol (the Cisco-world alternative to OSPF;
+# advanced distance-vector, IP proto 88, multicast 224.0.0.10 / ff02::a). Like OSPF
+# it has no protection on the wire unless HMAC-MD5/SHA authentication (key-chains) is
+# configured, so any host on the segment can form an adjacency and inject Update
+# packets with attractive metrics to blackhole or MITM traffic. Unlike OSPF, tcpdump
+# fully decodes EIGRP's route TLVs — the advertised prefix, next-hop and metrics are
+# visible — so this passive scanner can see route injection directly. It flags:
+#   * injection    — a prefix that isn't in the baseline being advertised, or a known
+#     prefix now originated by a different router / pointing at a different next-hop
+#     (route/next-hop hijack).
+#   * rogue-router — a new EIGRP speaker (source/AS) not in the baseline.
+#   * storm        — an EIGRP flood (hello/query storm) by rate.
+#   * anomaly      — K-value or AS-number mismatch between speakers (misconfig / probe).
+#   * weak-auth    — EIGRP packets with no Authentication TLV (the injection enabler).
+# Detection-only: it never forms an adjacency, sends a hello, or injects a route.
+_EIGRP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'data', 'eigrp_watch.json')
+_eigrp_watch_lock = threading.Lock()
+_EIGRP_EVENTS_CAP = 200
+_EIGRP_STORM_RATE = 25          # EIGRP pkts/s above this (with volume) == flood
+_EIGRP_OPCODES = {1: 'update', 2: 'request', 3: 'query', 4: 'reply', 5: 'hello',
+                  10: 'siaquery', 11: 'siareply'}
+_EIGRP_V4HDR_RE = re.compile(r'^(\d+\.\d+\.\d+\.\d+)\s*>\s*(\S+):\s*$')
+_EIGRP_V6HDR_RE = re.compile(r'next-header EIGRP \(88\).*?\)\s+(\S+)\s*>\s*(\S+):')
+_EIGRP_OP_RE = re.compile(r'EIGRP v(\d+), opcode:\s*(\w+)\s*\((\d+)\)')
+
+
+def _parse_eigrp_capture(output):
+    """Parse `tcpdump -t -v` text over EIGRP into per-packet events. Block-structured:
+    an IP/IP6 header line sets the current src/dst, then an `EIGRP v2, opcode:` line
+    starts a packet whose TLVs (params/auth/routes) follow indented."""
+    events = []
+    cur = None
+    cur_src = cur_dst = None
+    last_kind = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m6 = _EIGRP_V6HDR_RE.search(line)
+        if m6:
+            cur_src, cur_dst = m6.group(1), m6.group(2)
+            continue
+        m4 = _EIGRP_V4HDR_RE.match(line)
+        if m4:
+            cur_src, cur_dst = m4.group(1), m4.group(2)
+            continue
+        mo = _EIGRP_OP_RE.search(line)
+        if mo:
+            if cur:
+                events.append(cur)
+            op = int(mo.group(3))
+            cur = {'src': cur_src, 'dst': cur_dst,
+                   'af': 'ipv6' if (cur_dst and ':' in str(cur_dst)) else 'ipv4',
+                   'opcode': _EIGRP_OPCODES.get(op, mo.group(2).lower()),
+                   'opcode_num': op, 'asn': None, 'auth': False, 'kvals': None,
+                   'holdtime': None, 'routes': []}
+            last_kind = None
+            continue
+        if cur is None:
+            continue
+        a = re.search(r'\bAS:\s*(\d+)', line)
+        if a:
+            cur['asn'] = int(a.group(1))
+        if 'Authentication TLV' in line:
+            cur['auth'] = True
+        if 'Internal routes TLV' in line:
+            last_kind = 'internal'
+        elif 'External routes TLV' in line:
+            last_kind = 'external'
+        k = re.search(r'holdtime:\s*(\d+)s,\s*k1\s*(\d+),\s*k2\s*(\d+),\s*k3\s*(\d+),'
+                      r'\s*k4\s*(\d+),\s*k5\s*(\d+)', line)
+        if k:
+            cur['holdtime'] = int(k.group(1))
+            cur['kvals'] = tuple(int(k.group(i)) for i in range(2, 7))
+        pr = re.search(r'prefix:\s*([0-9a-fA-F:.]+/\d+),\s*nexthop:\s*([0-9a-fA-F:.]+)',
+                       line)
+        if pr:
+            cur['routes'].append({'prefix': pr.group(1),
+                                  'nexthop': pr.group(2).rstrip(','),
+                                  'kind': last_kind or 'internal',
+                                  'origin_router': None, 'origin_as': None,
+                                  'origin_proto': None, 'delay': None,
+                                  'bandwidth': None})
+        og = re.search(r'origin-router\s*([0-9a-fA-F:.]+),\s*origin-as\s*(\d+),'
+                       r'\s*origin-proto\s*(\w+)', line)
+        if og and cur['routes']:
+            cur['routes'][-1]['origin_router'] = og.group(1).rstrip(',')
+            cur['routes'][-1]['origin_as'] = int(og.group(2))
+            cur['routes'][-1]['origin_proto'] = og.group(3)
+        dl = re.search(r'delay\s*(\d+)\s*ms,\s*bandwidth\s*(\d+)\s*Kbps', line)
+        if dl and cur['routes']:
+            cur['routes'][-1]['delay'] = int(dl.group(1))
+            cur['routes'][-1]['bandwidth'] = int(dl.group(2))
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _eigrp_watch_load():
+    try:
+        with open(_EIGRP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _eigrp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_EIGRP_WATCH_PATH), exist_ok=True)
+        tmp = _EIGRP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _EIGRP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_eigrp_baseline(action='get'):
+    """Manage the learned EIGRP baseline (trusted routers + advertised prefixes)."""
+    with _eigrp_watch_lock:
+        if action == 'reset':
+            _eigrp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _eigrp_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted((b.get('routers') or {}).keys()),
+            'prefixes': sorted((b.get('prefixes') or {}).keys())}}
+
+
+def _eigrp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed EIGRP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    routers = {}
+    prefixes = {}
+    noauth_any = False
+    for e in events:
+        r = routers.setdefault(e['src'], {
+            'src': e['src'], 'af': e['af'], 'as': set(), 'kvals': set(),
+            'opcodes': set(), 'auth': False, 'noauth': False, 'count': 0})
+        r['count'] += 1
+        r['opcodes'].add(e['opcode'])
+        if e['asn'] is not None:
+            r['as'].add(e['asn'])
+        if e.get('kvals'):
+            r['kvals'].add(e['kvals'])
+        if e['auth']:
+            r['auth'] = True
+        else:
+            r['noauth'] = True
+            noauth_any = True
+        for rt in e['routes']:
+            prefixes.setdefault(rt['prefix'], {
+                'prefix': rt['prefix'], 'origin': e['src'],
+                'nexthop': rt['nexthop'], 'kind': rt['kind'], 'af': e['af']})
+
+    known = dict(baseline.get('routers') or {})
+    base_prefixes = dict(baseline.get('prefixes') or {})
+    had_baseline = bool(known) or bool(base_prefixes)
+
+    learned = False
+    if learn and not had_baseline and routers:
+        baseline['routers'] = {
+            s: {'as': sorted(r['as']), 'kvals': [list(k) for k in r['kvals']]}
+            for s, r in routers.items()}
+        baseline['prefixes'] = {
+            p: {'origin': d['origin'], 'nexthop': d['nexthop']}
+            for p, d in prefixes.items()}
+        learned = True
+        known = dict(baseline['routers'])
+        base_prefixes = dict(baseline['prefixes'])
+        had_baseline = True
+
+    PRIORITY = ['injection', 'rogue-router', 'storm', 'anomaly', 'weak-auth', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Route injection / next-hop hijack (only meaningful once a baseline exists).
+    if had_baseline:
+        for p in sorted(prefixes):
+            d = prefixes[p]
+            base = base_prefixes.get(p)
+            if base is None:
+                bump('injection')
+                reasons.append(
+                    f"EIGRP ROUTE INJECTION: prefix {p} advertised by {d['origin']} "
+                    f"(next-hop {d['nexthop']}) is not in the baseline — a forged "
+                    f"route that can blackhole or MITM traffic to it")
+            elif base.get('nexthop') and d['nexthop'] != base['nexthop']:
+                bump('injection')
+                reasons.append(
+                    f"EIGRP NEXT-HOP HIJACK: prefix {p} now points at next-hop "
+                    f"{d['nexthop']} (was {base['nexthop']}) — traffic to {p} is being "
+                    f"steered to a new gateway")
+
+    # Rogue routers.
+    for src in sorted(routers):
+        if had_baseline and src not in known:
+            bump('rogue-router')
+            asn = ', '.join(str(a) for a in sorted(routers[src]['as'])) or '?'
+            reasons.append(
+                f"Rogue EIGRP speaker {src} (AS {asn}) — not in the baseline; a new "
+                f"router forming adjacencies on this segment (adjacency spoofing)")
+
+    # K-value / AS mismatch across speakers.
+    all_as = set()
+    all_kvals = set()
+    for r in routers.values():
+        all_as |= r['as']
+        all_kvals |= r['kvals']
+    if len(all_as) > 1:
+        bump('anomaly')
+        reasons.append(
+            f"Multiple EIGRP AS numbers on one segment ({', '.join(str(a) for a in sorted(all_as))}) "
+            f"— usually one AS per link; a mismatch is a misconfig or a probing router")
+    if len(all_kvals) > 1:
+        bump('anomaly')
+        reasons.append(
+            "EIGRP K-value mismatch between speakers — K-values must match to form an "
+            "adjacency; a mismatch blocks peering (misconfig) or signals a crafted hello")
+
+    # Weak / no authentication.
+    if noauth_any:
+        bump('weak-auth')
+        reasons.append(
+            "EIGRP packets seen without an Authentication TLV — no HMAC-MD5/SHA "
+            "protection. This is what lets a forged Update win; configure an EIGRP "
+            "key-chain (authentication mode md5/hmac-sha-256) on every neighbor")
+
+    # Flooding.
+    rate = round(len(events) / seconds, 2)
+    if len(events) > 100 and rate > _EIGRP_STORM_RATE:
+        bump('storm')
+        reasons.append(
+            f"EIGRP flood: {rate} pkts/s (hellos are normally every 5s) — a "
+            f"hello/query storm (churn or DoS against the routing process)")
+
+    advisories = []
+    if routers:
+        advisories.append(
+            "Authenticate EIGRP with an HMAC-MD5/SHA-256 key-chain on every interface, "
+            "make edge/access ports passive (`passive-interface`), filter proto-88 "
+            "multicast off host ports, and alert on any new neighbor, new prefix or "
+            "next-hop change.")
+
+    def _pub_router(r):
+        return {'src': r['src'], 'af': r['af'], 'as': sorted(r['as']),
+                'opcodes': sorted(r['opcodes']),
+                'auth': r['auth'] and not r['noauth'],
+                'kvals': [list(k) for k in sorted(r['kvals'])], 'count': r['count'],
+                'baseline': r['src'] in known}
+
+    def _pub_prefix(p, d):
+        base = base_prefixes.get(p)
+        status = 'known' if base else ('new' if had_baseline else 'learned')
+        if base and base.get('nexthop') and d['nexthop'] != base['nexthop']:
+            status = 'nexthop-changed'
+        return {'prefix': p, 'origin': d['origin'], 'nexthop': d['nexthop'],
+                'kind': d['kind'], 'af': d['af'], 'status': status}
+
+    if reasons:
+        summary = reasons
+    elif not routers:
+        summary = ['No EIGRP traffic seen — no EIGRP on this segment']
+    else:
+        summary = ['All EIGRP routers and advertised prefixes match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'router_count': len(routers),
+        'prefix_count': len(prefixes),
+        'packet_count': len(events),
+        'rate': rate,
+        'routers': [_pub_router(routers[s]) for s in sorted(routers)],
+        'prefixes': [_pub_prefix(p, prefixes[p]) for p in sorted(prefixes)],
+        'advisories': advisories,
+    }
+
+
+def _eigrp_capture(interface, seconds):
+    """One passive tcpdump window over EIGRP (IPv4 proto 88 + IPv6 proto 88)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ip proto 88 or ip6 proto 88'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_eigrp_watch(interface=None, seconds=15, learn=True):
+    """Passive EIGRP routing-security scanner (detection-only). Captures EIGRP for a
+    few seconds and classifies: injection / rogue-router / storm / anomaly / weak-auth
+    / clean. Learns the trusted routers + advertised prefixes on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 15, 5, 40)
+
+    text, err = _eigrp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_eigrp_capture(text)
+
+    with _eigrp_watch_lock:
+        baseline = _eigrp_watch_load()
+        result = _eigrp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _eigrp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _eigrp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_EIGRP_EVENTS_CAP:]
+            _eigrp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _eigrp_selftest():
+    """Self-test the EIGRP detectors with synthetic captures, plus a Scapy end-to-end
+    leg (craft real EIGRP Hello + Update-with-route -> pcap -> tcpdump -> parse)."""
+    scenarios = []
+
+    def hdr4(src, dst='224.0.0.10'):
+        return (f"IP (tos 0x0, ttl 64, id 1, offset 0, flags [none], proto EIGRP "
+                f"(88), length 60)\n    {src} > {dst}: ")
+
+    def eigrp4(src, opcode='Update', opnum=1, asn=100, auth=False, kvals=(1, 0, 1, 0, 0),
+               routes=()):
+        s = hdr4(src) + "\n"
+        s += f"\tEIGRP v2, opcode: {opcode} ({opnum}), chksum: 0x0, Flags: [none]\n"
+        s += f"\tseq: 0x00000000, ack: 0x00000000, VRID: 0, AS: {asn}, length: 20\n"
+        s += (f"\t  General Parameters TLV (0x0001), length: 12\n"
+              f"\t    holdtime: 15s, k1 {kvals[0]}, k2 {kvals[1]}, k3 {kvals[2]}, "
+              f"k4 {kvals[3]}, k5 {kvals[4]}\n")
+        if auth:
+            s += "\t  Authentication TLV (0x0002), length: 40\n"
+        for (pfx, nh) in routes:
+            s += (f"\t  IP Internal routes TLV (0x0102), length: 28\n"
+                  f"\t    IPv4 prefix:      {pfx}, nexthop: {nh}\n"
+                  f"\t      delay 1280 ms, bandwidth 256 Kbps, mtu 1500, hop 0, "
+                  f"reliability 255, load 0\n")
+        return s.rstrip("\n")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_eigrp_capture(text)
+        res = _eigrp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'routers': {'10.0.0.1': {'as': [100], 'kvals': [[1, 0, 1, 0, 0]]}},
+            'prefixes': {'10.1.0.0/24': {'origin': '10.0.0.1', 'nexthop': '10.0.0.1'}}}
+
+    # 1. clean: known router, authed, re-advertising the known prefix with same next-hop.
+    run('clean', eigrp4('10.0.0.1', auth=True,
+                        routes=[('10.1.0.0/24', '10.0.0.1')]), 15, base, 'clean')
+    # 2. injection: a new prefix from the known router.
+    run('injection', eigrp4('10.0.0.1', auth=True,
+                            routes=[('10.66.66.0/24', '10.0.0.1')]), 15, base,
+        'injection')
+    # 3. injection via next-hop hijack: known prefix, new next-hop.
+    run('nexthop-hijack', eigrp4('10.0.0.1', auth=True,
+                                 routes=[('10.1.0.0/24', '10.0.0.66')]), 15, base,
+        'injection')
+    # 4. rogue-router: a new speaker (authed, no new routes) — not in baseline.
+    run('rogue-router', eigrp4('10.0.0.66', opcode='Hello', opnum=5, auth=True), 15,
+        base, 'rogue-router')
+    # 5. anomaly: known router but a second AS appears.
+    run('anomaly-as', eigrp4('10.0.0.1', asn=100, auth=True) + "\n"
+        + eigrp4('10.0.0.1', asn=200, auth=True), 15, base, 'anomaly')
+    # 6. weak-auth: known router + prefix, but no Authentication TLV.
+    run('weak-auth', eigrp4('10.0.0.1', auth=False,
+                            routes=[('10.1.0.0/24', '10.0.0.1')]), 15, base, 'weak-auth')
+    # 7. parse: internal + external routes, auth flag, AS.
+    pev = _parse_eigrp_capture(
+        hdr4('10.0.0.9') + "\n"
+        "\tEIGRP v2, opcode: Update (1), chksum: 0x0, Flags: [none]\n"
+        "\tseq: 0x0, ack: 0x0, VRID: 0, AS: 100, length: 128\n"
+        "\t  Authentication TLV (0x0002), length: 40\n"
+        "\t  IP Internal routes TLV (0x0102), length: 28\n"
+        "\t    IPv4 prefix:      10.66.66.0/24, nexthop: 10.0.0.9\n"
+        "\t      delay 1280 ms, bandwidth 256 Kbps, mtu 1500, hop 0, reliability 255, load 0\n"
+        "\t  IP External routes TLV (0x0103), length: 48\n"
+        "\t    IPv4 prefix:      172.16.9.0/24, nexthop: 10.0.0.9\n"
+        "\t      origin-router 192.168.0.1, origin-as 0, origin-proto Static, flags [0x00], tag 0x0, metric 0\n"
+        "\t      delay 0 ms, bandwidth 256 Kbps, mtu 1500, hop 0, reliability 255, load 0")
+    e0 = pev[0] if pev else {}
+    kinds = {r['kind'] for r in e0.get('routes', [])}
+    p_ok = (e0.get('asn') == 100 and e0.get('auth') is True
+            and len(e0.get('routes', [])) == 2 and kinds == {'internal', 'external'}
+            and e0['routes'][1].get('origin_router') == '192.168.0.1')
+    scenarios.append({'name': 'eigrp-parse', 'expect': 'int+ext/auth/AS100',
+                      'got': f"routes={len(e0.get('routes', []))} auth={e0.get('auth')}",
+                      'pass': p_ok})
+
+    # Scapy end-to-end.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, IP, wrpcap
+        import scapy.contrib.eigrp as E
+        if _have('tcpdump'):
+            upd = (Ether() / IP(src='10.0.0.9', dst='224.0.0.10', proto=88)
+                   / E.EIGRP(opcode=1, asn=100, tlvlist=[
+                       E.EIGRPParam(k1=1, k2=0, k3=1, k4=0, k5=0, holdtime=15),
+                       E.EIGRPIntRoute(dst='10.66.66.0', prefixlen=24,
+                                       nexthop='10.0.0.9')]))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [upd])
+            res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_eigrp_capture(res['out'])
+            e = evs[0] if evs else {}
+            rt = e.get('routes', [{}])[0] if e.get('routes') else {}
+            ok = (e.get('src') == '10.0.0.9' and e.get('asn') == 100
+                  and rt.get('prefix') == '10.66.66.0/24'
+                  and rt.get('nexthop') == '10.0.0.9')
+            scapy_result = {'ran': True, 'src': e.get('src'), 'asn': e.get('asn'),
+                            'prefix': rt.get('prefix'), 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # FHRP Watch: passive HSRP/VRRP/GLBP/CARP hijack scanner (detection-only)
 # --------------------------------------------------------------------------
 # First Hop Redundancy Protocols share a *virtual gateway* (one virtual IP+MAC that
@@ -8076,6 +8874,7 @@ def do_routing_selftest():
               'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
+              'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
@@ -8951,6 +9750,42 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/tls-baseline {action}")
         return jsonify(do_tls_baseline(action))
 
+    @app.route('/api/net/dtp-watch', methods=['GET'])
+    def net_dtp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/dtp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_dtp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/dtp-baseline', methods=['GET', 'POST'])
+    def net_dtp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/dtp-baseline {action}")
+        return jsonify(do_dtp_baseline(action))
+
+    @app.route('/api/net/eigrp-watch', methods=['GET'])
+    def net_eigrp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 40)
+        _log(f"net/eigrp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_eigrp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/eigrp-baseline', methods=['GET', 'POST'])
+    def net_eigrp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/eigrp-baseline {action}")
+        return jsonify(do_eigrp_baseline(action))
+
     @app.route('/api/net/fhrp-watch', methods=['GET'])
     def net_fhrp_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -9235,6 +10070,24 @@ def _cli(argv=None):
 
     twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
     twst.add_argument('--json', action='store_true', help='emit JSON')
+
+    dt = sub.add_parser('dtp-watch', help='passive DTP / VLAN-hopping scan (Cisco)')
+    dt.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    dt.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    dt.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    dt.add_argument('--json', action='store_true', help='emit JSON')
+
+    dtst = sub.add_parser('dtp-selftest', help='self-test the DTP detector (no root)')
+    dtst.add_argument('--json', action='store_true', help='emit JSON')
+
+    eg = sub.add_parser('eigrp-watch', help='passive EIGRP routing-security scan (Cisco)')
+    eg.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    eg.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-40)')
+    eg.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    eg.add_argument('--json', action='store_true', help='emit JSON')
+
+    egst = sub.add_parser('eigrp-selftest', help='self-test the EIGRP detectors (no root)')
+    egst.add_argument('--json', action='store_true', help='emit JSON')
 
     fh = sub.add_parser('fhrp-watch', help='passive FHRP (HSRP/VRRP/GLBP/CARP) hijack scan')
     fh.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -9562,6 +10415,84 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] e2e-local-server: {e.get('reason')}")
             print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'dtp-watch':
+        r = do_dtp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"DTP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} frame(s), {r['speaker_count']} speaker(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for sp in r.get('speakers', []):
+                tag = '' if sp['baseline'] else ' *NEW*'
+                print(f"  {sp['src']} status={sp['status']}"
+                      f"{' TRUNK-FORMING' if sp['forming'] else ''}{tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'dtp-selftest':
+        r = _dtp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"src={sc.get('src')} status={sc.get('status')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"DTP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'eigrp-watch':
+        r = do_eigrp_watch(interface=args.iface, seconds=args.seconds,
+                           learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"EIGRP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} pkts, {r['router_count']} router(s), "
+                  f"{r['prefix_count']} prefix(es))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for rt in r.get('routers', []):
+                tag = '' if rt['baseline'] else ' *NEW*'
+                print(f"  router {rt['src']} AS={','.join(str(a) for a in rt['as']) or '?'}"
+                      f" auth={'yes' if rt['auth'] else 'NO'}{tag}")
+            for p in r.get('prefixes', []):
+                mark = '' if p['status'] in ('known', 'learned') else f" [{p['status']}]"
+                print(f"    {p['prefix']} via {p['nexthop']} ({p['kind']}){mark}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'eigrp-selftest':
+        r = _eigrp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"src={sc.get('src')} AS={sc.get('asn')} prefix={sc.get('prefix')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"EIGRP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'fhrp-watch':

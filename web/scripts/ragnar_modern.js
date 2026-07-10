@@ -1221,6 +1221,8 @@ function showNetworkSubtab(name) {
         _ipv6FillIfaces();
         _icmpFillIfaces();
         _ospfFillIfaces();
+        _dtpFillIfaces();
+        _eigrpFillIfaces();
         _fhrpFillIfaces();
         _bgpFillIfaces();
         dhcpSnoopStatus();
@@ -3346,6 +3348,202 @@ async function ospfTrustBaseline() {
     }
 }
 
+// ---- DTP Watch (passive VLAN-hopping / switch-spoofing scanner) -------------
+const _DTP_VERDICT_STYLE = {
+    clean:               ['bg-green-950/40 border-green-900 text-green-400', '✓ No DTP trunk negotiation — ports are not forming trunks here'],
+    'dtp-enabled':       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ DTP is enabled on this segment — disable with `switchport nonegotiate`'],
+    'trunk-negotiation': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ DTP is negotiating trunks — a rogue host could VLAN-hop'],
+    'vlan-hop':          ['bg-red-950/60 border-red-800 text-red-300', '🛑 VLAN HOP — trunk-forming DTP from a new speaker (switch spoofing)'],
+    unknown:             ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _dtpFillIfaces() {
+    const sel = document.getElementById('dtp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runDtpWatch() {
+    const out = document.getElementById('dtp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('dtp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('dtp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '30';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing DTP frames (hellos are ~30s apart)…</p>';
+    try {
+        _dtpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/dtp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runDtpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _DTP_VERDICT_STYLE[d.verdict] || _DTP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} DTP frame(s), ${d.speaker_count} speaker(s)${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.speakers || []).length) {
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Speaker MAC</th><th class="px-2 py-1">Status</th><th class="px-2 py-1">Trunk?</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.speakers.map(sp => {
+                    const badge = sp.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    const forming = sp.forming ? '<span class="text-red-300">forming</span>' : '<span class="text-gray-500">no</span>';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${sp.baseline ? '' : 'text-amber-300'}">${escapeHtml(sp.src)}</td>
+                        <td class="px-2 py-1 font-mono">${escapeHtml(sp.status)}</td>
+                        <td class="px-2 py-1">${forming}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function dtpTrustBaseline() {
+    try {
+        await postAPI('/api/net/dtp-baseline', { action: 'reset' });
+        addConsoleMessage('DTP baseline reset — re-learning current DTP speakers', 'info');
+        await runDtpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset DTP baseline: ' + e.message, 'error');
+    }
+}
+
+// ---- EIGRP Watch (passive Cisco IGP routing-security scanner) ---------------
+const _EIGRP_VERDICT_STYLE = {
+    clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No EIGRP anomalies detected'],
+    'weak-auth':    ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ EIGRP without HMAC authentication — exposed to route injection'],
+    anomaly:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ EIGRP anomaly — K-value / AS mismatch'],
+    storm:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 EIGRP flooding storm detected'],
+    'rogue-router': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue EIGRP speaker — adjacency spoofing'],
+    injection:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 EIGRP route/next-hop injection detected'],
+    unknown:        ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _eigrpFillIfaces() {
+    const sel = document.getElementById('eigrp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runEigrpWatch() {
+    const out = document.getElementById('eigrp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('eigrp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('eigrp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing EIGRP on the segment…</p>';
+    try {
+        _eigrpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/eigrp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runEigrpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _EIGRP_VERDICT_STYLE[d.verdict] || _EIGRP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} EIGRP pkts, ${d.router_count} router(s), ${d.prefix_count} prefix(es) @ ${d.rate}/s${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.routers || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">EIGRP routers (' + d.routers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Router</th><th class="px-2 py-1">AS</th><th class="px-2 py-1">AF</th><th class="px-2 py-1">Auth</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.routers.map(r => {
+                    const badge = r.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    const auth = r.auth ? '<span class="text-green-400">yes</span>' : '<span class="text-amber-300">none</span>';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${r.baseline ? '' : 'text-amber-300'}">${escapeHtml(r.src)}</td>
+                        <td class="px-2 py-1 font-mono">${(r.as || []).join(', ') || '?'}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(r.af)}</td>
+                        <td class="px-2 py-1">${auth}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if ((d.prefixes || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Advertised prefixes (' + d.prefixes.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Prefix</th><th class="px-2 py-1">Next-hop</th><th class="px-2 py-1">Origin</th><th class="px-2 py-1">Kind</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.prefixes.map(p => {
+                    const bad = (p.status === 'new' || p.status === 'nexthop-changed');
+                    const st = bad ? `<span class="text-red-300">${escapeHtml(p.status)}</span>` : `<span class="text-gray-500">${escapeHtml(p.status)}</span>`;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${bad ? 'text-red-300' : ''}">${escapeHtml(p.prefix)}</td>
+                        <td class="px-2 py-1 font-mono">${escapeHtml(p.nexthop)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(p.origin)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(p.kind)}</td>
+                        <td class="px-2 py-1">${st}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function eigrpTrustBaseline() {
+    try {
+        await postAPI('/api/net/eigrp-baseline', { action: 'reset' });
+        addConsoleMessage('EIGRP baseline reset — re-learning current routers & prefixes', 'info');
+        await runEigrpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset EIGRP baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- FHRP Watch (passive HSRP/VRRP/GLBP/CARP hijack scanner) ----------------
 const _FHRP_VERDICT_STYLE = {
     clean:             ['bg-green-950/40 border-green-900 text-green-400', '✓ FHRP groups/speakers match the trusted baseline'],
@@ -3674,7 +3872,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -3683,7 +3881,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'dtp', 'eigrp', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">

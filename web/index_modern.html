@@ -1521,6 +1521,21 @@
                     </div>
                     <div id="igmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- DTP Watch (VLAN hopping) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">DTP Watch <span class="text-xs font-normal text-gray-500">(Cisco · VLAN hopping)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive Dynamic Trunking Protocol scanner — <strong>detection-only</strong>, never sends a DTP frame. DTP auto-negotiates whether a switch port becomes an 802.1Q/ISL <strong>trunk</strong>; a port left in the default <span class="font-mono">dynamic auto/desirable</span> mode will form a trunk with anything that speaks DTP "desirable". That's the classic <strong>VLAN-hopping / switch-spoofing</strong> attack (Yersinia "enable trunking"): a rogue host trunks the port to itself and sees/injects into <strong>every VLAN</strong>. Flags <strong>vlan-hop</strong> (trunk-forming DTP from a new speaker), <strong>trunk-negotiation</strong> (a port isn't <span class="font-mono">nonegotiate</span>, so it's exploitable) and <strong>dtp-enabled</strong> (DTP present at all). DTP should never appear on an access segment.</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, DTP PID 0x2004). DTP hellos are ~30s apart, so give it a longer window. The first scan learns the current DTP speakers (real switches) as the baseline (<span class="font-mono">data/dtp_watch.json</span>); a new speaker sending trunk-forming DTP is the tell. Click "Trust current" after a legitimate switch change.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="dtp-iface" title="Interface for the DTP capture — pick the access-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="dtp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runDtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan DTP</button>
+                        <button onclick="dtpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current DTP speakers as the trusted baseline — use after a legitimate switch change">Trust current</button>
+                    </div>
+                    <div id="dtp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- OSPF Security Scanner -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">OSPF Security Scanner</h3>
@@ -1535,6 +1550,21 @@
                         <button onclick="ospfTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current routers/originators as the trusted baseline — use after a legitimate topology change">Trust current</button>
                     </div>
                     <div id="ospf-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- EIGRP Watch (Cisco IGP) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">EIGRP Watch <span class="text-xs font-normal text-gray-500">(Cisco · IGP)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive EIGRP routing-security scanner — <strong>detection-only</strong>, never forms an adjacency, sends a hello, or injects a route. EIGRP is Cisco's interior gateway protocol (the Cisco-world alternative to OSPF; IP proto 88, multicast 224.0.0.10 / ff02::a). Without an HMAC key-chain, any host on the segment can peer and inject <strong>Update</strong> packets with attractive metrics to blackhole/MITM traffic. Unlike OSPF, tcpdump decodes EIGRP's route TLVs, so this sees <strong>route injection</strong> directly. Flags <strong>injection</strong> (a prefix not in the baseline, or a known prefix with a new next-hop — route/next-hop hijack), <strong>rogue-router</strong> (a new EIGRP speaker), <strong>storm</strong> (hello/query flood), <strong>anomaly</strong> (K-value / AS mismatch) and <strong>weak-auth</strong> (no Authentication TLV).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture (put the Pi on the routed VLAN or a SPAN/mirror to see EIGRP). The first scan learns the current routers and advertised prefix→next-hop map as the baseline (<span class="font-mono">data/eigrp_watch.json</span>); after a legitimate topology change, click "Trust current". IPv4 route TLVs are fully decoded; IPv6 EIGRP gives speaker/AS/auth/K-values (per-prefix v6 TLVs aren't dissected by tcpdump).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="eigrp-iface" title="Interface for the EIGRP capture — pick the routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="eigrp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runEigrpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan EIGRP</button>
+                        <button onclick="eigrpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current routers/prefixes as the trusted baseline — use after a legitimate topology change">Trust current</button>
+                    </div>
+                    <div id="eigrp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <!-- FHRP Watch (HSRP/VRRP/GLBP/CARP) -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
@@ -1612,7 +1642,7 @@
                 <!-- Routing-scanner self-test + Scapy -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
+                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · DTP · EIGRP · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
                         <div id="scapy-status" class="text-xs text-gray-400"></div>
                     </div>
                     <p class="text-sm text-gray-400 mb-3 mt-1">Validates the IGMP, IPv6 first-hop, NTP, ICMP, SNMP, TLS-cert, OSPF and BGP detectors by running each classifier against crafted attack captures — no root, no live traffic. Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span> (and TLS Watch grades a real local handshake), so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
@@ -5910,7 +5940,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260710-fhrp"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260710-dtp-eigrp"></script>
 
 </body>
 </html>

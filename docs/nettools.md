@@ -49,7 +49,9 @@ alert.
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [SNMP Watch](#snmp-watch) | Diagnostics | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
 | [TLS Watch](#tls-watch) | Diagnostics | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
+| [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
+| [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -90,7 +92,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **DTP**, **EIGRP**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -922,6 +924,33 @@ end.
 - Endpoint: `GET /api/net/icmp-watch` `{interface, seconds}`,
   `POST /api/net/icmp-baseline` `{action: reset}` · binary: `tcpdump`
 
+### DTP Watch
+A **passive** VLAN-hopping / switch-spoofing scanner for Cisco's **Dynamic Trunking
+Protocol** (proprietary; group MAC `01:00:0c:cc:cc:cc`, SNAP OUI `0x00000c`, PID
+`0x2004`). **Detection-only** — it never transmits a DTP frame.
+
+DTP auto-negotiates whether a switch port becomes an 802.1Q/ISL **trunk**. A port
+left in the default `dynamic auto` / `dynamic desirable` mode will form a trunk with
+*anything* that sends DTP "desirable" frames — so an attacker plugs into an access
+port, forges DTP desirable (Yersinia's "enable trunking"), the port trunks to them,
+and they can now see and inject into **every VLAN** on the switch. This is the
+classic VLAN hop. DTP should never appear on an access segment; the fix is
+`switchport mode access` + `switchport nonegotiate` on every user port. What it flags:
+
+- **vlan-hop** — trunk-forming DTP (on/desirable/auto) from a **new** speaker not in
+  the baseline: an active switch-spoofing attempt.
+- **trunk-negotiation** — trunk-forming DTP present at all (the port isn't
+  `nonegotiate`, so it's exploitable) even from a known switch.
+- **dtp-enabled** — DTP frames present but not negotiating a trunk. Advisory / learn.
+
+The scan uses `tcpdump -e` (to capture the sender's MAC) with the BPF
+`ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2004`, which isolates DTP from the
+other protocols sharing that Cisco group MAC (CDP/VTP/UDLD/PAgP). DTP hellos are ~30s
+apart, so the default window is longer (30s). The first scan **learns** the current
+DTP speakers (the real switches) as the baseline (`data/dtp_watch.json`); "Trust
+current" re-learns. **API:** `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline`.
+**CLI:** `dtp-watch`, `dtp-selftest`.
+
 ### FHRP Watch
 A **passive** hijack scanner for the **First Hop Redundancy Protocols** — **HSRP**
 (Cisco, UDP 1985), **VRRP** (RFC 5798, IP proto 112), **GLBP** (Cisco, UDP 3222)
@@ -958,6 +987,40 @@ presence, since `tcpdump` doesn't dissect GLBP). The BPF is
 Pi on the routed VLAN or a SPAN/mirror to see the hellos. **API:**
 `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline`. **CLI:** `fhrp-watch`,
 `fhrp-selftest`.
+
+### EIGRP Watch
+A **passive** routing-security scanner for Cisco's **EIGRP** — its interior gateway
+protocol and the Cisco-world alternative to OSPF (mechanically it's an *advanced
+distance-vector* protocol rather than link-state, but it fills the same IGP role).
+EIGRP runs over **IP proto 88**, multicast **224.0.0.10** (and `ff02::a` for IPv6).
+**Detection-only** — it never forms an adjacency, sends a hello, or injects a route.
+
+Like OSPF, EIGRP is unprotected on the wire unless an **HMAC-MD5/SHA authentication
+key-chain** is configured, so any host on the segment can peer and inject **Update**
+packets with attractive metrics to blackhole or MITM traffic. The advantage here:
+unlike OSPF (whose LSA internals `tcpdump` leaves opaque), `tcpdump` **fully decodes
+EIGRP's route TLVs** — the advertised prefix, next-hop and metrics are visible — so
+this scanner sees route injection directly. What it flags:
+
+- **injection** — a prefix that isn't in the baseline being advertised, or a known
+  prefix now pointing at a **different next-hop** (route / next-hop hijack). This is
+  the money finding — a forged route steering traffic.
+- **rogue-router** — a new EIGRP speaker (source / AS) not in the baseline
+  (adjacency spoofing).
+- **storm** — an EIGRP flood (hello / query storm) by rate.
+- **anomaly** — a **K-value** or **AS-number** mismatch between speakers (a misconfig
+  that blocks peering, or a crafted hello probing the segment).
+- **weak-auth** — EIGRP packets with **no Authentication TLV** (the enabler for
+  every injection attack).
+
+The BPF is `ip proto 88 or ip6 proto 88`. IPv4 route TLVs (internal + external, with
+next-hop, origin-router/AS and metrics) are fully decoded; **IPv6 EIGRP** yields the
+speaker, AS, auth state and K-values but not per-prefix detail (this `tcpdump` build
+prints the v6 route TLV as `Unknown TLV (0x0402)`). Put the Pi on the routed VLAN or
+a SPAN/mirror to see EIGRP. The first scan **learns** the current routers and the
+advertised prefix→next-hop map as the baseline (`data/eigrp_watch.json`); after a
+legitimate topology change, click "Trust current". **API:** `GET /api/net/eigrp-watch`,
+`POST /api/net/eigrp-baseline`. **CLI:** `eigrp-watch`, `eigrp-selftest`.
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
