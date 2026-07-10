@@ -2302,27 +2302,50 @@ const _NETINT_STYLE = {
     starvation:  ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
     unknown:     ['bg-slate-800 border-slate-700 text-slate-400', '—'],
 };
+// A verdict is clean/informational, an active attack (critical, red), or — anything
+// else non-clean — a suspicious finding (amber). Mirrors the server's _ni_rank so the
+// chips colour every scanner's verdicts without enumerating them all.
+const _NETINT_CLEAN = new Set(['clean', 'unknown', 'ok', 'none', 'hardened', 'learned', 'n/a', 'no-traffic', 'disabled']);
+const _NETINT_CRITICAL = new Set(['hijacked', 'spoofed', 'rogue', 'starvation', 'compromised', 'root-hijack', 'bpdu-flood', 'vlan-hop', 'hijack', 'injection', 'rogue-router', 'poisoning', 'spoof-conflict', 'smbv1-active', 'coercion-attempt', 'relay-suspected', 'rogue-speaker', 'rogue-redirect', 'rogue-ra', 'rogue-irdp']);
+function _netintRank(verdict) {
+    const v = verdict || 'unknown';
+    if (_NETINT_CLEAN.has(v)) return 0;
+    if (_NETINT_CRITICAL.has(v)) return 2;
+    return 1;
+}
+function _netintStyleFor(verdict) {
+    if (_NETINT_STYLE[verdict]) return _NETINT_STYLE[verdict];
+    return [_NETINT_STYLE.clean, _NETINT_STYLE.suspicious, _NETINT_STYLE.compromised][_netintRank(verdict)];
+}
 function _netintChip(label, verdict) {
-    const [cls, icon] = _NETINT_STYLE[verdict] || _NETINT_STYLE.unknown;
+    const [cls, icon] = _netintStyleFor(verdict);
     return `<span class="px-2.5 py-1 rounded border ${cls}">${icon} ${label}: ${escapeHtml(verdict || 'unknown')}</span>`;
 }
 function renderNetIntegrity(d) {
     const out = document.getElementById('netint-status');
     if (!out) return;
     if (!d || d.success === false) { out.innerHTML = ''; return; }
-    const dnsV = (d.dns && d.dns.verdict) || 'unknown';
-    const arpV = (d.arp && d.arp.verdict) || 'unknown';
-    const dhcpV = (d.dhcp && d.dhcp.verdict) || 'unknown';
-    const chips = [_netintChip('Overall', d.overall || 'unknown'),
-                   _netintChip('DNS', dnsV), _netintChip('ARP', arpV),
-                   _netintChip('DHCP', dhcpV)].join(' ');
-    const reasons = [].concat((d.dns && d.dns.reasons) || [], (d.arp && d.arp.reasons) || [],
-                              (d.dhcp && d.dhcp.reasons) || []);
+    // Prefer the full per-check map (extended monitor); fall back to dns/arp/dhcp.
+    let entries;
+    if (d.checks && Object.keys(d.checks).length) {
+        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'igmp', 'ipv6', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'tls'];
+        entries = Object.keys(d.checks).sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99))
+            .map(k => [d.checks[k].label || k.toUpperCase(), d.checks[k].verdict, d.checks[k].reasons || []]);
+    } else {
+        entries = [['DNS', (d.dns && d.dns.verdict), (d.dns && d.dns.reasons) || []],
+                   ['ARP', (d.arp && d.arp.verdict), (d.arp && d.arp.reasons) || []],
+                   ['DHCP', (d.dhcp && d.dhcp.verdict), (d.dhcp && d.dhcp.reasons) || []]];
+    }
+    // Worst-first so bad findings lead.
+    entries.sort((a, b) => _netintRank(b[1]) - _netintRank(a[1]));
+    const chips = [_netintChip('Overall', d.overall || 'unknown')]
+        .concat(entries.map(e => _netintChip(e[0], e[1] || 'unknown'))).join(' ');
+    const reasons = [].concat(...entries.filter(e => _netintRank(e[1]) >= 1).map(e => e[2]));
     const when = d.ts ? new Date(d.ts).toLocaleString() : (d.monitor_enabled ? 'awaiting first check…' : 'monitor off');
-    let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}</span>`;
+    let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}${d.extended_enabled ? ' · extended (rotating passive scanners)' : ''}</span>`;
     if (reasons.length) {
         html += '<ul class="text-xs text-gray-400 w-full list-disc pl-5 mt-1">' +
-            reasons.slice(0, 3).map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+            reasons.slice(0, 4).map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
     }
     out.innerHTML = html;
 }
@@ -2374,9 +2397,13 @@ async function netIntegrityRefresh(force) {
 }
 async function syncNetIntegrityFromServer() {
     const cb = document.getElementById('netint-enabled');
+    const ext = document.getElementById('netint-extended');
+    const batch = document.getElementById('netint-batch');
     try {
         const d = await fetchAPI('/api/net/integrity');
         if (cb) cb.checked = !!d.monitor_enabled;
+        if (ext) ext.checked = d.extended_enabled !== false;
+        if (batch && d.batch_size) batch.value = d.batch_size;
         renderNetIntegrity(d);
     } catch (e) { /* offline */ }
 }
@@ -2390,6 +2417,21 @@ function onNetIntegrityToggled(cb) {
             addConsoleMessage('Failed to toggle integrity monitor: ' + err.message, 'error');
             cb.checked = !cb.checked;
         });
+}
+function onNetIntegrityExtendedToggled(cb) {
+    postAPI('/api/config', { net_integrity_extended_enabled: cb.checked })
+        .then(() => addConsoleMessage('Extended passive-suite monitoring ' + (cb.checked ? 'ON' : 'OFF'), 'info'))
+        .catch(err => {
+            addConsoleMessage('Failed to toggle extended monitoring: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+        });
+}
+function onNetIntegrityBatchChanged(el) {
+    const n = Math.max(1, Math.min(15, parseInt(el.value, 10) || 3));
+    el.value = n;
+    postAPI('/api/config', { net_integrity_batch_size: n })
+        .then(() => addConsoleMessage('Monitor rotation set to ' + n + ' scanner(s)/cycle', 'info'))
+        .catch(err => addConsoleMessage('Failed to set batch size: ' + err.message, 'error'));
 }
 async function netIntegrityTrustGateway() {
     try {

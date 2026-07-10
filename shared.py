@@ -729,6 +729,8 @@ class SharedData:
             "net_integrity_interval_min": 5,        # minutes between checks
             "pushover_notify_net_integrity": True,  # alert on poison/spoof (when monitor on)
             "net_integrity_notify_cooldown_s": 300, # min seconds between repeat alerts
+            "net_integrity_extended_enabled": True,  # also rotate the passive Watch scanners
+            "net_integrity_batch_size": 3,           # capture-scanners run per cycle (round-robin)
             # Browser terminal (interactive shell over the web UI). OFF by
             # default — it exposes a shell on the Pi (as the 'ragnar' user),
             # gated by login. Enable in Settings only if you want it.

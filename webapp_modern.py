@@ -1224,82 +1224,142 @@ def _rusense_notify_loop():
 _net_integrity_lock = threading.Lock()
 _net_integrity_state = {
     'enabled': False, 'ts': None, 'overall': 'unknown',
-    'dns': None, 'arp': None,
+    'checks': {},                 # name -> {label, verdict, reasons, ts, rank}
+    'dns': None, 'arp': None, 'dhcp': None,   # mirrored for the legacy chip
 }
-# Verdict severity so we only alert on a transition into (or deeper into) a bad
-# state, not every cycle it stays bad. Covers both per-check verdicts (DNS:
-# hijacked, ARP: spoofed) and the derived overall (compromised).
-_NET_INTEGRITY_RANK = {'clean': 0, 'unknown': 0, 'suspicious': 1,
-                       'suspect': 1, 'hijacked': 2, 'spoofed': 2, 'compromised': 2,
-                       'rogue': 2, 'starvation': 2}
+_net_integrity_rotation = 0       # round-robin cursor into the capture-based scanners
+
+# Verdict severity. A check's verdict is CLEAN (0), a real posture/deviation finding
+# (1, "suspicious"), or an active attack (2, "compromised"). Anything not explicitly
+# clean-or-critical is treated as a rank-1 finding, so a new scanner's verdicts still
+# surface without needing to be enumerated here.
+_NI_CLEAN = {'clean', 'unknown', 'ok', 'none', 'hardened', 'learned', 'n/a',
+             'no-traffic', 'disabled', 'not-applicable'}
+_NI_CRITICAL = {
+    'hijacked', 'spoofed', 'rogue', 'starvation', 'compromised',        # dns/arp/dhcp
+    'root-hijack', 'bpdu-flood',                                        # stp
+    'vlan-hop',                                                         # dtp
+    'hijack',                                                           # fhrp/bgp
+    'injection', 'rogue-router',                                        # ospf/eigrp/isis
+    'poisoning', 'spoof-conflict', 'smbv1-active',                      # smb
+    'coercion-attempt', 'relay-suspected',                             # relay
+    'rogue-speaker',                                                    # fhrp
+    'rogue-redirect', 'rogue-ra', 'rogue-irdp',                         # ipv6/icmp
+}
+
+
+def _ni_rank(v):
+    v = (v or 'unknown')
+    if v in _NI_CLEAN:
+        return 0
+    if v in _NI_CRITICAL:
+        return 2
+    return 1
 
 
 def _net_integrity_check_once():
-    """Run the DNS-poison and ARP-spoof checks once, update shared state, and
-    alert on a worsening verdict. Returns the overall verdict string."""
+    """Run the fast core checks (DNS/ARP/DHCP + RA-Guard posture) plus, when extended
+    monitoring is on, the next round-robin batch of the passive Watch scanners. Update
+    per-check state and alert on any check that worsens. Returns the overall verdict."""
     import network_diagnostics as nd
+    global _net_integrity_rotation
+    cfg = shared_data.config
 
-    name = shared_data.config.get('netdiag_dns_test_name', 'example.com')
-    dns_v, arp_v, dhcp_v = 'unknown', 'unknown', 'unknown'
-    dns_reasons, arp_reasons, dhcp_reasons = [], [], []
-
-    try:
-        d = nd.do_dns_doctor(name)
-        if d.get('success'):
-            p = d.get('poison') or {}
-            dns_v = p.get('verdict', 'unknown')
-            dns_reasons = p.get('reasons') or []
-    except Exception as exc:
-        logger.debug(f"[net-integrity] DNS check failed: {exc}")
-
-    try:
-        a = nd.do_arp_check()
-        if a.get('success'):
-            arp_v = a.get('verdict', 'unknown')
-            arp_reasons = a.get('reasons') or []
-    except Exception as exc:
-        logger.debug(f"[net-integrity] ARP check failed: {exc}")
-
-    # DHCP: rogue-server discovery only (quick=True skips the starvation capture)
-    # so the background cycle stays fast; opt-in alongside the monitor.
-    if shared_data.config.get('net_integrity_check_dhcp', True):
+    def watch(fn, **kw):
         try:
-            h = nd.do_dhcp_guardian(quick=True)
-            if h.get('success'):
-                dhcp_v = h.get('verdict', 'unknown')
-                dhcp_reasons = h.get('reasons') or []
+            r = fn(**kw)
+            if r.get('success'):
+                return r.get('verdict', 'unknown'), (r.get('reasons') or [])
         except Exception as exc:
-            logger.debug(f"[net-integrity] DHCP check failed: {exc}")
+            logger.debug(f"[net-integrity] {getattr(fn, '__name__', fn)} failed: {exc}")
+        return 'unknown', []
 
-    dns_rank = _NET_INTEGRITY_RANK.get(dns_v, 0)
-    arp_rank = _NET_INTEGRITY_RANK.get(arp_v, 0)
-    dhcp_rank = _NET_INTEGRITY_RANK.get(dhcp_v, 0)
-    worst = max(dns_rank, arp_rank, dhcp_rank)
-    overall = {0: 'clean', 1: 'suspicious', 2: 'compromised'}[worst]
+    name = cfg.get('netdiag_dns_test_name', 'example.com')
 
+    def run_dns():
+        try:
+            d = nd.do_dns_doctor(name)
+            if d.get('success'):
+                p = d.get('poison') or {}
+                return p.get('verdict', 'unknown'), (p.get('reasons') or [])
+        except Exception as exc:
+            logger.debug(f"[net-integrity] DNS check failed: {exc}")
+        return 'unknown', []
+
+    # Fast core — cheap enough to run every cycle.
+    fast = [('dns', 'DNS', run_dns),
+            ('arp', 'ARP', lambda: watch(nd.do_arp_check)),
+            ('raguard', 'RA-Guard', lambda: watch(nd.do_raguard, action='check'))]
+    if cfg.get('net_integrity_check_dhcp', True):
+        fast.append(('dhcp', 'DHCP', lambda: watch(nd.do_dhcp_guardian, quick=True)))
+
+    # Capture-based passive scanners — rotated a batch at a time so each cycle stays
+    # light. Each self-noops cheaply when its protocol isn't on the segment.
+    rotation = [
+        ('stp', 'STP', lambda: watch(nd.do_stp_watch)),
+        ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch)),
+        ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch)),
+        ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch)),
+        ('fhrp', 'FHRP', lambda: watch(nd.do_fhrp_watch)),
+        ('ospf', 'OSPF', lambda: watch(nd.do_ospf_watch)),
+        ('eigrp', 'EIGRP', lambda: watch(nd.do_eigrp_watch)),
+        ('isis', 'IS-IS', lambda: watch(nd.do_isis_watch)),
+        ('bgp', 'BGP', lambda: watch(nd.do_bgp_watch, enrich=False)),
+        ('smb', 'SMB', lambda: watch(nd.do_smb_watch)),
+        ('relay', 'Relay', lambda: watch(nd.do_relay_watch)),
+        ('ntp', 'NTP', lambda: watch(nd.do_ntp_watch)),
+        ('icmp', 'ICMP', lambda: watch(nd.do_icmp_watch)),
+        ('snmp', 'SNMP', lambda: watch(nd.do_snmp_watch)),
+        ('tls', 'TLS', lambda: watch(nd.do_tls_watch, discover=False)),
+    ]
+
+    to_run = list(fast)
+    if cfg.get('net_integrity_extended_enabled', True) and rotation:
+        try:
+            batch = max(1, int(cfg.get('net_integrity_batch_size', 3)))
+        except (TypeError, ValueError):
+            batch = 3
+        n = len(rotation)
+        idx = _net_integrity_rotation % n
+        to_run += [rotation[(idx + i) % n] for i in range(min(batch, n))]
+        _net_integrity_rotation = (idx + min(batch, n)) % n
+
+    results = {}
+    for key, label, fn in to_run:
+        v, r = fn()
+        results[key] = (label, v, r)
+
+    now = datetime.now().isoformat()
+    worsened = []
     with _net_integrity_lock:
-        prev_rank = _NET_INTEGRITY_RANK.get(_net_integrity_state.get('overall'), 0)
+        checks = dict(_net_integrity_state.get('checks') or {})
+        for key, (label, v, r) in results.items():
+            prev_rank = _ni_rank((checks.get(key) or {}).get('verdict'))
+            new_rank = _ni_rank(v)
+            checks[key] = {'label': label, 'verdict': v, 'reasons': r, 'ts': now,
+                           'rank': new_rank}
+            if new_rank >= 1 and new_rank > prev_rank:
+                worsened.append((label, v, r, new_rank))
+        worst = max([c['rank'] for c in checks.values()] or [0])
+        overall = {0: 'clean', 1: 'suspicious', 2: 'compromised'}[worst]
+        dns_c = checks.get('dns') or {}
         _net_integrity_state.update({
-            'enabled': True, 'ts': datetime.now().isoformat(), 'overall': overall,
-            'dns': {'name': name, 'verdict': dns_v, 'reasons': dns_reasons},
-            'arp': {'verdict': arp_v, 'reasons': arp_reasons},
-            'dhcp': {'verdict': dhcp_v, 'reasons': dhcp_reasons},
+            'enabled': True, 'ts': now, 'overall': overall, 'checks': checks,
+            'dns': {'name': name, 'verdict': dns_c.get('verdict', 'unknown'),
+                    'reasons': dns_c.get('reasons') or []},
+            'arp': {'verdict': (checks.get('arp') or {}).get('verdict', 'unknown'),
+                    'reasons': (checks.get('arp') or {}).get('reasons') or []},
+            'dhcp': {'verdict': (checks.get('dhcp') or {}).get('verdict', 'unknown'),
+                     'reasons': (checks.get('dhcp') or {}).get('reasons') or []},
         })
 
-    # Alert only when the situation worsens (rank increases) into a bad state.
-    if worst >= 1 and worst > prev_rank:
-        reasons = max((dns_reasons, dns_rank), (arp_reasons, arp_rank),
-                      (dhcp_reasons, dhcp_rank), key=lambda t: t[1])[0] or \
-                  (dns_reasons + arp_reasons + dhcp_reasons)
-        headline = 'compromised' if worst >= 2 else 'suspicious'
-        bits = []
-        if dns_rank >= 1:
-            bits.append(f'DNS {dns_v}')
-        if arp_rank >= 1:
-            bits.append(f'ARP {arp_v}')
-        if dhcp_rank >= 1:
-            bits.append(f'DHCP {dhcp_v}')
-        msg = f"Network integrity {headline}: {', '.join(bits)}."
+    # Alert when any check worsened into a bad state this cycle.
+    if worsened:
+        worst_w = max(w[3] for w in worsened)
+        headline = 'compromised' if worst_w >= 2 else 'suspicious'
+        bits = ', '.join(f'{label} {v}' for label, v, r, rk in worsened)
+        reasons = max(worsened, key=lambda t: t[3])[2]
+        msg = f"Network integrity {headline}: {bits}."
         if reasons:
             msg += ' ' + reasons[0]
         try:
@@ -1308,7 +1368,7 @@ def _net_integrity_check_once():
             if _po is None:
                 _po = PushoverService(shared_data)
                 shared_data._pushover_service = _po
-            _po.notify_net_integrity(msg, priority=(1 if worst >= 2 else 0))
+            _po.notify_net_integrity(msg, priority=(1 if worst_w >= 2 else 0))
         except Exception as exc:
             logger.debug(f"[net-integrity] pushover alert skipped: {exc}")
         logger.warning(f"[net-integrity] {msg}")
@@ -1352,6 +1412,8 @@ def net_integrity_status():
         state = dict(_net_integrity_state)
     state['monitor_enabled'] = bool(shared_data.config.get('net_integrity_monitor_enabled', False))
     state['interval_min'] = shared_data.config.get('net_integrity_interval_min', 5)
+    state['extended_enabled'] = bool(shared_data.config.get('net_integrity_extended_enabled', True))
+    state['batch_size'] = shared_data.config.get('net_integrity_batch_size', 3)
     return jsonify({'success': True, **state})
 
 

@@ -345,23 +345,38 @@ tracking as the neighbour-table approximation.
 
 ### 🛡️ Network Integrity Monitor
 The one **passive, alerting** tool in the suite (everything else is on-demand).
-When enabled it runs the [DNS Doctor](#dns-doctor) poisoning check, the
-[ARP Poisoning](#arp-poisoning) check and the [DHCP Guardian](#dhcp-guardian)
-rogue-server check on a schedule (default **every 5 min**), derives an overall
-verdict — **clean / suspicious / compromised** — and:
+When enabled it runs a fast core every cycle (default **every 5 min**) — the
+[DNS Doctor](#dns-doctor) poisoning check, the [ARP Poisoning](#arp-poisoning)
+check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
+[IPv6 RA Guard](#ipv6-ra-guard) posture read — derives an overall verdict
+(**clean / suspicious / compromised**) and:
 
-- Surfaces a live **dashboard chip** (Overall / DNS / ARP / DHCP) in the
-  Diagnostics sub-tab, with the reasons and last-check time.
-- Sends a **Pushover alert** when the verdict *worsens* into a bad state (it
-  alerts on the transition, not every cycle, with a cooldown backstop).
+- Surfaces a live **dashboard chip** (Overall + every check) in the Diagnostics
+  sub-tab, worst-first, with reasons and last-check time.
+- Sends a **Pushover alert** when *any* check *worsens* into a bad state (on the
+  transition, not every cycle, with a cooldown backstop). Active attacks
+  (hijack / injection / poisoning / coercion / VLAN-hop / root-hijack …) page as
+  **compromised**; posture/deviation findings (weak-auth, SMBv1, unsigned SMB,
+  name-exposure …) as **suspicious**.
+
+**Extended monitoring** (on by default alongside the monitor) additionally
+**rotates the whole passive-scanner suite** through the background poller —
+STP · DTP · IGMP · IPv6 first-hop · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
+Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
+`tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
+cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
+several cycles, and each scanner self-noops cheaply when its protocol isn't on
+the segment. The dashboard shows every scanner's last-known verdict even on
+cycles it didn't run. Each scanner **learns its baseline on first sight**, so
+run the monitor on a trusted network first (or use each card's "Trust current").
 
 **Off by default**, because it makes outbound DNS/DoH calls each cycle — opt in
-with the toggle. When you first enable it, be on a trusted network: the first
-cycle learns the gateway ARP baseline. **Check now** runs both checks
-immediately (works even while the monitor is off).
+with the toggle. **Check now** runs the fast core immediately (works even while
+the monitor is off); the extended scanners run on the background rotation.
 
 - Endpoint: `GET /api/net/integrity` · config: `net_integrity_monitor_enabled`,
   `net_integrity_interval_min`, `net_integrity_check_dhcp`,
+  `net_integrity_extended_enabled`, `net_integrity_batch_size`,
   `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`
 
 ### Path MTU / Black-hole

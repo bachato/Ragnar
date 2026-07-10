@@ -1159,7 +1159,7 @@
                     <div class="flex items-center justify-between gap-4">
                         <div class="min-w-0">
                             <h3 class="text-lg font-semibold">Network Integrity Monitor</h3>
-                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong>, <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) and <strong>rogue DHCP servers</strong> in the background, and sends a Pushover alert if the verdict goes bad. Makes outbound DNS/DoH calls each cycle — off by default.</p>
+                            <p class="text-sm text-gray-400">Periodically checks for <strong>DNS poisoning</strong>, <strong>ARP spoofing</strong> (gateway-MAC watch + subnet impersonation) and <strong>rogue DHCP servers</strong> in the background, and sends a Pushover alert if the verdict goes bad. With <strong>extended monitoring</strong> it also rotates the full passive-scanner suite — STP root-hijack, DTP VLAN-hop, FHRP/OSPF/EIGRP/IS-IS/BGP routing hijack & injection, SMB poisoning, NTLM relay/coercion, IGMP/IPv6/ICMP/NTP/SNMP/TLS and RA-Guard posture — a few per cycle so each stays light. Makes outbound DNS/DoH calls each cycle — off by default.</p>
                         </div>
                         <label class="toggle-switch relative inline-flex items-center cursor-pointer shrink-0">
                             <input type="checkbox" id="netint-enabled" class="sr-only peer" onchange="onNetIntegrityToggled(this)">
@@ -1167,10 +1167,18 @@
                         </label>
                     </div>
                     <div id="netint-status" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
-                    <div class="mt-3 flex flex-wrap items-center gap-2">
+                    <div class="mt-3 flex flex-wrap items-center gap-3">
                         <button onclick="netIntegrityRefresh(true)" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Check now</button>
-                        <span class="text-xs text-gray-500">Runs the DNS Doctor, ARP Poisoning and DHCP Guardian checks below.</span>
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer" title="Also rotate the passive Watch scanners (STP/DTP/FHRP/OSPF/EIGRP/IS-IS/BGP/SMB/Relay/…) through the background monitor">
+                            <input type="checkbox" id="netint-extended" class="accent-Ragnar-600" onchange="onNetIntegrityExtendedToggled(this)">
+                            Extended (full passive suite)
+                        </label>
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400" title="How many capture-based scanners run per cycle (round-robin). Higher = fresher but heavier cycles.">
+                            <span>scanners/cycle</span>
+                            <input type="number" id="netint-batch" min="1" max="15" value="3" onchange="onNetIntegrityBatchChanged(this)" class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+                        </label>
                     </div>
+                    <p class="text-xs text-gray-500 mt-2">"Check now" runs the fast core (DNS · ARP · DHCP) immediately; the extended scanners run on the background rotation once the monitor is enabled.</p>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
@@ -6000,7 +6008,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260710-relay"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260710-netint"></script>
 
 </body>
 </html>
