@@ -902,6 +902,60 @@ class Display:
             y += line_h
         return y
 
+    def _draw_scrollable_rows(self, image, draw, top_y, bottom_y, row_groups):
+        """Draw stat-row groups into the vertical band [top_y, bottom_y).
+
+        row_groups is a list of ('rows', [(label, value), ...]) and/or
+        ('divider', None) entries, drawn in order via _draw_stat_rows. When
+        the combined content is taller than the band (e.g. the Discovered
+        page's 9 rows on a 128px LCD HAT), it's rendered to an offscreen
+        strip and a window is slid over it — a slow triangle-wave scroll
+        driven by wall-clock time — instead of drawing statically and
+        spilling past bottom_y into the footer.
+        """
+        w = getattr(self, 'render_w', self.shared_data.width)
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        available_h = bottom_y - top_y
+
+        def _emit(d, y0):
+            y = y0
+            for kind, payload in row_groups:
+                if kind == 'divider':
+                    y += int(2 * sy)
+                    d.line((int(4 * sx), y, w - int(4 * sx), y), fill=0)
+                    y += int(4 * sy)
+                else:
+                    y = self._draw_stat_rows(d, y, payload)
+            return y
+
+        total_h = _emit(ImageDraw.Draw(Image.new('1', (w, 1), 255)), 0)
+
+        if total_h <= available_h:
+            _emit(draw, top_y)
+            return
+
+        strip = Image.new('1', (w, total_h), 255)
+        _emit(ImageDraw.Draw(strip), 0)
+
+        overflow = total_h - available_h
+        speed_px_s = 14.0   # slow scroll — easy to read while it moves
+        hold_s = 1.5        # pause at each end so the extremes are readable
+        scroll_s = overflow / speed_px_s
+        cycle = 2 * hold_s + 2 * scroll_s
+        t = time.time() % cycle
+        if t < hold_s:
+            offset = 0.0
+        elif t < hold_s + scroll_s:
+            offset = (t - hold_s) * speed_px_s
+        elif t < 2 * hold_s + scroll_s:
+            offset = float(overflow)
+        else:
+            offset = overflow - (t - 2 * hold_s - scroll_s) * speed_px_s
+        offset = max(0, min(overflow, int(offset)))
+
+        image.paste(strip.crop((0, offset, w, offset + available_h)), (0, top_y))
+
     # ------------------------------------------------------------------
     # Network Diagnostic mode (Ethernet-focused, internet-independent)
     # ------------------------------------------------------------------
@@ -1574,12 +1628,10 @@ class Display:
     def _render_discovered_page(self, image, draw):
         """Render Page 4: Discovered - real credentials, loot, and attack data."""
         self._draw_page_frame(draw, "DISCOVERED")
-        w = getattr(self, 'render_w', self.shared_data.width)
         h = getattr(self, 'render_h', self.shared_data.height)
-        sx = getattr(self, 'render_sx', self.scale_factor_x)
         sy = getattr(self, 'render_sy', self.scale_factor_y)
-        font = self.shared_data.font_arial9
-        y = int(28 * sy)
+        top_y = int(28 * sy)
+        bottom_y = h - int(18 * sy)
 
         data = self._get_cached_page_data('discovered', self._fetch_discovered_data, ttl=15)
 
@@ -1593,23 +1645,20 @@ class Display:
                 ("RDP creds", str(creds.get('RDP', 0))),
                 ("SQL creds", str(creds.get('SQL', 0))),
             ]
-            y = self._draw_stat_rows(draw, y, stats)
-            y += int(2 * sy)
-            draw.line((int(4 * sx), y, w - int(4 * sx), y), fill=0)
-            y += int(4 * sy)
             summary = [
                 ("Data stolen", f"{data['loot']} files"),
                 ("Attack logs", str(data['attacks'])),
                 ("Zombies", str(data['zombies'])),
             ]
-            self._draw_stat_rows(draw, y, summary)
+            self._draw_scrollable_rows(image, draw, top_y, bottom_y,
+                                        [('rows', stats), ('divider', None), ('rows', summary)])
         else:
             stats = [
                 ("Credentials", str(getattr(self.shared_data, 'crednbr', 0))),
                 ("Data files", str(getattr(self.shared_data, 'datanbr', 0))),
                 ("Zombies", str(getattr(self.shared_data, 'zombiesnbr', 0))),
             ]
-            self._draw_stat_rows(draw, y, stats)
+            self._draw_stat_rows(draw, top_y, stats)
 
     def _render_advanced_page(self, image, draw):
         """Render Page 5: Advanced Vuln Scanner - real scanner status and findings."""
