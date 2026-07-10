@@ -49,6 +49,7 @@ alert.
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [SNMP Watch](#snmp-watch) | Diagnostics | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
 | [TLS Watch](#tls-watch) | Diagnostics | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
+| [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
 | [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
@@ -92,7 +93,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **DTP**, **EIGRP**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **EIGRP**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -923,6 +924,40 @@ end.
 
 - Endpoint: `GET /api/net/icmp-watch` `{interface, seconds}`,
   `POST /api/net/icmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### STP/BPDU Watch
+A **passive** spanning-tree security scanner covering **802.1D STP / 802.1w RSTP /
+802.1s MSTP** (IEEE group MAC `01:80:c2:00:00:00`) and **Cisco PVST+ / Rapid-PVST+**
+(per-VLAN, group MAC `01:00:0c:cc:cc:cd`). **Detection-only** — it never sends a BPDU.
+
+Spanning tree prevents L2 loops by electing a **root bridge** (the switch with the
+numerically lowest Bridge ID = priority + MAC) and blocking redundant paths back
+toward it. BPDUs carry the election and are multicast in the clear with **no
+authentication**, so an attacker who injects a BPDU claiming a **superior root**
+(priority 0 — the Yersinia "claim root role" move) wins the election, becomes the
+root bridge, and the tree reconverges to pull traffic through them (subnet-wide L2
+MITM). BPDU/TCN floods force constant reconvergence (DoS) and MAC-table flushing
+(which turns the switch into a hub — an aid to sniffing). What it flags:
+
+- **root-hijack** — a BPDU advertising a root **superior** to the baseline root
+  (lower priority, or equal priority + lower MAC): a root-bridge takeover. This is
+  the top finding — an active L2 MITM.
+- **rogue-bridge** — a new bridge (Bridge-ID MAC) participating in spanning tree that
+  isn't in the baseline (an unexpected switch, or a spoofed bridge).
+- **bpdu-flood** — an elevated BPDU rate: a reconvergence-storm DoS.
+- **topology-change** — TCN / TC-flag churn: repeated topology changes flushing the
+  MAC tables (instability, or a TCN-flood attack).
+
+The BPF is `(ether dst 01:80:c2:00:00:00) or (ether dst 01:00:0c:cc:cc:cd)`, captured
+with `tcpdump -e` for the sender MAC. For PVST+ the per-VLAN root is carried in the
+Bridge-ID's extended system-id, so the scanner tracks a root **per VLAN/instance**.
+The first scan **learns** the current root(s) and legitimate bridges as the baseline
+(`data/stp_watch.json`); after a legitimate topology change, click "Trust current".
+The real hardening — which this tool exists to nudge you toward — is **BPDU Guard**
+(+ PortFast) on edge/access ports and **Root Guard** on ports toward downstream
+switches, plus pinning your real root/backup-root to priority 0/4096. **API:**
+`GET /api/net/stp-watch`, `POST /api/net/stp-baseline`. **CLI:** `stp-watch`,
+`stp-selftest`.
 
 ### DTP Watch
 A **passive** VLAN-hopping / switch-spoofing scanner for Cisco's **Dynamic Trunking

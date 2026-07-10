@@ -1521,6 +1521,21 @@
                     </div>
                     <div id="igmp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- STP/BPDU Watch (spanning tree) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">STP/BPDU Watch <span class="text-xs font-normal text-gray-500">(spanning tree · root hijack)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive spanning-tree security scanner — <strong>detection-only</strong>, never sends a BPDU. STP/RSTP/MSTP (and Cisco PVST+) elect a <strong>root bridge</strong> by lowest Bridge ID; BPDUs carry the election, multicast in the clear with no auth. An attacker who sends a BPDU claiming a <strong>superior root</strong> (priority 0 — Yersinia "claim root role") wins and the tree reconverges to pull traffic through them (<strong>L2 MITM</strong>). Flags <strong>root-hijack</strong> (a root superior to the baseline), <strong>rogue-bridge</strong> (a new bridge in spanning tree), <strong>bpdu-flood</strong> (reconvergence-storm DoS) and <strong>topology-change</strong> (TCN/TC churn that flushes MAC tables). Defenses are BPDU Guard on edge ports and Root Guard downstream.</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the BPDU group MACs (IEEE <span class="font-mono">01:80:c2:00:00:00</span> + Cisco PVST+ <span class="font-mono">01:00:0c:cc:cc:cd</span>). The first scan learns the current root(s) — per VLAN for PVST+ — and legitimate bridges as the baseline (<span class="font-mono">data/stp_watch.json</span>); after a legitimate topology change, click "Trust current".</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="stp-iface" title="Interface for the BPDU capture — pick the switch-facing NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="stp-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runStpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan STP</button>
+                        <button onclick="stpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current root(s) and bridges as the trusted baseline — use after a legitimate topology change">Trust current</button>
+                    </div>
+                    <div id="stp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- DTP Watch (VLAN hopping) -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">DTP Watch <span class="text-xs font-normal text-gray-500">(Cisco · VLAN hopping)</span></h3>
@@ -1642,7 +1657,7 @@
                 <!-- Routing-scanner self-test + Scapy -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · DTP · EIGRP · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
+                        <h3 class="text-lg font-semibold">Detector Self-Test <span class="text-xs font-normal text-gray-500">(IGMP · IPv6 · RA Guard · NTP · ICMP · SNMP · TLS · STP · DTP · EIGRP · FHRP · OSPF · BGP · speaker · OWD)</span></h3>
                         <div id="scapy-status" class="text-xs text-gray-400"></div>
                     </div>
                     <p class="text-sm text-gray-400 mb-3 mt-1">Validates the IGMP, IPv6 first-hop, NTP, ICMP, SNMP, TLS-cert, OSPF and BGP detectors by running each classifier against crafted attack captures — no root, no live traffic. Installing <strong>Scapy</strong> adds an end-to-end leg that builds real packets, writes a pcap and parses it back through <span class="font-mono">tcpdump</span> (and TLS Watch grades a real local handshake), so the whole capture→parse→classify path is exercised. Recommended for a fully-validated security tool.</p>
@@ -5940,7 +5955,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260710-dtp-eigrp"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260710-stp"></script>
 
 </body>
 </html>

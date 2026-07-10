@@ -6355,6 +6355,453 @@ def _tls_selftest():
 
 
 # --------------------------------------------------------------------------
+# STP/BPDU Watch: passive spanning-tree security scanner (detection-only)
+# --------------------------------------------------------------------------
+# Spanning Tree (802.1D STP / 802.1w RSTP / 802.1s MSTP, and Cisco PVST+/Rapid-PVST+)
+# prevents L2 loops by electing a *root bridge* — the switch with the numerically
+# lowest Bridge ID (priority + MAC) — and blocking redundant links back toward it.
+# BPDUs (Bridge Protocol Data Units) carry the election; they are multicast in the
+# clear (IEEE 01:80:c2:00:00:00 / PVST+ 01:00:0c:cc:cc:cd) with no authentication. So
+# an attacker who sends a BPDU claiming a *superior* root (priority 0 — the Yersinia
+# "claim root role" attack) wins the election, becomes the root bridge, and the tree
+# reconverges to pull traffic through them (subnet-wide MITM). BPDU/TCN floods force
+# constant reconvergence (DoS) and MAC-table flushing (which aids sniffing). The
+# defenses are BPDU Guard (kill the port on any BPDU) on edge ports and Root Guard
+# toward downstream switches. This scanner is PASSIVE: one short capture of the BPDUs,
+# classified against a learned baseline of the root(s) and legitimate bridges. It
+# never sends a BPDU. What it flags:
+#   * root-hijack      — a BPDU advertising a root superior to the baseline root
+#     (lower priority, or equal priority + lower MAC): a root-bridge takeover.
+#   * rogue-bridge     — a new bridge (Bridge-ID MAC) speaking STP, not in the baseline.
+#   * bpdu-flood       — an elevated BPDU rate: a reconvergence-storm DoS.
+#   * topology-change  — TCN / TC-flag churn: forced MAC-table flushing / instability.
+_STP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'stp_watch.json')
+_stp_watch_lock = threading.Lock()
+_STP_EVENTS_CAP = 200
+_STP_FLOOD_RATE = 30            # BPDUs/s above this (with volume) == flood
+_STP_TCN_CHURN = 3              # TCN/TC events in a window above this == instability
+_STP_SRC_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*'
+                         r'(01:80:c2:00:00:00|01:00:0c:cc:cc:cd)')
+_STP_TYPE_RE = re.compile(r'STP 802\.1(\w)')
+_STP_BRIDGE_RE = re.compile(r'bridge-id ([0-9a-fA-F]{4})\.([0-9a-fA-F:]{17})')
+_STP_ROOT_RE = re.compile(r'root-id ([0-9a-fA-F]{4})\.([0-9a-fA-F:]{17}),'
+                          r'\s*root-pathcost (\d+)')
+_STP_FLAGS_RE = re.compile(r'Flags \[([^\]]*)\]')
+
+
+def _mac_int(mac):
+    try:
+        return int(mac.replace(':', ''), 16)
+    except (ValueError, AttributeError):
+        return 0
+
+
+def _parse_stp_capture(output):
+    """Parse `tcpdump -e -t -v` text over BPDUs into events. Each BPDU is a header
+    line (`<src> > <group-mac>, 802.3, ... STP 802.1d, Config, Flags [...], bridge-id
+    PRIO.MAC.PORT`) optionally followed by a `root-id PRIO.MAC, root-pathcost N` line.
+    TCN BPDUs are a single `STP 802.1d, Topology Change` line."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if 'STP 802.1' in line:
+            if cur:
+                events.append(cur)
+            src = _STP_SRC_RE.match(line)
+            t = _STP_TYPE_RE.search(line)
+            tletter = t.group(1).lower() if t else 'd'
+            is_pvst = ('pid PVST' in line
+                       or (src and src.group(2) == '01:00:0c:cc:cc:cd'))
+            if is_pvst:
+                proto = 'pvst+'
+            elif tletter == 'w':
+                proto = 'rstp'
+            elif tletter == 's':
+                proto = 'mstp'
+            else:
+                proto = 'stp'
+            is_tcn = 'Topology Change' in line and 'Config' not in line
+            fl = _STP_FLAGS_RE.search(line)
+            flagset = ([f.strip() for f in fl.group(1).split(',') if f.strip()]
+                       if fl else [])
+            br = _STP_BRIDGE_RE.search(line)
+            cur = {'src': src.group(1).lower() if src else None,
+                   'dst': src.group(2) if src else None,
+                   'proto': proto, 'kind': 'tcn' if is_tcn else 'config',
+                   'tc': 'Topology change' in flagset, 'flags': flagset,
+                   'bridge_prio': int(br.group(1), 16) if br else None,
+                   'bridge_mac': br.group(2).lower() if br else None,
+                   'root_prio': None, 'root_mac': None, 'pathcost': None,
+                   'port_role': None, 'vlan': None}
+            continue
+        if cur is None:
+            continue
+        rm = _STP_ROOT_RE.search(line)
+        if rm:
+            cur['root_prio'] = int(rm.group(1), 16)
+            cur['root_mac'] = rm.group(2).lower()
+            cur['pathcost'] = int(rm.group(3))
+            cur['vlan'] = cur['root_prio'] & 0x0FFF
+            pr = re.search(r'port-role (\w+)', line)
+            if pr:
+                cur['port_role'] = pr.group(1)
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _stp_watch_load():
+    try:
+        with open(_STP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _stp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_STP_WATCH_PATH), exist_ok=True)
+        tmp = _STP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _STP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_stp_baseline(action='get'):
+    """Manage the learned STP baseline (per-instance root bridge + legitimate bridges)."""
+    with _stp_watch_lock:
+        if action == 'reset':
+            _stp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _stp_watch_load()
+        return {'success': True, 'baseline': {
+            'roots': b.get('roots') or {}, 'bridges': b.get('bridges') or []}}
+
+
+def _stp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed BPDU events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    instances = {}
+    bridges = {}
+    tcn_count = 0
+    tc_count = 0
+    for e in events:
+        if e['bridge_mac']:
+            b = bridges.setdefault(e['bridge_mac'], {
+                'mac': e['bridge_mac'], 'proto': e['proto'], 'count': 0,
+                'roles': set()})
+            b['count'] += 1
+            if e['port_role']:
+                b['roles'].add(e['port_role'])
+        if e['kind'] == 'tcn':
+            tcn_count += 1
+        if e['tc']:
+            tc_count += 1
+        if e['root_prio'] is not None:
+            key = str(e['vlan'] if e['vlan'] is not None else 0)
+            inst = instances.setdefault(key, {
+                'vlan': int(key), 'proto': e['proto'], 'best': None,
+                'claimer': None, 'root_macs': set()})
+            inst['root_macs'].add(e['root_mac'])
+            cand = (e['root_prio'], _mac_int(e['root_mac']))
+            if inst['best'] is None or cand < inst['best']:
+                inst['best'] = cand
+                inst['claimer'] = {'prio': e['root_prio'], 'mac': e['root_mac'],
+                                   'by': e['bridge_mac'] or e['src']}
+
+    known_roots = dict(baseline.get('roots') or {})
+    known_bridges = set(baseline.get('bridges') or [])
+    had_baseline = bool(known_roots) or bool(known_bridges)
+
+    learned = False
+    if learn and not had_baseline and (instances or bridges):
+        baseline['roots'] = {
+            k: {'prio': inst['claimer']['prio'], 'mac': inst['claimer']['mac']}
+            for k, inst in instances.items() if inst['claimer']}
+        baseline['bridges'] = sorted(bridges.keys())
+        learned = True
+        known_roots = dict(baseline['roots'])
+        known_bridges = set(baseline['bridges'])
+        had_baseline = True
+
+    PRIORITY = ['root-hijack', 'rogue-bridge', 'bpdu-flood', 'topology-change', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # Root hijack: an advertised root superior to (or displacing) the baseline root.
+    if had_baseline:
+        for k in sorted(instances, key=lambda x: int(x)):
+            inst = instances[k]
+            base = known_roots.get(k)
+            if not base or not inst['claimer']:
+                continue
+            cand = inst['best']
+            base_t = (base['prio'], _mac_int(base['mac']))
+            if cand < base_t:
+                bump('root-hijack')
+                c = inst['claimer']
+                where = f"VLAN {inst['vlan']}" if inst['proto'] == 'pvst+' else \
+                    (f"instance {inst['vlan']}" if inst['vlan'] else "the CIST")
+                reasons.append(
+                    f"ROOT HIJACK on {where}: {c['by']} is advertising root "
+                    f"{c['prio']}.{c['mac']} — superior to the baseline root "
+                    f"{base['prio']}.{base['mac']}. It wins the election and becomes "
+                    f"the root bridge, pulling traffic through it (L2 MITM). Enable "
+                    f"Root Guard / BPDU Guard")
+
+    # Rogue bridges (new senders).
+    if had_baseline:
+        for mac in sorted(bridges):
+            if mac not in known_bridges:
+                bump('rogue-bridge')
+                reasons.append(
+                    f"New STP bridge {mac} ({bridges[mac]['proto'].upper()}) — not in "
+                    f"the baseline; an unexpected switch (or a spoofed bridge) is "
+                    f"participating in spanning tree on this segment")
+
+    # BPDU flood (reconvergence-storm DoS).
+    rate = round(len(events) / seconds, 2)
+    if len(events) > 100 and rate > _STP_FLOOD_RATE:
+        bump('bpdu-flood')
+        reasons.append(
+            f"BPDU flood: {rate} BPDUs/s (normal is ~1 per bridge every 2s) — a "
+            f"spanning-tree storm forcing constant reconvergence (DoS)")
+
+    # Topology-change churn (MAC-table flushing).
+    if (tcn_count + tc_count) > _STP_TCN_CHURN:
+        bump('topology-change')
+        reasons.append(
+            f"Topology-change churn: {tcn_count} TCN + {tc_count} TC-flagged BPDUs in "
+            f"{seconds}s — repeated topology changes flush the MAC tables (traffic "
+            f"floods, which aids sniffing) and can be a TCN-flood attack")
+
+    advisories = []
+    if instances or bridges:
+        advisories.append(
+            "Harden spanning tree: BPDU Guard + PortFast on every edge/access port "
+            "(any BPDU there err-disables the port), Root Guard on ports toward "
+            "downstream switches (rejects superior BPDUs), and set your real root/backup "
+            "root to a low priority (0/4096) so a rogue can't outbid them.")
+
+    def _pub_inst(k, inst):
+        base = known_roots.get(k)
+        c = inst['claimer'] or {}
+        status = 'known'
+        if base:
+            if (c.get('prio'), _mac_int(c.get('mac', ''))) < (base['prio'],
+                                                              _mac_int(base['mac'])):
+                status = 'hijacked'
+        elif had_baseline:
+            status = 'new'
+        else:
+            status = 'learned'
+        return {'vlan': inst['vlan'], 'proto': inst['proto'],
+                'root_prio': c.get('prio'), 'root_mac': c.get('mac'),
+                'advertised_by': c.get('by'),
+                'baseline_root': (f"{base['prio']}.{base['mac']}" if base else None),
+                'status': status}
+
+    if reasons:
+        summary = reasons
+    elif not (instances or bridges):
+        summary = ['No BPDUs seen — no spanning tree on this segment (an access port '
+                   'with BPDU Guard, or an isolated link)']
+    else:
+        summary = ['Spanning-tree root(s) and bridges match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'bridge_count': len(bridges),
+        'instance_count': len(instances),
+        'packet_count': len(events),
+        'rate': rate,
+        'tcn_count': tcn_count,
+        'tc_count': tc_count,
+        'instances': [_pub_inst(k, instances[k])
+                      for k in sorted(instances, key=lambda x: int(x))],
+        'bridges': [{'mac': m, 'proto': bridges[m]['proto'],
+                     'roles': sorted(bridges[m]['roles']), 'count': bridges[m]['count'],
+                     'baseline': m in known_bridges} for m in sorted(bridges)],
+        'advisories': advisories,
+    }
+
+
+def _stp_capture(interface, seconds):
+    """One passive tcpdump window over BPDUs -> (raw, error). Uses -e for the sender
+    MAC; the BPF covers IEEE (01:80:c2:00:00:00) and Cisco PVST+ (01:00:0c:cc:cc:cd)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = '(ether dst 01:80:c2:00:00:00) or (ether dst 01:00:0c:cc:cc:cd)'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '128', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_stp_watch(interface=None, seconds=20, learn=True):
+    """Passive spanning-tree / BPDU security scanner (detection-only). BPDUs are ~2s
+    apart, so a slightly longer window. Learns the root(s) + legitimate bridges on
+    first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    text, err = _stp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_stp_capture(text)
+
+    with _stp_watch_lock:
+        baseline = _stp_watch_load()
+        result = _stp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _stp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _stp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_STP_EVENTS_CAP:]
+            _stp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _stp_selftest():
+    """Self-test the STP/BPDU detectors with synthetic captures, plus a Scapy
+    end-to-end leg (craft a real superior-root BPDU -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def cfg(src, root_prio, root_mac, bridge_prio=None, bridge_mac=None, flags='none',
+            pathcost=0, pvst=False):
+        bridge_prio = bridge_prio if bridge_prio is not None else root_prio
+        bridge_mac = bridge_mac or src
+        dst = '01:00:0c:cc:cc:cd' if pvst else '01:80:c2:00:00:00'
+        pid = 'oui Cisco (0x00000c), pid PVST (0x010b), length 41: ' if pvst else ''
+        return (f"{src} > {dst}, 802.3, length 49: LLC, dsap STP (0x42) Individual, "
+                f"ssap STP (0x42) Command, ctrl 0x03: {pid}STP 802.1d, Config, "
+                f"Flags [{flags}], bridge-id {bridge_prio:04x}.{bridge_mac}.0000, "
+                f"length 35\n"
+                f"\tmessage-age 1.00s, max-age 20.00s, hello-time 2.00s, "
+                f"forwarding-delay 15.00s\n"
+                f"\troot-id {root_prio:04x}.{root_mac}, root-pathcost {pathcost}")
+
+    def tcn(src):
+        return (f"{src} > 01:80:c2:00:00:00, 802.3, length 7: LLC, dsap STP (0x42) "
+                f"Individual, ssap STP (0x42) Command, ctrl 0x03: STP 802.1d, "
+                f"Topology Change")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_stp_capture(text)
+        res = _stp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    # Baseline: root of the CIST is 8000.00:11:22:33:44:55 (priority 32768), one bridge.
+    base = {'roots': {'0': {'prio': 0x8000, 'mac': '00:11:22:33:44:55'}},
+            'bridges': ['00:11:22:33:44:55']}
+
+    # 1. clean: the known root re-advertising itself.
+    run('clean', cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55'), 20, base,
+        'clean')
+    # 2. root-hijack: a new bridge claims root with priority 0 (superior).
+    run('root-hijack', cfg('de:ad:be:ef:00:01', 0x0000, 'de:ad:be:ef:00:01'), 20, base,
+        'root-hijack')
+    # 3. rogue-bridge: a new bridge advertising the *existing* root (not superior).
+    run('rogue-bridge', cfg('de:ad:be:ef:00:02', 0x8000, '00:11:22:33:44:55',
+                            bridge_mac='de:ad:be:ef:00:02'), 20, base, 'rogue-bridge')
+    # 4. topology-change: known bridge + several TCNs (MAC-flush churn).
+    run('topology-change',
+        cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55') + "\n"
+        + "\n".join(tcn('00:11:22:33:44:55') for _ in range(4)), 20, base,
+        'topology-change')
+    # 5. bpdu-flood: a burst of BPDUs from the known root.
+    run('bpdu-flood',
+        "\n".join(cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55')
+                  for _ in range(200)), 3, base, 'bpdu-flood')
+    # 6. pvst+ parse: per-VLAN BPDU, VLAN encoded in the priority low bits.
+    pev = _parse_stp_capture(cfg('00:11:22:33:44:55', 0x8064, '00:11:22:33:44:55',
+                                 bridge_prio=0x8064, pvst=True))
+    p_ok = (len(pev) == 1 and pev[0]['proto'] == 'pvst+' and pev[0]['vlan'] == 100
+            and pev[0]['root_prio'] == 0x8064)
+    scenarios.append({'name': 'pvst-parse', 'expect': 'pvst+/vlan100',
+                      'got': f"{pev[0]['proto'] if pev else '-'}/vlan"
+                             f"{pev[0]['vlan'] if pev else '?'}", 'pass': p_ok})
+    # 7. parse: TC flag + fields.
+    fev = _parse_stp_capture(cfg('00:11:22:33:44:55', 0x8000, '00:11:22:33:44:55',
+                                 flags='Topology change, Topology change ACK'))
+    f_ok = (len(fev) == 1 and fev[0]['tc'] is True
+            and fev[0]['root_mac'] == '00:11:22:33:44:55'
+            and fev[0]['bridge_prio'] == 0x8000)
+    scenarios.append({'name': 'flags-parse', 'expect': 'tc=True',
+                      'got': f"tc={fev[0]['tc'] if fev else '?'}", 'pass': f_ok})
+
+    # Scapy end-to-end: craft a real superior-root (priority 0) BPDU.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, STP, wrpcap
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:80:c2:00:00:00', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0x42, ssap=0x42, ctrl=3)
+                   / STP(rootid=0, rootmac='de:ad:be:ef:00:01', bridgeid=0,
+                         bridgemac='de:ad:be:ef:00:01', pathcost=0))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_stp_capture(res['out'])
+            e = evs[0] if evs else {}
+            base2 = {'roots': {'0': {'prio': 0x8000, 'mac': '00:11:22:33:44:55'}},
+                     'bridges': ['00:11:22:33:44:55']}
+            cls = _stp_analyze(evs, 20, dict(base2), learn=False)
+            ok = (e.get('root_prio') == 0 and e.get('src') == 'de:ad:be:ef:00:01'
+                  and cls['verdict'] == 'root-hijack')
+            scapy_result = {'ran': True, 'root_prio': e.get('root_prio'),
+                            'src': e.get('src'), 'verdict': cls['verdict'], 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # DTP Watch: passive Dynamic Trunking Protocol / VLAN-hopping scanner (Cisco)
 # --------------------------------------------------------------------------
 # DTP (Cisco proprietary, group MAC 01:00:0c:cc:cc:cc, SNAP OUI 0x00000c PID 0x2004)
@@ -8874,6 +9321,7 @@ def do_routing_selftest():
               'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
+              'stp': _stp_selftest(),
               'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
@@ -9750,6 +10198,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/tls-baseline {action}")
         return jsonify(do_tls_baseline(action))
 
+    @app.route('/api/net/stp-watch', methods=['GET'])
+    def net_stp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/stp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_stp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/stp-baseline', methods=['GET', 'POST'])
+    def net_stp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/stp-baseline {action}")
+        return jsonify(do_stp_baseline(action))
+
     @app.route('/api/net/dtp-watch', methods=['GET'])
     def net_dtp_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -10070,6 +10536,15 @@ def _cli(argv=None):
 
     twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
     twst.add_argument('--json', action='store_true', help='emit JSON')
+
+    st = sub.add_parser('stp-watch', help='passive STP/BPDU spanning-tree security scan')
+    st.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    st.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    st.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    st.add_argument('--json', action='store_true', help='emit JSON')
+
+    stst = sub.add_parser('stp-selftest', help='self-test the STP/BPDU detectors (no root)')
+    stst.add_argument('--json', action='store_true', help='emit JSON')
 
     dt = sub.add_parser('dtp-watch', help='passive DTP / VLAN-hopping scan (Cisco)')
     dt.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -10415,6 +10890,47 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] e2e-local-server: {e.get('reason')}")
             print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'stp-watch':
+        r = do_stp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"STP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} BPDUs, {r['bridge_count']} bridge(s), "
+                  f"{r['instance_count']} instance(s); {r['tcn_count']} TCN)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for inst in r.get('instances', []):
+                mark = '' if inst['status'] in ('known', 'learned') else f" [{inst['status']}]"
+                print(f"  {inst['proto'].upper()} vlan/inst {inst['vlan']}: root "
+                      f"{inst['root_prio']}.{inst['root_mac']} via {inst['advertised_by']}{mark}")
+            for b in r.get('bridges', []):
+                tag = '' if b['baseline'] else ' *NEW*'
+                print(f"    bridge {b['mac']} ({b['proto']}){tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'stp-selftest':
+        r = _stp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"root_prio={sc.get('root_prio')} verdict={sc.get('verdict')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"STP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'dtp-watch':
