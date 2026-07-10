@@ -53,6 +53,7 @@ alert.
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
 | [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
+| [IS-IS Watch](#is-is-watch) | Switch & L2/L3 | `GET /api/net/isis-watch`, `POST /api/net/isis-baseline` |
 | [OSPF Security Scanner](#ospf-security-scanner) | Switch & L2/L3 | `GET /api/net/ospf-watch`, `POST /api/net/ospf-baseline` |
 | [BGP Path Watch](#bgp-path-watch) | Switch & L2/L3 | `GET /api/net/bgp-watch`, `POST /api/net/bgp-baseline` |
 | [BGP Collector & Path Asymmetry](#bgp-collector--path-asymmetry-control-plane--data-plane) | Switch & L2/L3 | `GET/POST /api/net/bgp-collector`, `/api/net/owd-reflector`, `POST /api/net/path-asymmetry` |
@@ -93,7 +94,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **EIGRP**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -1056,6 +1057,43 @@ a SPAN/mirror to see EIGRP. The first scan **learns** the current routers and th
 advertised prefix→next-hop map as the baseline (`data/eigrp_watch.json`); after a
 legitimate topology change, click "Trust current". **API:** `GET /api/net/eigrp-watch`,
 `POST /api/net/eigrp-baseline`. **CLI:** `eigrp-watch`, `eigrp-selftest`.
+
+### IS-IS Watch
+A **passive** routing-security scanner for **IS-IS** (ISO/IEC 10589) — the third
+interior gateway protocol alongside OSPF and EIGRP, and the one that dominates
+**ISP / service-provider and data-center cores**. **Detection-only** — it never forms
+an adjacency, sends a hello, or injects an LSP.
+
+IS-IS is architecturally unusual: it runs **directly on L2** (ISO CLNS, LLC DSAP
+`0xFE`) — *not* over IP — so IP ACLs never touch it, and its only real protection is
+the **TLV-10 authentication** (a cleartext password or HMAC-MD5). On a broadcast LAN
+its PDUs go to the AllL1ISs (`01:80:c2:00:00:14`) and AllL2ISs (`01:80:c2:00:00:15`)
+multicast MACs: **IIH** (Hello) forms adjacencies, **LSP** (Link State PDU) carries
+the topology and reachable prefixes, and **CSNP/PSNP** sync the database. Without
+authentication, any host on the segment can peer and inject LSPs with attractive
+metrics to blackhole or MITM traffic (the IS-IS analogue of OSPF LSA injection).
+`tcpdump` fully decodes IS-IS — including the reachable prefixes in LSPs and the
+**dynamic-hostname TLV (#137)** that maps a system-id to a router name — so this
+scanner sees injection directly and can name the routers. What it flags:
+
+- **injection** — an LSP from a system-id **not** in the baseline, or a **new /
+  re-homed** reachable prefix (an LSP hijack steering traffic). The money finding.
+- **rogue-router** — a new IS-IS speaker (system-id) sending hellos, not in baseline
+  (adjacency spoofing).
+- **storm** — an IIH/LSP flood by rate.
+- **anomaly** — a **duplicate system-id** seen from two MACs (a spoof), or a **new
+  area address** on a known router.
+- **weak-auth** — a PDU with **no Authentication TLV** or a **cleartext** password
+  (the injection enabler).
+
+The BPF is the two IS-IS multicast MACs, captured with `tcpdump -e` for the sender.
+The first scan **learns** the current routers (resolved to hostnames via TLV 137),
+their areas, and the advertised prefix→originator map as the baseline
+(`data/isis_watch.json`); after a legitimate topology change, click "Trust current".
+Because IS-IS rides directly on L2, the hardening is HMAC authentication at both
+levels plus restricting which access ports may carry it. **API:**
+`GET /api/net/isis-watch`, `POST /api/net/isis-baseline`. **CLI:** `isis-watch`,
+`isis-selftest`.
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control

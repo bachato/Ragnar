@@ -6355,6 +6355,523 @@ def _tls_selftest():
 
 
 # --------------------------------------------------------------------------
+# IS-IS Watch: passive IS-IS routing-security scanner (detection-only)
+# --------------------------------------------------------------------------
+# IS-IS (ISO/IEC 10589) is the third interior gateway protocol alongside OSPF and
+# EIGRP, and the one that dominates ISP / service-provider and data-center cores. It
+# is architecturally unusual: it runs *directly on L2* (ISO CLNS, LLC DSAP 0xFE) — not
+# over IP — so IP ACLs don't touch it, and its only real protection is the TLV-10
+# authentication (cleartext password or HMAC-MD5). On a broadcast LAN its PDUs go to
+# the AllL1ISs (01:80:c2:00:00:14) and AllL2ISs (01:80:c2:00:00:15) multicast MACs:
+#   IIH  (Hello, PDU 15/16/17)  — forms adjacencies
+#   LSP  (Link State PDU 18/20) — carries the topology + reachable prefixes
+#   CSNP/PSNP (24-27)           — database sync
+# Without authentication any host on the segment can form an adjacency and inject LSPs
+# with attractive metrics to blackhole or MITM traffic (the IS-IS analogue of OSPF LSA
+# injection). tcpdump fully decodes IS-IS — system-ids, areas, the Authentication TLV,
+# the reachable prefixes in LSPs, and the dynamic-hostname TLV (#137) that maps a
+# system-id to a router name — so this passive scanner sees injection directly and can
+# name the routers. It never sends an IS-IS PDU. What it flags:
+#   * injection    — an LSP from a system-id not in the baseline, or a new / re-homed
+#     reachable prefix (topology poisoning).
+#   * rogue-router — a new IS-IS speaker (system-id) sending hellos, not in baseline.
+#   * storm        — an IIH/LSP flood by rate.
+#   * anomaly      — a duplicate system-id from two MACs (spoof), or a new area address.
+#   * weak-auth    — a PDU with no Authentication TLV, or a cleartext password.
+_ISIS_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'data', 'isis_watch.json')
+_isis_watch_lock = threading.Lock()
+_ISIS_EVENTS_CAP = 200
+_ISIS_STORM_RATE = 25           # IS-IS PDUs/s above this (with volume) == flood
+_ISIS_SRC_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*'
+                          r'(01:80:c2:00:00:1[45])')
+_ISIS_PDU_RE = re.compile(r'\b(L1|L2|p2p)\s+(Lan IIH|IIH|LSP|CSNP|PSNP)')
+_ISIS_SRCID_RE = re.compile(r'source-id:\s*([0-9a-fA-F.]+)')
+_ISIS_LSPID_RE = re.compile(r'lsp-id:\s*([0-9a-fA-F.\-]+),\s*seq:\s*(0x[0-9a-fA-F]+)')
+_ISIS_AREA_RE = re.compile(r'Area address \(length: \d+\):\s*([0-9a-fA-F.]+)')
+_ISIS_HOST_RE = re.compile(r'Hostname:\s*(\S+)')
+_ISIS_PFX_RE = re.compile(r'IP(?:v4|v6) prefix:\s*([0-9a-fA-F:.]+/\d+),.*?Metric:\s*(\d+)')
+
+
+def _isis_sysid_of_lsp(lspid):
+    """System-id (first three dotted groups) of an LSP-ID like 0000.0000.0001.00-00."""
+    return '.'.join((lspid or '').split('.')[:3]) or None
+
+
+def _parse_isis_capture(output):
+    """Parse `tcpdump -e -t -v` text over IS-IS into per-PDU events. Block-structured:
+    a header line (`<src> > <AllISs-mac>, 802.3, ... IS-IS (0x83)`) starts a PDU whose
+    type line (`L1 Lan IIH` / `L2 LSP` / ...) and TLVs (area/auth/hostname/prefix)
+    follow indented."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _ISIS_SRC_RE.match(line)
+        if m and 'IS-IS' in line:
+            if cur:
+                events.append(cur)
+            cur = {'src_mac': m.group(1).lower(), 'dst': m.group(2),
+                   'level': None, 'kind': None, 'source_id': None, 'lsp_id': None,
+                   'seq': None, 'areas': [], 'auth_present': False, 'auth': None,
+                   'hostname': None, 'prefixes': []}
+            continue
+        if cur is None:
+            continue
+        p = _ISIS_PDU_RE.search(line)
+        if p and cur['kind'] is None:
+            lvl = p.group(1)
+            cur['level'] = 1 if lvl == 'L1' else (2 if lvl == 'L2' else None)
+            t = p.group(2)
+            cur['kind'] = ('iih' if 'IIH' in t else 'lsp' if t == 'LSP'
+                           else 'csnp' if t == 'CSNP' else 'psnp' if t == 'PSNP'
+                           else 'unknown')
+        sid = _ISIS_SRCID_RE.search(line)
+        if sid:
+            cur['source_id'] = sid.group(1)
+        lsp = _ISIS_LSPID_RE.search(line)
+        if lsp:
+            cur['lsp_id'] = lsp.group(1)
+            cur['seq'] = lsp.group(2)
+        ar = _ISIS_AREA_RE.search(line)
+        if ar and ar.group(1) not in cur['areas']:
+            cur['areas'].append(ar.group(1))
+        if 'Authentication TLV' in line:
+            cur['auth_present'] = True
+        elif 'simple text password' in line:
+            cur['auth'] = 'cleartext'
+        elif 'HMAC' in line:
+            cur['auth'] = 'hmac'
+        hn = _ISIS_HOST_RE.search(line)
+        if hn:
+            cur['hostname'] = hn.group(1)
+        pf = _ISIS_PFX_RE.search(line)
+        if pf:
+            cur['prefixes'].append({'pfx': pf.group(1), 'metric': int(pf.group(2))})
+    if cur:
+        events.append(cur)
+    # Attribute a stable system-id to every event (LSPs carry it in the lsp-id).
+    for e in events:
+        e['system_id'] = e['source_id'] or _isis_sysid_of_lsp(e['lsp_id'])
+    return [e for e in events if e['system_id']]
+
+
+def _isis_watch_load():
+    try:
+        with open(_ISIS_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _isis_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_ISIS_WATCH_PATH), exist_ok=True)
+        tmp = _ISIS_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _ISIS_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_isis_baseline(action='get'):
+    """Manage the learned IS-IS baseline (trusted routers + advertised prefixes)."""
+    with _isis_watch_lock:
+        if action == 'reset':
+            _isis_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _isis_watch_load()
+        return {'success': True, 'baseline': {
+            'routers': sorted((b.get('routers') or {}).keys()),
+            'prefixes': sorted((b.get('prefixes') or {}).keys())}}
+
+
+def _isis_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed IS-IS events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    routers = {}
+    prefixes = {}
+    noauth_any = False
+    for e in events:
+        sid = e['system_id']
+        r = routers.setdefault(sid, {
+            'system_id': sid, 'hostname': None, 'areas': set(), 'levels': set(),
+            'macs': set(), 'kinds': set(), 'auth': set(), 'count': 0})
+        r['count'] += 1
+        if e['hostname']:
+            r['hostname'] = e['hostname']
+        for a in e['areas']:
+            r['areas'].add(a)
+        if e['level']:
+            r['levels'].add(e['level'])
+        if e['src_mac']:
+            r['macs'].add(e['src_mac'])
+        if e['kind']:
+            r['kinds'].add(e['kind'])
+        # An IIH/LSP with no Authentication TLV, or a cleartext password, is weak.
+        if e['kind'] in ('iih', 'lsp'):
+            if not e['auth_present'] or e['auth'] == 'cleartext':
+                r['auth'].add(e['auth'] or 'none')
+                noauth_any = True
+            else:
+                r['auth'].add(e['auth'])
+        if e['kind'] == 'lsp':
+            for p in e['prefixes']:
+                prefixes.setdefault(p['pfx'], {
+                    'pfx': p['pfx'], 'origin': sid, 'metric': p['metric']})
+
+    known = dict(baseline.get('routers') or {})
+    base_prefixes = dict(baseline.get('prefixes') or {})
+    had_baseline = bool(known) or bool(base_prefixes)
+
+    def _name(sid):
+        r = routers.get(sid)
+        hn = (r['hostname'] if r else None) or (known.get(sid) or {}).get('hostname')
+        return f"{hn} ({sid})" if hn else sid
+
+    learned = False
+    if learn and not had_baseline and routers:
+        baseline['routers'] = {
+            s: {'areas': sorted(r['areas']), 'hostname': r['hostname'],
+                'levels': sorted(r['levels'])}
+            for s, r in routers.items()}
+        baseline['prefixes'] = {
+            p: {'origin': d['origin']} for p, d in prefixes.items()}
+        learned = True
+        known = dict(baseline['routers'])
+        base_prefixes = dict(baseline['prefixes'])
+        had_baseline = True
+
+    PRIORITY = ['injection', 'rogue-router', 'storm', 'anomaly', 'weak-auth', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # LSP injection: new prefix, or a known prefix re-homed to a different originator.
+    if had_baseline:
+        for p in sorted(prefixes):
+            d = prefixes[p]
+            base = base_prefixes.get(p)
+            if base is None:
+                bump('injection')
+                reasons.append(
+                    f"IS-IS LSP INJECTION: prefix {p} advertised by {_name(d['origin'])} "
+                    f"is not in the baseline — a forged LSP that can blackhole or MITM "
+                    f"traffic to it")
+            elif base.get('origin') and d['origin'] != base['origin']:
+                bump('injection')
+                reasons.append(
+                    f"IS-IS PREFIX RE-HOMED: {p} is now originated by "
+                    f"{_name(d['origin'])} (was {_name(base['origin'])}) — an LSP "
+                    f"hijack steering traffic to {p}")
+
+    # Rogue routers (new system-ids sending hellos/LSPs).
+    for sid in sorted(routers):
+        if had_baseline and sid not in known:
+            bump('rogue-router')
+            r = routers[sid]
+            area = ', '.join(sorted(r['areas'])) or '?'
+            reasons.append(
+                f"Rogue IS-IS speaker {_name(sid)} (area {area}, "
+                f"L{'/'.join(str(x) for x in sorted(r['levels'])) or '?'}) — not in "
+                f"the baseline; a new router forming adjacencies on this segment")
+
+    # Anomalies: duplicate system-id across MACs (spoof), or a new area on a known router.
+    for sid in sorted(routers):
+        r = routers[sid]
+        if len(r['macs']) > 1:
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS system-id {_name(sid)} seen from {len(r['macs'])} different "
+                f"MACs ({', '.join(sorted(r['macs']))}) — a duplicate system-id / "
+                f"adjacency spoof")
+        base = known.get(sid)
+        if base:
+            new_areas = [a for a in r['areas'] if a not in (base.get('areas') or [])]
+            if new_areas:
+                bump('anomaly')
+                reasons.append(
+                    f"IS-IS router {_name(sid)} is advertising a new area address "
+                    f"{', '.join(new_areas)} (baseline: "
+                    f"{', '.join(base.get('areas') or []) or 'none'}) — area/topology "
+                    f"change or a crafted hello")
+
+    # Weak / no authentication.
+    if noauth_any:
+        bump('weak-auth')
+        reasons.append(
+            "IS-IS PDUs seen with no Authentication TLV or a cleartext password — no "
+            "HMAC protection. This is what lets a forged LSP win; configure IS-IS "
+            "authentication (key-chain / hmac-md5) at both levels on every interface")
+
+    # Flooding.
+    rate = round(len(events) / seconds, 2)
+    if len(events) > 100 and rate > _ISIS_STORM_RATE:
+        bump('storm')
+        reasons.append(
+            f"IS-IS flood: {rate} PDUs/s — a hello/LSP storm (churn or a DoS against "
+            f"the routing process)")
+
+    advisories = []
+    if routers:
+        advisories.append(
+            "Authenticate IS-IS (hmac-md5 key-chain at both L1 and L2), set edge "
+            "interfaces passive, and — because IS-IS rides directly on L2 — restrict "
+            "which access ports may carry it. Alert on any new system-id, new area, or "
+            "new/re-homed prefix.")
+
+    def _pub_router(r):
+        return {'system_id': r['system_id'], 'hostname': r['hostname'],
+                'areas': sorted(r['areas']),
+                'levels': sorted(r['levels']), 'kinds': sorted(r['kinds']),
+                'macs': sorted(r['macs']),
+                'auth': ('hmac' if r['auth'] == {'hmac'} else
+                         ('none/cleartext' if (r['auth'] & {'none', 'cleartext'})
+                          else (sorted(r['auth'])[0] if r['auth'] else 'n/a'))),
+                'count': r['count'], 'baseline': r['system_id'] in known}
+
+    def _pub_prefix(p, d):
+        base = base_prefixes.get(p)
+        status = 'known' if base else ('new' if had_baseline else 'learned')
+        if base and base.get('origin') and d['origin'] != base['origin']:
+            status = 're-homed'
+        return {'pfx': p, 'origin': d['origin'], 'origin_name': _name(d['origin']),
+                'metric': d['metric'], 'status': status}
+
+    if reasons:
+        summary = reasons
+    elif not routers:
+        summary = ['No IS-IS traffic seen — no IS-IS on this segment']
+    else:
+        summary = ['All IS-IS routers and advertised prefixes match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'router_count': len(routers),
+        'prefix_count': len(prefixes),
+        'packet_count': len(events),
+        'rate': rate,
+        'routers': [_pub_router(routers[s]) for s in sorted(routers)],
+        'prefixes': [_pub_prefix(p, prefixes[p]) for p in sorted(prefixes)],
+        'advisories': advisories,
+    }
+
+
+def _isis_capture(interface, seconds):
+    """One passive tcpdump window over IS-IS PDUs -> (raw, error). Uses -e for the
+    sender MAC; the BPF covers the AllL1ISs + AllL2ISs multicast MACs."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:80:c2:00:00:14 or ether dst 01:80:c2:00:00:15'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_isis_watch(interface=None, seconds=20, learn=True):
+    """Passive IS-IS routing-security scanner (detection-only). Captures IS-IS for a
+    few seconds and classifies: injection / rogue-router / storm / anomaly / weak-auth
+    / clean. Learns the trusted routers + advertised prefixes on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 20, 5, 50)
+
+    text, err = _isis_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_isis_capture(text)
+
+    with _isis_watch_lock:
+        baseline = _isis_watch_load()
+        result = _isis_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _isis_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _isis_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_ISIS_EVENTS_CAP:]
+            _isis_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _isis_selftest():
+    """Self-test the IS-IS detectors with synthetic captures, plus a Scapy end-to-end
+    leg (craft a real IIH + LSP-with-prefix -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def _hdr(srcmac, level, length=54):
+        mac = '14' if level == 1 else '15'
+        return (f"{srcmac} > 01:80:c2:00:00:{mac}, 802.3, length {length + 3}: LLC, "
+                f"dsap OSI (0xfe) Individual, ssap OSI (0xfe) Command, ctrl 0x03: "
+                f"OSI NLPID IS-IS (0x83): length {length}")
+
+    def _auth(kind):
+        if kind == 'hmac':
+            return ["\t    Authentication TLV #10, length: 17",
+                    "\t      HMAC-MD5 password: <redacted>"]
+        if kind == 'cleartext':
+            return ["\t    Authentication TLV #10, length: 7",
+                    "\t      simple text password: secret"]
+        return []
+
+    def iih(srcmac, sysid, level=2, area='49.0001', auth='hmac', hostname=None):
+        lines = [_hdr(srcmac, level),
+                 f"\tL{level} Lan IIH, hlen: 27, v: 1, pdu-v: 1, sys-id-len: 6 (0), "
+                 f"max-area: 3 (0)",
+                 f"\t  source-id: {sysid},  holding time: 30s, Flags: [Level {level}]",
+                 f"\t  lan-id:    {sysid}.01, Priority: 64, PDU length: 54",
+                 f"\t    Area address(es) TLV #1, length: 4",
+                 f"\t      Area address (length: 3): {area}"]
+        lines += _auth(auth)
+        if hostname:
+            lines += [f"\t    Hostname TLV #137, length: {len(hostname)}",
+                      f"\t      Hostname: {hostname}"]
+        return "\n".join(lines)
+
+    def lsp(srcmac, sysid, level=2, prefixes=(), auth='hmac', hostname=None, seq=0x10):
+        lines = [_hdr(srcmac, level),
+                 f"\tL{level} LSP, hlen: 27, v: 1, pdu-v: 1, sys-id-len: 6 (0), "
+                 f"max-area: 3 (0)",
+                 f"\t  lsp-id: {sysid}.00-00, seq: {seq:#010x}, lifetime:  1199s",
+                 f"\t  chksum: 0x1771 (correct), PDU length: 49, Flags: [ L{level} IS ]"]
+        lines += _auth(auth)
+        for (pfx, metric) in prefixes:
+            lines += [f"\t    Extended IPv4 Reachability TLV #135, length: 8",
+                      f"\t      IPv4 prefix:      {pfx}, Distribution: up, "
+                      f"Metric: {metric}"]
+        if hostname:
+            lines += [f"\t    Hostname TLV #137, length: {len(hostname)}",
+                      f"\t      Hostname: {hostname}"]
+        return "\n".join(lines)
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_isis_capture(text)
+        res = _isis_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'routers': {'0000.0000.0001': {'areas': ['49.0001'],
+                                           'hostname': 'core-rtr-1', 'levels': [2]}},
+            'prefixes': {'10.1.0.0/24': {'origin': '0000.0000.0001'}}}
+
+    # 1. clean: known router (hmac) re-advertising the known prefix.
+    run('clean', iih('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                     hostname='core-rtr-1') + "\n"
+        + lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+              prefixes=[('10.1.0.0/24', 10)]), 20, base, 'clean')
+    # 2. injection: known router advertises a NEW prefix.
+    run('injection', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                         prefixes=[('10.66.66.0/24', 10)]), 20, base, 'injection')
+    # 3. injection via re-home: known prefix now from a different originator.
+    run('re-home', iih('de:ad:be:ef:00:01', '0000.0000.0009', auth='hmac') + "\n"
+        + lsp('de:ad:be:ef:00:01', '0000.0000.0009', auth='hmac',
+              prefixes=[('10.1.0.0/24', 5)]), 20, base, 'injection')
+    # 4. rogue-router: a brand-new system-id speaking IS-IS (authed, no LSP).
+    run('rogue-router', iih('de:ad:be:ef:00:02', '0000.0000.0666', auth='hmac'), 20,
+        base, 'rogue-router')
+    # 5. anomaly: duplicate system-id from two different MACs.
+    run('anomaly-dup', iih('00:11:22:33:44:55', '0000.0000.0001', auth='hmac') + "\n"
+        + iih('de:ad:be:ef:00:03', '0000.0000.0001', auth='hmac'), 20, base, 'anomaly')
+    # 6. weak-auth: known router + prefix, but no Authentication TLV.
+    run('weak-auth', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='none',
+                         prefixes=[('10.1.0.0/24', 10)]), 20, base, 'weak-auth')
+    # 7. parse: source-id, area, cleartext auth, hostname, LSP prefix.
+    pev = _parse_isis_capture(
+        iih('00:11:22:33:44:55', '0000.0000.0001', area='49.0001', auth='cleartext',
+            hostname='core-rtr-1') + "\n"
+        + lsp('00:11:22:33:44:55', '0000.0000.0001', prefixes=[('10.66.66.0/24', 10)]))
+    iih_ev = next((e for e in pev if e['kind'] == 'iih'), {})
+    lsp_ev = next((e for e in pev if e['kind'] == 'lsp'), {})
+    p_ok = (iih_ev.get('system_id') == '0000.0000.0001'
+            and iih_ev.get('areas') == ['49.0001']
+            and iih_ev.get('auth') == 'cleartext'
+            and iih_ev.get('hostname') == 'core-rtr-1'
+            and lsp_ev.get('prefixes') == [{'pfx': '10.66.66.0/24', 'metric': 10}])
+    scenarios.append({'name': 'isis-parse', 'expect': 'sysid/area/cleartext/host/pfx',
+                      'got': f"auth={iih_ev.get('auth')} host={iih_ev.get('hostname')}",
+                      'pass': p_ok})
+
+    # Scapy end-to-end: real IIH (no auth) + LSP with a prefix -> tcpdump -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, wrpcap
+        import scapy.contrib.isis as ISIS
+        if _have('tcpdump'):
+            pkts = [
+                (Dot3(dst='01:80:c2:00:00:15', src='de:ad:be:ef:00:01')
+                 / LLC(dsap=0xfe, ssap=0xfe, ctrl=3) / ISIS.ISIS_CommonHdr()
+                 / ISIS.ISIS_L2_LAN_Hello(
+                     sourceid='0000.0000.0009', lanid='0000.0000.0009.01',
+                     tlvs=[ISIS.ISIS_AreaTlv(
+                         areas=[ISIS.ISIS_AreaEntry(areaid='49.0009')])])),
+                (Dot3(dst='01:80:c2:00:00:15', src='de:ad:be:ef:00:01')
+                 / LLC(dsap=0xfe, ssap=0xfe, ctrl=3) / ISIS.ISIS_CommonHdr()
+                 / ISIS.ISIS_L2_LSP(
+                     lspid='0000.0000.0009.00-00', seqnum=0x10,
+                     tlvs=[ISIS.ISIS_ExtendedIpReachabilityTlv(
+                         pfxs=[ISIS.ISIS_ExtendedIpPrefix(pfx='10.66.66.0/24',
+                                                          metric=10)])]))]
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, pkts)
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path], timeout=10)
+            evs = _parse_isis_capture(res['out'])
+            base2 = {'routers': {'0000.0000.0001': {'areas': ['49.0001'],
+                                                    'hostname': None, 'levels': [2]}},
+                     'prefixes': {'10.1.0.0/24': {'origin': '0000.0000.0001'}}}
+            cls = _isis_analyze(evs, 20, dict(base2), learn=False)
+            hostm = next((e for e in evs if e['kind'] == 'iih'), {})
+            lspm = next((e for e in evs if e['kind'] == 'lsp'), {})
+            ok = (hostm.get('system_id') == '0000.0000.0009'
+                  and lspm.get('prefixes') == [{'pfx': '10.66.66.0/24', 'metric': 10}]
+                  and cls['verdict'] == 'injection')
+            scapy_result = {'ran': True, 'sysid': hostm.get('system_id'),
+                            'prefix': (lspm.get('prefixes') or [{}])[0].get('pfx'),
+                            'verdict': cls['verdict'], 'pass': ok,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and (not scapy_result.get('ran')
+                                                    or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # STP/BPDU Watch: passive spanning-tree security scanner (detection-only)
 # --------------------------------------------------------------------------
 # Spanning Tree (802.1D STP / 802.1w RSTP / 802.1s MSTP, and Cisco PVST+/Rapid-PVST+)
@@ -9321,7 +9838,7 @@ def do_routing_selftest():
               'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
-              'stp': _stp_selftest(),
+              'stp': _stp_selftest(), 'isis': _isis_selftest(),
               'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
@@ -10198,6 +10715,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/tls-baseline {action}")
         return jsonify(do_tls_baseline(action))
 
+    @app.route('/api/net/isis-watch', methods=['GET'])
+    def net_isis_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 20, 5, 50)
+        _log(f"net/isis-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_isis_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/isis-baseline', methods=['GET', 'POST'])
+    def net_isis_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/isis-baseline {action}")
+        return jsonify(do_isis_baseline(action))
+
     @app.route('/api/net/stp-watch', methods=['GET'])
     def net_stp_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -10536,6 +11071,15 @@ def _cli(argv=None):
 
     twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
     twst.add_argument('--json', action='store_true', help='emit JSON')
+
+    ii = sub.add_parser('isis-watch', help='passive IS-IS routing-security scan')
+    ii.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    ii.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
+    ii.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    ii.add_argument('--json', action='store_true', help='emit JSON')
+
+    iist = sub.add_parser('isis-selftest', help='self-test the IS-IS detectors (no root)')
+    iist.add_argument('--json', action='store_true', help='emit JSON')
 
     st = sub.add_parser('stp-watch', help='passive STP/BPDU spanning-tree security scan')
     st.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -10890,6 +11434,50 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] e2e-local-server: {e.get('reason')}")
             print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'isis-watch':
+        r = do_isis_watch(interface=args.iface, seconds=args.seconds,
+                          learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"IS-IS Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} PDUs, {r['router_count']} router(s), "
+                  f"{r['prefix_count']} prefix(es))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for rt in r.get('routers', []):
+                tag = '' if rt['baseline'] else ' *NEW*'
+                name = f"{rt['hostname']} " if rt['hostname'] else ''
+                print(f"  router {name}{rt['system_id']} area={','.join(rt['areas']) or '?'}"
+                      f" L{'/'.join(str(x) for x in rt['levels']) or '?'}"
+                      f" auth={rt['auth']}{tag}")
+            for p in r.get('prefixes', []):
+                mark = '' if p['status'] in ('known', 'learned') else f" [{p['status']}]"
+                print(f"    {p['pfx']} <- {p['origin_name']} (metric {p['metric']}){mark}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'isis-selftest':
+        r = _isis_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"sysid={sc.get('sysid')} prefix={sc.get('prefix')} "
+                      f"verdict={sc.get('verdict')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"IS-IS self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'stp-watch':

@@ -1224,6 +1224,7 @@ function showNetworkSubtab(name) {
         _stpFillIfaces();
         _dtpFillIfaces();
         _eigrpFillIfaces();
+        _isisFillIfaces();
         _fhrpFillIfaces();
         _bgpFillIfaces();
         dhcpSnoopStatus();
@@ -3542,6 +3543,116 @@ async function dtpTrustBaseline() {
     }
 }
 
+// ---- IS-IS Watch (passive IGP routing-security scanner) --------------------
+const _ISIS_VERDICT_STYLE = {
+    clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No IS-IS anomalies detected'],
+    'weak-auth':    ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ IS-IS without HMAC auth (or cleartext) — exposed to LSP injection'],
+    anomaly:        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ IS-IS anomaly — duplicate system-id / new area'],
+    storm:          ['bg-red-950/60 border-red-800 text-red-300', '🛑 IS-IS flooding storm detected'],
+    'rogue-router': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue IS-IS speaker — adjacency spoofing'],
+    injection:      ['bg-red-950/60 border-red-800 text-red-300', '🛑 IS-IS LSP / prefix injection detected'],
+    unknown:        ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _isisFillIfaces() {
+    const sel = document.getElementById('isis-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runIsisWatch() {
+    const out = document.getElementById('isis-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('isis-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('isis-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '20';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing IS-IS on the segment…</p>';
+    try {
+        _isisFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/isis-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runIsisWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _ISIS_VERDICT_STYLE[d.verdict] || _ISIS_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} IS-IS PDUs, ${d.router_count} router(s), ${d.prefix_count} prefix(es) @ ${d.rate}/s${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.routers || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">IS-IS routers (' + d.routers.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Router</th><th class="px-2 py-1">Area</th><th class="px-2 py-1">Level</th><th class="px-2 py-1">Auth</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.routers.map(r => {
+                    const badge = r.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-amber-300">? new</span>';
+                    const weak = (r.auth === 'none/cleartext' || r.auth === 'cleartext' || r.auth === 'none');
+                    const auth = weak ? `<span class="text-amber-300">${escapeHtml(r.auth)}</span>` : `<span class="text-green-400">${escapeHtml(r.auth)}</span>`;
+                    const name = r.hostname ? `<span class="text-gray-200">${escapeHtml(r.hostname)}</span> <span class="text-gray-500">${escapeHtml(r.system_id)}</span>` : `<span class="font-mono">${escapeHtml(r.system_id)}</span>`;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 ${r.baseline ? '' : 'text-amber-300'}">${name}</td>
+                        <td class="px-2 py-1 font-mono">${(r.areas || []).join(', ') || '?'}</td>
+                        <td class="px-2 py-1 text-gray-400">L${(r.levels || []).join('/') || '?'}</td>
+                        <td class="px-2 py-1">${auth}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if ((d.prefixes || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">Advertised prefixes (' + d.prefixes.length + ')</p>' +
+                '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Prefix</th><th class="px-2 py-1">Originator</th><th class="px-2 py-1">Metric</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>' +
+                d.prefixes.map(p => {
+                    const bad = (p.status === 'new' || p.status === 're-homed');
+                    const st = bad ? `<span class="text-red-300">${escapeHtml(p.status)}</span>` : `<span class="text-gray-500">${escapeHtml(p.status)}</span>`;
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${bad ? 'text-red-300' : ''}">${escapeHtml(p.pfx)}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml(p.origin_name || p.origin)}</td>
+                        <td class="px-2 py-1 font-mono">${p.metric == null ? '—' : p.metric}</td>
+                        <td class="px-2 py-1">${st}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function isisTrustBaseline() {
+    try {
+        await postAPI('/api/net/isis-baseline', { action: 'reset' });
+        addConsoleMessage('IS-IS baseline reset — re-learning current routers & prefixes', 'info');
+        await runIsisWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset IS-IS baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- EIGRP Watch (passive Cisco IGP routing-security scanner) ---------------
 const _EIGRP_VERDICT_STYLE = {
     clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No EIGRP anomalies detected'],
@@ -3979,7 +4090,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', stp: 'STP/BPDU Watch (spanning tree)', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', stp: 'STP/BPDU Watch (spanning tree)', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -3988,7 +4099,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'stp', 'dtp', 'eigrp', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'stp', 'dtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">
