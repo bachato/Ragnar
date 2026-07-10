@@ -1,15 +1,20 @@
-# 🌐 Network Tools
+# 🛡️ Authority Verification Across the Stack
 
-The **Network** tab in the Ragnar web interface is a built-in network engineer's
-toolbox — everything you'd normally reach for a laptop, a terminal and a bag of
-CLI tools to do, run straight from the device that's already sitting on the
-segment you care about.
+The **Network** tab in the Ragnar web interface is a built-in engine for
+**verifying authority across the stack** — at every layer, someone claims to be
+the legitimate authority (the root bridge, the default gateway, the DNS
+resolver, the DHCP server, the routing neighbour, the name responder, the SMB
+server), and each tool here answers one question: *is that claim genuine, or is
+an impostor asserting authority it shouldn't have?* It runs straight from the
+device that's already sitting on the segment you care about, so it sees what the
+segment sees — plus the everyday diagnostics you'd normally reach for a laptop
+and a bag of CLI tools to do.
 
 It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 **Interfaces**.
 
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
-> Network Tools suite was designed and built in collaboration with Solarflere.
+> Authority Verification suite was designed and built in collaboration with Solarflere.
 
 All tools are served under `/api/net/*` by `network_diagnostics.py`, a
 self-contained module wrapped so a failure there can never take down the rest of
@@ -1545,4 +1550,4 @@ alone would miss".
 
 ---
 
-*Network Tools co-authored by [Solarflere](https://www.instagram.com/solarflere).*
+*Authority Verification suite co-authored by [Solarflere](https://www.instagram.com/solarflere).*
