@@ -34,6 +34,7 @@ from datetime import datetime, timezone, timedelta
 import bgp_speaker
 import path_asymmetry
 import tls_watch
+import wifi_analyzer
 from tls_watch import do_tls_watch
 
 try:
@@ -13201,6 +13202,68 @@ def register_network_diagnostics(app, logger=None):
         _log("net/interfaces")
         include_virtual = request.args.get('all') in ('1', 'true', 'yes')
         return jsonify(do_interfaces(include_virtual=include_virtual))
+
+    # ------------------------------------------------------------------
+    # Passive Wi-Fi spectrum analyzer (wifi_analyzer.py) — Ekahau-style
+    # tri-band troubleshooter. Strictly passive: iw scan passive only.
+    # ------------------------------------------------------------------
+    @app.route('/api/net/wifi/interfaces', methods=['GET'])
+    def net_wifi_interfaces():
+        _log("net/wifi/interfaces")
+        return jsonify({"interfaces": wifi_analyzer.list_wifi_interfaces()})
+
+    @app.route('/api/net/wifi/scan', methods=['GET'])
+    def net_wifi_scan():
+        iface = (request.args.get('interface') or 'wlan0').strip()
+        band = (request.args.get('band') or 'all').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        if band not in ('all', '2.4', '5', '6'):
+            return _bad('Invalid band')
+        _log(f"net/wifi/scan {iface} band={band}")
+        return jsonify(wifi_analyzer.do_scan(interface=iface, band=band, passive=True))
+
+    @app.route('/api/net/wifi/radius', methods=['GET'])
+    def net_wifi_radius():
+        iface = (request.args.get('interface') or 'wlan0').strip()
+        bssid = (request.args.get('bssid') or '').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        try:
+            tx = float(request.args.get('tx', wifi_analyzer._DEFAULT_TX_DBM))
+            ple = float(request.args.get('ple', wifi_analyzer._DEFAULT_PLE))
+        except (TypeError, ValueError):
+            return _bad('Invalid tx/ple')
+        _log(f"net/wifi/radius {iface} {bssid}")
+        return jsonify(wifi_analyzer.do_radius(iface, bssid, tx_dbm=tx, ple=ple))
+
+    @app.route('/api/net/wifi/heatmap', methods=['GET', 'POST'])
+    def net_wifi_heatmap():
+        if request.method == 'GET':
+            return jsonify(wifi_analyzer.heatmap_get())
+        data = request.get_json(silent=True) or {}
+        action = data.get('action')
+        if action == 'floorplan':
+            return jsonify(wifi_analyzer.heatmap_set_floorplan(
+                data.get('floorplan'), data.get('bssid'), data.get('ssid')))
+        if action == 'clear':
+            return jsonify(wifi_analyzer.heatmap_clear())
+        if action == 'sample_live':
+            iface = (data.get('interface') or 'wlan0').strip()
+            if not _valid_iface(iface):
+                return _bad('Invalid interface')
+            return jsonify(wifi_analyzer.heatmap_sample_live(
+                iface, data.get('x'), data.get('y'), data.get('bssid')))
+        if action == 'sample':
+            return jsonify(wifi_analyzer.heatmap_add_sample(
+                data.get('x'), data.get('y'), data.get('rssi'),
+                data.get('bssid'), data.get('ssid')))
+        return _bad('Unknown action')
+
+    @app.route('/api/net/wifi/selftest', methods=['GET'])
+    def net_wifi_selftest():
+        _log("net/wifi/selftest")
+        return jsonify(wifi_analyzer.selftest())
 
     @app.route('/api/net/isp', methods=['GET'])
     def net_isp():
