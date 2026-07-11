@@ -1499,6 +1499,21 @@
                     </div>
                     <div id="ipv6-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- NDP Watch -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">NDP Watch <span class="text-xs font-normal text-gray-500">(IPv6 neighbor spoofing · the v6 ARP-poison twin)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">The <strong>IPv6 twin of ARP Watch.</strong> <em>ARP Watch</em> catches IPv4 cache poisoning and <em>IPv6 First-Hop Watch</em> catches rogue RA / DHCPv6 — but neither catches the direct v6 analogue of ARP poisoning: a forged <strong>Neighbor Advertisement</strong> claiming someone else's address, which poisons every neighbour's ND cache and puts an attacker on-path (<span class="font-mono">parasite6</span>). On any dual-stack LAN this is the open door a v4-only defender never sees. <strong>Detection-only</strong> — never sends an NA, never answers a solicit.</p>
+                    <p class="text-sm text-gray-400 mb-3">Passively captures ICMPv6 <span class="font-mono">Neighbor Solicitation / Advertisement</span> (135/136) and flags <strong>spoofed</strong> (two MACs claiming one address, the default router advertised by a rogue MAC, or a learned host's owner-MAC changing), <strong>dad-dos</strong> (one MAC answering every Duplicate Address Detection probe — <span class="font-mono">dos-new-ip6</span>, so no host can pick an address), and an NA <strong>flood</strong>. First scan learns the trusted target→MAC bindings + default router (<span class="font-mono">data/ndp_watch.json</span>); "Trust current" re-learns. Mitigate with switch <strong>IPv6 Snooping / ND Inspection</strong> (SAVI, RFC 6620).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="ndp-iface" title="Interface for the NDP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="ndp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runNdpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan NDP</button>
+                        <button onclick="ndpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current neighbour bindings + default router as the trusted baseline — use after a legitimate device/router change">Trust current</button>
+                    </div>
+                    <div id="ndp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- ICMP Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">ICMP Watch <span class="text-xs font-normal text-gray-500">(ICMP redirect · L3 route injection)</span></h3>
@@ -1574,6 +1589,36 @@
                         <button onclick="dtpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current DTP speakers as the trusted baseline — use after a legitimate switch change">Trust current</button>
                     </div>
                     <div id="dtp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- CDP Watch (flood / spoof / info-leak) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">CDP Watch <span class="text-xs font-normal text-gray-500">(Cisco Discovery · flood / spoof / info-leak)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive Cisco Discovery Protocol scanner — <strong>detection-only</strong>, never sends a CDP frame. CDP is on by default on every Cisco device and, <strong>unauthenticated</strong>, advertises to anyone on the wire the device hostname, full <strong>IOS version</strong> (→ known CVEs), hardware model, <strong>management IP</strong>, <strong>native VLAN</strong>, VTP domain and voice VLAN — a reconnaissance goldmine. Flags <strong>flood</strong> (Yersinia CDP flood — CAM/CPU exhaustion DoS), <strong>spoof</strong> (a new/rogue CDP speaker, incl. a fake IP phone advertising a Voice VLAN = VoIP-VLAN-hop), and <strong>cdp-enabled</strong> (surfaces exactly what CDP leaks here).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, CDP PID 0x2000). CDP hellos are ~60s apart, so give it a longer window. The first scan learns the current CDP speakers (real switches/phones) as the baseline (<span class="font-mono">data/cdp_watch.json</span>); "Trust current" re-learns. Mitigate by disabling CDP on access ports (<span class="font-mono">no cdp enable</span>) and preferring LLDP with minimal TLVs.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="cdp-iface" title="Interface for the CDP capture — pick the access-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="cdp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runCdpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan CDP</button>
+                        <button onclick="cdpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current CDP speakers as the trusted baseline — use after a legitimate switch/phone change">Trust current</button>
+                    </div>
+                    <div id="cdp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
+                <!-- VTP Watch (bomb / rogue-server) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">VTP Watch <span class="text-xs font-normal text-gray-500">(Cisco · VTP bomb / VLAN-DB wipe)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive VLAN Trunking Protocol scanner — <strong>detection-only</strong>, never sends a VTP frame. VTP syncs the VLAN database across a domain, and its whole security model rests on one number: the switch advertising the <strong>highest configuration revision</strong> wins, and every other switch overwrites its VLAN database to match. So a rogue switch — or one forged frame — carrying the domain name and a higher revision silently <strong>rewrites, and can delete, every VLAN across the entire domain</strong>: the <strong>VTP bomb</strong>, a one-frame domain-wide outage. VTPv1/2 have no per-port authentication. Flags <strong>revision-bomb</strong> (higher revision from an unexpected source), <strong>rogue-server</strong> (a new VTP speaker / different domain), and <strong>vtp-enabled</strong> (present / a legit bump from the known server).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, VTP PID 0x2003). The first scan learns the domain, revision and VTP server as the baseline (<span class="font-mono">data/vtp_watch.json</span>); a higher revision from a source that isn't the known server is the bomb signal. Click "Trust current" after a legitimate VLAN change. Mitigate with <span class="font-mono">vtp mode transparent</span> (or VTPv3 + password), and always zero a switch's config-revision before connecting it.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="vtp-iface" title="Interface for the VTP capture — pick the access/trunk-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="vtp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runVtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan VTP</button>
+                        <button onclick="vtpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current VTP domain / revision / server as the trusted baseline — use after a legitimate VLAN change">Trust current</button>
+                    </div>
+                    <div id="vtp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
                 <!-- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning) -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
@@ -6024,7 +6069,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260711-tlswatch"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260711-vtpwatch"></script>
 
 </body>
 </html>

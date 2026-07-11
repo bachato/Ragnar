@@ -47,6 +47,7 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
 | [TLS Watch](#tls-watch) | Switch & L2/L3 | `GET /api/net/tls-watch` |
 | [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
+| [NDP Watch](#ndp-watch) | Switch & L2/L3 | `GET /api/net/ndp-watch`, `POST /api/net/ndp-baseline` |
 | [IPv6 RA Guard](#ipv6-ra-guard) | Diagnostics | `GET /api/net/raguard`, `POST /api/net/raguard` `{action: harden}` |
 | [NTP Watch](#ntp-watch) | Diagnostics | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
@@ -54,6 +55,8 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 | [Cert Watch](#cert-watch) | Diagnostics | `POST /api/net/cert-watch`, `POST /api/net/cert-baseline` |
 | [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
+| [CDP Watch](#cdp-watch) | Switch & L2/L3 | `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline` |
+| [VTP Watch](#vtp-watch) | Switch & L2/L3 | `GET /api/net/vtp-watch`, `POST /api/net/vtp-baseline` |
 | [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
 | [Relay/Coercion Watch](#relaycoercion-watch) | Switch & L2/L3 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
@@ -98,8 +101,8 @@ leg that crafts real packets → pcap → `tcpdump` → parse to exercise the wh
 capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
-A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NDP**, **RA Guard**,
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **CDP**, **VTP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -364,7 +367,7 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
-STP · DTP · IGMP · IPv6 first-hop · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
+STP · DTP · CDP · VTP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
 Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
 `tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
 cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
@@ -954,6 +957,52 @@ exercising the capture→parse path end to end.
 - Endpoint: `GET /api/net/ipv6-watch` `{interface, seconds}`,
   `POST /api/net/ipv6-baseline` `{action: reset}` · binary: `tcpdump`
 
+### NDP Watch
+The **IPv6 twin of [ARP Watch](#arp-poisoning--mitm-detection)**, and the missing half
+of a capability most toolkits only ship for IPv4. ARP Watch catches IPv4 cache
+poisoning; [IPv6 First-Hop Watch](#ipv6-first-hop-watch) catches rogue RA / DHCPv6
+(mitm6) — but **neither catches the direct IPv6 analogue of ARP poisoning**: a forged
+**Neighbor Advertisement** (ICMPv6 type 136) that claims someone else's address,
+poisons every neighbour's **ND cache**, and puts an attacker **on-path** (THC
+`parasite6`). On any dual-stack LAN — i.e. almost every LAN — that's an open door a
+v4-only defender never sees. This scanner is **passive and detection-only**: it never
+sends an NA and never answers a solicit. One short `tcpdump` window over ICMPv6
+Neighbor Solicitation / Advertisement (135/136, captured with Ethernet source MACs)
+is parsed and classified:
+
+- **Spoofed** — two or more **different MACs claim one target IPv6 address**
+  (`parasite6`); the **default router** advertised by a MAC other than the trusted
+  one (**NDP router poisoning** / IPv6 MITM); or a **learned host's owner-MAC
+  changing** (ND cache takeover). The binding a spoofer forges is the NA's *target
+  link-layer address* option — the watch reads that, not just the Ethernet source.
+- **dad-dos** — one MAC answering the **Duplicate Address Detection** probe (NA) for
+  many addresses it doesn't own: THC **`dos-new-ip6`**, which defends *every* claim so
+  no host on the segment can pick an IPv6 address — a SLAAC **denial of service**.
+- **Storm** — a Neighbor Advertisement **flood** (e.g. `flood_advertise6`), by rate.
+
+The **first scan learns** the trusted target→MAC bindings and seeds the **default
+router** binding from the kernel neighbour table into `data/ndp_watch.json`; after a
+legitimate device/router change, click **Trust current** to re-learn. Every result
+carries a **mitigation advisory**: enable switch **IPv6 Snooping / ND Inspection**
+(the RA-Guard family, RFC 6620 **SAVI**) on access ports; if IPv6 is genuinely unused,
+disable it on hosts to remove the neighbour-cache attack surface entirely.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py ndp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py ndp-selftest     # self-test the detectors, no root
+```
+
+`ndp-selftest` drives the real parser + classifier with synthetic captures (clean /
+spoofed-conflict / router-poison / binding-changed / dad-dos / storm, plus NA and DAD
+parse checks), and — when [Scapy](https://scapy.net) is installed — crafts a real
+Neighbor Advertisement (with the target link-layer address option) into a pcap and
+parses it back through `tcpdump -e`, exercising the capture→parse path end to end.
+
+- Endpoint: `GET /api/net/ndp-watch` `{interface, seconds}`,
+  `POST /api/net/ndp-baseline` `{action: reset}` · binary: `tcpdump`
+
 ### ICMP Watch
 The **ICMP Redirect** (type 5) is the classic **Layer-3 man-in-the-middle**. Any
 host on the segment can forge a Redirect that appears to come from the real gateway
@@ -1133,6 +1182,99 @@ apart, so the default window is longer (30s). The first scan **learns** the curr
 DTP speakers (the real switches) as the baseline (`data/dtp_watch.json`); "Trust
 current" re-learns. **API:** `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline`.
 **CLI:** `dtp-watch`, `dtp-selftest`.
+
+### CDP Watch
+A **passive** flood / spoof / information-leak scanner for Cisco's **Discovery
+Protocol** (proprietary; the same group MAC `01:00:0c:cc:cc:cc` as DTP, SNAP OUI
+`0x00000c`, PID `0x2000`). **Detection-only** — it never transmits a CDP frame.
+
+CDP is **on by default** on virtually every Cisco device and, with **no
+authentication**, broadcasts to anyone on the segment a remarkable amount about the
+switch: the **device hostname**, the **full IOS software version** (which maps
+directly to known **CVEs**), the **hardware platform/model**, a **management IP**, the
+**native VLAN**, the **VTP domain**, the **voice VLAN**, and the **port-ID**. The
+[LLDP/CDP Switch Discovery](#switch-discovery-lldp) tool *uses* that to map a network;
+CDP Watch looks at the same frames from the attacker's side and flags their abuse:
+
+- **flood** — a spray of CDP frames / many distinct device-IDs in one window
+  (Yersinia `cdp` flood): fills the switch's CDP neighbour table and spikes its CPU —
+  a denial of service.
+- **spoof** — a **new CDP speaker** not in the learned baseline (a rogue device
+  injecting a fake neighbour), including a **fake Cisco IP Phone** advertising a Voice
+  VLAN — the CDP half of a **VoIP-VLAN-hop**.
+- **cdp-enabled** — CDP is present at all: the scan surfaces **exactly what it leaks**
+  here (IOS version, model, management IP, native/voice VLAN) so you can see the
+  reconnaissance an attacker on that port gets for free. Advisory / learn.
+
+The scan uses `tcpdump -e` with the BPF
+`ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2000`, isolating CDP from the other
+protocols on that Cisco group MAC (DTP/VTP/UDLD/PAgP). CDP hellos are ~60s apart, so
+the default window is longer (30s). The first scan **learns** the current CDP speakers
+(the real switches/phones) as the baseline (`data/cdp_watch.json`); "Trust current"
+re-learns. Every result carries a **mitigation advisory**: disable CDP on access/edge
+ports (`no cdp enable`, or `no cdp run` globally if unused), and prefer **LLDP** with
+minimal TLVs where discovery is genuinely needed.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py cdp-watch [--iface eth0] [--seconds 30] [--json]
+python3 network_diagnostics.py cdp-selftest     # self-test the detector, no root
+```
+
+`cdp-selftest` drives the real parser + classifier with synthetic captures (clean /
+spoof / fake-phone VoIP-hop / cdp-enabled leak / flood / field-parse), and — when
+[Scapy](https://scapy.net) is installed — crafts a real CDP frame into a pcap and
+parses it back through `tcpdump -e`, exercising the capture→parse path end to end.
+**API:** `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline`.
+
+### VTP Watch
+A **passive** bomb / rogue-server scanner for Cisco's **VLAN Trunking Protocol**
+(proprietary; the same group MAC `01:00:0c:cc:cc:cc` as CDP/DTP, SNAP OUI `0x00000c`,
+PID `0x2003`). **Detection-only** — it never transmits a VTP frame.
+
+VTP synchronises the **VLAN database** across a VTP domain, and its entire security
+model rests on one 32-bit **configuration revision number**: the switch advertising
+the **highest** revision in the domain wins, and every other switch (in server/client
+mode) **overwrites its VLAN database** to match. So a rogue switch — or a single
+forged Summary Advertisement — that carries the domain name and a higher revision
+silently **rewrites, and can delete, every VLAN across the whole domain**. That's the
+**VTP bomb**: a one-frame, domain-wide outage. VTPv1/2 offer **no per-port
+authentication** (only an optional weak MD5 domain password). What it flags:
+
+- **revision-bomb** — a config revision **higher than the learned baseline** coming
+  from a source that **isn't the known VTP server**: the VLAN-database-overwrite
+  attack. (A higher revision from the *known* server is treated as a legitimate VLAN
+  edit — reported as `vtp-enabled`, with a "Trust current" prompt.)
+- **rogue-server** — a **new VTP speaker**, or a **different VTP domain name**, than
+  the baseline: a rogue switch positioned to seize VLAN management.
+- **vtp-enabled** — VTP present, or a legit revision bump from the known server.
+  Advisory / learn.
+
+The scan uses `tcpdump -e` with the BPF
+`ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2003`, isolating VTP from the other
+protocols on that Cisco group MAC (CDP/DTP/UDLD/PAgP). (Note tcpdump prints the config
+revision in **hex** — `Config Rev a` is 10.) The first scan **learns** the domain,
+revision and server (`data/vtp_watch.json`); "Trust current" re-learns after a
+legitimate VLAN change. Every result carries a **mitigation advisory**: run switches
+in `vtp mode transparent` (or VTPv3 with a password) unless you truly need domain-wide
+VLAN sync, always set a VTP password, and **always zero a switch's config-revision
+before connecting it** — a client/server switch with a higher revision overwrites the
+domain's VLAN database on connect.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py vtp-watch [--iface eth0] [--seconds 30] [--json]
+python3 network_diagnostics.py vtp-selftest     # self-test the detector, no root
+```
+
+`vtp-selftest` drives the real parser + classifier with synthetic captures (clean /
+revision-bomb / legit-bump / rogue-server / rogue-domain / learn / hex-revision
+parse), and — when [Scapy](https://scapy.net) is installed — crafts a real VTP Summary
+Advertisement into a pcap and parses it back through `tcpdump -e`, exercising the
+capture→parse path end to end. **API:** `GET /api/net/vtp-watch`,
+`POST /api/net/vtp-baseline`.
 
 ### FHRP Watch
 A **passive** hijack scanner for the **First Hop Redundancy Protocols** — **HSRP**

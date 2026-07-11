@@ -3982,6 +3982,440 @@ def _ipv6_selftest():
 
 
 # --------------------------------------------------------------------------
+# NDP Watch: passive IPv6 Neighbor Discovery spoofing detector (detection-only)
+# --------------------------------------------------------------------------
+# The IPv6 twin of ARP Watch. ARP Watch catches IPv4 cache poisoning; IPv6
+# First-Hop Watch catches rogue RA / DHCPv6 (mitm6) — but neither catches the
+# direct IPv6 analogue of ARP poisoning: a forged Neighbor Advertisement (ICMPv6
+# type 136) claiming someone else's address, which poisons every neighbour's ND
+# cache and puts an attacker on-path (THC parasite6). On any dual-stack LAN this
+# is the open door a v4-only defender never sees. This scanner is PASSIVE: one
+# short tcpdump window over Neighbor Solicitation/Advertisement (135/136), parsed
+# and classified. It never sends an NA, never answers a solicit. What it flags:
+#   * spoofed  — two+ MACs claim one target address (parasite6), the default
+#     router advertised by a MAC other than the trusted one (router poisoning /
+#     MITM), or a learned host's owner-MAC changing (ND cache takeover).
+#   * dad-dos  — one MAC answering the Duplicate Address Detection probe for many
+#     addresses it doesn't own (THC dos-new-ip6): defends every claim so no host
+#     can pick an IPv6 address — a SLAAC denial of service.
+#   * storm    — a Neighbor Advertisement flood (flood_advertise6) by rate.
+# First run learns the trusted target->MAC bindings + the default router into
+# data/ndp_watch.json; "Trust current" re-learns after a legitimate change.
+# Mitigation advisory points at switch IPv6 Snooping / ND Inspection (SAVI, RFC
+# 6620) — the RA-Guard family that also binds the neighbour table.
+
+_NDP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'ndp_watch.json')
+_ndp_watch_lock = threading.Lock()
+
+# One MAC that NA-defends at least this many distinct DAD targets is running the
+# dos-new-ip6 attack (answering every address claim so no host can join).
+_NDP_DAD_DEFENDER_MIN = 4
+# Sustained NA rate at/above this is a flood (parasite6 / flood_advertise6). NAs
+# are normally rare (a handful per host as caches refresh), so the floor is high.
+_NDP_NA_FLOOD_RATE = 20.0
+# Keep at most this many anomaly events in the store (newest wins).
+_NDP_EVENTS_CAP = 200
+
+_NDP_MAC_RE = r'([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})'
+
+
+def _default_gateway6():
+    """Return (ipv6_gateway, dev) for the IPv6 default route, or (None, None).
+    The gateway is usually a link-local fe80:: address."""
+    res = _run(['ip', '-6', 'route', 'show', 'default'], timeout=5)
+    addr = re.search(r'default\s+via\s+' + _IPV6_ADDR_RE, res['out'])
+    dev = re.search(r'default\b.*?\bdev\s+(\S+)', res['out'])
+    return (addr.group(1) if addr else None, dev.group(1) if dev else None)
+
+
+def _neigh6_mac(ip):
+    """Current MAC bound to an IPv6 `ip` in the kernel neighbour table, or None."""
+    if not ip:
+        return None
+    res = _run(['ip', '-6', 'neigh', 'show'], timeout=5)
+    for line in res['out'].splitlines():
+        m = re.match(r'^' + _IPV6_ADDR_RE + r'\b.*?\blladdr\s+' + _NDP_MAC_RE, line)
+        if m and m.group(1) == ip:
+            return m.group(2).lower()
+    return None
+
+
+def _ndp_watch_load():
+    try:
+        with open(_NDP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ndp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_NDP_WATCH_PATH), exist_ok=True)
+        tmp = _NDP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _NDP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ndp_baseline(action='get'):
+    """Manage the learned NDP baseline (trusted target->MAC bindings + the default
+    router's MAC). action='reset' re-learns the current segment on the next scan
+    (use after a legitimate device/router change)."""
+    with _ndp_watch_lock:
+        if action == 'reset':
+            _ndp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ndp_watch_load()
+        return {'success': True, 'baseline': {
+            'bindings': b.get('bindings') or {},
+            'router': b.get('router') or {},
+        }}
+
+
+def _parse_ndp_capture(output):
+    """Parse `tcpdump -e -nn -t -v` NS/NA text into events.
+
+    With -e each packet's header line begins with the Ethernet src/dst MAC and
+    carries ', ethertype '; option lines are indented. Events:
+      na : {kind, eth_src, src, tgt, flags{router,solicited,override}, lladdr}
+      ns : {kind, eth_src, src, tgt, dad, lladdr}
+    `lladdr` for an NA is the *claimed owner* of tgt (target link-layer address
+    option, which tcpdump prints as 'destination link-address option (2)'); it
+    falls back to the Ethernet source when the option is absent. That binding
+    (tgt -> lladdr) is exactly what a spoofer forges.
+    """
+    events = []
+    blocks, cur = [], []
+    for raw in output.splitlines():
+        if not raw.strip():
+            continue
+        if not raw[0].isspace() and ', ethertype ' in raw:
+            if cur:
+                blocks.append(cur)
+            cur = [raw]
+        elif cur:
+            cur.append(raw)
+    if cur:
+        blocks.append(cur)
+
+    hdr_re = re.compile(r'^' + _NDP_MAC_RE + r'\s*>\s*' + _NDP_MAC_RE)
+    inner_re = re.compile(r'ethertype IPv6[^:]*:\s*' + _IPV6_ADDR_RE +
+                          r'\s*>\s*' + _IPV6_ADDR_RE + r':')
+    for block in blocks:
+        head = block[0]
+        text = '\n'.join(block)
+        low = text.lower()
+        hm = hdr_re.match(head.strip())
+        eth_src = hm.group(1).lower() if hm else None
+        im = inner_re.search(head)
+        src = im.group(1) if im else None
+
+        if 'neighbor advertisement' in low:
+            tm = re.search(r'tgt is\s+' + _IPV6_ADDR_RE, text)
+            fl = re.search(r'flags\s+\[([^\]]*)\]', low)
+            flags = fl.group(1) if fl else ''
+            om = re.search(r'destination link-address option \(2\).*?:\s*' +
+                           _NDP_MAC_RE, low, re.S)
+            events.append({'kind': 'na', 'eth_src': eth_src, 'src': src,
+                           'tgt': tm.group(1) if tm else None,
+                           'lladdr': (om.group(1).lower() if om else eth_src),
+                           'flags': {'router': 'router' in flags,
+                                     'solicited': 'solicited' in flags,
+                                     'override': 'override' in flags}})
+        elif 'neighbor solicitation' in low:
+            wm = re.search(r'who has\s+' + _IPV6_ADDR_RE, text)
+            om = re.search(r'source link-address option \(1\).*?:\s*' +
+                           _NDP_MAC_RE, low, re.S)
+            events.append({'kind': 'ns', 'eth_src': eth_src, 'src': src,
+                           'tgt': wm.group(1) if wm else None,
+                           'dad': (src == '::'),
+                           'lladdr': (om.group(1).lower() if om else eth_src)})
+    return events
+
+
+def _ndp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed NS/NA events. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with
+    synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    na = [e for e in events if e['kind'] == 'na' and e.get('tgt')]
+    ns = [e for e in events if e['kind'] == 'ns' and e.get('tgt')]
+    na_count = len(na)
+    na_rate = round(na_count / seconds, 2)
+
+    known = dict(baseline.get('bindings') or {})          # ipv6 -> mac
+    router = baseline.get('router') or {}                  # {addr, mac}
+    had_baseline = bool(known or router.get('mac'))
+
+    # tgt -> set of MACs claiming to own it (from each NA's target-lladdr).
+    claims = {}
+    for e in na:
+        claims.setdefault(e['tgt'], set()).add(e['lladdr'])
+
+    # Learn-on-first-run: adopt every *unambiguous* binding on the wire.
+    learned = False
+    if learn and not had_baseline and claims:
+        known = {ip: next(iter(macs)) for ip, macs in claims.items()
+                 if len(macs) == 1}
+        baseline['bindings'] = dict(known)
+        learned = True
+
+    reasons = []
+    verdict = 'clean'
+
+    # --- storm: NA flood (parasite6 / flood_advertise6) ---
+    if na_rate >= _NDP_NA_FLOOD_RATE and na_count >= _NDP_NA_FLOOD_RATE * seconds:
+        verdict = 'storm'
+        reasons.append(f"Neighbor Advertisement flood: {na_count} NAs in {seconds}s "
+                       f"({na_rate}/s) — NDP flood DoS (e.g. flood_advertise6)")
+
+    # --- spoofed: two+ MACs claim one target, a baseline binding changed, or the
+    # default router is advertised by a MAC other than the trusted one ---
+    conflicts = {ip: sorted(macs) for ip, macs in claims.items() if len(macs) > 1}
+    changed = {ip: (known[ip], next(iter(macs)))
+               for ip, macs in claims.items()
+               if ip in known and len(macs) == 1 and next(iter(macs)) != known[ip]}
+    router_hit = None
+    if router.get('addr') and router['addr'] in claims:
+        rmacs = claims[router['addr']]
+        if router.get('mac') and (len(rmacs) > 1 or
+                                  next(iter(rmacs)) != router['mac']):
+            router_hit = sorted(rmacs)
+
+    if conflicts or changed or router_hit:
+        verdict = 'spoofed' if verdict == 'clean' else verdict
+        if router_hit:
+            reasons.append(f"Default router {router['addr']} advertised by "
+                           f"{', '.join(router_hit)} (trusted {router['mac']}) — "
+                           f"NDP router poisoning / IPv6 MITM")
+        for ip, macs in conflicts.items():
+            if router_hit and ip == router.get('addr'):
+                continue
+            reasons.append(f"{ip} claimed by {len(macs)} MACs ({', '.join(macs)}) "
+                           f"— spoofed Neighbor Advertisement (parasite6), the IPv6 "
+                           f"twin of ARP cache poisoning")
+        for ip, (was, now) in changed.items():
+            reasons.append(f"{ip} owner MAC changed from trusted {was} to {now} "
+                           f"— NDP cache poisoning / MITM")
+
+    # --- dad-dos: one MAC NA-defends many distinct DAD'd targets (dos-new-ip6) ---
+    dad_targets = {e['tgt'] for e in ns if e.get('dad')}
+    defender = {}                                          # mac -> set(targets)
+    for e in na:
+        if e['tgt'] in dad_targets and not e['flags'].get('solicited'):
+            defender.setdefault(e['lladdr'], set()).add(e['tgt'])
+    dad_dos = {mac: sorted(t) for mac, t in defender.items()
+               if len(t) >= _NDP_DAD_DEFENDER_MIN}
+    if dad_dos and verdict == 'clean':
+        verdict = 'dad-dos'
+    for mac, tgts in dad_dos.items():
+        reasons.append(f"MAC {mac} defends {len(tgts)} address claims via NA "
+                       f"(DAD responses) — dos-new-ip6: blocks every host from "
+                       f"picking an IPv6 address (SLAAC DoS)")
+
+    advisories = []
+    if claims or dad_targets:
+        advisories.append("Enable IPv6 Snooping / ND Inspection (RA-Guard family, "
+                          "RFC 6620 SAVI) on access ports; if IPv6 is unused, disable "
+                          "it on hosts to remove the neighbour-cache attack surface.")
+
+    hosts = [{'ip': ip, 'macs': sorted(macs),
+              'baseline': known.get(ip), 'conflict': len(macs) > 1}
+             for ip, macs in sorted(claims.items())]
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': reasons or (['No Neighbor Discovery traffic seen — segment quiet']
+                               if not (na or ns) else
+                               ['All neighbour bindings consistent; no NA conflicts']),
+        'learned': learned,
+        'na_count': na_count,
+        'ns_count': len(ns),
+        'dad_count': len(dad_targets),
+        'rate': na_rate,
+        'hosts': hosts,
+        'advisories': advisories,
+    }
+
+
+def _ndp_capture(interface, seconds):
+    """Run one passive tcpdump window over Neighbor Solicitation/Advertisement
+    (ICMPv6 135/136) and return (raw_text, error). -e keeps the Ethernet source
+    MAC, which the spoof correlation needs."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    # ip6[40] is the ICMPv6 type when there are no extension headers, which NS/NA
+    # never carry.
+    bpf = 'icmp6 and (ip6[40] == 135 or ip6[40] == 136)'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-e', '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ndp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive IPv6 Neighbor Discovery spoofing scanner (detection-only). Captures
+    NS/NA for a few seconds and classifies the segment: storm / spoofed / dad-dos
+    / clean. Learns the trusted target->MAC bindings + default router on first
+    run. The IPv6 twin of ARP Watch."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _ndp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_ndp_capture(text)
+
+    with _ndp_watch_lock:
+        baseline = _ndp_watch_load()
+        # Seed the trusted default-router binding from the kernel on first run so
+        # router poisoning is named even before we see the router advertise.
+        if learn and not (baseline.get('router') or {}).get('mac'):
+            gw6, _ = _default_gateway6()
+            gw_mac = _neigh6_mac(gw6) if gw6 else None
+            if gw6 and gw_mac:
+                baseline['router'] = {'addr': gw6, 'mac': gw_mac}
+        result = _ndp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned') or (baseline.get('router') or {}).get('mac'):
+            _ndp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ndp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_NDP_EVENTS_CAP:]
+            _ndp_watch_save(b)
+
+    result['interface'] = iface
+    return result
+
+
+def _ndp_selftest():
+    """Self-test the NDP spoofing detectors with synthetic captures (no root, no
+    live traffic). Feeds crafted tcpdump text through the real parser + classifier,
+    and — if Scapy is available — builds a real NA into a pcap and parses it back
+    through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_ndp_capture(text)
+        res = _ndp_analyze(events, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    def na(eth, tgt, lladdr=None, flags='router, solicited, override', src=None):
+        src = src or tgt
+        ll = lladdr or eth
+        return (f"{eth} > 11:22:33:44:55:66, ethertype IPv6 (0x86dd), length 86: "
+                f"{src} > ff02::1: ICMP6, neighbor advertisement, length 32, "
+                f"tgt is {tgt}, Flags [{flags}]\n"
+                f"\t  destination link-address option (2), length 8 (1): {ll}")
+
+    def ns(eth, tgt, src=None):
+        src = src or 'fe80::aaaa'
+        line = (f"{eth} > 33:33:ff:00:00:01, ethertype IPv6 (0x86dd), length 86: "
+                f"{src} > ff02::1:ff00:1: ICMP6, neighbor solicitation, length 32, "
+                f"who has {tgt}")
+        if src != '::':
+            line += f"\n\t  source link-address option (1), length 8 (1): {eth}"
+        return line
+
+    base = {'bindings': {'2001:db8::10': 'aa:bb:cc:00:00:10'},
+            'router': {'addr': 'fe80::1', 'mac': 'aa:bb:cc:00:00:01'}}
+
+    # 1. clean: the known host re-advertises its own address with its own MAC.
+    run('clean', na('aa:bb:cc:00:00:10', '2001:db8::10'), 12, base, 'clean')
+    # 2. spoofed: two MACs both claim one target (parasite6).
+    run('spoofed-conflict',
+        na('aa:bb:cc:00:00:10', '2001:db8::10') + "\n" +
+        na('de:ad:be:ef:00:99', '2001:db8::10'), 12, base, 'spoofed')
+    # 3. spoofed: the default router advertised by a rogue MAC (router poison).
+    run('spoofed-router', na('de:ad:be:ef:00:99', 'fe80::1'), 12, base, 'spoofed')
+    # 4. spoofed: a known host's binding changed to a new single MAC.
+    run('spoofed-changed',
+        na('de:ad:be:ef:00:99', '2001:db8::10'), 12, base, 'spoofed')
+    # 5. dad-dos: one MAC answers NA (unsolicited) for many DAD'd targets.
+    dad = "\n".join(
+        ns('00:00:00:00:00:00', f'2001:db8::{i}', src='::') + "\n" +
+        na('de:ad:be:ef:00:99', f'2001:db8::{i}', flags='override')
+        for i in range(1, 7))
+    run('dad-dos', dad, 12, base, 'dad-dos')
+    # 6. storm: an NA flood.
+    flood = "\n".join(na(f'aa:bb:cc:00:{i//256:02x}:{i%256:02x}',
+                         f'2001:db8:f::{i}', flags='override')
+                      for i in range(300))
+    run('storm', flood, 5, base, 'storm')
+
+    # 7. parse: NA target-lladdr option is read as the claimed owner, not eth_src.
+    pev = _parse_ndp_capture(na('aa:bb:cc:00:00:10', '2001:db8::10',
+                                lladdr='aa:bb:cc:00:00:aa'))
+    p_ok = (len(pev) == 1 and pev[0]['kind'] == 'na'
+            and pev[0]['tgt'] == '2001:db8::10'
+            and pev[0]['lladdr'] == 'aa:bb:cc:00:00:aa'
+            and pev[0]['flags']['override'])
+    scenarios.append({'name': 'na-parse', 'expect': 'tgt+lladdr+flags',
+                      'got': str(pev[0] if pev else None)[:80], 'pass': p_ok})
+    # 8. parse: DAD NS (unspecified source ::) is flagged.
+    dev = _parse_ndp_capture(ns('00:00:00:00:00:00', '2001:db8::9', src='::'))
+    d_ok = len(dev) == 1 and dev[0]['kind'] == 'ns' and dev[0]['dad']
+    scenarios.append({'name': 'dad-parse', 'expect': 'dad=True',
+                      'got': str(dev[0] if dev else None)[:80], 'pass': d_ok})
+
+    # Optional Scapy end-to-end: craft a real NA -> pcap -> tcpdump -e -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, wrpcap
+        from scapy.layers.inet6 import IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr
+        if _have('tcpdump'):
+            pkt = (Ether(src='de:ad:be:ef:00:99') /
+                   IPv6(src='fe80::99', dst='ff02::1') /
+                   ICMPv6ND_NA(tgt='fe80::1', R=1, S=0, O=1) /
+                   ICMPv6NDOptDstLLAddr(lladdr='de:ad:be:ef:00:99'))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path],
+                       timeout=10)
+            evs = _parse_ndp_capture(res['out'])
+            nas = [e for e in evs if e['kind'] == 'na']
+            scapy_result = {'ran': True,
+                            'tgt': nas[0]['tgt'] if nas else None,
+                            'lladdr': nas[0]['lladdr'] if nas else None,
+                            'pass': bool(nas) and nas[0]['tgt'] == 'fe80::1'
+                                    and nas[0]['lladdr'] == 'de:ad:be:ef:00:99',
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # IPv6 RA Guard: host first-hop posture check + hardening (active, local)
 # --------------------------------------------------------------------------
 # Where IPv6 First-Hop Watch *detects* a rogue RA / DHCPv6 / ICMPv6-Redirect on the
@@ -8609,6 +9043,803 @@ def _dtp_selftest():
 
 
 # --------------------------------------------------------------------------
+# CDP Watch: passive Cisco Discovery Protocol flood / spoof / info-leak scanner
+# --------------------------------------------------------------------------
+# CDP (Cisco proprietary, group MAC 01:00:0c:cc:cc:cc, SNAP OUI 0x00000c PID
+# 0x2000) is on by default on every Cisco device and advertises, unauthenticated,
+# to anyone on the wire: the device hostname, full IOS software version, hardware
+# platform/model, management IP, native VLAN, VTP domain, voice VLAN and port-ID.
+# LLDP Switch Discovery *uses* that to map the network; this Watch looks at the
+# same frames as a defender and flags their abuse. Where DTP Watch (same group
+# MAC, PID 0x2004) catches VLAN-hop trunk negotiation, CDP Watch flags:
+#   * flood        — a spray of CDP frames / distinct device-IDs (Yersinia cdp
+#     flood): fills the neighbour table and spikes switch CPU (a DoS).
+#   * spoof        — a NEW CDP speaker not in the learned baseline (a rogue device
+#     injecting a fake neighbour), including a fake Cisco IP Phone advertising a
+#     Voice VLAN — the CDP half of a VoIP-VLAN-hop.
+#   * cdp-enabled  — CDP is on here at all: the scan surfaces exactly what it
+#     leaks (IOS version → CVEs, model, mgmt IP, native/voice VLAN) so an operator
+#     can see the reconnaissance an attacker on that port gets for free.
+# This scanner is PASSIVE: it decodes captured CDP, it never transmits CDP. First
+# run learns the trusted speakers into data/cdp_watch.json; "Trust current"
+# re-learns after a legitimate change.
+_CDP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'cdp_watch.json')
+_cdp_watch_lock = threading.Lock()
+_CDP_EVENTS_CAP = 200
+_CDP_HDR_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*01:00:0c:cc:cc:cc')
+# CDP hellos are ~60s apart per neighbour, so any sustained rate is a flood.
+_CDP_FLOOD_RATE = 10.0
+# Yersinia cdp-flood sprays frames with random device-IDs; many distinct IDs in
+# one short window is the flood signature even if the raw rate looks modest.
+_CDP_FLOOD_IDS = 30
+
+
+def _cdp_tlv_val(line):
+    """Text after the final 'bytes:' / 'byte:' on a CDP TLV line, unquoted."""
+    m = re.search(r'byte[s]?:\s*(.*)$', line)
+    v = (m.group(1).strip() if m else '')
+    return v.strip("'") if v else ''
+
+
+def _parse_cdp_capture(output):
+    """Parse `tcpdump -e -t -v` CDP text into per-frame events. Each frame is a
+    header line (`<src> > 01:00:0c:cc:cc:cc, ... pid CDP (0x2000): CDPv2, ...`)
+    followed by indented TLV lines (Device-ID, Version, Platform, Address, Native
+    VLAN, VTP domain, Port-ID, Voice/appliance VLAN, Management Address)."""
+    events = []
+    cur = None
+    collecting_version = False
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _CDP_HDR_RE.match(line)
+        if m and 'CDPv' in line:
+            if cur:
+                events.append(cur)
+            ver = re.search(r'CDPv(\d+)', line)
+            cur = {'src': m.group(1).lower(),
+                   'cdpv': int(ver.group(1)) if ver else None,
+                   'device_id': None, 'sw_version': None, 'platform': None,
+                   'port_id': None, 'native_vlan': None, 'vtp_domain': None,
+                   'mgmt_addr': None, 'address': None, 'voice_vlan': None,
+                   'capabilities': None}
+            collecting_version = False
+            continue
+        if cur is None:
+            continue
+        low = line.lower()
+        if collecting_version:
+            # A multi-line Version String continues on indented lines until the
+            # next TLV header (`Name (0xNN)`).
+            if re.match(r'^[A-Z][\w /-]*\(0x[0-9a-fA-F]+\)', line):
+                collecting_version = False
+            elif line:
+                cur['sw_version'] = ((cur['sw_version'] + ' ') if cur['sw_version']
+                                     else '') + line
+                continue
+        if low.startswith('device-id'):
+            cur['device_id'] = _cdp_tlv_val(line) or None
+        elif low.startswith('version string') or low.startswith('software version'):
+            v = _cdp_tlv_val(line)
+            if v:
+                cur['sw_version'] = v
+            else:
+                collecting_version = True
+        elif low.startswith('platform'):
+            cur['platform'] = _cdp_tlv_val(line) or None
+        elif low.startswith('port-id'):
+            cur['port_id'] = _cdp_tlv_val(line) or None
+        elif low.startswith('native vlan'):
+            nv = re.search(r'byte[s]?:\s*(\d+)', line)
+            cur['native_vlan'] = int(nv.group(1)) if nv else None
+        elif low.startswith('vtp management domain'):
+            cur['vtp_domain'] = _cdp_tlv_val(line) or None
+        elif low.startswith('appliance') or 'voice vlan' in low:
+            vv = re.search(r'vlan[^0-9]*(\d+)', low)
+            cur['voice_vlan'] = int(vv.group(1)) if vv else cur['voice_vlan']
+        elif low.startswith('address') and cur['address'] is None:
+            a = re.search(r'ipv4 \(\d+\)\s*([0-9.]+)', low)
+            cur['address'] = a.group(1) if a else None
+        elif low.startswith('management address'):
+            a = re.search(r'ipv4 \(\d+\)\s*([0-9.]+)', low)
+            cur['mgmt_addr'] = a.group(1) if a else None
+        elif low.startswith('capability'):
+            c = re.search(r'byte[s]?:.*?:\s*(.*)$', line)
+            cur['capabilities'] = (c.group(1).strip() if c else None) or None
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _cdp_watch_load():
+    try:
+        with open(_CDP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cdp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_CDP_WATCH_PATH), exist_ok=True)
+        tmp = _CDP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _CDP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_cdp_baseline(action='get'):
+    """Manage the learned CDP baseline (trusted CDP speaker MACs — the real
+    switches/phones). action='reset' re-learns on the next scan."""
+    with _cdp_watch_lock:
+        if action == 'reset':
+            _cdp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _cdp_watch_load()
+        return {'success': True, 'baseline': {'speakers': b.get('speakers') or []}}
+
+
+def _cdp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed CDP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    speakers = {}
+    for e in events:
+        sp = speakers.setdefault(e['src'], {
+            'src': e['src'], 'count': 0, 'device_id': None, 'sw_version': None,
+            'platform': None, 'port_id': None, 'native_vlan': None,
+            'vtp_domain': None, 'mgmt_addr': None, 'address': None,
+            'voice_vlan': None, 'capabilities': None})
+        sp['count'] += 1
+        for k in ('device_id', 'sw_version', 'platform', 'port_id', 'native_vlan',
+                  'vtp_domain', 'mgmt_addr', 'address', 'voice_vlan', 'capabilities'):
+            if e.get(k) is not None:
+                sp[k] = e[k]
+
+    known = set(baseline.get('speakers') or [])
+    had_baseline = bool(known)
+    device_ids = {sp['device_id'] for sp in speakers.values() if sp['device_id']}
+
+    learned = False
+    if learn and not had_baseline and speakers:
+        baseline['speakers'] = sorted(speakers.keys())
+        learned = True
+        known = set(speakers.keys())
+        had_baseline = True
+
+    PRIORITY = ['flood', 'spoof', 'cdp-enabled', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # --- flood: sustained rate or a spray of distinct device-IDs (Yersinia) ---
+    rate = round(len(events) / seconds, 2)
+    if (rate >= _CDP_FLOOD_RATE and len(events) >= _CDP_FLOOD_RATE * seconds) \
+            or len(device_ids) >= _CDP_FLOOD_IDS:
+        bump('flood')
+        reasons.append(f"CDP flood: {len(events)} frames in {seconds}s ({rate}/s), "
+                       f"{len(device_ids)} distinct device-IDs — CDP neighbour-table / "
+                       f"CPU exhaustion DoS (e.g. Yersinia cdp flood)")
+
+    for src in sorted(speakers):
+        sp = speakers[src]
+        is_new = had_baseline and src not in known
+        if is_new and verdict != 'flood':
+            bump('spoof')
+            phone = ((sp['capabilities'] and 'phone' in sp['capabilities'].lower())
+                     or sp['voice_vlan'] is not None)
+            tail = (f" advertising IP-Phone capability / Voice VLAN "
+                    f"{sp['voice_vlan']} — possible VoIP-VLAN-hop (fake phone)"
+                    if phone else "")
+            reasons.append(
+                f"New CDP speaker {src} claiming '{sp['device_id'] or '?'}' "
+                f"({sp['platform'] or '?'}) not in the baseline — rogue/spoofed CDP "
+                f"neighbour{tail}")
+
+    # --- cdp-enabled / info-leak: surface exactly what CDP hands an attacker ---
+    if verdict == 'clean' and learned and speakers:
+        bump('cdp-enabled')
+    if verdict == 'cdp-enabled' and not reasons:
+        leaks = []
+        for sp in speakers.values():
+            bits = []
+            if sp['sw_version']:
+                bits.append('IOS/version')
+            if sp['mgmt_addr'] or sp['address']:
+                bits.append('mgmt IP ' + (sp['mgmt_addr'] or sp['address']))
+            if sp['native_vlan'] is not None:
+                bits.append(f'native VLAN {sp["native_vlan"]}')
+            if sp['voice_vlan'] is not None:
+                bits.append(f'voice VLAN {sp["voice_vlan"]}')
+            leaks.append(f"{sp['device_id'] or sp['src']} ({sp['platform'] or '?'})"
+                         + (': ' + ', '.join(bits) if bits else ''))
+        reasons.append(
+            "CDP is enabled on this segment — it broadcasts " + '; '.join(leaks) +
+            " in clear to anyone on the wire (reconnaissance goldmine). If any of "
+            "these ports face users, disable CDP there (`no cdp enable`).")
+
+    advisories = []
+    if speakers:
+        advisories.append(
+            "Disable CDP on access/edge ports (`no cdp enable`; `no cdp run` globally "
+            "if unused). CDP is unauthenticated and leaks device model, IOS version "
+            "(→ known CVEs), management IP, native/voice VLAN and port-ID to any "
+            "listener. Where discovery is needed, prefer LLDP with minimal TLVs.")
+
+    if reasons:
+        summary = reasons
+    elif not speakers:
+        summary = ['No CDP seen — no Cisco Discovery Protocol on this segment']
+    else:
+        summary = ['CDP speakers all match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'speaker_count': len(speakers),
+        'packet_count': len(events),
+        'rate': rate,
+        'speakers': [{
+            'src': s, 'device_id': sp['device_id'], 'platform': sp['platform'],
+            'sw_version': sp['sw_version'], 'port_id': sp['port_id'],
+            'native_vlan': sp['native_vlan'], 'vtp_domain': sp['vtp_domain'],
+            'mgmt_addr': sp['mgmt_addr'] or sp['address'],
+            'voice_vlan': sp['voice_vlan'], 'count': sp['count'],
+            'baseline': s in known,
+        } for s, sp in sorted(speakers.items())],
+        'advisories': advisories,
+    }
+
+
+def _cdp_capture(interface, seconds):
+    """One passive tcpdump window over CDP frames -> (raw, error). Uses -e for the
+    sending MAC; the BPF isolates CDP (PID 0x2000) from the other protocols that
+    share the Cisco group MAC (DTP/VTP/UDLD/PAgP)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2000'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '1500', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_cdp_watch(interface=None, seconds=30, learn=True):
+    """Passive CDP flood / spoof / info-leak scanner (detection-only). CDP hellos
+    are ~60s apart, so the default window is longer. Learns the trusted CDP
+    speakers on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 30, 5, 65)
+
+    text, err = _cdp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_cdp_capture(text)
+
+    with _cdp_watch_lock:
+        baseline = _cdp_watch_load()
+        result = _cdp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _cdp_watch_save(baseline)
+        if result['verdict'] not in ('clean', 'cdp-enabled'):
+            b = _cdp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_CDP_EVENTS_CAP:]
+            _cdp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _cdp_selftest():
+    """Self-test the CDP detector with synthetic captures, plus a Scapy end-to-end
+    leg (craft a real CDP frame -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def frame(src, device_id='Switch1.lab', version='Cisco IOS Software, C3560, '
+              'Version 12.2(55)SE', platform='cisco WS-C3560-24TS', port='Fa0/1',
+              native=1, vtp='lab', mgmt='10.0.0.1', voice=None,
+              caps='Router, L2 Switch'):
+        L = [f"{src} > 01:00:0c:cc:cc:cc, 802.3, length 337: LLC, dsap SNAP (0xaa) "
+             f"Individual, ssap SNAP (0xaa) Command, ctrl 0x03: oui Cisco "
+             f"(0x00000c), pid CDP (0x2000): CDPv2, ttl: 180s, checksum: 0x0000, "
+             f"length 319",
+             f"\tDevice-ID (0x01), length: {len(device_id)} bytes: '{device_id}'",
+             f"\tVersion String (0x05), length: {len(version)} bytes: {version}",
+             f"\tPlatform (0x06), length: {len(platform)} bytes: '{platform}'",
+             f"\tAddress (0x02), length: 13 bytes: IPv4 (1) {mgmt}",
+             f"\tPort-ID (0x03), length: {len(port)} bytes: '{port}'",
+             f"\tCapability (0x04), length: 4 bytes: (0x00000029): {caps}",
+             f"\tVTP Management Domain (0x09), length: {len(vtp)} bytes: '{vtp}'",
+             f"\tNative VLAN ID (0x0a), length: 2 bytes: {native}",
+             f"\tManagement Addresses (0x16), length: 13 bytes: IPv4 (1) {mgmt}"]
+        if voice is not None:
+            L.append(f"\tAppliance VLAN-ID (0x0e), length: 7 bytes: "
+                     f"App id 1, vlan: {voice}")
+        return "\n".join(L)
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_cdp_capture(text)
+        res = _cdp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'speakers': ['00:11:22:33:44:55']}
+
+    # 1. clean: known switch re-advertising.
+    run('clean', frame('00:11:22:33:44:55'), 60, base, 'clean')
+    # 2. spoof: a NEW CDP speaker not in baseline.
+    run('spoof', frame('de:ad:be:ef:00:01', device_id='rogue'), 60, base, 'spoof')
+    # 3. spoof + phone: fake IP phone advertising a Voice VLAN (VoIP-hop recon).
+    rp = run('spoof-phone', frame('de:ad:be:ef:00:02', device_id='SEP001122',
+             platform='cisco IP Phone 7960', voice=200, caps='Host, Phone'),
+             60, base, 'spoof')
+    vp_ok = any('VoIP-VLAN-hop' in x for x in rp['reasons'])
+    scenarios.append({'name': 'spoof-phone-reason', 'expect': 'voip-hop',
+                      'got': 'voip-hop' if vp_ok else 'missing', 'pass': vp_ok})
+    # 4. cdp-enabled: first-run learn surfaces the info leak.
+    rc = run('cdp-enabled', frame('00:11:22:33:44:55'), 60, None, 'cdp-enabled')
+    leak_ok = any('reconnaissance goldmine' in x for x in rc['reasons'])
+    scenarios.append({'name': 'cdp-leak-reason', 'expect': 'leak',
+                      'got': 'leak' if leak_ok else 'missing', 'pass': leak_ok})
+    # 5. flood: a spray of distinct device-IDs (Yersinia).
+    flood = "\n".join(frame(f'aa:bb:cc:00:{i//256:02x}:{i%256:02x}',
+                            device_id=f'rnd{i}') for i in range(40))
+    run('flood', flood, 5, base, 'flood')
+    # 6. parse: fields extracted incl. version, native VLAN, mgmt IP.
+    pev = _parse_cdp_capture(frame('aa:bb:cc:dd:ee:ff', native=99, mgmt='192.0.2.7'))
+    p_ok = (len(pev) == 1 and pev[0]['device_id'] == 'Switch1.lab'
+            and pev[0]['native_vlan'] == 99 and pev[0]['mgmt_addr'] == '192.0.2.7'
+            and pev[0]['platform'] == 'cisco WS-C3560-24TS'
+            and '12.2(55)SE' in (pev[0]['sw_version'] or ''))
+    scenarios.append({'name': 'cdp-parse', 'expect': 'id+vlan+ip+ver',
+                      'got': str({k: pev[0][k] for k in
+                                  ('device_id', 'native_vlan', 'mgmt_addr')}
+                                 if pev else None)[:90], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real CDP frame -> pcap -> tcpdump -e -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, SNAP, wrpcap
+        from scapy.contrib.cdp import (CDPv2_HDR, CDPMsgDeviceID, CDPMsgPlatform,
+                                       CDPMsgPortID, CDPMsgNativeVLAN)
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:00:0c:cc:cc:cc', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0xaa, ssap=0xaa, ctrl=3)
+                   / SNAP(OUI=0x00000c, code=0x2000)
+                   / CDPv2_HDR(msg=[CDPMsgDeviceID(val=b'rogue-sw'),
+                                    CDPMsgPlatform(val=b'cisco WS-C2960'),
+                                    CDPMsgPortID(iface=b'Fa0/9'),
+                                    CDPMsgNativeVLAN(vlan=1)]))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path],
+                       timeout=10)
+            evs = _parse_cdp_capture(res['out'])
+            e = evs[0] if evs else {}
+            scapy_result = {'ran': True, 'device_id': e.get('device_id'),
+                            'platform': e.get('platform'),
+                            'pass': bool(evs) and e.get('device_id') == 'rogue-sw',
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as ex:
+        scapy_result = {'ran': False, 'reason': f'{type(ex).__name__}: {ex}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
+# VTP Watch: passive VLAN Trunking Protocol bomb / rogue-server scanner
+# --------------------------------------------------------------------------
+# VTP (Cisco proprietary; same group MAC 01:00:0c:cc:cc:cc as CDP/DTP, SNAP OUI
+# 0x00000c, PID 0x2003) synchronises the VLAN database across a VTP domain. Its
+# whole security model rests on one 32-bit **configuration revision number**: the
+# switch advertising the *highest* revision in the domain wins, and every other
+# switch (in server/client mode) overwrites its VLAN database to match. So a
+# rogue switch — or a forged Summary Advertisement — carrying the domain name and
+# a higher revision silently **rewrites, and can delete, every VLAN across the
+# entire domain**: the "VTP bomb", a one-frame domain-wide outage. VTPv1/2 have no
+# per-port authentication (only an optional weak MD5 domain password). This
+# scanner is PASSIVE: it decodes captured VTP Summary Advertisements, it never
+# transmits VTP. It flags:
+#   * revision-bomb — a config revision higher than the learned baseline coming
+#     from a source that ISN'T the known VTP server: the VLAN-DB-overwrite attack.
+#   * rogue-server  — a new VTP speaker, or a different VTP domain name, than the
+#     learned baseline (a rogue switch positioned to seize VLAN management).
+#   * vtp-enabled   — VTP present / a legit revision bump from the known server.
+# First run learns the domain, revision and server into data/vtp_watch.json;
+# "Trust current" re-learns after a legitimate VLAN change. NB tcpdump prints the
+# config revision in hex ("Config Rev a" == 10).
+_VTP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'vtp_watch.json')
+_vtp_watch_lock = threading.Lock()
+_VTP_EVENTS_CAP = 200
+_VTP_HDR_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*01:00:0c:cc:cc:cc')
+# A brand-new switch ships revision 0; an attacker sets a high one. Any higher
+# revision from a source that isn't the known server is the bomb signal.
+_VTP_REV_JUMP = 1
+
+
+def _parse_vtp_capture(output):
+    """Parse `tcpdump -e -t -v` VTP text into per-frame events. The header line
+    carries `pid VTP (0x2003) ... VTPv1, Message <type> (0xNN)`; indented lines
+    carry `Domain name: <d>, Followers: <n>` and `Config Rev <hex>, Updater <ip>`.
+    tcpdump prints the config revision in HEX."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _VTP_HDR_RE.match(line)
+        if m and 'VTP' in line and 'Message' in line:
+            if cur:
+                events.append(cur)
+            mt = re.search(r'Message\s+(.+?)\s*\(0x([0-9a-fA-F]+)\)', line)
+            cur = {'src': m.group(1).lower(),
+                   'msgtype': mt.group(1).strip() if mt else None,
+                   'msgcode': int(mt.group(2), 16) if mt else None,
+                   'domain': None, 'revision': None, 'updater': None,
+                   'followers': None}
+            continue
+        if cur is None:
+            continue
+        dm = re.search(r'Domain name:\s*(.+?)\s*,', line)
+        if dm:
+            cur['domain'] = dm.group(1)
+        fm = re.search(r'Followers:\s*(\d+)', line)
+        if fm:
+            cur['followers'] = int(fm.group(1))
+        rm = re.search(r'Config Rev\s+([0-9a-fA-F]+)', line)
+        if rm:
+            cur['revision'] = int(rm.group(1), 16)
+        um = re.search(r'Updater\s+([0-9.]+)', line)
+        if um:
+            cur['updater'] = um.group(1)
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _vtp_watch_load():
+    try:
+        with open(_VTP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _vtp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_VTP_WATCH_PATH), exist_ok=True)
+        tmp = _VTP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _VTP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_vtp_baseline(action='get'):
+    """Manage the learned VTP baseline (trusted domain(s), config revision, VTP
+    server(s)). action='reset' re-learns on the next scan (use after a legitimate
+    VLAN-database change)."""
+    with _vtp_watch_lock:
+        if action == 'reset':
+            _vtp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _vtp_watch_load()
+        return {'success': True, 'baseline': {'domains': b.get('domains') or {}}}
+
+
+def _vtp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed VTP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    # Aggregate by VTP domain (the config revision is domain-wide).
+    domains = {}
+    for e in events:
+        name = e.get('domain')
+        if not name:
+            continue
+        d = domains.setdefault(name, {'name': name, 'revision': -1,
+                                      'updaters': set(), 'srcs': set(),
+                                      'msgtypes': set(), 'count': 0})
+        d['count'] += 1
+        d['srcs'].add(e['src'])
+        if e.get('updater'):
+            d['updaters'].add(e['updater'])
+        if e.get('msgtype'):
+            d['msgtypes'].add(e['msgtype'])
+        if e.get('revision') is not None and e['revision'] > d['revision']:
+            d['revision'] = e['revision']
+
+    base_domains = dict(baseline.get('domains') or {})
+    had_baseline = bool(base_domains)
+
+    learned = False
+    if learn and not had_baseline and domains:
+        baseline['domains'] = {n: {'revision': d['revision'],
+                                   'updaters': sorted(d['updaters']),
+                                   'speakers': sorted(d['srcs'])}
+                               for n, d in domains.items()}
+        learned = True
+        base_domains = dict(baseline['domains'])
+        had_baseline = True
+
+    PRIORITY = ['revision-bomb', 'rogue-server', 'vtp-enabled', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    if learned and domains:
+        bump('vtp-enabled')
+
+    for name in sorted(domains):
+        d = domains[name]
+        kd = base_domains.get(name)
+        if had_baseline and kd is None:
+            bump('rogue-server')
+            reasons.append(
+                f"New VTP domain '{name}' seen from {', '.join(sorted(d['srcs']))} "
+                f"— not the baseline domain; a rogue switch advertising VTP can seize "
+                f"VLAN management on this segment")
+            continue
+        if kd is None:
+            continue
+        base_rev = kd.get('revision', -1)
+        known_srcs = set(kd.get('speakers') or [])
+        known_upd = set(kd.get('updaters') or [])
+        new_src = bool(d['srcs'] - known_srcs)
+        new_upd = bool(d['updaters'] - known_upd)
+
+        if d['revision'] > base_rev and (d['revision'] - base_rev) >= _VTP_REV_JUMP:
+            if new_src or new_upd:
+                bump('revision-bomb')
+                who = ', '.join(sorted(d['updaters'] or d['srcs']))
+                reasons.append(
+                    f"VTP BOMB: config revision in domain '{name}' jumped {base_rev} "
+                    f"→ {d['revision']} advertised by {who} (NOT the known VTP server) "
+                    f"— a higher revision overwrites the VLAN database across the whole "
+                    f"domain and can delete every VLAN (domain-wide outage). Isolate "
+                    f"that port now")
+            else:
+                bump('vtp-enabled')
+                reasons.append(
+                    f"Config revision in domain '{name}' increased {base_rev} → "
+                    f"{d['revision']} from the known VTP server "
+                    f"({', '.join(sorted(d['updaters'])) or '?'}) — the VLAN database "
+                    f"changed (legitimate if you just edited VLANs; click Trust current "
+                    f"to accept the new revision)")
+        elif new_src or new_upd:
+            bump('rogue-server')
+            who = ', '.join(sorted((d['srcs'] - known_srcs)
+                                   or (d['updaters'] - known_upd)))
+            reasons.append(
+                f"New VTP speaker {who} in domain '{name}' not in the baseline — a "
+                f"rogue switch that could raise the config revision and overwrite the "
+                f"domain's VLANs. Verify it, or set the port/switch to VTP transparent")
+
+    advisories = []
+    if domains:
+        advisories.append(
+            "Neutralise VTP bombs: run switches in `vtp mode transparent` (or VTPv3) "
+            "unless you truly need domain-wide VLAN sync, always set a VTP password, "
+            "and ALWAYS zero a switch's config-revision (set VTP transparent, or change "
+            "the domain name and back) before connecting it — a client/server switch "
+            "with a higher revision silently overwrites the entire domain's VLAN "
+            "database on connect.")
+
+    if reasons:
+        summary = reasons
+    elif not domains:
+        summary = ['No VTP seen — no VLAN Trunking Protocol advertisements on this '
+                   'segment (good; VTP is not exposed here)']
+    else:
+        summary = ['VTP domain/revision match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'domain_count': len(domains),
+        'packet_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'domains': [{
+            'name': d['name'], 'revision': d['revision'],
+            'updaters': sorted(d['updaters']), 'srcs': sorted(d['srcs']),
+            'msgtypes': sorted(d['msgtypes']), 'count': d['count'],
+            'baseline': d['name'] in base_domains,
+            'baseline_revision': (base_domains.get(d['name']) or {}).get('revision'),
+        } for _, d in sorted(domains.items())],
+        'advisories': advisories,
+    }
+
+
+def _vtp_capture(interface, seconds):
+    """One passive tcpdump window over VTP frames -> (raw, error). Uses -e for the
+    sending MAC; the BPF isolates VTP (PID 0x2003) from the other protocols that
+    share the Cisco group MAC (CDP/DTP/UDLD/PAgP)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2003'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_vtp_watch(interface=None, seconds=30, learn=True):
+    """Passive VTP bomb / rogue-server scanner (detection-only). VTP Summary
+    Advertisements are ~30s apart (plus on every change), so the default window is
+    longer. Learns the trusted domain/revision/server on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 30, 5, 65)
+
+    text, err = _vtp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_vtp_capture(text)
+
+    with _vtp_watch_lock:
+        baseline = _vtp_watch_load()
+        result = _vtp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _vtp_watch_save(baseline)
+        if result['verdict'] not in ('clean', 'vtp-enabled'):
+            b = _vtp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_VTP_EVENTS_CAP:]
+            _vtp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _vtp_selftest():
+    """Self-test the VTP detector with synthetic captures, plus a Scapy end-to-end
+    leg (craft a real VTP summary advert -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def frame(src, domain='LAB', rev=10, updater='10.0.0.1', followers=1,
+              msgtype='Summary advertisement', code=0x01):
+        return (f"{src} > 01:00:0c:cc:cc:cc, 802.3, length 80: LLC, dsap SNAP (0xaa) "
+                f"Individual, ssap SNAP (0xaa) Command, ctrl 0x03: oui Cisco "
+                f"(0x00000c), pid VTP (0x2003), length 72: VTPv1, Message {msgtype} "
+                f"(0x{code:02x}), length 72\n"
+                f"\tDomain name: {domain}, Followers: {followers}\n"
+                f"\t  Config Rev {rev:x}, Updater {updater}, Timestamp 0x0 0x0 0x0, "
+                f"MD5 digest: 00000000000000000000000000000000")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_vtp_capture(text)
+        res = _vtp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'domains': {'LAB': {'revision': 10, 'updaters': ['10.0.0.1'],
+                                'speakers': ['00:11:22:33:44:55']}}}
+
+    # 1. clean: known server re-advertises the same revision.
+    run('clean', frame('00:11:22:33:44:55', rev=10), 30, base, 'clean')
+    # 2. revision-bomb: higher revision from a NEW source (the classic VTP bomb).
+    rb = run('revision-bomb', frame('de:ad:be:ef:00:01', rev=99, updater='10.0.0.66'),
+             30, base, 'revision-bomb')
+    bomb_ok = any('VTP BOMB' in x for x in rb['reasons'])
+    scenarios.append({'name': 'bomb-reason', 'expect': 'bomb',
+                      'got': 'bomb' if bomb_ok else 'missing', 'pass': bomb_ok})
+    # 3. vtp-enabled: higher revision from the KNOWN server = legit VLAN edit.
+    run('legit-bump', frame('00:11:22:33:44:55', rev=11), 30, base, 'vtp-enabled')
+    # 4. rogue-server: new speaker, same revision (rogue switch present).
+    run('rogue-server', frame('de:ad:be:ef:00:02', rev=10, updater='10.0.0.1'),
+        30, base, 'rogue-server')
+    # 5. rogue-server: a different VTP domain name (domain confusion).
+    run('rogue-domain', frame('de:ad:be:ef:00:03', domain='EVIL', rev=5),
+        30, base, 'rogue-server')
+    # 6. vtp-enabled: first-run learn (no baseline).
+    run('learn', frame('00:11:22:33:44:55', rev=10), 30, None, 'vtp-enabled')
+    # 7. parse: hex revision decoded, domain + updater extracted.
+    pev = _parse_vtp_capture(frame('aa:bb:cc:dd:ee:ff', domain='PROD', rev=255,
+                                   updater='192.0.2.9'))
+    p_ok = (len(pev) == 1 and pev[0]['domain'] == 'PROD'
+            and pev[0]['revision'] == 255 and pev[0]['updater'] == '192.0.2.9'
+            and pev[0]['msgcode'] == 0x01)
+    scenarios.append({'name': 'vtp-parse', 'expect': 'domain+rev255+updater',
+                      'got': str({k: pev[0][k] for k in
+                                  ('domain', 'revision', 'updater')} if pev else None),
+                      'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real VTP summary advert -> pcap -> tcpdump.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, SNAP, wrpcap
+        import scapy.contrib.vtp as vtp
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:00:0c:cc:cc:cc', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0xaa, ssap=0xaa, ctrl=3)
+                   / SNAP(OUI=0x00000c, code=0x2003)
+                   / vtp.VTP(ver=1, code=1, followers=1, domnamelen=3,
+                             domname='LAB', rev=99, uid='10.0.0.66'))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path],
+                       timeout=10)
+            evs = _parse_vtp_capture(res['out'])
+            e = evs[0] if evs else {}
+            scapy_result = {'ran': True, 'domain': e.get('domain'),
+                            'revision': e.get('revision'), 'updater': e.get('updater'),
+                            'pass': bool(evs) and e.get('domain') == 'LAB'
+                                    and e.get('revision') == 99,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as ex:
+        scapy_result = {'ran': False, 'reason': f'{type(ex).__name__}: {ex}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # EIGRP Watch: passive EIGRP routing-security scanner (Cisco; detection-only)
 # --------------------------------------------------------------------------
 # EIGRP is Cisco's interior gateway protocol (the Cisco-world alternative to OSPF;
@@ -10797,12 +12028,13 @@ def do_routing_selftest():
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
-              'raguard': _raguard_selftest(),
+              'ndp': _ndp_selftest(), 'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'cert': _cert_selftest(),
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
               'smb': _smb_selftest(), 'relay': _relay_selftest(),
-              'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
+              'dtp': _dtp_selftest(), 'cdp': _cdp_selftest(), 'vtp': _vtp_selftest(),
+              'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(), 'tls': _tls_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
@@ -11603,6 +12835,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/ipv6-baseline {action}")
         return jsonify(do_ipv6_baseline(action))
 
+    @app.route('/api/net/ndp-watch', methods=['GET'])
+    def net_ndp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/ndp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ndp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ndp-baseline', methods=['GET', 'POST'])
+    def net_ndp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ndp-baseline {action}")
+        return jsonify(do_ndp_baseline(action))
+
     @app.route('/api/net/raguard', methods=['GET', 'POST'])
     def net_raguard():
         action = 'check'
@@ -11778,6 +13028,42 @@ def register_network_diagnostics(app, logger=None):
             action = 'reset' if (data.get('action') == 'reset') else 'get'
         _log(f"net/dtp-baseline {action}")
         return jsonify(do_dtp_baseline(action))
+
+    @app.route('/api/net/cdp-watch', methods=['GET'])
+    def net_cdp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/cdp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_cdp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/cdp-baseline', methods=['GET', 'POST'])
+    def net_cdp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/cdp-baseline {action}")
+        return jsonify(do_cdp_baseline(action))
+
+    @app.route('/api/net/vtp-watch', methods=['GET'])
+    def net_vtp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/vtp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_vtp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/vtp-baseline', methods=['GET', 'POST'])
+    def net_vtp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/vtp-baseline {action}")
+        return jsonify(do_vtp_baseline(action))
 
     @app.route('/api/net/eigrp-watch', methods=['GET'])
     def net_eigrp_watch():
@@ -12045,6 +13331,15 @@ def _cli(argv=None):
     v6st = sub.add_parser('ipv6-selftest', help='self-test the IPv6 first-hop detectors (no root)')
     v6st.add_argument('--json', action='store_true', help='emit JSON')
 
+    ndp = sub.add_parser('ndp-watch', help='passive IPv6 Neighbor Discovery spoofing scan')
+    ndp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    ndp.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    ndp.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    ndp.add_argument('--json', action='store_true', help='emit JSON')
+
+    ndpst = sub.add_parser('ndp-selftest', help='self-test the NDP spoofing detectors (no root)')
+    ndpst.add_argument('--json', action='store_true', help='emit JSON')
+
     rg = sub.add_parser('raguard', help='IPv6 RA Guard: audit (and optionally harden) host first-hop posture')
     rg.add_argument('--harden', action='store_true', help='apply + persist the safe sysctls')
     rg.add_argument('--json', action='store_true', help='emit JSON')
@@ -12135,6 +13430,24 @@ def _cli(argv=None):
 
     dtst = sub.add_parser('dtp-selftest', help='self-test the DTP detector (no root)')
     dtst.add_argument('--json', action='store_true', help='emit JSON')
+
+    cdp = sub.add_parser('cdp-watch', help='passive CDP flood/spoof/info-leak scan (Cisco)')
+    cdp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    cdp.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    cdp.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    cdp.add_argument('--json', action='store_true', help='emit JSON')
+
+    cdpst = sub.add_parser('cdp-selftest', help='self-test the CDP detector (no root)')
+    cdpst.add_argument('--json', action='store_true', help='emit JSON')
+
+    vtp = sub.add_parser('vtp-watch', help='passive VTP bomb / rogue-server scan (Cisco)')
+    vtp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    vtp.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    vtp.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    vtp.add_argument('--json', action='store_true', help='emit JSON')
+
+    vtpst = sub.add_parser('vtp-selftest', help='self-test the VTP detector (no root)')
+    vtpst.add_argument('--json', action='store_true', help='emit JSON')
 
     eg = sub.add_parser('eigrp-watch', help='passive EIGRP routing-security scan (Cisco)')
     eg.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -12284,6 +13597,43 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"IPv6 first-hop self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ndp-watch':
+        r = do_ndp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"NDP Watch [{r['interface']}]: {r['verdict'].upper()}  "
+                  f"({r['na_count']} NA @ {r['rate']}/s, {r['ns_count']} NS, "
+                  f"{r['dad_count']} DAD)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for h in r.get('hosts', []):
+                tag = ' *CONFLICT*' if h['conflict'] else ''
+                print(f"  {h['ip']} -> {', '.join(h['macs'])}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ndp-selftest':
+        r = _ndp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"tgt={sc.get('tgt')} lladdr={sc.get('lladdr')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"NDP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'raguard':
@@ -12710,6 +14060,90 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"DTP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'cdp-watch':
+        r = do_cdp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"CDP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} frame(s), {r['speaker_count']} speaker(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for sp in r.get('speakers', []):
+                tag = '' if sp['baseline'] else ' *NEW*'
+                leak = []
+                if sp.get('sw_version'):
+                    leak.append(sp['sw_version'][:40])
+                if sp.get('native_vlan') is not None:
+                    leak.append(f"nativeVLAN={sp['native_vlan']}")
+                if sp.get('mgmt_addr'):
+                    leak.append(f"mgmt={sp['mgmt_addr']}")
+                print(f"  {sp['src']} '{sp.get('device_id') or '?'}' "
+                      f"({sp.get('platform') or '?'}){tag}"
+                      + (('  [' + '; '.join(leak) + ']') if leak else ''))
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'cdp-selftest':
+        r = _cdp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"device_id={sc.get('device_id')} platform={sc.get('platform')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"CDP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'vtp-watch':
+        r = do_vtp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"VTP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} frame(s), {r['domain_count']} domain(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for dm in r.get('domains', []):
+                tag = '' if dm['baseline'] else ' *NEW*'
+                base = ('' if dm.get('baseline_revision') is None
+                        else f" (baseline rev {dm['baseline_revision']})")
+                print(f"  domain '{dm['name']}' rev={dm['revision']}{base} "
+                      f"updater={','.join(dm['updaters']) or '?'}{tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'vtp-selftest':
+        r = _vtp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"domain={sc.get('domain')} revision={sc.get('revision')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"VTP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'eigrp-watch':
