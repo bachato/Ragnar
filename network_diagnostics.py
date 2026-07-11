@@ -9462,6 +9462,384 @@ def _cdp_selftest():
 
 
 # --------------------------------------------------------------------------
+# VTP Watch: passive VLAN Trunking Protocol bomb / rogue-server scanner
+# --------------------------------------------------------------------------
+# VTP (Cisco proprietary; same group MAC 01:00:0c:cc:cc:cc as CDP/DTP, SNAP OUI
+# 0x00000c, PID 0x2003) synchronises the VLAN database across a VTP domain. Its
+# whole security model rests on one 32-bit **configuration revision number**: the
+# switch advertising the *highest* revision in the domain wins, and every other
+# switch (in server/client mode) overwrites its VLAN database to match. So a
+# rogue switch — or a forged Summary Advertisement — carrying the domain name and
+# a higher revision silently **rewrites, and can delete, every VLAN across the
+# entire domain**: the "VTP bomb", a one-frame domain-wide outage. VTPv1/2 have no
+# per-port authentication (only an optional weak MD5 domain password). This
+# scanner is PASSIVE: it decodes captured VTP Summary Advertisements, it never
+# transmits VTP. It flags:
+#   * revision-bomb — a config revision higher than the learned baseline coming
+#     from a source that ISN'T the known VTP server: the VLAN-DB-overwrite attack.
+#   * rogue-server  — a new VTP speaker, or a different VTP domain name, than the
+#     learned baseline (a rogue switch positioned to seize VLAN management).
+#   * vtp-enabled   — VTP present / a legit revision bump from the known server.
+# First run learns the domain, revision and server into data/vtp_watch.json;
+# "Trust current" re-learns after a legitimate VLAN change. NB tcpdump prints the
+# config revision in hex ("Config Rev a" == 10).
+_VTP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'vtp_watch.json')
+_vtp_watch_lock = threading.Lock()
+_VTP_EVENTS_CAP = 200
+_VTP_HDR_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*01:00:0c:cc:cc:cc')
+# A brand-new switch ships revision 0; an attacker sets a high one. Any higher
+# revision from a source that isn't the known server is the bomb signal.
+_VTP_REV_JUMP = 1
+
+
+def _parse_vtp_capture(output):
+    """Parse `tcpdump -e -t -v` VTP text into per-frame events. The header line
+    carries `pid VTP (0x2003) ... VTPv1, Message <type> (0xNN)`; indented lines
+    carry `Domain name: <d>, Followers: <n>` and `Config Rev <hex>, Updater <ip>`.
+    tcpdump prints the config revision in HEX."""
+    events = []
+    cur = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _VTP_HDR_RE.match(line)
+        if m and 'VTP' in line and 'Message' in line:
+            if cur:
+                events.append(cur)
+            mt = re.search(r'Message\s+(.+?)\s*\(0x([0-9a-fA-F]+)\)', line)
+            cur = {'src': m.group(1).lower(),
+                   'msgtype': mt.group(1).strip() if mt else None,
+                   'msgcode': int(mt.group(2), 16) if mt else None,
+                   'domain': None, 'revision': None, 'updater': None,
+                   'followers': None}
+            continue
+        if cur is None:
+            continue
+        dm = re.search(r'Domain name:\s*(.+?)\s*,', line)
+        if dm:
+            cur['domain'] = dm.group(1)
+        fm = re.search(r'Followers:\s*(\d+)', line)
+        if fm:
+            cur['followers'] = int(fm.group(1))
+        rm = re.search(r'Config Rev\s+([0-9a-fA-F]+)', line)
+        if rm:
+            cur['revision'] = int(rm.group(1), 16)
+        um = re.search(r'Updater\s+([0-9.]+)', line)
+        if um:
+            cur['updater'] = um.group(1)
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _vtp_watch_load():
+    try:
+        with open(_VTP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _vtp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_VTP_WATCH_PATH), exist_ok=True)
+        tmp = _VTP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _VTP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_vtp_baseline(action='get'):
+    """Manage the learned VTP baseline (trusted domain(s), config revision, VTP
+    server(s)). action='reset' re-learns on the next scan (use after a legitimate
+    VLAN-database change)."""
+    with _vtp_watch_lock:
+        if action == 'reset':
+            _vtp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _vtp_watch_load()
+        return {'success': True, 'baseline': {'domains': b.get('domains') or {}}}
+
+
+def _vtp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed VTP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    # Aggregate by VTP domain (the config revision is domain-wide).
+    domains = {}
+    for e in events:
+        name = e.get('domain')
+        if not name:
+            continue
+        d = domains.setdefault(name, {'name': name, 'revision': -1,
+                                      'updaters': set(), 'srcs': set(),
+                                      'msgtypes': set(), 'count': 0})
+        d['count'] += 1
+        d['srcs'].add(e['src'])
+        if e.get('updater'):
+            d['updaters'].add(e['updater'])
+        if e.get('msgtype'):
+            d['msgtypes'].add(e['msgtype'])
+        if e.get('revision') is not None and e['revision'] > d['revision']:
+            d['revision'] = e['revision']
+
+    base_domains = dict(baseline.get('domains') or {})
+    had_baseline = bool(base_domains)
+
+    learned = False
+    if learn and not had_baseline and domains:
+        baseline['domains'] = {n: {'revision': d['revision'],
+                                   'updaters': sorted(d['updaters']),
+                                   'speakers': sorted(d['srcs'])}
+                               for n, d in domains.items()}
+        learned = True
+        base_domains = dict(baseline['domains'])
+        had_baseline = True
+
+    PRIORITY = ['revision-bomb', 'rogue-server', 'vtp-enabled', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    if learned and domains:
+        bump('vtp-enabled')
+
+    for name in sorted(domains):
+        d = domains[name]
+        kd = base_domains.get(name)
+        if had_baseline and kd is None:
+            bump('rogue-server')
+            reasons.append(
+                f"New VTP domain '{name}' seen from {', '.join(sorted(d['srcs']))} "
+                f"— not the baseline domain; a rogue switch advertising VTP can seize "
+                f"VLAN management on this segment")
+            continue
+        if kd is None:
+            continue
+        base_rev = kd.get('revision', -1)
+        known_srcs = set(kd.get('speakers') or [])
+        known_upd = set(kd.get('updaters') or [])
+        new_src = bool(d['srcs'] - known_srcs)
+        new_upd = bool(d['updaters'] - known_upd)
+
+        if d['revision'] > base_rev and (d['revision'] - base_rev) >= _VTP_REV_JUMP:
+            if new_src or new_upd:
+                bump('revision-bomb')
+                who = ', '.join(sorted(d['updaters'] or d['srcs']))
+                reasons.append(
+                    f"VTP BOMB: config revision in domain '{name}' jumped {base_rev} "
+                    f"→ {d['revision']} advertised by {who} (NOT the known VTP server) "
+                    f"— a higher revision overwrites the VLAN database across the whole "
+                    f"domain and can delete every VLAN (domain-wide outage). Isolate "
+                    f"that port now")
+            else:
+                bump('vtp-enabled')
+                reasons.append(
+                    f"Config revision in domain '{name}' increased {base_rev} → "
+                    f"{d['revision']} from the known VTP server "
+                    f"({', '.join(sorted(d['updaters'])) or '?'}) — the VLAN database "
+                    f"changed (legitimate if you just edited VLANs; click Trust current "
+                    f"to accept the new revision)")
+        elif new_src or new_upd:
+            bump('rogue-server')
+            who = ', '.join(sorted((d['srcs'] - known_srcs)
+                                   or (d['updaters'] - known_upd)))
+            reasons.append(
+                f"New VTP speaker {who} in domain '{name}' not in the baseline — a "
+                f"rogue switch that could raise the config revision and overwrite the "
+                f"domain's VLANs. Verify it, or set the port/switch to VTP transparent")
+
+    advisories = []
+    if domains:
+        advisories.append(
+            "Neutralise VTP bombs: run switches in `vtp mode transparent` (or VTPv3) "
+            "unless you truly need domain-wide VLAN sync, always set a VTP password, "
+            "and ALWAYS zero a switch's config-revision (set VTP transparent, or change "
+            "the domain name and back) before connecting it — a client/server switch "
+            "with a higher revision silently overwrites the entire domain's VLAN "
+            "database on connect.")
+
+    if reasons:
+        summary = reasons
+    elif not domains:
+        summary = ['No VTP seen — no VLAN Trunking Protocol advertisements on this '
+                   'segment (good; VTP is not exposed here)']
+    else:
+        summary = ['VTP domain/revision match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'domain_count': len(domains),
+        'packet_count': len(events),
+        'rate': round(len(events) / seconds, 2),
+        'domains': [{
+            'name': d['name'], 'revision': d['revision'],
+            'updaters': sorted(d['updaters']), 'srcs': sorted(d['srcs']),
+            'msgtypes': sorted(d['msgtypes']), 'count': d['count'],
+            'baseline': d['name'] in base_domains,
+            'baseline_revision': (base_domains.get(d['name']) or {}).get('revision'),
+        } for _, d in sorted(domains.items())],
+        'advisories': advisories,
+    }
+
+
+def _vtp_capture(interface, seconds):
+    """One passive tcpdump window over VTP frames -> (raw, error). Uses -e for the
+    sending MAC; the BPF isolates VTP (PID 0x2003) from the other protocols that
+    share the Cisco group MAC (CDP/DTP/UDLD/PAgP)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2003'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_vtp_watch(interface=None, seconds=30, learn=True):
+    """Passive VTP bomb / rogue-server scanner (detection-only). VTP Summary
+    Advertisements are ~30s apart (plus on every change), so the default window is
+    longer. Learns the trusted domain/revision/server on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 30, 5, 65)
+
+    text, err = _vtp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_vtp_capture(text)
+
+    with _vtp_watch_lock:
+        baseline = _vtp_watch_load()
+        result = _vtp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _vtp_watch_save(baseline)
+        if result['verdict'] not in ('clean', 'vtp-enabled'):
+            b = _vtp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_VTP_EVENTS_CAP:]
+            _vtp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _vtp_selftest():
+    """Self-test the VTP detector with synthetic captures, plus a Scapy end-to-end
+    leg (craft a real VTP summary advert -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def frame(src, domain='LAB', rev=10, updater='10.0.0.1', followers=1,
+              msgtype='Summary advertisement', code=0x01):
+        return (f"{src} > 01:00:0c:cc:cc:cc, 802.3, length 80: LLC, dsap SNAP (0xaa) "
+                f"Individual, ssap SNAP (0xaa) Command, ctrl 0x03: oui Cisco "
+                f"(0x00000c), pid VTP (0x2003), length 72: VTPv1, Message {msgtype} "
+                f"(0x{code:02x}), length 72\n"
+                f"\tDomain name: {domain}, Followers: {followers}\n"
+                f"\t  Config Rev {rev:x}, Updater {updater}, Timestamp 0x0 0x0 0x0, "
+                f"MD5 digest: 00000000000000000000000000000000")
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_vtp_capture(text)
+        res = _vtp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'domains': {'LAB': {'revision': 10, 'updaters': ['10.0.0.1'],
+                                'speakers': ['00:11:22:33:44:55']}}}
+
+    # 1. clean: known server re-advertises the same revision.
+    run('clean', frame('00:11:22:33:44:55', rev=10), 30, base, 'clean')
+    # 2. revision-bomb: higher revision from a NEW source (the classic VTP bomb).
+    rb = run('revision-bomb', frame('de:ad:be:ef:00:01', rev=99, updater='10.0.0.66'),
+             30, base, 'revision-bomb')
+    bomb_ok = any('VTP BOMB' in x for x in rb['reasons'])
+    scenarios.append({'name': 'bomb-reason', 'expect': 'bomb',
+                      'got': 'bomb' if bomb_ok else 'missing', 'pass': bomb_ok})
+    # 3. vtp-enabled: higher revision from the KNOWN server = legit VLAN edit.
+    run('legit-bump', frame('00:11:22:33:44:55', rev=11), 30, base, 'vtp-enabled')
+    # 4. rogue-server: new speaker, same revision (rogue switch present).
+    run('rogue-server', frame('de:ad:be:ef:00:02', rev=10, updater='10.0.0.1'),
+        30, base, 'rogue-server')
+    # 5. rogue-server: a different VTP domain name (domain confusion).
+    run('rogue-domain', frame('de:ad:be:ef:00:03', domain='EVIL', rev=5),
+        30, base, 'rogue-server')
+    # 6. vtp-enabled: first-run learn (no baseline).
+    run('learn', frame('00:11:22:33:44:55', rev=10), 30, None, 'vtp-enabled')
+    # 7. parse: hex revision decoded, domain + updater extracted.
+    pev = _parse_vtp_capture(frame('aa:bb:cc:dd:ee:ff', domain='PROD', rev=255,
+                                   updater='192.0.2.9'))
+    p_ok = (len(pev) == 1 and pev[0]['domain'] == 'PROD'
+            and pev[0]['revision'] == 255 and pev[0]['updater'] == '192.0.2.9'
+            and pev[0]['msgcode'] == 0x01)
+    scenarios.append({'name': 'vtp-parse', 'expect': 'domain+rev255+updater',
+                      'got': str({k: pev[0][k] for k in
+                                  ('domain', 'revision', 'updater')} if pev else None),
+                      'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real VTP summary advert -> pcap -> tcpdump.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, SNAP, wrpcap
+        import scapy.contrib.vtp as vtp
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:00:0c:cc:cc:cc', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0xaa, ssap=0xaa, ctrl=3)
+                   / SNAP(OUI=0x00000c, code=0x2003)
+                   / vtp.VTP(ver=1, code=1, followers=1, domnamelen=3,
+                             domname='LAB', rev=99, uid='10.0.0.66'))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path],
+                       timeout=10)
+            evs = _parse_vtp_capture(res['out'])
+            e = evs[0] if evs else {}
+            scapy_result = {'ran': True, 'domain': e.get('domain'),
+                            'revision': e.get('revision'), 'updater': e.get('updater'),
+                            'pass': bool(evs) and e.get('domain') == 'LAB'
+                                    and e.get('revision') == 99,
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as ex:
+        scapy_result = {'ran': False, 'reason': f'{type(ex).__name__}: {ex}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # EIGRP Watch: passive EIGRP routing-security scanner (Cisco; detection-only)
 # --------------------------------------------------------------------------
 # EIGRP is Cisco's interior gateway protocol (the Cisco-world alternative to OSPF;
@@ -11655,7 +12033,8 @@ def do_routing_selftest():
               'snmp': _snmp_selftest(), 'cert': _cert_selftest(),
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
               'smb': _smb_selftest(), 'relay': _relay_selftest(),
-              'dtp': _dtp_selftest(), 'cdp': _cdp_selftest(), 'eigrp': _eigrp_selftest(),
+              'dtp': _dtp_selftest(), 'cdp': _cdp_selftest(), 'vtp': _vtp_selftest(),
+              'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(), 'tls': _tls_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
@@ -12668,6 +13047,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/cdp-baseline {action}")
         return jsonify(do_cdp_baseline(action))
 
+    @app.route('/api/net/vtp-watch', methods=['GET'])
+    def net_vtp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/vtp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_vtp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/vtp-baseline', methods=['GET', 'POST'])
+    def net_vtp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/vtp-baseline {action}")
+        return jsonify(do_vtp_baseline(action))
+
     @app.route('/api/net/eigrp-watch', methods=['GET'])
     def net_eigrp_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -13042,6 +13439,15 @@ def _cli(argv=None):
 
     cdpst = sub.add_parser('cdp-selftest', help='self-test the CDP detector (no root)')
     cdpst.add_argument('--json', action='store_true', help='emit JSON')
+
+    vtp = sub.add_parser('vtp-watch', help='passive VTP bomb / rogue-server scan (Cisco)')
+    vtp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    vtp.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    vtp.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    vtp.add_argument('--json', action='store_true', help='emit JSON')
+
+    vtpst = sub.add_parser('vtp-selftest', help='self-test the VTP detector (no root)')
+    vtpst.add_argument('--json', action='store_true', help='emit JSON')
 
     eg = sub.add_parser('eigrp-watch', help='passive EIGRP routing-security scan (Cisco)')
     eg.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -13699,6 +14105,45 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"CDP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'vtp-watch':
+        r = do_vtp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"VTP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} frame(s), {r['domain_count']} domain(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for dm in r.get('domains', []):
+                tag = '' if dm['baseline'] else ' *NEW*'
+                base = ('' if dm.get('baseline_revision') is None
+                        else f" (baseline rev {dm['baseline_revision']})")
+                print(f"  domain '{dm['name']}' rev={dm['revision']}{base} "
+                      f"updater={','.join(dm['updaters']) or '?'}{tag}")
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'vtp-selftest':
+        r = _vtp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"domain={sc.get('domain')} revision={sc.get('revision')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"VTP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'eigrp-watch':

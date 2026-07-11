@@ -56,6 +56,7 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 | [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
 | [CDP Watch](#cdp-watch) | Switch & L2/L3 | `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline` |
+| [VTP Watch](#vtp-watch) | Switch & L2/L3 | `GET /api/net/vtp-watch`, `POST /api/net/vtp-baseline` |
 | [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
 | [Relay/Coercion Watch](#relaycoercion-watch) | Switch & L2/L3 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
@@ -101,7 +102,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NDP**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **CDP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **CDP**, **VTP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -366,7 +367,7 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
-STP · DTP · CDP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
+STP · DTP · CDP · VTP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
 Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
 `tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
 cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
@@ -1226,6 +1227,54 @@ spoof / fake-phone VoIP-hop / cdp-enabled leak / flood / field-parse), and — w
 [Scapy](https://scapy.net) is installed — crafts a real CDP frame into a pcap and
 parses it back through `tcpdump -e`, exercising the capture→parse path end to end.
 **API:** `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline`.
+
+### VTP Watch
+A **passive** bomb / rogue-server scanner for Cisco's **VLAN Trunking Protocol**
+(proprietary; the same group MAC `01:00:0c:cc:cc:cc` as CDP/DTP, SNAP OUI `0x00000c`,
+PID `0x2003`). **Detection-only** — it never transmits a VTP frame.
+
+VTP synchronises the **VLAN database** across a VTP domain, and its entire security
+model rests on one 32-bit **configuration revision number**: the switch advertising
+the **highest** revision in the domain wins, and every other switch (in server/client
+mode) **overwrites its VLAN database** to match. So a rogue switch — or a single
+forged Summary Advertisement — that carries the domain name and a higher revision
+silently **rewrites, and can delete, every VLAN across the whole domain**. That's the
+**VTP bomb**: a one-frame, domain-wide outage. VTPv1/2 offer **no per-port
+authentication** (only an optional weak MD5 domain password). What it flags:
+
+- **revision-bomb** — a config revision **higher than the learned baseline** coming
+  from a source that **isn't the known VTP server**: the VLAN-database-overwrite
+  attack. (A higher revision from the *known* server is treated as a legitimate VLAN
+  edit — reported as `vtp-enabled`, with a "Trust current" prompt.)
+- **rogue-server** — a **new VTP speaker**, or a **different VTP domain name**, than
+  the baseline: a rogue switch positioned to seize VLAN management.
+- **vtp-enabled** — VTP present, or a legit revision bump from the known server.
+  Advisory / learn.
+
+The scan uses `tcpdump -e` with the BPF
+`ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2003`, isolating VTP from the other
+protocols on that Cisco group MAC (CDP/DTP/UDLD/PAgP). (Note tcpdump prints the config
+revision in **hex** — `Config Rev a` is 10.) The first scan **learns** the domain,
+revision and server (`data/vtp_watch.json`); "Trust current" re-learns after a
+legitimate VLAN change. Every result carries a **mitigation advisory**: run switches
+in `vtp mode transparent` (or VTPv3 with a password) unless you truly need domain-wide
+VLAN sync, always set a VTP password, and **always zero a switch's config-revision
+before connecting it** — a client/server switch with a higher revision overwrites the
+domain's VLAN database on connect.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py vtp-watch [--iface eth0] [--seconds 30] [--json]
+python3 network_diagnostics.py vtp-selftest     # self-test the detector, no root
+```
+
+`vtp-selftest` drives the real parser + classifier with synthetic captures (clean /
+revision-bomb / legit-bump / rogue-server / rogue-domain / learn / hex-revision
+parse), and — when [Scapy](https://scapy.net) is installed — crafts a real VTP Summary
+Advertisement into a pcap and parses it back through `tcpdump -e`, exercising the
+capture→parse path end to end. **API:** `GET /api/net/vtp-watch`,
+`POST /api/net/vtp-baseline`.
 
 ### FHRP Watch
 A **passive** hijack scanner for the **First Hop Redundancy Protocols** — **HSRP**

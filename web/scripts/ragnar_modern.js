@@ -1227,6 +1227,7 @@ function showNetworkSubtab(name) {
         _relayFillIfaces();
         _dtpFillIfaces();
         _cdpFillIfaces();
+        _vtpFillIfaces();
         _eigrpFillIfaces();
         _isisFillIfaces();
         _fhrpFillIfaces();
@@ -2331,7 +2332,7 @@ function renderNetIntegrity(d) {
     // Prefer the full per-check map (extended monitor); fall back to dns/arp/dhcp.
     let entries;
     if (d.checks && Object.keys(d.checks).length) {
-        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'cdp', 'igmp', 'ipv6', 'ndp', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'cert', 'tls'];
+        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'cdp', 'vtp', 'igmp', 'ipv6', 'ndp', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'cert', 'tls'];
         entries = Object.keys(d.checks).sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99))
             .map(k => [d.checks[k].label || k.toUpperCase(), d.checks[k].verdict, d.checks[k].reasons || []]);
     } else {
@@ -4055,6 +4056,95 @@ async function cdpTrustBaseline() {
     }
 }
 
+// ---- VTP Watch (passive VLAN Trunking Protocol bomb / rogue-server) --------
+const _VTP_VERDICT_STYLE = {
+    clean:           ['bg-green-950/40 border-green-900 text-green-400', '✓ No VTP anomaly — domain / revision match the trusted baseline'],
+    'vtp-enabled':   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ VTP is enabled here — a higher config-revision can overwrite the VLAN DB'],
+    'rogue-server':  ['bg-red-950/60 border-red-800 text-red-300', '🛑 Rogue VTP speaker / domain — a switch positioned to seize VLAN management'],
+    'revision-bomb': ['bg-red-950/60 border-red-800 text-red-300', '🛑 VTP BOMB — higher revision from an unknown source overwrites every VLAN (domain-wide outage)'],
+    unknown:         ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+function _vtpFillIfaces() {
+    const sel = document.getElementById('vtp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runVtpWatch() {
+    const out = document.getElementById('vtp-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('vtp-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('vtp-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '30';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing VTP advertisements (~30s apart)…</p>';
+    try {
+        _vtpFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/vtp-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool) extra = ' <button onclick="installNetTool(\'tcpdump\', this, runVtpWatch)" class="ml-2 underline text-cyan-400">Install tcpdump</button>';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + extra + '</p>';
+            return;
+        }
+        const [cls, label] = _VTP_VERDICT_STYLE[d.verdict] || _VTP_VERDICT_STYLE.unknown;
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${d.packet_count} VTP frame(s), ${d.domain_count} domain(s)${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        if ((d.domains || []).length) {
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Domain</th><th class="px-2 py-1">Config Rev</th><th class="px-2 py-1">Baseline Rev</th><th class="px-2 py-1">Updater</th><th class="px-2 py-1">Source MAC(s)</th><th class="px-2 py-1">Trust</th></tr>' +
+                '</thead><tbody>' +
+                d.domains.map(dm => {
+                    const bombed = dm.baseline && dm.baseline_revision != null && dm.revision > dm.baseline_revision;
+                    const badge = dm.baseline ? '<span class="text-green-400">✓ known</span>' : '<span class="text-red-300">? new</span>';
+                    return `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono ${dm.baseline ? 'text-gray-200' : 'text-red-300'}">${escapeHtml(dm.name)}</td>
+                        <td class="px-2 py-1 font-mono ${bombed ? 'text-red-300' : 'text-gray-200'}">${dm.revision}</td>
+                        <td class="px-2 py-1 font-mono text-gray-500">${dm.baseline_revision == null ? '—' : dm.baseline_revision}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((dm.updaters || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((dm.srcs || []).join(', '))}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        }
+        if (d.reasons && d.reasons.length) {
+            html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
+                d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
+        }
+        (d.advisories || []).forEach(a => {
+            html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-gray-400 border-slate-700 bg-slate-900/40">${escapeHtml(a)}</div>`;
+        });
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+async function vtpTrustBaseline() {
+    try {
+        await postAPI('/api/net/vtp-baseline', { action: 'reset' });
+        addConsoleMessage('VTP baseline reset — re-learning current domain / revision / server', 'info');
+        await runVtpWatch();
+    } catch (e) {
+        addConsoleMessage('Failed to reset VTP baseline: ' + e.message, 'error');
+    }
+}
+
 // ---- IS-IS Watch (passive IGP routing-security scanner) --------------------
 const _ISIS_VERDICT_STYLE = {
     clean:          ['bg-green-950/40 border-green-900 text-green-400', '✓ No IS-IS anomalies detected'],
@@ -4602,7 +4692,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ndp: 'NDP Watch (IPv6 neighbor spoofing)', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', cert: 'Cert Watch', tls: 'TLS Watch (passive JA4/QUIC)', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', cdp: 'CDP Watch (Cisco Discovery leak/flood)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ndp: 'NDP Watch (IPv6 neighbor spoofing)', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', cert: 'Cert Watch', tls: 'TLS Watch (passive JA4/QUIC)', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', cdp: 'CDP Watch (Cisco Discovery leak/flood)', vtp: 'VTP Watch (VTP bomb / VLAN-DB wipe)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -4611,7 +4701,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'ndp', 'raguard', 'ntp', 'icmp', 'snmp', 'cert', 'tls', 'stp', 'smb', 'relay', 'dtp', 'cdp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'ndp', 'raguard', 'ntp', 'icmp', 'snmp', 'cert', 'tls', 'stp', 'smb', 'relay', 'dtp', 'cdp', 'vtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">

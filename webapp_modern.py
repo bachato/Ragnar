@@ -1239,6 +1239,7 @@ _NI_CRITICAL = {
     'hijacked', 'spoofed', 'rogue', 'starvation', 'compromised',        # dns/arp/dhcp
     'root-hijack', 'bpdu-flood',                                        # stp
     'vlan-hop',                                                         # dtp
+    'revision-bomb',                                                    # vtp (VLAN-DB wipe)
     'hijack',                                                           # fhrp/bgp
     'injection', 'rogue-router',                                        # ospf/eigrp/isis
     'poisoning', 'spoof-conflict', 'smbv1-active',                      # smb
@@ -1299,6 +1300,7 @@ def _net_integrity_check_once():
         ('stp', 'STP', lambda: watch(nd.do_stp_watch)),
         ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch)),
         ('cdp', 'CDP', lambda: watch(nd.do_cdp_watch)),
+        ('vtp', 'VTP', lambda: watch(nd.do_vtp_watch)),
         ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch)),
         ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch)),
         ('ndp', 'NDP', lambda: watch(nd.do_ndp_watch)),

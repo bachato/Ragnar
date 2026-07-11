@@ -1605,6 +1605,21 @@
                     </div>
                     <div id="cdp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- VTP Watch (bomb / rogue-server) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">VTP Watch <span class="text-xs font-normal text-gray-500">(Cisco · VTP bomb / VLAN-DB wipe)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive VLAN Trunking Protocol scanner — <strong>detection-only</strong>, never sends a VTP frame. VTP syncs the VLAN database across a domain, and its whole security model rests on one number: the switch advertising the <strong>highest configuration revision</strong> wins, and every other switch overwrites its VLAN database to match. So a rogue switch — or one forged frame — carrying the domain name and a higher revision silently <strong>rewrites, and can delete, every VLAN across the entire domain</strong>: the <strong>VTP bomb</strong>, a one-frame domain-wide outage. VTPv1/2 have no per-port authentication. Flags <strong>revision-bomb</strong> (higher revision from an unexpected source), <strong>rogue-server</strong> (a new VTP speaker / different domain), and <strong>vtp-enabled</strong> (present / a legit bump from the known server).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, VTP PID 0x2003). The first scan learns the domain, revision and VTP server as the baseline (<span class="font-mono">data/vtp_watch.json</span>); a higher revision from a source that isn't the known server is the bomb signal. Click "Trust current" after a legitimate VLAN change. Mitigate with <span class="font-mono">vtp mode transparent</span> (or VTPv3 + password), and always zero a switch's config-revision before connecting it.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="vtp-iface" title="Interface for the VTP capture — pick the access/trunk-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="vtp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runVtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan VTP</button>
+                        <button onclick="vtpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current VTP domain / revision / server as the trusted baseline — use after a legitimate VLAN change">Trust current</button>
+                    </div>
+                    <div id="vtp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning) -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">SMB Watch <span class="text-xs font-normal text-gray-500">(SMBv1 · LLMNR/NBT-NS/mDNS poisoning)</span></h3>
@@ -6054,7 +6069,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260711-cdpwatch"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260711-vtpwatch"></script>
 
 </body>
 </html>
