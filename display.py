@@ -83,9 +83,12 @@ logger = Logger(name="display.py", level=logging.DEBUG)
 # Import button listener (only functional on Pi with GPIO)
 try:
     from epd_button import EPDButtonListener, PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC
+    from epd_button import NETDIAG_CARD_FUNCS, NETDIAG_CARD_NAMES
 except ImportError:
     EPDButtonListener = None
     PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC = 0, 1, 2, 3, 4, 5
+    NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL"]
+    NETDIAG_CARD_FUNCS = {}
 
 # Network Diagnostic mode: number of auto-cycling e-Paper sub-pages
 # (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL). See
@@ -1154,20 +1157,51 @@ class Display:
                                   pad_x + name_w, w - pad_x)
             y += row_h
 
-    def _render_netdiag_page(self, image, draw, page, frozen=False):
+    def _render_netdiag_menu(self, image, draw, highlight):
+        """The card-selection menu (reached with KEY2 on the LCD HAT): list the
+        net-diag cards and highlight the current one. The joystick moves the
+        highlight; the centre press opens that card."""
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        font = self.shared_data.font_arial9
+        self._draw_page_frame(draw, "NET CARDS", hint="K2 back · press=open")
+        y = int(26 * sy)
+        pad_x = int(8 * sx)
+        row_h = int(13 * sy)
+        n = len(NETDIAG_CARD_NAMES)
+        for i, nm in enumerate(NETDIAG_CARD_NAMES):
+            sel = (i == highlight % n)
+            label = f"{i + 1}. {nm}"
+            if sel:
+                draw.rectangle([int(3 * sx), y - int(1 * sy),
+                                w - int(3 * sx), y + row_h - int(2 * sy)], fill=0)
+                draw.text((pad_x, y), label, font=font, fill=1)
+            else:
+                draw.text((pad_x, y), label, font=font, fill=0)
+            y += row_h
+
+    def _render_netdiag_page(self, image, draw, page, frozen=False, func_idx=-1):
         """Render one network-diagnostic sub-page. Space on the panel is scarce,
         so each page shows only the handful of facts an engineer actually needs
-        when diagnosing a switch port or a wireless link."""
+        when diagnosing a switch port or a wireless link. On the LCD HAT the
+        footer shows the highlighted in-card function (Up/Down cycles it, the
+        centre press runs it); ``func_idx`` is the selection (-1 = none)."""
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         data = self._get_cached_page_data('netdiag', self._fetch_netdiag_data, ttl=10)
-        names = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL"]
+        names = NETDIAG_CARD_NAMES
         name = names[page % len(names)]
-        state = "PAUSED" if frozen else "auto5s"
-        # Narrow panels (128px LCD HAT) have no room for the key legend, and its
-        # joystick drives navigation anyway — show just the page counter/state.
+        state = "auto" if not frozen else "manual"
         render_w = getattr(self, 'render_w', self.shared_data.width)
+        funcs = NETDIAG_CARD_FUNCS.get(page, [])
         if render_w < 150:
-            hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}"
+            # Narrow LCD HAT: show the page counter + the highlighted function
+            # (the joystick's Up/Down selects it, press runs it). Cards with no
+            # functions just show the auto/manual state.
+            if funcs and func_idx >= 0:
+                hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} >{funcs[func_idx % len(funcs)][0]}"
+            else:
+                hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}"
         else:
             hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}  K1nav K2port K3png K4dns"
         self._draw_page_frame(draw, f"NET {name}", hint=hint)
@@ -3387,18 +3421,28 @@ class Display:
                         self._netdiag_sleep(1.0 if result.get('running') else NETDIAG_CYCLE_SECONDS, bl, seq0)
                         continue
                     frozen = bool(getattr(bl, 'netdiag_frozen', False)) if bl else False
+                    view = getattr(bl, 'netdiag_view', 'card') if bl else 'card'
                     if bl is not None:
                         page = bl.netdiag_page % NETDIAG_PAGE_COUNT
                     else:
                         page = getattr(self, '_netdiag_page', 0) % NETDIAG_PAGE_COUNT
                     try:
-                        self._render_netdiag_page(image, draw, page, frozen=frozen)
+                        if view == 'menu':
+                            self._render_netdiag_menu(image, draw, page)
+                        else:
+                            func_idx = getattr(bl, 'netdiag_func_idx', -1) if bl else -1
+                            self._render_netdiag_page(image, draw, page,
+                                                      frozen=frozen, func_idx=func_idx)
                     except Exception as e:
                         logger.debug(f"netdiag render error: {e}")
-                    if not frozen:
+                    # Auto-cycle the cards only while auto-switch is on (not
+                    # frozen) and not in the selection menu.
+                    if not frozen and view != 'menu':
                         nextp = (page + 1) % NETDIAG_PAGE_COUNT
                         if bl is not None:
                             bl.netdiag_page = nextp
+                            if hasattr(bl, 'netdiag_func_idx'):
+                                bl.netdiag_func_idx = 0
                         else:
                             self._netdiag_page = nextp
                     self._commit_netdiag_frame(image)

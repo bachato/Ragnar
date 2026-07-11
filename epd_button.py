@@ -53,6 +53,22 @@ CONFLICTING_BUTTON_SERVICES = ['airprint.service']
 # to avoid importing display.py here (display imports this module).
 NETDIAG_PAGE_COUNT = 3
 
+# Net-diag "cards" and the test functions selectable inside each one. On the
+# 1.44" LCD HAT the joystick cycles these with Up/Down and runs the highlighted
+# one with the centre press (the "card" navigation model); the 2.7" e-Paper HAT
+# still fires them from its hardware keys. Kept module-level so both display.py
+# (for rendering) and the LCD listener (for dispatch) share one definition.
+NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL"]
+NETDIAG_CARD_FUNCS = {
+    0: [("Locate Port", "port"), ("L2 Health", "l2")],            # LINK
+    1: [("Ping GW", "ping_gw"), ("Ping WAN", "ping_wan"),
+        ("DNS Doctor", "dns"), ("Speedtest", "speedtest")],       # IP
+    2: [("Locate Port", "port"), ("L2 Health", "l2")],            # SWITCH
+    3: [],                                                         # DHCP (auto)
+    4: [],                                                         # WIFI (live)
+    5: [],                                                         # SIGNAL (auto)
+}
+
 # Hold time (seconds) that separates a short press from a long press in the
 # netdiag layer. Comfortably above the 0.3s debounce.
 NETDIAG_HOLD_TIME = 0.6
