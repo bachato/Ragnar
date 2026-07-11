@@ -23,6 +23,10 @@ exception, the [Network Integrity Monitor](#-network-integrity-monitor), which
 watches for DNS poisoning and ARP spoofing in the background and can push you an
 alert.
 
+<img width="1206" height="1862" alt="image" src="https://github.com/user-attachments/assets/bcf622a8-f8b8-45d8-857d-d214dd724f1e" />
+
+
+
 ### Tool index
 
 | Tool | Sub-tab | Endpoint |
