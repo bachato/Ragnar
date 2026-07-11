@@ -33,6 +33,8 @@ from datetime import datetime, timezone, timedelta
 
 import bgp_speaker
 import path_asymmetry
+import tls_watch
+from tls_watch import do_tls_watch
 
 try:
     from flask import request, jsonify
@@ -10779,6 +10781,17 @@ def _bgp_selftest():
     return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
 
 
+def _tls_selftest():
+    """Adapt tls_watch.selftest() to the aggregator's scenarios/scapy shape."""
+    r = tls_watch.selftest()
+    scen = [{'name': c['name'], 'pass': c['pass'],
+             'expect': c.get('want'), 'got': c.get('got')}
+            for c in r['checks'] if not c.get('skipped')]
+    return {'success': r['success'], 'scenarios': scen,
+            'scapy': {'ran': _have_scapy(),
+                      'pass': all(c['pass'] for c in r['checks'])}}
+
+
 def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
@@ -10790,7 +10803,7 @@ def do_routing_selftest():
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
               'smb': _smb_selftest(), 'relay': _relay_selftest(),
               'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
-              'fhrp': _fhrp_selftest(),
+              'fhrp': _fhrp_selftest(), 'tls': _tls_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
@@ -11561,6 +11574,17 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/igmp-baseline {action}")
         return jsonify(do_igmp_baseline(action))
 
+    @app.route('/api/net/tls-watch', methods=['GET'])
+    def net_tls_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        iface = iface or _default_route_iface()
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 30)
+        no_quic = (request.args.get('no_quic') or '').lower() in ('1', 'true', 'yes')
+        _log(f"net/tls-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_tls_watch(interface=iface, seconds=secs, no_quic=no_quic))
+
     @app.route('/api/net/ipv6-watch', methods=['GET'])
     def net_ipv6_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -12003,6 +12027,15 @@ def _cli(argv=None):
     st = sub.add_parser('igmp-selftest', help='self-test the IGMP detectors (no root)')
     st.add_argument('--json', action='store_true', help='emit JSON')
 
+    tw = sub.add_parser('tls-watch', help='passive TLS/QUIC handshake observer')
+    tw.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    tw.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-30)')
+    tw.add_argument('--no-quic', action='store_true', help='skip QUIC observation')
+    tw.add_argument('--json', action='store_true', help='emit JSON')
+
+    tst = sub.add_parser('tls-selftest', help='self-test the TLS Watch detectors (no root)')
+    tst.add_argument('--json', action='store_true', help='emit JSON')
+
     v6 = sub.add_parser('ipv6-watch', help='passive IPv6 first-hop (RA/DHCPv6) scan')
     v6.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     v6.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
@@ -12141,6 +12174,35 @@ def _cli(argv=None):
     bst.add_argument('--json', action='store_true', help='emit JSON')
 
     args = p.parse_args(argv)
+    if args.cmd == 'tls-watch':
+        iface = args.iface or _default_route_iface()
+        r = do_tls_watch(interface=iface, seconds=args.seconds, no_quic=args.no_quic)
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"TLS Watch [{r.get('interface')}] {r.get('seconds')}s: "
+                  f"{r['verdict'].upper()}  ({r.get('tls', 0)} TLS, {r.get('quic', 0)} QUIC)")
+            for x in r.get('sessions', []):
+                print(f"  [{x['proto']}] {x['src']} -> {x['dst']}  {x.get('ja4', '')}")
+                if x.get('sni'):
+                    print(f"      SNI {x['sni']}  ALPN {x.get('alpn')}")
+                for f in x.get('findings', []):
+                    print(f"      - {f['severity']} {f['code']}: {f['message']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'tls-selftest':
+        r = _tls_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        else:
+            for sc in r['scenarios']:
+                print(f"  [{'PASS' if sc['pass'] else 'FAIL'}] {sc['name']}")
+            print(f"  scapy: {'available' if r['scapy']['ran'] else 'absent'}")
+            print(f"TLS Watch self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
     if args.cmd == 'igmp-watch':
         r = do_igmp_watch(interface=args.iface, seconds=args.seconds,
                           learn=not args.no_learn)
