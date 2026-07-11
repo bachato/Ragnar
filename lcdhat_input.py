@@ -27,12 +27,13 @@
 #   KEY3 short/long: next display page / restart Ragnar service
 #
 # Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad.
+# Pages: LINK / IP / SWITCH / DHCP / WIFI (SSID+RSSI) / SIGNAL (nearby strengths).
 # The joystick navigates + pings, the keys fire tests (a long key-press fires
 # the "advanced" variant, mirroring the 2.7" HAT's short/long netdiag gestures):
-#   Joy Up        : previous diagnostic page   (as seen on the text)
-#   Joy Down      : next diagnostic page       (as seen on the text)
-#   Joy Left      : ping gateway (LAN)
-#   Joy Right     : ping internet (8.8.8.8, WAN)
+#   Joy Left      : previous diagnostic page   (as seen on the text)
+#   Joy Right     : next diagnostic page       (as seen on the text)
+#   Joy Up        : ping gateway (LAN)
+#   Joy Down      : ping internet (8.8.8.8, WAN)
 #   Joy Press     : dismiss a shown result, else pause/resume auto-cycle
 #   KEY1          : toggle the mode off (back to the normal screens)
 #   KEY2 short/long: locate switch port / L2 health capture (~12s)
@@ -50,9 +51,10 @@ logger = logging.getLogger(__name__)
 # (joystick-center toggles it). Matches the net-diag auto-cycle cadence.
 AUTOSCROLL_INTERVAL = 5.0
 
-# Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP). Mirrors
-# display.NETDIAG_PAGE_COUNT; kept local so this module needn't import display.py.
-NETDIAG_PAGE_COUNT = 4
+# Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP / WIFI / SIGNAL).
+# Mirrors display.NETDIAG_PAGE_COUNT; kept local so this module needn't import
+# display.py.
+NETDIAG_PAGE_COUNT = 6
 
 # Button pins
 KEY1_PIN = 21
@@ -266,18 +268,19 @@ class LCDHATInputListener(EPDButtonListener):
         self.netdiag_seq += 1   # wake the display promptly
 
         name = self._visual_dir(name)
-        # Up/Down page through the diagnostics; Left/Right run the two pings
-        # (KEY1 now owns the mode toggle, so the pings moved off it).
-        if name == 'up':
+        # Left/Right page through the diagnostics (like turning pages); Up/Down
+        # run the two pings. (KEY1 owns the mode toggle, so the pings live on the
+        # joystick.)
+        if name == 'left':
             self._netdiag_step_page(-1)
             return
-        if name == 'down':
+        if name == 'right':
             self._netdiag_step_page(+1)
             return
-        if name == 'left':
+        if name == 'up':
             self._run_netdiag_test('ping_gw')
             return
-        if name == 'right':
+        if name == 'down':
             self._run_netdiag_test('ping_wan')
             return
         if name == 'press':

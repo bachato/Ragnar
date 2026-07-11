@@ -75,9 +75,10 @@ GPIO pins (BCM), fixed by the HAT: `KEY1=21`, `KEY2=20`, `KEY3=16`; joystick
 
 ### Network Diagnostic mode
 
-**KEY1** toggles the mode back off. The joystick navigates (↑/↓ page) and runs
-the two pings (← gateway, → internet); **KEY2**/**KEY3** fire the other tests
-(short/long) — see the full
+Pages: **LINK · IP · SWITCH · DHCP · WIFI · SIGNAL**. **KEY1** toggles the mode
+back off. The joystick pages through the diagnostics (**← previous / → next**)
+and runs the two pings (**↑ gateway, ↓ internet**); **KEY2**/**KEY3** fire the
+other tests (short/long) — see the full
 [field‑test pad](nettools.md#field-test-pad-144-lcd-hat--joystick) table.
 
 ---

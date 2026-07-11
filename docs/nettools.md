@@ -126,7 +126,7 @@ into a switch and read the essentials off the screen with **no laptop and no
 internet**. Everything shown is gathered locally (`ip` / `ethtool` /
 `lldpctl` / `resolv.conf`), so it works on an isolated or dead network.
 
-The display auto-cycles four pages every **5 seconds**:
+The display auto-cycles six pages every **5 seconds**:
 
 1. **LINK** — the physical wired port: interface, link up/down, negotiated
    speed, duplex, auto-negotiation, MAC. (Instantly spot a port that fell back
@@ -140,11 +140,18 @@ The display auto-cycles four pages every **5 seconds**:
    how many DHCP servers answered, the server-id and gateway it offers vs. your
    active gateway, and a **ROGUE!** count if a fake server is present. The scan
    runs in the background so the page never blocks the cycle.
+5. **WIFI** — the wireless link you're on: **SSID**, **RSSI** (dBm) + quality %,
+   band/channel and TX rate, with a live signal bar under the facts (walk around
+   to find dead spots). Read passively from `iw dev … link` — no scan.
+6. **SIGNAL** — a bar chart of the **strongest nearby networks' signal
+   strengths** (SSID + RSSI), from a background [passive Wi-Fi
+   scan](wifi-analyzer.md) so the page never blocks.
 
-It focuses on the **physical** wired NIC (`eth*` / `en*`), ignoring VPN,
-tunnel, bridge and container interfaces. Toggle it off to restore the normal
-Ragnar display. The setting is persisted (`network_diagnostic_mode` in the
-config) and shared across sessions.
+The wired pages focus on the **physical** wired NIC (`eth*` / `en*`), ignoring
+VPN, tunnel, bridge and container interfaces; the WIFI/SIGNAL pages use the
+wireless interface. Toggle it off to restore the normal Ragnar display. The
+setting is persisted (`network_diagnostic_mode` in the config) and shared across
+sessions.
 
 #### Field-test key pad (2.7" HAT)
 
@@ -179,9 +186,9 @@ settings** as *"1.44" ST7735S LCD HAT + joystick"*. While the mode is on:
 | Input | Action |
 |-------|--------|
 | **KEY1** | **Toggle the mode off** — back to the normal screens |
-| **Joystick ↑ / ↓** | Previous / next diagnostic page |
-| **Joystick ←** | **Ping the gateway** (LAN) |
-| **Joystick →** | **Ping the internet** (`8.8.8.8`, WAN) |
+| **Joystick ← / →** | Previous / next diagnostic page |
+| **Joystick ↑** | **Ping the gateway** (LAN) |
+| **Joystick ↓** | **Ping the internet** (`8.8.8.8`, WAN) |
 | **Joystick press** | Dismiss a shown result, else **pause / resume** the auto-cycle |
 | **KEY2** short / long | **Locate port** — blink the switch link LED / **L2 health** capture (~12 s) |
 | **KEY3** short / long | **Speed test** / **DNS Doctor** — poisoning/hijack verdict |
