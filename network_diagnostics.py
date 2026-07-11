@@ -9043,6 +9043,425 @@ def _dtp_selftest():
 
 
 # --------------------------------------------------------------------------
+# CDP Watch: passive Cisco Discovery Protocol flood / spoof / info-leak scanner
+# --------------------------------------------------------------------------
+# CDP (Cisco proprietary, group MAC 01:00:0c:cc:cc:cc, SNAP OUI 0x00000c PID
+# 0x2000) is on by default on every Cisco device and advertises, unauthenticated,
+# to anyone on the wire: the device hostname, full IOS software version, hardware
+# platform/model, management IP, native VLAN, VTP domain, voice VLAN and port-ID.
+# LLDP Switch Discovery *uses* that to map the network; this Watch looks at the
+# same frames as a defender and flags their abuse. Where DTP Watch (same group
+# MAC, PID 0x2004) catches VLAN-hop trunk negotiation, CDP Watch flags:
+#   * flood        — a spray of CDP frames / distinct device-IDs (Yersinia cdp
+#     flood): fills the neighbour table and spikes switch CPU (a DoS).
+#   * spoof        — a NEW CDP speaker not in the learned baseline (a rogue device
+#     injecting a fake neighbour), including a fake Cisco IP Phone advertising a
+#     Voice VLAN — the CDP half of a VoIP-VLAN-hop.
+#   * cdp-enabled  — CDP is on here at all: the scan surfaces exactly what it
+#     leaks (IOS version → CVEs, model, mgmt IP, native/voice VLAN) so an operator
+#     can see the reconnaissance an attacker on that port gets for free.
+# This scanner is PASSIVE: it decodes captured CDP, it never transmits CDP. First
+# run learns the trusted speakers into data/cdp_watch.json; "Trust current"
+# re-learns after a legitimate change.
+_CDP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'cdp_watch.json')
+_cdp_watch_lock = threading.Lock()
+_CDP_EVENTS_CAP = 200
+_CDP_HDR_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*01:00:0c:cc:cc:cc')
+# CDP hellos are ~60s apart per neighbour, so any sustained rate is a flood.
+_CDP_FLOOD_RATE = 10.0
+# Yersinia cdp-flood sprays frames with random device-IDs; many distinct IDs in
+# one short window is the flood signature even if the raw rate looks modest.
+_CDP_FLOOD_IDS = 30
+
+
+def _cdp_tlv_val(line):
+    """Text after the final 'bytes:' / 'byte:' on a CDP TLV line, unquoted."""
+    m = re.search(r'byte[s]?:\s*(.*)$', line)
+    v = (m.group(1).strip() if m else '')
+    return v.strip("'") if v else ''
+
+
+def _parse_cdp_capture(output):
+    """Parse `tcpdump -e -t -v` CDP text into per-frame events. Each frame is a
+    header line (`<src> > 01:00:0c:cc:cc:cc, ... pid CDP (0x2000): CDPv2, ...`)
+    followed by indented TLV lines (Device-ID, Version, Platform, Address, Native
+    VLAN, VTP domain, Port-ID, Voice/appliance VLAN, Management Address)."""
+    events = []
+    cur = None
+    collecting_version = False
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _CDP_HDR_RE.match(line)
+        if m and 'CDPv' in line:
+            if cur:
+                events.append(cur)
+            ver = re.search(r'CDPv(\d+)', line)
+            cur = {'src': m.group(1).lower(),
+                   'cdpv': int(ver.group(1)) if ver else None,
+                   'device_id': None, 'sw_version': None, 'platform': None,
+                   'port_id': None, 'native_vlan': None, 'vtp_domain': None,
+                   'mgmt_addr': None, 'address': None, 'voice_vlan': None,
+                   'capabilities': None}
+            collecting_version = False
+            continue
+        if cur is None:
+            continue
+        low = line.lower()
+        if collecting_version:
+            # A multi-line Version String continues on indented lines until the
+            # next TLV header (`Name (0xNN)`).
+            if re.match(r'^[A-Z][\w /-]*\(0x[0-9a-fA-F]+\)', line):
+                collecting_version = False
+            elif line:
+                cur['sw_version'] = ((cur['sw_version'] + ' ') if cur['sw_version']
+                                     else '') + line
+                continue
+        if low.startswith('device-id'):
+            cur['device_id'] = _cdp_tlv_val(line) or None
+        elif low.startswith('version string') or low.startswith('software version'):
+            v = _cdp_tlv_val(line)
+            if v:
+                cur['sw_version'] = v
+            else:
+                collecting_version = True
+        elif low.startswith('platform'):
+            cur['platform'] = _cdp_tlv_val(line) or None
+        elif low.startswith('port-id'):
+            cur['port_id'] = _cdp_tlv_val(line) or None
+        elif low.startswith('native vlan'):
+            nv = re.search(r'byte[s]?:\s*(\d+)', line)
+            cur['native_vlan'] = int(nv.group(1)) if nv else None
+        elif low.startswith('vtp management domain'):
+            cur['vtp_domain'] = _cdp_tlv_val(line) or None
+        elif low.startswith('appliance') or 'voice vlan' in low:
+            vv = re.search(r'vlan[^0-9]*(\d+)', low)
+            cur['voice_vlan'] = int(vv.group(1)) if vv else cur['voice_vlan']
+        elif low.startswith('address') and cur['address'] is None:
+            a = re.search(r'ipv4 \(\d+\)\s*([0-9.]+)', low)
+            cur['address'] = a.group(1) if a else None
+        elif low.startswith('management address'):
+            a = re.search(r'ipv4 \(\d+\)\s*([0-9.]+)', low)
+            cur['mgmt_addr'] = a.group(1) if a else None
+        elif low.startswith('capability'):
+            c = re.search(r'byte[s]?:.*?:\s*(.*)$', line)
+            cur['capabilities'] = (c.group(1).strip() if c else None) or None
+    if cur:
+        events.append(cur)
+    return [e for e in events if e['src']]
+
+
+def _cdp_watch_load():
+    try:
+        with open(_CDP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cdp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_CDP_WATCH_PATH), exist_ok=True)
+        tmp = _CDP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _CDP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_cdp_baseline(action='get'):
+    """Manage the learned CDP baseline (trusted CDP speaker MACs — the real
+    switches/phones). action='reset' re-learns on the next scan."""
+    with _cdp_watch_lock:
+        if action == 'reset':
+            _cdp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _cdp_watch_load()
+        return {'success': True, 'baseline': {'speakers': b.get('speakers') or []}}
+
+
+def _cdp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed CDP events. Separated from capture for the
+    self-test. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+
+    speakers = {}
+    for e in events:
+        sp = speakers.setdefault(e['src'], {
+            'src': e['src'], 'count': 0, 'device_id': None, 'sw_version': None,
+            'platform': None, 'port_id': None, 'native_vlan': None,
+            'vtp_domain': None, 'mgmt_addr': None, 'address': None,
+            'voice_vlan': None, 'capabilities': None})
+        sp['count'] += 1
+        for k in ('device_id', 'sw_version', 'platform', 'port_id', 'native_vlan',
+                  'vtp_domain', 'mgmt_addr', 'address', 'voice_vlan', 'capabilities'):
+            if e.get(k) is not None:
+                sp[k] = e[k]
+
+    known = set(baseline.get('speakers') or [])
+    had_baseline = bool(known)
+    device_ids = {sp['device_id'] for sp in speakers.values() if sp['device_id']}
+
+    learned = False
+    if learn and not had_baseline and speakers:
+        baseline['speakers'] = sorted(speakers.keys())
+        learned = True
+        known = set(speakers.keys())
+        had_baseline = True
+
+    PRIORITY = ['flood', 'spoof', 'cdp-enabled', 'clean']
+    verdict = 'clean'
+    reasons = []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    # --- flood: sustained rate or a spray of distinct device-IDs (Yersinia) ---
+    rate = round(len(events) / seconds, 2)
+    if (rate >= _CDP_FLOOD_RATE and len(events) >= _CDP_FLOOD_RATE * seconds) \
+            or len(device_ids) >= _CDP_FLOOD_IDS:
+        bump('flood')
+        reasons.append(f"CDP flood: {len(events)} frames in {seconds}s ({rate}/s), "
+                       f"{len(device_ids)} distinct device-IDs — CDP neighbour-table / "
+                       f"CPU exhaustion DoS (e.g. Yersinia cdp flood)")
+
+    for src in sorted(speakers):
+        sp = speakers[src]
+        is_new = had_baseline and src not in known
+        if is_new and verdict != 'flood':
+            bump('spoof')
+            phone = ((sp['capabilities'] and 'phone' in sp['capabilities'].lower())
+                     or sp['voice_vlan'] is not None)
+            tail = (f" advertising IP-Phone capability / Voice VLAN "
+                    f"{sp['voice_vlan']} — possible VoIP-VLAN-hop (fake phone)"
+                    if phone else "")
+            reasons.append(
+                f"New CDP speaker {src} claiming '{sp['device_id'] or '?'}' "
+                f"({sp['platform'] or '?'}) not in the baseline — rogue/spoofed CDP "
+                f"neighbour{tail}")
+
+    # --- cdp-enabled / info-leak: surface exactly what CDP hands an attacker ---
+    if verdict == 'clean' and learned and speakers:
+        bump('cdp-enabled')
+    if verdict == 'cdp-enabled' and not reasons:
+        leaks = []
+        for sp in speakers.values():
+            bits = []
+            if sp['sw_version']:
+                bits.append('IOS/version')
+            if sp['mgmt_addr'] or sp['address']:
+                bits.append('mgmt IP ' + (sp['mgmt_addr'] or sp['address']))
+            if sp['native_vlan'] is not None:
+                bits.append(f'native VLAN {sp["native_vlan"]}')
+            if sp['voice_vlan'] is not None:
+                bits.append(f'voice VLAN {sp["voice_vlan"]}')
+            leaks.append(f"{sp['device_id'] or sp['src']} ({sp['platform'] or '?'})"
+                         + (': ' + ', '.join(bits) if bits else ''))
+        reasons.append(
+            "CDP is enabled on this segment — it broadcasts " + '; '.join(leaks) +
+            " in clear to anyone on the wire (reconnaissance goldmine). If any of "
+            "these ports face users, disable CDP there (`no cdp enable`).")
+
+    advisories = []
+    if speakers:
+        advisories.append(
+            "Disable CDP on access/edge ports (`no cdp enable`; `no cdp run` globally "
+            "if unused). CDP is unauthenticated and leaks device model, IOS version "
+            "(→ known CVEs), management IP, native/voice VLAN and port-ID to any "
+            "listener. Where discovery is needed, prefer LLDP with minimal TLVs.")
+
+    if reasons:
+        summary = reasons
+    elif not speakers:
+        summary = ['No CDP seen — no Cisco Discovery Protocol on this segment']
+    else:
+        summary = ['CDP speakers all match the trusted baseline']
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': summary,
+        'learned': learned,
+        'speaker_count': len(speakers),
+        'packet_count': len(events),
+        'rate': rate,
+        'speakers': [{
+            'src': s, 'device_id': sp['device_id'], 'platform': sp['platform'],
+            'sw_version': sp['sw_version'], 'port_id': sp['port_id'],
+            'native_vlan': sp['native_vlan'], 'vtp_domain': sp['vtp_domain'],
+            'mgmt_addr': sp['mgmt_addr'] or sp['address'],
+            'voice_vlan': sp['voice_vlan'], 'count': sp['count'],
+            'baseline': s in known,
+        } for s, sp in sorted(speakers.items())],
+        'advisories': advisories,
+    }
+
+
+def _cdp_capture(interface, seconds):
+    """One passive tcpdump window over CDP frames -> (raw, error). Uses -e for the
+    sending MAC; the BPF isolates CDP (PID 0x2000) from the other protocols that
+    share the Cisco group MAC (DTP/VTP/UDLD/PAgP)."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    bpf = 'ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2000'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-e',
+                '-nn', '-t', '-v', '-s', '1500', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_cdp_watch(interface=None, seconds=30, learn=True):
+    """Passive CDP flood / spoof / info-leak scanner (detection-only). CDP hellos
+    are ~60s apart, so the default window is longer. Learns the trusted CDP
+    speakers on first run."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 30, 5, 65)
+
+    text, err = _cdp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_cdp_capture(text)
+
+    with _cdp_watch_lock:
+        baseline = _cdp_watch_load()
+        result = _cdp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned'):
+            _cdp_watch_save(baseline)
+        if result['verdict'] not in ('clean', 'cdp-enabled'):
+            b = _cdp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_CDP_EVENTS_CAP:]
+            _cdp_watch_save(b)
+
+    result['interface'] = iface
+    result['seconds'] = seconds
+    return result
+
+
+def _cdp_selftest():
+    """Self-test the CDP detector with synthetic captures, plus a Scapy end-to-end
+    leg (craft a real CDP frame -> pcap -> tcpdump -e -> parse)."""
+    scenarios = []
+
+    def frame(src, device_id='Switch1.lab', version='Cisco IOS Software, C3560, '
+              'Version 12.2(55)SE', platform='cisco WS-C3560-24TS', port='Fa0/1',
+              native=1, vtp='lab', mgmt='10.0.0.1', voice=None,
+              caps='Router, L2 Switch'):
+        L = [f"{src} > 01:00:0c:cc:cc:cc, 802.3, length 337: LLC, dsap SNAP (0xaa) "
+             f"Individual, ssap SNAP (0xaa) Command, ctrl 0x03: oui Cisco "
+             f"(0x00000c), pid CDP (0x2000): CDPv2, ttl: 180s, checksum: 0x0000, "
+             f"length 319",
+             f"\tDevice-ID (0x01), length: {len(device_id)} bytes: '{device_id}'",
+             f"\tVersion String (0x05), length: {len(version)} bytes: {version}",
+             f"\tPlatform (0x06), length: {len(platform)} bytes: '{platform}'",
+             f"\tAddress (0x02), length: 13 bytes: IPv4 (1) {mgmt}",
+             f"\tPort-ID (0x03), length: {len(port)} bytes: '{port}'",
+             f"\tCapability (0x04), length: 4 bytes: (0x00000029): {caps}",
+             f"\tVTP Management Domain (0x09), length: {len(vtp)} bytes: '{vtp}'",
+             f"\tNative VLAN ID (0x0a), length: 2 bytes: {native}",
+             f"\tManagement Addresses (0x16), length: 13 bytes: IPv4 (1) {mgmt}"]
+        if voice is not None:
+            L.append(f"\tAppliance VLAN-ID (0x0e), length: 7 bytes: "
+                     f"App id 1, vlan: {voice}")
+        return "\n".join(L)
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_cdp_capture(text)
+        res = _cdp_analyze(events, seconds, dict(baseline or {}), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    base = {'speakers': ['00:11:22:33:44:55']}
+
+    # 1. clean: known switch re-advertising.
+    run('clean', frame('00:11:22:33:44:55'), 60, base, 'clean')
+    # 2. spoof: a NEW CDP speaker not in baseline.
+    run('spoof', frame('de:ad:be:ef:00:01', device_id='rogue'), 60, base, 'spoof')
+    # 3. spoof + phone: fake IP phone advertising a Voice VLAN (VoIP-hop recon).
+    rp = run('spoof-phone', frame('de:ad:be:ef:00:02', device_id='SEP001122',
+             platform='cisco IP Phone 7960', voice=200, caps='Host, Phone'),
+             60, base, 'spoof')
+    vp_ok = any('VoIP-VLAN-hop' in x for x in rp['reasons'])
+    scenarios.append({'name': 'spoof-phone-reason', 'expect': 'voip-hop',
+                      'got': 'voip-hop' if vp_ok else 'missing', 'pass': vp_ok})
+    # 4. cdp-enabled: first-run learn surfaces the info leak.
+    rc = run('cdp-enabled', frame('00:11:22:33:44:55'), 60, None, 'cdp-enabled')
+    leak_ok = any('reconnaissance goldmine' in x for x in rc['reasons'])
+    scenarios.append({'name': 'cdp-leak-reason', 'expect': 'leak',
+                      'got': 'leak' if leak_ok else 'missing', 'pass': leak_ok})
+    # 5. flood: a spray of distinct device-IDs (Yersinia).
+    flood = "\n".join(frame(f'aa:bb:cc:00:{i//256:02x}:{i%256:02x}',
+                            device_id=f'rnd{i}') for i in range(40))
+    run('flood', flood, 5, base, 'flood')
+    # 6. parse: fields extracted incl. version, native VLAN, mgmt IP.
+    pev = _parse_cdp_capture(frame('aa:bb:cc:dd:ee:ff', native=99, mgmt='192.0.2.7'))
+    p_ok = (len(pev) == 1 and pev[0]['device_id'] == 'Switch1.lab'
+            and pev[0]['native_vlan'] == 99 and pev[0]['mgmt_addr'] == '192.0.2.7'
+            and pev[0]['platform'] == 'cisco WS-C3560-24TS'
+            and '12.2(55)SE' in (pev[0]['sw_version'] or ''))
+    scenarios.append({'name': 'cdp-parse', 'expect': 'id+vlan+ip+ver',
+                      'got': str({k: pev[0][k] for k in
+                                  ('device_id', 'native_vlan', 'mgmt_addr')}
+                                 if pev else None)[:90], 'pass': p_ok})
+
+    # Optional Scapy end-to-end: craft a real CDP frame -> pcap -> tcpdump -e -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Dot3, LLC, SNAP, wrpcap
+        from scapy.contrib.cdp import (CDPv2_HDR, CDPMsgDeviceID, CDPMsgPlatform,
+                                       CDPMsgPortID, CDPMsgNativeVLAN)
+        if _have('tcpdump'):
+            pkt = (Dot3(dst='01:00:0c:cc:cc:cc', src='de:ad:be:ef:00:01')
+                   / LLC(dsap=0xaa, ssap=0xaa, ctrl=3)
+                   / SNAP(OUI=0x00000c, code=0x2000)
+                   / CDPv2_HDR(msg=[CDPMsgDeviceID(val=b'rogue-sw'),
+                                    CDPMsgPlatform(val=b'cisco WS-C2960'),
+                                    CDPMsgPortID(iface=b'Fa0/9'),
+                                    CDPMsgNativeVLAN(vlan=1)]))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path],
+                       timeout=10)
+            evs = _parse_cdp_capture(res['out'])
+            e = evs[0] if evs else {}
+            scapy_result = {'ran': True, 'device_id': e.get('device_id'),
+                            'platform': e.get('platform'),
+                            'pass': bool(evs) and e.get('device_id') == 'rogue-sw',
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as ex:
+        scapy_result = {'ran': False, 'reason': f'{type(ex).__name__}: {ex}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # EIGRP Watch: passive EIGRP routing-security scanner (Cisco; detection-only)
 # --------------------------------------------------------------------------
 # EIGRP is Cisco's interior gateway protocol (the Cisco-world alternative to OSPF;
@@ -11236,7 +11655,7 @@ def do_routing_selftest():
               'snmp': _snmp_selftest(), 'cert': _cert_selftest(),
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
               'smb': _smb_selftest(), 'relay': _relay_selftest(),
-              'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
+              'dtp': _dtp_selftest(), 'cdp': _cdp_selftest(), 'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(), 'tls': _tls_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
@@ -12231,6 +12650,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/dtp-baseline {action}")
         return jsonify(do_dtp_baseline(action))
 
+    @app.route('/api/net/cdp-watch', methods=['GET'])
+    def net_cdp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 30, 5, 65)
+        _log(f"net/cdp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_cdp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/cdp-baseline', methods=['GET', 'POST'])
+    def net_cdp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/cdp-baseline {action}")
+        return jsonify(do_cdp_baseline(action))
+
     @app.route('/api/net/eigrp-watch', methods=['GET'])
     def net_eigrp_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -12596,6 +13033,15 @@ def _cli(argv=None):
 
     dtst = sub.add_parser('dtp-selftest', help='self-test the DTP detector (no root)')
     dtst.add_argument('--json', action='store_true', help='emit JSON')
+
+    cdp = sub.add_parser('cdp-watch', help='passive CDP flood/spoof/info-leak scan (Cisco)')
+    cdp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    cdp.add_argument('--seconds', '-s', type=int, default=30, help='capture window (5-65)')
+    cdp.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    cdp.add_argument('--json', action='store_true', help='emit JSON')
+
+    cdpst = sub.add_parser('cdp-selftest', help='self-test the CDP detector (no root)')
+    cdpst.add_argument('--json', action='store_true', help='emit JSON')
 
     eg = sub.add_parser('eigrp-watch', help='passive EIGRP routing-security scan (Cisco)')
     eg.add_argument('--iface', '-i', default=None, help='interface (default: route)')
@@ -13208,6 +13654,51 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"DTP self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'cdp-watch':
+        r = do_cdp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"CDP Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
+                  f"({r['packet_count']} frame(s), {r['speaker_count']} speaker(s))")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for sp in r.get('speakers', []):
+                tag = '' if sp['baseline'] else ' *NEW*'
+                leak = []
+                if sp.get('sw_version'):
+                    leak.append(sp['sw_version'][:40])
+                if sp.get('native_vlan') is not None:
+                    leak.append(f"nativeVLAN={sp['native_vlan']}")
+                if sp.get('mgmt_addr'):
+                    leak.append(f"mgmt={sp['mgmt_addr']}")
+                print(f"  {sp['src']} '{sp.get('device_id') or '?'}' "
+                      f"({sp.get('platform') or '?'}){tag}"
+                      + (('  [' + '; '.join(leak) + ']') if leak else ''))
+            for rs in r.get('reasons', []):
+                print(f"  - {rs}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'cdp-selftest':
+        r = _cdp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"device_id={sc.get('device_id')} platform={sc.get('platform')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"CDP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'eigrp-watch':

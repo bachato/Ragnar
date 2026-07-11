@@ -1590,6 +1590,21 @@
                     </div>
                     <div id="dtp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- CDP Watch (flood / spoof / info-leak) -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">CDP Watch <span class="text-xs font-normal text-gray-500">(Cisco Discovery · flood / spoof / info-leak)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">Passive Cisco Discovery Protocol scanner — <strong>detection-only</strong>, never sends a CDP frame. CDP is on by default on every Cisco device and, <strong>unauthenticated</strong>, advertises to anyone on the wire the device hostname, full <strong>IOS version</strong> (→ known CVEs), hardware model, <strong>management IP</strong>, <strong>native VLAN</strong>, VTP domain and voice VLAN — a reconnaissance goldmine. Flags <strong>flood</strong> (Yersinia CDP flood — CAM/CPU exhaustion DoS), <strong>spoof</strong> (a new/rogue CDP speaker, incl. a fake IP phone advertising a Voice VLAN = VoIP-VLAN-hop), and <strong>cdp-enabled</strong> (surfaces exactly what CDP leaks here).</p>
+                    <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, CDP PID 0x2000). CDP hellos are ~60s apart, so give it a longer window. The first scan learns the current CDP speakers (real switches/phones) as the baseline (<span class="font-mono">data/cdp_watch.json</span>); "Trust current" re-learns. Mitigate by disabling CDP on access ports (<span class="font-mono">no cdp enable</span>) and preferring LLDP with minimal TLVs.</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="cdp-iface" title="Interface for the CDP capture — pick the access-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="cdp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runCdpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan CDP</button>
+                        <button onclick="cdpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current CDP speakers as the trusted baseline — use after a legitimate switch/phone change">Trust current</button>
+                    </div>
+                    <div id="cdp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning) -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">SMB Watch <span class="text-xs font-normal text-gray-500">(SMBv1 · LLMNR/NBT-NS/mDNS poisoning)</span></h3>
@@ -6039,7 +6054,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260711-ndpwatch"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260711-cdpwatch"></script>
 
 </body>
 </html>

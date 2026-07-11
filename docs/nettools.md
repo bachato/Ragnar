@@ -55,6 +55,7 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 | [Cert Watch](#cert-watch) | Diagnostics | `POST /api/net/cert-watch`, `POST /api/net/cert-baseline` |
 | [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
+| [CDP Watch](#cdp-watch) | Switch & L2/L3 | `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline` |
 | [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
 | [Relay/Coercion Watch](#relaycoercion-watch) | Switch & L2/L3 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
@@ -100,7 +101,7 @@ capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
 A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NDP**, **RA Guard**,
-**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
+**NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **CDP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
@@ -365,7 +366,7 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
-STP · DTP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
+STP · DTP · CDP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
 Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
 `tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
 cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
@@ -1180,6 +1181,51 @@ apart, so the default window is longer (30s). The first scan **learns** the curr
 DTP speakers (the real switches) as the baseline (`data/dtp_watch.json`); "Trust
 current" re-learns. **API:** `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline`.
 **CLI:** `dtp-watch`, `dtp-selftest`.
+
+### CDP Watch
+A **passive** flood / spoof / information-leak scanner for Cisco's **Discovery
+Protocol** (proprietary; the same group MAC `01:00:0c:cc:cc:cc` as DTP, SNAP OUI
+`0x00000c`, PID `0x2000`). **Detection-only** — it never transmits a CDP frame.
+
+CDP is **on by default** on virtually every Cisco device and, with **no
+authentication**, broadcasts to anyone on the segment a remarkable amount about the
+switch: the **device hostname**, the **full IOS software version** (which maps
+directly to known **CVEs**), the **hardware platform/model**, a **management IP**, the
+**native VLAN**, the **VTP domain**, the **voice VLAN**, and the **port-ID**. The
+[LLDP/CDP Switch Discovery](#switch-discovery-lldp) tool *uses* that to map a network;
+CDP Watch looks at the same frames from the attacker's side and flags their abuse:
+
+- **flood** — a spray of CDP frames / many distinct device-IDs in one window
+  (Yersinia `cdp` flood): fills the switch's CDP neighbour table and spikes its CPU —
+  a denial of service.
+- **spoof** — a **new CDP speaker** not in the learned baseline (a rogue device
+  injecting a fake neighbour), including a **fake Cisco IP Phone** advertising a Voice
+  VLAN — the CDP half of a **VoIP-VLAN-hop**.
+- **cdp-enabled** — CDP is present at all: the scan surfaces **exactly what it leaks**
+  here (IOS version, model, management IP, native/voice VLAN) so you can see the
+  reconnaissance an attacker on that port gets for free. Advisory / learn.
+
+The scan uses `tcpdump -e` with the BPF
+`ether dst 01:00:0c:cc:cc:cc and ether[20:2] = 0x2000`, isolating CDP from the other
+protocols on that Cisco group MAC (DTP/VTP/UDLD/PAgP). CDP hellos are ~60s apart, so
+the default window is longer (30s). The first scan **learns** the current CDP speakers
+(the real switches/phones) as the baseline (`data/cdp_watch.json`); "Trust current"
+re-learns. Every result carries a **mitigation advisory**: disable CDP on access/edge
+ports (`no cdp enable`, or `no cdp run` globally if unused), and prefer **LLDP** with
+minimal TLVs where discovery is genuinely needed.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py cdp-watch [--iface eth0] [--seconds 30] [--json]
+python3 network_diagnostics.py cdp-selftest     # self-test the detector, no root
+```
+
+`cdp-selftest` drives the real parser + classifier with synthetic captures (clean /
+spoof / fake-phone VoIP-hop / cdp-enabled leak / flood / field-parse), and — when
+[Scapy](https://scapy.net) is installed — crafts a real CDP frame into a pcap and
+parses it back through `tcpdump -e`, exercising the capture→parse path end to end.
+**API:** `GET /api/net/cdp-watch`, `POST /api/net/cdp-baseline`.
 
 ### FHRP Watch
 A **passive** hijack scanner for the **First Hop Redundancy Protocols** — **HSRP**

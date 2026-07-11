@@ -1298,6 +1298,7 @@ def _net_integrity_check_once():
     rotation = [
         ('stp', 'STP', lambda: watch(nd.do_stp_watch)),
         ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch)),
+        ('cdp', 'CDP', lambda: watch(nd.do_cdp_watch)),
         ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch)),
         ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch)),
         ('ndp', 'NDP', lambda: watch(nd.do_ndp_watch)),
