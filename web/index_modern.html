@@ -880,6 +880,7 @@
                 <button id="net-subtab-diagnostics" onclick="showNetworkSubtab('diagnostics')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Diagnostics</button>
                 <button id="net-subtab-switch" onclick="showNetworkSubtab('switch')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Switch &amp; L2/L3</button>
                 <button id="net-subtab-interfaces" onclick="showNetworkSubtab('interfaces')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">Interfaces</button>
+                <button id="net-subtab-wifi" onclick="showNetworkSubtab('wifi')" class="net-subtab px-4 py-2 rounded-lg text-sm font-semibold transition-colors text-slate-400 hover:bg-slate-700 hover:text-white">WiFi Analyzer</button>
             </div>
 
             <div id="net-sub-hosts" class="net-subview">
@@ -1851,6 +1852,116 @@
                     <div id="isp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Click <span class="text-gray-300">Detect ISPs</span> to look up the ISP behind each interface.</div>
                 </div>
             </div><!-- /#net-sub-interfaces -->
+
+            <!-- ============================ WiFi Analyzer ============================ -->
+            <div id="net-sub-wifi" class="net-subview hidden">
+                <div class="glass rounded-xl p-6 mb-5">
+                    <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 mb-2">
+                        <div>
+                            <h3 class="text-lg font-semibold flex items-center gap-2">📊 WiFi Spectrum Analyzer</h3>
+                            <p class="text-sm text-gray-400 mt-1">A passive, Ekahau Sidekick-style tri-band RF troubleshooter. <strong>Strictly passive</strong> — it only listens for beacons (<span class="font-mono">iw scan passive</span>) and <strong>never transmits a probe</strong> to any AP. Shows every BSS with RSSI, channel + width, SSID and the AP-advertised channel utilisation; flags co-/adjacent-channel interference and DFS/radar channels; estimates an AP's coverage radius. Tuned for the Alfa AWUS036AXM (Wi-Fi 6E, <span class="font-mono">mt7921u</span>).</p>
+                        </div>
+                    </div>
+                    <!-- Controls -->
+                    <div class="flex flex-wrap items-end gap-3 mt-4">
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">Interface</label>
+                            <select id="wifi-iface" class="bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-sm min-w-[130px]"><option value="">Loading…</option></select>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">Band</label>
+                            <div id="wifi-band-group" class="flex rounded-lg overflow-hidden border border-slate-700">
+                                <button data-band="all"  class="wifi-band px-3 py-1.5 text-sm bg-Ragnar-600 text-white">All</button>
+                                <button data-band="2.4" class="wifi-band px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700">2.4</button>
+                                <button data-band="5"   class="wifi-band px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700">5</button>
+                                <button data-band="6"   class="wifi-band px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700">6&nbsp;GHz</button>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">View</label>
+                            <div class="flex rounded-lg overflow-hidden border border-slate-700">
+                                <button id="wifi-view-bar"  class="px-3 py-1.5 text-sm bg-Ragnar-600 text-white">📊 Bar</button>
+                                <button id="wifi-view-dome" class="px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700">◗ Dome</button>
+                            </div>
+                        </div>
+                        <button onclick="wifiScan()" id="wifi-scan-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm font-semibold">Scan</button>
+                        <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifi-auto" class="accent-Ragnar-600"> Auto-refresh (8s)</label>
+                        <span id="wifi-status" class="text-xs text-gray-500 ml-auto"></span>
+                    </div>
+                </div>
+
+                <!-- Big center spectrum graph -->
+                <div class="glass rounded-xl p-4 mb-5">
+                    <div id="wifi-band-summary" class="flex flex-wrap gap-3 mb-3 text-xs"></div>
+                    <div class="w-full overflow-x-auto">
+                        <canvas id="wifi-spectrum" class="w-full" style="height:360px; min-width:640px;"></canvas>
+                    </div>
+                    <div id="wifi-legend" class="flex flex-wrap gap-4 mt-2 text-xs text-gray-400"></div>
+                </div>
+
+                <div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
+                    <!-- AP list -->
+                    <div class="glass rounded-xl p-4 xl:col-span-2">
+                        <h4 class="font-semibold mb-3 text-sm">Access Points <span id="wifi-ap-count" class="text-gray-500 font-normal"></span></h4>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead><tr class="text-left text-gray-400 border-b border-slate-800">
+                                    <th class="py-1 pr-2">SSID</th><th class="py-1 pr-2">Band</th><th class="py-1 pr-2">Ch</th>
+                                    <th class="py-1 pr-2">Width</th><th class="py-1 pr-2">Signal</th><th class="py-1 pr-2">Util</th><th class="py-1 pr-2">Security</th>
+                                </tr></thead>
+                                <tbody id="wifi-ap-tbody"><tr><td colspan="7" class="py-4 text-center text-gray-500">Click <span class="text-gray-300">Scan</span> to start a passive survey.</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Interference + selected AP radius -->
+                    <div class="space-y-5">
+                        <div class="glass rounded-xl p-4">
+                            <h4 class="font-semibold mb-2 text-sm">Interference</h4>
+                            <div id="wifi-interference" class="text-xs text-gray-400">—</div>
+                        </div>
+                        <div class="glass rounded-xl p-4">
+                            <h4 class="font-semibold mb-2 text-sm">Signal Radius <span id="wifi-radius-target" class="text-gray-500 font-normal"></span></h4>
+                            <p class="text-[11px] text-gray-500 mb-2">Click an AP row to model its coverage (log-distance path-loss estimate).</p>
+                            <div class="flex items-center gap-3 mb-2 text-xs" id="wifi-radius-controls" style="display:none">
+                                <label class="text-gray-400">Tx dBm <input id="wifi-tx" type="number" value="20" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                <label class="text-gray-400">Env n <input id="wifi-ple" type="number" step="0.1" value="3.0" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                            </div>
+                            <canvas id="wifi-radius-canvas" class="w-full" style="height:220px; display:none;"></canvas>
+                            <div id="wifi-radius-info" class="text-xs text-gray-400 mt-2"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Coverage heatmap (Ekahau-style walk-around survey) -->
+                <div class="glass rounded-xl p-4 mt-5">
+                    <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                        <div>
+                            <h4 class="font-semibold text-sm">Coverage Heatmap</h4>
+                            <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Samples are interpolated (IDW) into a coverage map. Green = strong, red = weak.</p>
+                        </div>
+                        <div class="flex flex-wrap items-end gap-2">
+                            <div>
+                                <label class="block text-[11px] text-gray-400 mb-1">Target AP</label>
+                                <select id="wifi-hm-ap" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[160px]"><option value="">Scan first…</option></select>
+                            </div>
+                            <label class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs cursor-pointer">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
+                            <button onclick="wifiHeatmapRender()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Redraw</button>
+                            <button onclick="wifiHeatmapClear()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Clear</button>
+                            <span id="wifi-hm-status" class="text-[11px] text-gray-500"></span>
+                        </div>
+                    </div>
+                    <div class="w-full overflow-x-auto mt-3">
+                        <canvas id="wifi-heatmap" class="w-full rounded border border-slate-800 cursor-crosshair" style="height:380px; min-width:520px; background:#0b1220;"></canvas>
+                    </div>
+                    <div class="flex items-center gap-4 mt-2 text-[11px] text-gray-400">
+                        <span>Coverage:</span>
+                        <span class="flex items-center gap-1"><span style="width:40px;height:8px;display:inline-block;border-radius:2px;background:linear-gradient(90deg,#ef4444,#f59e0b,#eab308,#84cc16,#22c55e)"></span></span>
+                        <span>weak → strong</span>
+                        <span class="ml-2">● live sample</span>
+                    </div>
+                </div>
+            </div><!-- /#net-sub-wifi -->
         </div><!-- /#network-tab -->
 
         <!-- Connect Tab -->
@@ -6069,7 +6180,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260711-vtpwatch"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260711-wifiheatmap"></script>
 
 </body>
 </html>
