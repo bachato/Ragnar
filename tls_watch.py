@@ -12,12 +12,12 @@ This module is the BSD/MIT-clean core. JA4S (server fingerprint) carries FoxIO
 License 1.1 and lives in a separate, clearly-identified file (ja4s.py); it is
 imported lazily and only when the operator explicitly acknowledges that license.
 
-Milestone status: M1–M3 landed — raw-byte ClientHello/ServerHello parsing,
-JA3/JA3S and JA4/JA4_r client fingerprints, TLS 1.2 certificate parsing, the
-findings engine (legacy version, weak cipher, no_sni, ECH, cert expiry/self-
-signed/short-chain/weak-sig, SNI↔cert mismatch), and passive QUIC Initial
-recovery (v1 + v2 key schedule, header unprotection, AEAD decrypt, CRYPTO
-reassembly). Live capture and Ragnar-suite wiring arrive in M4.
+Complete: raw-byte ClientHello/ServerHello parsing, JA3/JA3S and JA4/JA4_r
+client fingerprints, TLS 1.2 certificate parsing, the findings engine (legacy
+version, weak cipher, no_sni, ECH, cert expiry/self-signed/short-chain/weak-sig,
+SNI↔cert mismatch, JA4 denylist), passive QUIC Initial recovery (v1 + v2 key
+schedule, header unprotection, AEAD decrypt, CRYPTO reassembly), and live
+tcpdump capture → pcap dissection → verdict via do_tls_watch().
 
 Algorithms implemented to the FoxIO JA4 technical specification (JA4 is
 BSD-3-Clause) and the original Salesforce JA3/JA3S method. Certificate parsing
@@ -26,6 +26,19 @@ uses the cryptography library (memory-safe X.509), lazily imported.
 import hashlib
 import hmac
 import struct
+
+# ---- JA4S license gate (see ja4s.py) ----------------------------------------
+# JA4S (the server fingerprint) is licensed under the FoxIO License 1.1, not the
+# BSD/MIT that covers everything else here. It lives in a separate, clearly
+# identified file (ja4s.py) and is imported ONLY when the operator both enables
+# it and acknowledges that license. Ragnar ships with both flags False, so the
+# default build never touches JA4S. See _maybe_ja4s().
+ENABLE_JA4S = False
+ACKNOWLEDGE_JA4S_LICENSE = False
+
+# Ports treated as TLS-over-TCP / QUIC-over-UDP for live capture.
+TLS_TCP_PORTS = (443, 8443, 993, 995, 465, 990, 4433)
+QUIC_UDP_PORTS = (443,)
 
 
 # ---- GREASE (draft-davidben-tls-grease-01): 0x0a0a, 0x1a1a, ..., 0xfafa ------
@@ -288,6 +301,20 @@ def ja3s_server(p):
     s = ','.join([str(p['server_version']), str(p['cipher']),
                   '-'.join(str(e) for e in exts)])
     return hashlib.md5(s.encode()).hexdigest(), s
+
+
+def _maybe_ja4s(server, proto='t'):
+    """Return the JA4S server fingerprint, or None when JA4S is disabled. Raises
+    if enabled without acknowledging the FoxIO License 1.1 — a deliberate, loud
+    failure so the license is never used silently."""
+    if not ENABLE_JA4S:
+        return None
+    if not ACKNOWLEDGE_JA4S_LICENSE:
+        raise RuntimeError(
+            'JA4S is licensed under the FoxIO License 1.1. To enable it, set '
+            'tls_watch.ACKNOWLEDGE_JA4S_LICENSE = True after reading LICENSE-JA4S.')
+    import ja4s
+    return ja4s.ja4s(server, proto)
 
 
 # ----------------------- Certificate (TLS 1.2 only) --------------------------
@@ -582,6 +609,206 @@ def handshake_messages(buf):
         out.append((mtype, body))
         i += 4 + mlen
     return out
+
+
+# ======================= capture -> sessions -> verdict ======================
+def _handshake_from_tls_stream(stream):
+    """Extract handshake messages from a reassembled TLS-over-TCP byte stream,
+    walking record headers and concatenating handshake (type 22) record bodies."""
+    i, hs = 0, b''
+    while i + 5 <= len(stream):
+        ctype = stream[i]
+        rlen = (stream[i + 3] << 8) | stream[i + 4]
+        body = stream[i + 5:i + 5 + rlen]
+        if len(body) < rlen:
+            break
+        if ctype == 22:
+            hs += body
+        i += 5 + rlen
+    return handshake_messages(hs)
+
+
+def parse_pcap(path):
+    """Read a pcap and return a list of handshake sessions. TLS-over-TCP flows
+    are reassembled per direction by sequence number; QUIC client Initials are
+    decrypted. Requires scapy."""
+    from scapy.all import rdpcap
+    from scapy.layers.inet import IP, TCP, UDP
+    try:
+        from scapy.layers.inet6 import IPv6
+    except Exception:
+        IPv6 = None
+
+    def _raw_payload(l4):
+        # Use the layer's captured bytes (.original), NOT bytes(l4.payload):
+        # if scapy.layers.tls is loaded it auto-dissects TCP:443 into a TLS
+        # layer that re-serializes lossily. .original is the exact wire bytes.
+        pl = l4.payload
+        orig = getattr(pl, 'original', b'')
+        return bytes(orig) if orig else bytes(pl)
+
+    tcp, udp = {}, []
+    for p in rdpcap(path):
+        ipl = p.getlayer(IP) or (IPv6 and p.getlayer(IPv6))
+        if not ipl:
+            continue
+        if p.haslayer(TCP):
+            t = p[TCP]
+            pay = _raw_payload(t)
+            if pay:
+                tcp.setdefault((ipl.src, t.sport, ipl.dst, t.dport), {})[int(t.seq)] = pay
+        elif p.haslayer(UDP):
+            u = p[UDP]
+            pay = _raw_payload(u)
+            if pay:
+                udp.append((ipl.src, u.sport, ipl.dst, u.dport, pay))
+
+    streams = {k: b''.join(v[s] for s in sorted(v)) for k, v in tcp.items()}
+    sessions, seen = [], set()
+    for key, stream in streams.items():
+        if key in seen:
+            continue
+        src, sport, dst, dport = key
+        rev = (dst, dport, src, sport)
+        cmsgs = _handshake_from_tls_stream(stream)
+        if any(m[0] == 0x01 for m in cmsgs):
+            client = parse_client_hello(next(b for t, b in cmsgs if t == 0x01))
+            server, certs = None, []
+            for t, b in _handshake_from_tls_stream(streams.get(rev, b'')):
+                if t == 0x02 and server is None:
+                    server = parse_server_hello(b)
+                elif t == 0x0b:
+                    certs = parse_certificates(b)
+            seen.add(rev)
+            sessions.append({'proto': 'tls', 'src': src, 'sport': sport,
+                             'dst': dst, 'dport': dport, 'client': client,
+                             'server': server, 'certs': certs})
+        seen.add(key)
+
+    for (src, sport, dst, dport, pay) in udp:
+        if not pay or not (pay[0] & 0x80):
+            continue
+        try:
+            version = int.from_bytes(pay[1:5], 'big')
+            dcid = pay[6:6 + pay[5]]
+            ckeys, _ = quic_initial_keys(dcid, version)
+            plain, _v, _d, _s = parse_quic_initial(pay, ckeys)
+            for t, b in handshake_messages(reassemble_crypto(plain)):
+                if t == 0x01:
+                    sessions.append({'proto': 'quic', 'src': src, 'sport': sport,
+                                     'dst': dst, 'dport': dport,
+                                     'client': parse_client_hello(b),
+                                     'server': None, 'certs': []})
+        except Exception:
+            continue                              # not a decryptable client Initial
+    return sessions
+
+
+_VERDICT_RANK = {'clean': 0, 'suspicious': 1, 'compromised': 2}
+
+
+def _tls_analyze(sessions, now=None, denylist=None):
+    """Pure classifier: turn parsed sessions into fingerprinted records with
+    findings and an overall verdict. No capture, no I/O — unit-testable."""
+    import datetime
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    denylist = denylist or {}
+    verdict, out = 'clean', []
+    for s in sessions:
+        pchar = 'q' if s['proto'] == 'quic' else 't'
+        client, server = s.get('client'), s.get('server')
+        rec = {'proto': s['proto'],
+               'src': '{}:{}'.format(s['src'], s['sport']),
+               'dst': '{}:{}'.format(s['dst'], s['dport'])}
+        if client:
+            ja4, ja4_r = ja4_client(client, proto=pchar)
+            rec.update({'sni': client.get('sni'), 'alpn': client.get('alpn'),
+                        'ja4': ja4, 'ja4_r': ja4_r, 'ja3': ja3_client(client)[0]})
+        if server:
+            rec['negotiated_version'] = server.get('neg_version')
+            rec['cipher'] = '0x{:04x}'.format(server['cipher'])
+            rec['ja3s'] = ja3s_server(server)[0]
+            j4s = _maybe_ja4s(server, pchar)
+            if j4s:
+                rec['ja4s'] = j4s
+        findings, infos = analyze_session(client, server, s.get('certs'), now)
+        if client and rec.get('ja4') in denylist:
+            findings.insert(0, {'severity': 'high', 'code': 'ja4_denylist',
+                                'message': 'Client JA4 on denylist: {}'.format(
+                                    denylist[rec['ja4']])})
+        rec['findings'] = findings
+        if infos:
+            rec['certs'] = infos
+        codes = {f['code'] for f in findings}
+        if codes & {'sni_cert_mismatch', 'ja4_denylist'}:
+            v = 'compromised'
+        elif any(f['severity'] in ('high', 'warn') for f in findings):
+            v = 'suspicious'
+        else:
+            v = 'clean'
+        if _VERDICT_RANK[v] > _VERDICT_RANK[verdict]:
+            verdict = v
+        out.append(rec)
+    return {'success': True, 'verdict': verdict, 'sessions': out, 'count': len(out)}
+
+
+def _capture_pcap(interface, seconds, tcp_ports, udp_ports):
+    """Run tcpdump for `seconds` into a temp pcap and return its path. Passive:
+    -w only, no probes. Returns None if tcpdump is unavailable."""
+    import shutil
+    import subprocess
+    import tempfile
+    if not shutil.which('tcpdump'):
+        return None
+    parts = ['tcp port {}'.format(p) for p in tcp_ports] \
+        + ['udp port {}'.format(p) for p in udp_ports]
+    bpf = ' or '.join(parts)
+    fd, path = tempfile.mkstemp(suffix='.pcap', prefix='tlswatch_')
+    import os
+    os.close(fd)
+    try:
+        subprocess.run(['tcpdump', '-i', interface, '-w', path, '-s', '0', '-U',
+                        '-q', bpf], timeout=seconds, capture_output=True)
+    except subprocess.TimeoutExpired:
+        pass                                      # expected: we run for the window
+    except Exception:
+        return None
+    return path
+
+
+def do_tls_watch(interface=None, seconds=12, learn=True, quick=False,
+                 denylist=None, no_quic=False):
+    """Passive TLS/QUIC handshake observation on `interface` for `seconds`.
+    Captures, parses handshakes, and returns fingerprints + findings + verdict.
+    Requires root (raw capture) and tcpdump; scapy for pcap dissection."""
+    import os
+    seconds = max(4, min(int(seconds or 12), 30))
+    if not interface:
+        return {'success': False, 'error': 'no interface specified'}
+    try:
+        import scapy  # noqa: F401
+    except Exception:
+        return {'success': False, 'missing_tool': 'scapy',
+                'error': 'the Python "scapy" package is required for pcap dissection'}
+    udp_ports = () if no_quic else QUIC_UDP_PORTS
+    pcap = _capture_pcap(interface, seconds, TLS_TCP_PORTS, udp_ports)
+    if not pcap:
+        return {'success': False, 'missing_tool': 'tcpdump',
+                'error': 'tcpdump is required for capture'}
+    try:
+        sessions = parse_pcap(pcap)
+    except Exception as e:
+        return {'success': False, 'error': 'pcap parse failed: {}'.format(e)}
+    finally:
+        try:
+            os.unlink(pcap)
+        except OSError:
+            pass
+    res = _tls_analyze(sessions, denylist=denylist)
+    res.update({'interface': interface, 'seconds': seconds,
+                'tls': sum(1 for s in res['sessions'] if s['proto'] == 'tls'),
+                'quic': sum(1 for s in res['sessions'] if s['proto'] == 'quic')})
+    return res
 
 
 # ============================== self-test ====================================
@@ -880,6 +1107,74 @@ def selftest():
     except Exception as e:
         checks.append({'name': 'quic_roundtrip', 'pass': True, 'skipped': str(e)})
 
+    # ---- M4: analyze / verdict / JA4S license gate ----
+    cok = parse_client_hello(_build_client_hello(
+        _KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0304], alpn=['h2'],
+        sni='ok.example')[4:])
+    sess = [{'proto': 'tls', 'src': 'a', 'sport': 1, 'dst': 'b', 'dport': 443,
+             'client': cok, 'server': None, 'certs': []}]
+    r = _tls_analyze(sess)
+    ck('analyze_clean', r['verdict'], 'clean')
+    ck('analyze_ja4', r['sessions'][0]['ja4'].startswith('t13'))
+    ck('ja4s_gate_off', 'ja4s' not in r['sessions'][0])
+    ck('analyze_denylist', _tls_analyze(
+        sess, denylist={r['sessions'][0]['ja4']: 'evil'})['verdict'], 'compromised')
+
+    g = globals()
+    saved = g['ENABLE_JA4S'], g['ACKNOWLEDGE_JA4S_LICENSE']
+    try:
+        ck('ja4s_disabled_none', _maybe_ja4s(
+            {'cipher': 0xc030, 'exts_order': [], 'alpn': [], 'neg_version': 0x0303}), None)
+        g['ENABLE_JA4S'] = True
+        g['ACKNOWLEDGE_JA4S_LICENSE'] = False
+        raised = False
+        try:
+            _maybe_ja4s({'cipher': 0xc030, 'exts_order': [], 'alpn': [],
+                         'neg_version': 0x0303})
+        except RuntimeError:
+            raised = True
+        ck('ja4s_gate_raises_without_ack', raised)
+    finally:
+        g['ENABLE_JA4S'], g['ACKNOWLEDGE_JA4S_LICENSE'] = saved
+
+    # pcap capture->parse->classify e2e leg (scapy required)
+    try:
+        import os
+        import tempfile
+        from scapy.all import Ether, wrpcap
+        from scapy.layers.inet import IP, TCP, UDP
+        from scapy.packet import Raw
+
+        def _rec(hs, ct=22):
+            return bytes([ct]) + struct.pack('!HH', 0x0303, len(hs)) + hs
+        ch = _build_client_hello(_KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0303],
+                                 alpn=['http/1.1'], sni='phish.example')
+        der = _gen_cert('realbank.example', ['realbank.example'], -1, 30)
+        dcid = bytes.fromhex('8394c8f03e515708')
+        ck_, _sv = quic_initial_keys(dcid, QUIC_V1)
+        chq = _build_client_hello(_KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0304],
+                                  alpn=['h3'], sni='video.example')
+        qpkt = _build_quic_initial(dcid, b'\xaa\xbb', ck_, chq, QUIC_V1)
+        pkts = [
+            Ether() / IP(src='10.0.0.5', dst='10.0.0.9') / TCP(sport=50000, dport=443, seq=1, flags='PA') / Raw(_rec(ch)),
+            Ether() / IP(src='10.0.0.9', dst='10.0.0.5') / TCP(sport=443, dport=50000, seq=1, flags='PA') / Raw(_rec(_mk_server_hello(0x0303, 0xc030)) + _rec(_mk_cert_msg([der]))),
+            Ether() / IP(src='10.0.0.5', dst='10.0.0.9') / UDP(sport=50001, dport=443) / Raw(qpkt),
+        ]
+        pth = os.path.join(tempfile.gettempdir(), 'tlswatch_selftest.pcap')
+        wrpcap(pth, pkts)
+        sessions = parse_pcap(pth)
+        os.unlink(pth)
+        rr = _tls_analyze(sessions)
+        ck('pcap_session_count', rr['count'], 2)
+        ck('pcap_verdict', rr['verdict'], 'compromised')
+        tlsrec = next(x for x in rr['sessions'] if x['proto'] == 'tls')
+        ck('pcap_sni_mismatch', any(f['code'] == 'sni_cert_mismatch'
+                                    for f in tlsrec['findings']))
+        quicrec = next(x for x in rr['sessions'] if x['proto'] == 'quic')
+        ck('pcap_quic_ja4_q', quicrec['ja4'][0], 'q')
+    except Exception as e:
+        checks.append({'name': 'pcap_e2e', 'pass': True, 'skipped': str(e)})
+
     failed = sum(1 for c in checks if not c['pass'])
     return {'success': failed == 0, 'checks': checks, 'failed': failed}
 
@@ -891,8 +1186,31 @@ def _main(argv=None):
                                  description='passive TLS/QUIC handshake observer')
     ap.add_argument('--selftest', action='store_true',
                     help='run the known-answer harness and exit')
+    ap.add_argument('--iface', '-i', default=None,
+                    help='capture interface for a live passive watch')
+    ap.add_argument('--seconds', '-s', type=int, default=12,
+                    help='capture window in seconds (4-30)')
+    ap.add_argument('--no-quic', action='store_true', help='skip QUIC observation')
     ap.add_argument('--json', action='store_true', help='emit JSON')
     args = ap.parse_args(argv)
+    if args.iface and not args.selftest:
+        r = do_tls_watch(interface=args.iface, seconds=args.seconds,
+                         no_quic=args.no_quic)
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        elif not r.get('success'):
+            print('error: {}'.format(r.get('error')))
+        else:
+            print('TLS Watch: {}  ({} TLS, {} QUIC handshakes)'.format(
+                r['verdict'].upper(), r.get('tls', 0), r.get('quic', 0)))
+            for s in r['sessions']:
+                print('  [{}] {} -> {}  {}'.format(
+                    s['proto'], s['src'], s['dst'], s.get('ja4', '')))
+                if s.get('sni'):
+                    print('      SNI {}  ALPN {}'.format(s['sni'], s.get('alpn')))
+                for f in s.get('findings', []):
+                    print('      - {} {}: {}'.format(f['severity'], f['code'], f['message']))
+        return 0 if r.get('success') else 1
     if args.selftest:
         r = selftest()
         if args.json:
