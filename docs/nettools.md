@@ -57,7 +57,7 @@ alert.
 | [NTP Watch](#ntp-watch) | Diagnostics | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
 | [SNMP Watch](#snmp-watch) | Diagnostics | `GET /api/net/snmp-watch`, `POST /api/net/snmp-baseline` |
-| [TLS Watch](#tls-watch) | Diagnostics | `POST /api/net/tls-watch`, `POST /api/net/tls-baseline` |
+| [Cert Watch](#cert-watch) | Diagnostics | `POST /api/net/cert-watch`, `POST /api/net/cert-baseline` |
 | [STP/BPDU Watch](#stpbpdu-watch) | Switch & L2/L3 | `GET /api/net/stp-watch`, `POST /api/net/stp-baseline` |
 | [DTP Watch](#dtp-watch) | Switch & L2/L3 | `GET /api/net/dtp-watch`, `POST /api/net/dtp-baseline` |
 | [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
@@ -109,7 +109,7 @@ A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA 
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
 installed it also runs the end-to-end packet-crafting leg for the capture-based
-scanners, and TLS Watch grades a real self-signed cert over a local (loopback)
+scanners, and Cert Watch grades a real self-signed cert over a local (loopback)
 handshake. This is how you confirm the routing-security detectors are working on a
 given box without waiting for a real attack — endpoint `GET /api/net/routing-selftest`.
 The same checks run headless via
@@ -598,7 +598,7 @@ inference and write-community detection end to end.
 - Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
   `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
 
-### TLS Watch
+### Cert Watch
 Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
 hypervisors, printers, IoT — with certificates **nobody audits**: long expired,
 self-signed, hostname-mismatched, or signed with weak crypto. Unlike the passive
@@ -626,7 +626,7 @@ RSA < 2048, or a weak/anon/NULL/RC4/DES cipher) · **deprecated-tls** (SSLv3 / T
 TLS 1.1 negotiated) · **expiring** (valid but < 21 days left) · **valid**. Each result
 carries the subject / issuer / SAN, validity dates + days-remaining, key type + size,
 signature algorithm, and the negotiated protocol + cipher. A learned **fingerprint
-baseline** (`data/tls_watch.json`, per `host:port`) flags a certificate that
+baseline** (`data/cert_watch.json`, per `host:port`) flags a certificate that
 **changed** between scans — a rotation, or a possible **MITM** — and *Trust current*
 re-learns. Targets are always explicit (typed, or discovered on your own segment), and
 runs are capped — this is device-hygiene auditing of your own network, not a scanner.
@@ -640,8 +640,8 @@ ECDSA P-256 with SHA-256+, disable TLS 1.0/1.1, and automate renewal.
 Small **CLI** (no web app needed):
 
 ```
-python3 network_diagnostics.py tls-watch router.local 192.168.1.1:443 nas:5001
-python3 network_diagnostics.py tls-watch --discover --iface eth0    # find + grade
+python3 network_diagnostics.py cert-watch router.local 192.168.1.1:443 nas:5001
+python3 network_diagnostics.py cert-watch --discover --iface eth0    # find + grade
 python3 network_diagnostics.py tls-selftest    # self-test the grader, no root
 ```
 
@@ -651,8 +651,8 @@ hostname-mismatch / weak-crypto / deprecated-tls / expiring / wildcard-match), t
 runs an **end-to-end** leg that starts a local TLS server with a self-signed cert and
 grades it through the real handshake path — no root, no network.
 
-- Endpoint: `POST /api/net/tls-watch` `{targets, discover, interface, seconds}`,
-  `POST /api/net/tls-baseline` `{action: reset}` · Python: `cryptography` ·
+- Endpoint: `POST /api/net/cert-watch` `{targets, discover, interface, seconds}`,
+  `POST /api/net/cert-baseline` `{action: reset}` · Python: `cryptography` ·
   binary: `tcpdump` (discovery only)
 
 ## 🔌 Switch & L2/L3

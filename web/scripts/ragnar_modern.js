@@ -1240,7 +1240,7 @@ function showNetworkSubtab(name) {
         _macWatchFillIfaces();
         _ntpFillIfaces();
         _snmpFillIfaces();
-        _tlsFillIfaces();
+        _certFillIfaces();
     }
     // Diagnostics tools run on demand; we only prefill the MTR start-point list.
 }
@@ -2328,7 +2328,7 @@ function renderNetIntegrity(d) {
     // Prefer the full per-check map (extended monitor); fall back to dns/arp/dhcp.
     let entries;
     if (d.checks && Object.keys(d.checks).length) {
-        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'igmp', 'ipv6', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'tls'];
+        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'igmp', 'ipv6', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'cert'];
         entries = Object.keys(d.checks).sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99))
             .map(k => [d.checks[k].label || k.toUpperCase(), d.checks[k].verdict, d.checks[k].reasons || []]);
     } else {
@@ -3184,8 +3184,8 @@ async function snmpTrustBaseline() {
     }
 }
 
-// ---- TLS Watch (active certificate & TLS hygiene checker) ------------------
-const _TLS_VERDICT_STYLE = {
+// ---- Cert Watch (active certificate & TLS hygiene checker) ------------------
+const _CERT_VERDICT_STYLE = {
     valid:              ['bg-green-950/40 border-green-900 text-green-400', '✓ valid'],
     clean:              ['bg-green-950/40 border-green-900 text-green-400', '✓ All certificates valid, trusted and in-date'],
     expiring:           ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ expiring soon'],
@@ -3200,11 +3200,11 @@ const _TLS_VERDICT_STYLE = {
     unknown:            ['bg-slate-800 border-slate-700 text-slate-400', '—'],
 };
 function _tlsBadge(v) {
-    const [cls, label] = _TLS_VERDICT_STYLE[v] || _TLS_VERDICT_STYLE.unknown;
+    const [cls, label] = _CERT_VERDICT_STYLE[v] || _CERT_VERDICT_STYLE.unknown;
     return `<span class="px-2 py-0.5 rounded border text-xs ${cls}">${label}</span>`;
 }
-function _tlsFillIfaces() {
-    const sel = document.getElementById('tls-iface');
+function _certFillIfaces() {
+    const sel = document.getElementById('cert-iface');
     if (!sel || sel.dataset.filled === '1') return Promise.resolve();
     return fetchAPI('/api/net/interfaces').then(x => {
         (x.interfaces || []).forEach(i => {
@@ -3217,15 +3217,15 @@ function _tlsFillIfaces() {
         sel.dataset.filled = '1';
     }).catch(() => {});
 }
-async function runTlsWatch() {
-    const out = document.getElementById('tls-results');
+async function runCertWatch() {
+    const out = document.getElementById('cert-results');
     if (!out) return;
     const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
-    const targets = (document.getElementById('tls-targets') || {}).value || '';
-    const discover = !!(document.getElementById('tls-discover') || {}).checked;
-    const ifaceSel = document.getElementById('tls-iface');
+    const targets = (document.getElementById('cert-targets') || {}).value || '';
+    const discover = !!(document.getElementById('cert-discover') || {}).checked;
+    const ifaceSel = document.getElementById('cert-iface');
     const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
-    const secsEl = document.getElementById('tls-secs');
+    const secsEl = document.getElementById('cert-secs');
     const secs = secsEl && secsEl.value ? parseInt(secsEl.value, 10) : 8;
     if (!targets.trim() && !discover) {
         out.classList.remove('hidden');
@@ -3236,13 +3236,13 @@ async function runTlsWatch() {
     out.classList.remove('hidden');
     out.innerHTML = '<p class="text-sm text-gray-400">Completing TLS handshakes and grading certificates…</p>';
     try {
-        _tlsFillIfaces();
-        const d = await postAPI('/api/net/tls-watch', { targets, discover, interface: iface, seconds: secs });
+        _certFillIfaces();
+        const d = await postAPI('/api/net/cert-watch', { targets, discover, interface: iface, seconds: secs });
         if (!d || d.success === false) {
             out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
             return;
         }
-        const [cls, label] = _TLS_VERDICT_STYLE[d.verdict] || _TLS_VERDICT_STYLE.unknown;
+        const [cls, label] = _CERT_VERDICT_STYLE[d.verdict] || _CERT_VERDICT_STYLE.unknown;
         let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${escapeHtml((d.reasons && d.reasons[0]) || label)}</div>`;
         html += `<p class="text-xs text-gray-500 mb-2">${d.graded || 0} graded${d.discovered ? ' · ' + d.discovered + ' discovered passively' : ''}${d.discover_error ? ' · <span class="text-amber-300">discovery: ' + escapeHtml(d.discover_error) + '</span>' : ''}</p>`;
         const rows = d.targets || [];
@@ -3278,11 +3278,11 @@ async function runTlsWatch() {
         _ndBusy(btn, false);
     }
 }
-async function tlsTrustBaseline() {
+async function certTrustBaseline() {
     try {
-        await postAPI('/api/net/tls-baseline', { action: 'reset' });
+        await postAPI('/api/net/cert-baseline', { action: 'reset' });
         addConsoleMessage('TLS cert-fingerprint baseline reset — re-learning on the next scan', 'info');
-        await runTlsWatch();
+        await runCertWatch();
     } catch (e) {
         addConsoleMessage('Failed to reset TLS baseline: ' + e.message, 'error');
     }
@@ -4338,7 +4338,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', tls: 'TLS Watch', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', cert: 'Cert Watch', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
@@ -4347,7 +4347,7 @@ async function runRoutingSelftest() {
             '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
             '<tr class="text-left text-gray-500"><th class="px-2 py-1">Scanner</th><th class="px-2 py-1">Scenarios</th><th class="px-2 py-1">End-to-end</th><th class="px-2 py-1">Result</th></tr>' +
             '</thead><tbody>';
-        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'tls', 'stp', 'smb', 'relay', 'dtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
+        ['igmp', 'ipv6', 'raguard', 'ntp', 'icmp', 'snmp', 'cert', 'stp', 'smb', 'relay', 'dtp', 'eigrp', 'isis', 'fhrp', 'ospf', 'bgp', 'bgp_speaker', 'path_asymmetry'].forEach(k => {
             const s = d.suites[k]; if (!s) return;
             const okAll = s.success;
             html += `<tr class="border-t border-slate-800">
