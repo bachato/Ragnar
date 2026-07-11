@@ -52,6 +52,7 @@ alert.
 | [ARP Scan](#arp-scan) | Switch & L2/L3 | `GET /api/net/arp-scan` |
 | [L2 Link Health](#l2-link-health) | Switch & L2/L3 | `POST /api/net/l2-health` |
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
+| [TLS Watch](#tls-watch) | Switch & L2/L3 | `GET /api/net/tls-watch` |
 | [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
 | [IPv6 RA Guard](#ipv6-ra-guard) | Diagnostics | `GET /api/net/raguard`, `POST /api/net/raguard` `{action: harden}` |
 | [NTP Watch](#ntp-watch) | Diagnostics | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
@@ -850,6 +851,64 @@ capture→parse path end to end.
 
 - Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
   `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
+
+### TLS Watch
+A **passive** TLS/QUIC handshake observer — the session/presentation-layer
+(OSI L5/L6) detector, companion to the active [Cert Watch](#cert-watch). It is
+**detection-only**: it never connects or probes, it sniffs handshakes off the
+wire. One short `tcpdump` window over the TLS ports (443/8443/993/995/465/990/
+4433) and QUIC (UDP/443) is dissected and, per handshake, yields:
+
+- **Fingerprints** — **JA4** and **JA4_r** (raw) client fingerprints to the FoxIO
+  specification, plus legacy **JA3 / JA3S**. Match a client JA4 against a denylist
+  of known-bad families.
+- **Identity / negotiation** — SNI, ALPN, offered vs. negotiated TLS version,
+  chosen cipher, ECH presence.
+- **Certificate posture (TLS 1.2 over TCP only)** — subject/issuer, SANs, validity
+  window, self-issued flag, signature hash, and findings: `cert_expired`,
+  `cert_not_yet_valid`, `cert_self_signed`, `cert_short_chain`, `cert_weak_sig`,
+  and **`sni_cert_mismatch`** — SNI not covered by the presented certificate, the
+  passive **interception** signal.
+
+**The one hard constraint:** the Certificate message is passively observable
+**only for TLS 1.2 over TCP**. TLS 1.3 encrypts it under the handshake secret and
+QUIC is always 1.3, so on modern traffic you get fingerprints, SNI, ALPN and
+version/cipher, but the certificate is a black box. This is a property of the
+protocols, not the tool; every `cert_*` finding is scoped to TLS 1.2 by
+construction.
+
+**QUIC** Initial packets are recovered passively — the Initial keys derive from
+the client's Destination Connection ID plus a public constant salt (RFC 9001
+§5.2 for v1, RFC 9369 for v2), so it is arithmetic over captured bytes, never an
+active operation. The client Initial's CRYPTO stream is reassembled into the
+ClientHello and fingerprinted with proto `q`.
+
+The verdict escalates to **compromised** on an `sni_cert_mismatch` or JA4 denylist
+hit, **suspicious** on any other high/warn finding (weak cipher, expired cert,
+legacy version), else **clean**. Needs a SPAN/mirror port to see other hosts on a
+switched segment.
+
+**JA4S** (the server fingerprint) is licensed under the **FoxIO License 1.1**, not
+the BSD/MIT that covers the rest, so it lives in a separate, clearly identified
+file (`ja4s.py`) and is **off by default** — Ragnar never computes it unless the
+operator sets both `tls_watch.ENABLE_JA4S` and `tls_watch.ACKNOWLEDGE_JA4S_LICENSE`.
+
+There is also a small **CLI**:
+
+```
+python3 network_diagnostics.py tls-watch [--iface eth0] [--seconds 12] [--no-quic] [--json]
+python3 network_diagnostics.py tls-selftest      # self-test the detectors, no root
+python3 tls_watch.py --selftest                  # the module's own KAT harness
+```
+
+`tls-selftest` pins the fingerprint math to FoxIO's published JA4 vector
+(`t13d1516h2_8daaf6152771_e5627efa2ab1`), JA3S to `771,49200,`, the QUIC key
+schedule to RFC 9001 (v1) and RFC 9369 (v2), and — with [Scapy](https://scapy.net)
+installed — crafts a TLS-1.2 SNI-mismatch session and a QUIC Initial into a pcap
+and classifies them end to end.
+
+- Endpoint: `GET /api/net/tls-watch` `{interface, seconds, no_quic}` · Python:
+  `scapy` (dissection), `cryptography` (X.509 + QUIC AEAD) · binary: `tcpdump`
 
 ### IPv6 First-Hop Watch
 The **most-overlooked LAN attack today**, and a genuine gap in most toolkits. Every

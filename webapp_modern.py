@@ -1311,6 +1311,7 @@ def _net_integrity_check_once():
         ('icmp', 'ICMP', lambda: watch(nd.do_icmp_watch)),
         ('snmp', 'SNMP', lambda: watch(nd.do_snmp_watch)),
         ('cert', 'Cert', lambda: watch(nd.do_cert_watch, discover=False)),
+        ('tls', 'TLS', lambda: watch(nd.do_tls_watch, interface=nd._default_route_iface())),
     ]
 
     to_run = list(fast)
