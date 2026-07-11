@@ -33,6 +33,8 @@ from datetime import datetime, timezone, timedelta
 
 import bgp_speaker
 import path_asymmetry
+import tls_watch
+from tls_watch import do_tls_watch
 
 try:
     from flask import request, jsonify
@@ -5710,7 +5712,7 @@ def _snmp_selftest():
 
 
 # --------------------------------------------------------------------------
-# TLS Watch: TLS / certificate hygiene checker (active grade + passive discovery)
+# Cert Watch: TLS / certificate hygiene checker (active grade + passive discovery)
 # --------------------------------------------------------------------------
 # Internal networks are full of TLS services — router/switch admin UIs, NAS boxes,
 # hypervisors, printers, IoT — with certificates nobody audits: long expired,
@@ -5729,9 +5731,9 @@ def _snmp_selftest():
 # fingerprint baseline flags a certificate that *changed* between scans (rotation or
 # a possible MITM). Targets are explicit (typed or discovered on the local segment)
 # — this is device-hygiene auditing of your own network, not a scanner.
-_TLS_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               'data', 'tls_watch.json')
-_tls_watch_lock = threading.Lock()
+_CERT_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'cert_watch.json')
+_cert_watch_lock = threading.Lock()
 
 _TLS_EXPIRING_DAYS = 21          # a valid cert with fewer days left is "expiring"
 _TLS_WEAK_RSA_BITS = 2048        # RSA below this is weak
@@ -5783,34 +5785,34 @@ def _tls_parse_targets(text):
     return out
 
 
-def _tls_watch_load():
+def _cert_watch_load():
     try:
-        with open(_TLS_WATCH_PATH) as f:
+        with open(_CERT_WATCH_PATH) as f:
             d = json.load(f)
             return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def _tls_watch_save(d):
+def _cert_watch_save(d):
     try:
-        os.makedirs(os.path.dirname(_TLS_WATCH_PATH), exist_ok=True)
-        tmp = _TLS_WATCH_PATH + '.tmp'
+        os.makedirs(os.path.dirname(_CERT_WATCH_PATH), exist_ok=True)
+        tmp = _CERT_WATCH_PATH + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(d, f, indent=2)
-        os.replace(tmp, _TLS_WATCH_PATH)
+        os.replace(tmp, _CERT_WATCH_PATH)
     except OSError:
         pass
 
 
-def do_tls_baseline(action='get'):
+def do_cert_baseline(action='get'):
     """Manage the learned certificate-fingerprint baseline (per host:port). Used to
     flag a cert that *changed* between scans. action='reset' forgets it."""
-    with _tls_watch_lock:
+    with _cert_watch_lock:
         if action == 'reset':
-            _tls_watch_save({})
+            _cert_watch_save({})
             return {'success': True, 'reset': True, 'baseline': {}}
-        b = _tls_watch_load()
+        b = _cert_watch_load()
         return {'success': True, 'baseline': {
             'certs': sorted((b.get('certs') or {}).keys()),
         }}
@@ -6102,7 +6104,7 @@ def _tls_discover(interface, seconds):
                 pass
 
 
-def do_tls_watch(targets='', interface=None, seconds=8, discover=False, learn=True):
+def do_cert_watch(targets='', interface=None, seconds=8, discover=False, learn=True):
     """Active TLS/certificate hygiene checker with optional passive discovery.
     Grades each target host:port (typed and/or discovered on the segment) for
     expired / not-yet-valid / self-signed / untrusted / hostname-mismatch /
@@ -6156,8 +6158,8 @@ def do_tls_watch(targets='', interface=None, seconds=8, discover=False, learn=Tr
             results.append(fut.result())
 
     # Fingerprint baseline: flag changed certs, then learn.
-    with _tls_watch_lock:
-        base = _tls_watch_load()
+    with _cert_watch_lock:
+        base = _cert_watch_load()
         certs = base.get('certs') or {}
         for r in results:
             fp = r.get('fingerprint')
@@ -6172,7 +6174,7 @@ def do_tls_watch(targets='', interface=None, seconds=8, discover=False, learn=Tr
                 certs[r['target']] = fp
         if learn:
             base['certs'] = certs
-            _tls_watch_save(base)
+            _cert_watch_save(base)
 
     # Sort worst-first; roll up an overall verdict from graded targets.
     def sev(r):
@@ -6224,7 +6226,7 @@ def do_tls_watch(targets='', interface=None, seconds=8, discover=False, learn=Tr
     }
 
 
-def _tls_selftest():
+def _cert_selftest():
     """Self-test the TLS/cert grader (no root, no network for the classifier legs).
     Builds synthetic certs with `cryptography` and drives the real classifier, then
     — as an end-to-end leg — starts a local TLS server with a self-signed cert and
@@ -10779,6 +10781,17 @@ def _bgp_selftest():
     return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
 
 
+def _tls_selftest():
+    """Adapt tls_watch.selftest() to the aggregator's scenarios/scapy shape."""
+    r = tls_watch.selftest()
+    scen = [{'name': c['name'], 'pass': c['pass'],
+             'expect': c.get('want'), 'got': c.get('got')}
+            for c in r['checks'] if not c.get('skipped')]
+    return {'success': r['success'], 'scenarios': scen,
+            'scapy': {'ran': _have_scapy(),
+                      'pass': all(c['pass'] for c in r['checks'])}}
+
+
 def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
@@ -10786,11 +10799,11 @@ def do_routing_selftest():
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
               'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
-              'snmp': _snmp_selftest(), 'tls': _tls_selftest(),
+              'snmp': _snmp_selftest(), 'cert': _cert_selftest(),
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
               'smb': _smb_selftest(), 'relay': _relay_selftest(),
               'dtp': _dtp_selftest(), 'eigrp': _eigrp_selftest(),
-              'fhrp': _fhrp_selftest(),
+              'fhrp': _fhrp_selftest(), 'tls': _tls_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
@@ -11561,6 +11574,17 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/igmp-baseline {action}")
         return jsonify(do_igmp_baseline(action))
 
+    @app.route('/api/net/tls-watch', methods=['GET'])
+    def net_tls_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        iface = iface or _default_route_iface()
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 30)
+        no_quic = (request.args.get('no_quic') or '').lower() in ('1', 'true', 'yes')
+        _log(f"net/tls-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_tls_watch(interface=iface, seconds=secs, no_quic=no_quic))
+
     @app.route('/api/net/ipv6-watch', methods=['GET'])
     def net_ipv6_watch():
         iface = (request.args.get('interface') or '').strip() or None
@@ -11642,8 +11666,8 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/snmp-baseline {action}")
         return jsonify(do_snmp_baseline(action))
 
-    @app.route('/api/net/tls-watch', methods=['POST'])
-    def net_tls_watch():
+    @app.route('/api/net/cert-watch', methods=['POST'])
+    def net_cert_watch():
         data = request.get_json(silent=True) or {}
         targets = (data.get('targets') or '')[:4000]
         discover = bool(data.get('discover'))
@@ -11653,17 +11677,17 @@ def register_network_diagnostics(app, logger=None):
         secs = _clamp_int(data.get('seconds'), 8, 4, 30)
         _log(f"net/tls-watch discover={discover} iface={iface or '-'} "
              f"targets={len(_tls_parse_targets(targets))}")
-        return jsonify(do_tls_watch(targets=targets, interface=iface, seconds=secs,
+        return jsonify(do_cert_watch(targets=targets, interface=iface, seconds=secs,
                                     discover=discover))
 
-    @app.route('/api/net/tls-baseline', methods=['GET', 'POST'])
-    def net_tls_baseline():
+    @app.route('/api/net/cert-baseline', methods=['GET', 'POST'])
+    def net_cert_baseline():
         action = 'get'
         if request.method == 'POST':
             data = request.get_json(silent=True) or {}
             action = 'reset' if (data.get('action') == 'reset') else 'get'
         _log(f"net/tls-baseline {action}")
-        return jsonify(do_tls_baseline(action))
+        return jsonify(do_cert_baseline(action))
 
     @app.route('/api/net/relay-watch', methods=['GET'])
     def net_relay_watch():
@@ -12003,6 +12027,15 @@ def _cli(argv=None):
     st = sub.add_parser('igmp-selftest', help='self-test the IGMP detectors (no root)')
     st.add_argument('--json', action='store_true', help='emit JSON')
 
+    tw = sub.add_parser('tls-watch', help='passive TLS/QUIC handshake observer')
+    tw.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    tw.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-30)')
+    tw.add_argument('--no-quic', action='store_true', help='skip QUIC observation')
+    tw.add_argument('--json', action='store_true', help='emit JSON')
+
+    tst = sub.add_parser('tls-selftest', help='self-test the TLS Watch detectors (no root)')
+    tst.add_argument('--json', action='store_true', help='emit JSON')
+
     v6 = sub.add_parser('ipv6-watch', help='passive IPv6 first-hop (RA/DHCPv6) scan')
     v6.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     v6.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
@@ -12046,7 +12079,7 @@ def _cli(argv=None):
     snst = sub.add_parser('snmp-selftest', help='self-test the SNMP detectors (no root)')
     snst.add_argument('--json', action='store_true', help='emit JSON')
 
-    tw = sub.add_parser('tls-watch', help='active TLS/certificate hygiene checker')
+    tw = sub.add_parser('cert-watch', help='active TLS/certificate hygiene checker')
     tw.add_argument('targets', nargs='*', help='host[:port] target(s) to grade')
     tw.add_argument('--discover', action='store_true',
                     help='passively discover TLS servers on the segment first')
@@ -12055,7 +12088,7 @@ def _cli(argv=None):
     tw.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
     tw.add_argument('--json', action='store_true', help='emit JSON')
 
-    twst = sub.add_parser('tls-selftest', help='self-test the TLS/cert grader (no root)')
+    twst = sub.add_parser('cert-selftest', help='self-test the TLS/cert grader (no root)')
     twst.add_argument('--json', action='store_true', help='emit JSON')
 
     rl = sub.add_parser('relay-watch', help='passive NTLM-relay + coercion scan')
@@ -12141,6 +12174,35 @@ def _cli(argv=None):
     bst.add_argument('--json', action='store_true', help='emit JSON')
 
     args = p.parse_args(argv)
+    if args.cmd == 'tls-watch':
+        iface = args.iface or _default_route_iface()
+        r = do_tls_watch(interface=iface, seconds=args.seconds, no_quic=args.no_quic)
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"TLS Watch [{r.get('interface')}] {r.get('seconds')}s: "
+                  f"{r['verdict'].upper()}  ({r.get('tls', 0)} TLS, {r.get('quic', 0)} QUIC)")
+            for x in r.get('sessions', []):
+                print(f"  [{x['proto']}] {x['src']} -> {x['dst']}  {x.get('ja4', '')}")
+                if x.get('sni'):
+                    print(f"      SNI {x['sni']}  ALPN {x.get('alpn')}")
+                for f in x.get('findings', []):
+                    print(f"      - {f['severity']} {f['code']}: {f['message']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'tls-selftest':
+        r = _tls_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        else:
+            for sc in r['scenarios']:
+                print(f"  [{'PASS' if sc['pass'] else 'FAIL'}] {sc['name']}")
+            print(f"  scapy: {'available' if r['scapy']['ran'] else 'absent'}")
+            print(f"TLS Watch self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
     if args.cmd == 'igmp-watch':
         r = do_igmp_watch(interface=args.iface, seconds=args.seconds,
                           learn=not args.no_learn)
@@ -12394,8 +12456,8 @@ def _cli(argv=None):
             print(f"SNMP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
-    if args.cmd == 'tls-watch':
-        r = do_tls_watch(targets=' '.join(args.targets or []), interface=args.iface,
+    if args.cmd == 'cert-watch':
+        r = do_cert_watch(targets=' '.join(args.targets or []), interface=args.iface,
                          seconds=args.seconds, discover=args.discover,
                          learn=not args.no_learn)
         if args.json:
@@ -12403,7 +12465,7 @@ def _cli(argv=None):
         elif not r.get('success'):
             print(f"error: {r.get('error')}")
         else:
-            print(f"TLS Watch: {r['verdict'].upper()}  "
+            print(f"Cert Watch: {r['verdict'].upper()}  "
                   f"({r.get('graded', 0)} graded"
                   f"{', ' + str(r['discovered']) + ' discovered' if r.get('discovered') else ''})")
             for t in r.get('targets', []):
@@ -12421,8 +12483,8 @@ def _cli(argv=None):
                 print(f"  {reason}")
         return 0 if r.get('success') else 1
 
-    if args.cmd == 'tls-selftest':
-        r = _tls_selftest()
+    if args.cmd == 'cert-selftest':
+        r = _cert_selftest()
         if args.json:
             print(json.dumps(r, indent=2))
         else:
@@ -12437,7 +12499,7 @@ def _cli(argv=None):
                       f"verdict={e.get('verdict')} proto={e.get('proto')}")
             else:
                 print(f"  [skip] e2e-local-server: {e.get('reason')}")
-            print(f"TLS self-test: {'OK' if r['success'] else 'FAILED'}")
+            print(f"Cert Watch self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'relay-watch':
