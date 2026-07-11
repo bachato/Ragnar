@@ -77,6 +77,7 @@ install_system_packages() {
         "dnsmasq"
         "network-manager"
         "wireless-tools"
+        "iw"
         "iproute2"
         "iputils-ping"
         "rfkill"
