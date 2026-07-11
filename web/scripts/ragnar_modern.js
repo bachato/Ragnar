@@ -1766,7 +1766,7 @@ async function loadLldp() {
 
 async function runArpScan() {
     const ifaceEl = document.getElementById('arp-iface');
-    const out = document.getElementById('arp-results');
+    const out = document.getElementById('arp-scan-results');
     const iface = (ifaceEl.value || '').trim();
     if (!iface) { ifaceEl.focus(); return; }
     const btn = event && event.target ? event.target : null;
