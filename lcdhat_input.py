@@ -26,23 +26,29 @@
 #   KEY2          : rotate the screen (0→90→180→270)
 #   KEY3 short/long: next display page / restart Ragnar service
 #
-# Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad.
-# The joystick navigates + pings, the keys fire tests (a long key-press fires
-# the "advanced" variant, mirroring the 2.7" HAT's short/long netdiag gestures):
-#   Joy Up        : previous diagnostic page   (as seen on the text)
-#   Joy Down      : next diagnostic page       (as seen on the text)
-#   Joy Left      : ping gateway (LAN)
-#   Joy Right     : ping internet (8.8.8.8, WAN)
-#   Joy Press     : dismiss a shown result, else pause/resume auto-cycle
-#   KEY1          : toggle the mode off (back to the normal screens)
-#   KEY2 short/long: locate switch port / L2 health capture (~12s)
-#   KEY3 short/long: speedtest / DNS Doctor poison-hijack check
+# Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad,
+# navigated as a stack of "cards": LINK / IP / SWITCH / DHCP / WIFI (SSID+RSSI) /
+# SIGNAL (nearby strengths). Left/Right move between cards; Up/Down cycle the
+# test functions inside a card; the centre press runs the highlighted one. The
+# three keys are exits/toggles (everything acts on press — no long-press here):
+#   Joy Left      : previous card    (as seen on the text)
+#   Joy Right     : next card        (as seen on the text)
+#   Joy Up / Down : cycle the highlighted function inside the card
+#   Joy Press     : OK/select — run the highlighted function (or dismiss a result)
+#   KEY1          : switch to Ragnar — toggle the mode off (normal screens)
+#   KEY2          : exit card → the card-selection menu (press again to leave it)
+#   KEY3          : pause / start auto-switch (auto-cycle the cards every 5 s)
+# Card functions (Up/Down + press): LINK/SWITCH → Locate Port · L2 Health;
+# IP → Ping GW · Ping WAN · DNS Doctor · Speedtest; DHCP/WIFI/SIGNAL are read-only.
+# In the card-selection menu any joystick direction moves the highlight and press
+# enters the card. See epd_button.NETDIAG_CARD_FUNCS.
 
 import logging
 import threading
 import time
 
-from epd_button import EPDButtonListener, PAGE_COUNT, NETDIAG_HOLD_TIME
+from epd_button import (EPDButtonListener, PAGE_COUNT, NETDIAG_HOLD_TIME,
+                        NETDIAG_CARD_FUNCS)
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +56,10 @@ logger = logging.getLogger(__name__)
 # (joystick-center toggles it). Matches the net-diag auto-cycle cadence.
 AUTOSCROLL_INTERVAL = 5.0
 
-# Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP). Mirrors
-# display.NETDIAG_PAGE_COUNT; kept local so this module needn't import display.py.
-NETDIAG_PAGE_COUNT = 4
+# Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP / WIFI / SIGNAL).
+# Mirrors display.NETDIAG_PAGE_COUNT; kept local so this module needn't import
+# display.py.
+NETDIAG_PAGE_COUNT = 6
 
 # Button pins
 KEY1_PIN = 21
@@ -95,6 +102,9 @@ class LCDHATInputListener(EPDButtonListener):
         self._held_inputs = set()
         self.autoscroll = False           # joystick-center toggles page autoscroll
         self._autoscroll_started = False
+        # Net-diag "card" navigation state (see _netdiag_input):
+        self.netdiag_view = 'card'        # 'card' (viewing) or 'menu' (card select)
+        self.netdiag_func_idx = 0         # highlighted function within the card
 
     def start(self):
         """Claim the HAT's buttons + joystick via gpiozero."""
@@ -153,10 +163,12 @@ class LCDHATInputListener(EPDButtonListener):
 
     def _defers(self, name):
         """Inputs that resolve short-vs-long on release/hold (the rest act on
-        press). In net-diag both KEY2 and KEY3 carry a short/long test pair; in
-        the default layer only KEY3 does (short = next page, long = restart)."""
+        press). In net-diag every input now acts on press — the tests moved onto
+        the joystick's function menu, so KEY2/KEY3 no longer carry a short/long
+        pair. In the default layer only KEY3 does (short = next page, long =
+        restart)."""
         if self._netdiag_active():
-            return name in ('key2', 'key3')
+            return False
         return name == 'key3'
 
     def _on_input_press(self, name):
@@ -253,7 +265,12 @@ class LCDHATInputListener(EPDButtonListener):
             if on:
                 self.netdiag_page = 0
                 self.netdiag_result = None
-                self.netdiag_frozen = False
+                # Card model: start on the card view, driven manually by the
+                # joystick. Auto-switch is off until KEY3 turns it on (frozen =
+                # auto-cycle paused).
+                self.netdiag_view = 'card'
+                self.netdiag_func_idx = 0
+                self.netdiag_frozen = True
             logger.info(f"LCD KEY1: Network Diagnostic Mode "
                         f"{'ON' if on else 'OFF'}")
         except Exception as e:
@@ -262,44 +279,70 @@ class LCDHATInputListener(EPDButtonListener):
     # --- Network Diagnostic layer ----------------------------------------
 
     def _netdiag_input(self, name, gesture):
-        """Map a joystick/key input to a net-diag navigation or test action."""
+        """Map a joystick/key input to a net-diag navigation or test action —
+        the "card" model (see the header). Two views:
+
+          * card  : Left/Right switch card, Up/Down cycle the card's functions,
+                    Press runs the highlighted function (or dismisses a result).
+          * menu  : the card-selection list — any direction moves the highlight,
+                    Press enters the card.
+
+        Keys (act on press): KEY1 = switch to Ragnar (handled in _on_input_press),
+        KEY2 = exit to card-selection menu, KEY3 = pause/start auto-switch."""
         self.netdiag_seq += 1   # wake the display promptly
 
+        # KEY2 / KEY3 work the same in either view.
+        if name == 'key2':
+            self.netdiag_view = 'card' if self.netdiag_view == 'menu' else 'menu'
+            logger.info(f"Netdiag: {'card menu' if self.netdiag_view == 'menu' else 'card view'}")
+            return
+        if name == 'key3':
+            self.netdiag_frozen = not self.netdiag_frozen
+            logger.info(f"Netdiag: auto-switch "
+                        f"{'OFF' if self.netdiag_frozen else 'ON'}")
+            return
+
         name = self._visual_dir(name)
-        # Up/Down page through the diagnostics; Left/Right run the two pings
-        # (KEY1 now owns the mode toggle, so the pings moved off it).
-        if name == 'up':
+
+        if self.netdiag_view == 'menu':
+            if name in ('up', 'left'):
+                self.netdiag_page = (self.netdiag_page - 1) % NETDIAG_PAGE_COUNT
+            elif name in ('down', 'right'):
+                self.netdiag_page = (self.netdiag_page + 1) % NETDIAG_PAGE_COUNT
+            elif name == 'press':
+                self.netdiag_view = 'card'      # OK/select: enter the card
+                self.netdiag_func_idx = 0
+            return
+
+        # --- card view ---
+        if name == 'left':
             self._netdiag_step_page(-1)
             return
-        if name == 'down':
+        if name == 'right':
             self._netdiag_step_page(+1)
             return
-        if name == 'left':
-            self._run_netdiag_test('ping_gw')
-            return
-        if name == 'right':
-            self._run_netdiag_test('ping_wan')
+        if name in ('up', 'down'):
+            funcs = NETDIAG_CARD_FUNCS.get(self.netdiag_page, [])
+            if funcs:
+                step = -1 if name == 'up' else 1
+                self.netdiag_func_idx = (self.netdiag_func_idx + step) % len(funcs)
             return
         if name == 'press':
-            # Dismiss a shown result first, else toggle the auto-cycle.
+            # OK/select: dismiss a shown result, else run the highlighted function.
             if self.netdiag_result is not None:
                 self.netdiag_result = None
-            else:
-                self.netdiag_frozen = not self.netdiag_frozen
-                logger.info(f"Netdiag: auto-cycle "
-                            f"{'PAUSED' if self.netdiag_frozen else 'resumed'}")
+                return
+            funcs = NETDIAG_CARD_FUNCS.get(self.netdiag_page, [])
+            if funcs:
+                idx = self.netdiag_func_idx % len(funcs)
+                self._run_netdiag_test(funcs[idx][1])
             return
 
-        kind = {
-            ('key2', 'short'): 'port',    ('key2', 'long'): 'l2',
-            ('key3', 'short'): 'speedtest', ('key3', 'long'): 'dns',
-        }.get((name, gesture))
-        if kind:
-            self._run_netdiag_test(kind)
-
     def _netdiag_step_page(self, step):
-        """Advance/rewind the net-diag page, dismissing a shown result first."""
+        """Advance/rewind the net-diag card, dismissing a shown result first and
+        resetting the in-card function highlight."""
         if self.netdiag_result is not None:
             self.netdiag_result = None
             return
         self.netdiag_page = (self.netdiag_page + step) % NETDIAG_PAGE_COUNT
+        self.netdiag_func_idx = 0

@@ -83,13 +83,17 @@ logger = Logger(name="display.py", level=logging.DEBUG)
 # Import button listener (only functional on Pi with GPIO)
 try:
     from epd_button import EPDButtonListener, PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC
+    from epd_button import NETDIAG_CARD_FUNCS, NETDIAG_CARD_NAMES
 except ImportError:
     EPDButtonListener = None
     PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC = 0, 1, 2, 3, 4, 5
+    NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL"]
+    NETDIAG_CARD_FUNCS = {}
 
 # Network Diagnostic mode: number of auto-cycling e-Paper sub-pages
-# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP). See Display._render_netdiag_page.
-NETDIAG_PAGE_COUNT = 4
+# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL). See
+# Display._render_netdiag_page.
+NETDIAG_PAGE_COUNT = 6
 NETDIAG_CYCLE_SECONDS = 5
 
 class Display:
@@ -1043,20 +1047,161 @@ class Display:
             threading.Thread(target=_worker, daemon=True).start()
         return st
 
-    def _render_netdiag_page(self, image, draw, page, frozen=False):
-        """Render one Ethernet network-diagnostic sub-page. Space on the panel
-        is scarce, so each page shows only the handful of facts an engineer
-        actually needs when diagnosing a switch port."""
+    def _fetch_wifi_link(self):
+        """Current wireless association for the net-diag WIFI page. Fast and
+        passive: reads `iw dev <iface> link` (no scan). Returns a dict with
+        ssid=None when the radio isn't associated."""
+        iface = getattr(self, '_wifi_iface', None) or 'wlan0'
+        info = {'iface': iface, 'ssid': None, 'signal': None, 'quality': None,
+                'freq': None, 'band': None, 'channel': None, 'rate': None,
+                'bssid': None}
+        try:
+            r = subprocess.run(['iw', 'dev', iface, 'link'],
+                               capture_output=True, text=True, timeout=3)
+        except Exception as e:
+            logger.debug(f"wifi link fetch error: {e}")
+            return info
+        out = r.stdout or ''
+        if r.returncode != 0 or 'Not connected' in out or not out.strip():
+            return info
+        m = re.search(r'Connected to ([0-9a-fA-F:]{17})', out)
+        if m:
+            info['bssid'] = m.group(1)
+        m = re.search(r'SSID:\s*(.+)', out)
+        if m:
+            info['ssid'] = m.group(1).strip()
+        m = re.search(r'freq:\s*(\d+)', out)
+        if m:
+            info['freq'] = int(m.group(1))
+            try:
+                import wifi_analyzer as wa
+                info['band'], info['channel'] = wa.freq_to_channel(info['freq'])
+            except Exception:
+                pass
+        m = re.search(r'signal:\s*(-?\d+)', out)
+        if m:
+            info['signal'] = int(m.group(1))
+            info['quality'] = self._dbm_to_quality(info['signal'])
+        m = re.search(r'tx bitrate:\s*([\d.]+)\s*MBit/s', out)
+        if m:
+            info['rate'] = float(m.group(1))
+        return info
+
+    def _netdiag_wifi_scan(self):
+        """Background-cached passive scan for the net-diag SIGNAL page. A full
+        passive scan takes several seconds, so it runs in a worker thread and the
+        page shows the last result — the render never blocks. Refreshes at most
+        ~every 45s, and only while this page is on screen."""
+        st = getattr(self, '_netdiag_wifi_state', None)
+        if st is None:
+            st = self._netdiag_wifi_state = {'ts': 0, 'aps': None, 'scanning': False}
+        now = time.time()
+        if not st['scanning'] and (now - st['ts']) > 45:
+            st['scanning'] = True
+
+            def _worker():
+                aps = None
+                try:
+                    import wifi_analyzer as wa
+                    iface = getattr(self, '_wifi_iface', None) or 'wlan0'
+                    d = wa.do_scan(interface=iface, band='all')
+                    if 'error' not in d:
+                        aps = sorted(d.get('aps', []),
+                                     key=lambda a: -(a.get('signal') or -999))[:5]
+                except Exception as e:
+                    logger.debug(f"netdiag wifi scan error: {e}")
+                if aps is not None:
+                    st['aps'] = aps
+                st['ts'] = time.time()
+                st['scanning'] = False
+
+            threading.Thread(target=_worker, daemon=True).start()
+        return st
+
+    def _draw_signal_bar(self, draw, y, dbm, x0, x1):
+        """One horizontal signal bar between x0..x1, fill ∝ quality, dBm at the
+        right edge. Returns the bar's bottom y."""
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        font = self.shared_data.font_arial9
+        q = self._dbm_to_quality(dbm) if dbm is not None else 0
+        q = q or 0
+        bar_h = int(9 * sy)
+        dbm_txt = f"{int(dbm)}" if dbm is not None else "—"
+        dbm_w = font.getlength(dbm_txt) + int(5 * sx)
+        bar_x1 = x1 - dbm_w
+        if bar_x1 > x0:
+            draw.rectangle([x0, y, bar_x1, y + bar_h], outline=0)
+            fill_w = int((bar_x1 - x0) * q / 100.0)
+            if fill_w > 0:
+                draw.rectangle([x0, y, x0 + fill_w, y + bar_h], fill=0)
+        draw.text((bar_x1 + int(4 * sx), y - int(1 * sy)), dbm_txt, font=font, fill=0)
+        return y + bar_h
+
+    def _draw_signal_bars(self, draw, y, aps):
+        """SSID + signal-strength bar list for the net-diag SIGNAL page."""
+        w = getattr(self, 'render_w', self.shared_data.width)
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        font = self.shared_data.font_arial9
+        pad_x = int(6 * sx)
+        row_h = int(15 * sy)
+        name_w = int(46 * sx)          # left column reserved for the SSID
+        for ap in aps:
+            ssid = ap.get('ssid') or 'hidden'
+            s = ssid
+            while s and font.getlength(s) > name_w:
+                s = s[:-1]
+            draw.text((pad_x, y), s or '·', font=font, fill=0)
+            self._draw_signal_bar(draw, y, ap.get('signal'),
+                                  pad_x + name_w, w - pad_x)
+            y += row_h
+
+    def _render_netdiag_menu(self, image, draw, highlight):
+        """The card-selection menu (reached with KEY2 on the LCD HAT): list the
+        net-diag cards and highlight the current one. The joystick moves the
+        highlight; the centre press opens that card."""
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        font = self.shared_data.font_arial9
+        self._draw_page_frame(draw, "NET CARDS", hint="K2 back · press=open")
+        y = int(26 * sy)
+        pad_x = int(8 * sx)
+        row_h = int(13 * sy)
+        n = len(NETDIAG_CARD_NAMES)
+        for i, nm in enumerate(NETDIAG_CARD_NAMES):
+            sel = (i == highlight % n)
+            label = f"{i + 1}. {nm}"
+            if sel:
+                draw.rectangle([int(3 * sx), y - int(1 * sy),
+                                w - int(3 * sx), y + row_h - int(2 * sy)], fill=0)
+                draw.text((pad_x, y), label, font=font, fill=1)
+            else:
+                draw.text((pad_x, y), label, font=font, fill=0)
+            y += row_h
+
+    def _render_netdiag_page(self, image, draw, page, frozen=False, func_idx=-1):
+        """Render one network-diagnostic sub-page. Space on the panel is scarce,
+        so each page shows only the handful of facts an engineer actually needs
+        when diagnosing a switch port or a wireless link. On the LCD HAT the
+        footer shows the highlighted in-card function (Up/Down cycles it, the
+        centre press runs it); ``func_idx`` is the selection (-1 = none)."""
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         data = self._get_cached_page_data('netdiag', self._fetch_netdiag_data, ttl=10)
-        names = ["LINK", "IP", "SWITCH", "DHCP"]
+        names = NETDIAG_CARD_NAMES
         name = names[page % len(names)]
-        state = "PAUSED" if frozen else "auto5s"
-        # Narrow panels (128px LCD HAT) have no room for the key legend, and its
-        # joystick drives navigation anyway — show just the page counter/state.
+        state = "auto" if not frozen else "manual"
         render_w = getattr(self, 'render_w', self.shared_data.width)
+        funcs = NETDIAG_CARD_FUNCS.get(page, [])
         if render_w < 150:
-            hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}"
+            # Narrow LCD HAT: show the page counter + the highlighted function
+            # (the joystick's Up/Down selects it, press runs it). Cards with no
+            # functions just show the auto/manual state.
+            if funcs and func_idx >= 0:
+                hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} >{funcs[func_idx % len(funcs)][0]}"
+            else:
+                hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}"
         else:
             hint = f"{page + 1}/{NETDIAG_PAGE_COUNT} {state}  K1nav K2port K3png K4dns"
         self._draw_page_frame(draw, f"NET {name}", hint=hint)
@@ -1140,7 +1285,7 @@ class Display:
                 ("Mgmt IP", n.get('mgmt_ip') or '—'),
             ])
 
-        else:  # page 3: DHCP — rogue-server / snooping watch
+        elif page == 3:  # DHCP — rogue-server / snooping watch
             st = self._netdiag_dhcp()
             d = st.get('data')
             if not d:
@@ -1163,6 +1308,40 @@ class Display:
             if d.get('rogue_count'):
                 rows.append(("ROGUE!", str(d.get('rogue_count'))))
             self._draw_stat_rows(draw, y, rows)
+
+        elif page == 4:  # WIFI — current wireless association (SSID + RSSI)
+            wl = self._fetch_wifi_link()
+            if not wl.get('ssid'):
+                self._draw_stat_rows(draw, y, [("WiFi", "not connected"),
+                                               ("Iface", wl.get('iface') or '—')])
+                return
+            rows = [("SSID", wl['ssid'])]
+            if wl.get('signal') is not None:
+                rows.append(("RSSI", f"{wl['signal']} dBm"))
+                rows.append(("Quality", f"{wl['quality']}%"))
+            if wl.get('band'):
+                rows.append(("Band/Ch", f"{wl['band']}G ch{wl['channel']}"))
+            if wl.get('rate'):
+                rows.append(("Rate", f"{int(wl['rate'])} Mbps"))
+            yy = self._draw_stat_rows(draw, y, rows)
+            # A live signal bar under the facts (walk around to find dead spots).
+            if wl.get('signal') is not None:
+                sx = getattr(self, 'render_sx', self.scale_factor_x)
+                w = getattr(self, 'render_w', self.shared_data.width)
+                pad_x = int(6 * sx)
+                self._draw_signal_bar(draw, yy + int(3 * sy), wl['signal'],
+                                      pad_x, w - pad_x)
+
+        else:  # page 5: SIGNAL — nearby networks' signal strengths (scan)
+            st = self._netdiag_wifi_scan()
+            aps = st.get('aps')
+            if not aps:
+                self._draw_stat_rows(draw, y, [
+                    ("Signal", "scanning..." if st.get('scanning') else "no data"),
+                    ("Wait", "~5s"),
+                ])
+                return
+            self._draw_signal_bars(draw, y, aps)
 
     def _draw_wrapped_note(self, draw, y, text, max_lines=3):
         """Word-wrap a short note across up to max_lines using the small font."""
@@ -3242,18 +3421,28 @@ class Display:
                         self._netdiag_sleep(1.0 if result.get('running') else NETDIAG_CYCLE_SECONDS, bl, seq0)
                         continue
                     frozen = bool(getattr(bl, 'netdiag_frozen', False)) if bl else False
+                    view = getattr(bl, 'netdiag_view', 'card') if bl else 'card'
                     if bl is not None:
                         page = bl.netdiag_page % NETDIAG_PAGE_COUNT
                     else:
                         page = getattr(self, '_netdiag_page', 0) % NETDIAG_PAGE_COUNT
                     try:
-                        self._render_netdiag_page(image, draw, page, frozen=frozen)
+                        if view == 'menu':
+                            self._render_netdiag_menu(image, draw, page)
+                        else:
+                            func_idx = getattr(bl, 'netdiag_func_idx', -1) if bl else -1
+                            self._render_netdiag_page(image, draw, page,
+                                                      frozen=frozen, func_idx=func_idx)
                     except Exception as e:
                         logger.debug(f"netdiag render error: {e}")
-                    if not frozen:
+                    # Auto-cycle the cards only while auto-switch is on (not
+                    # frozen) and not in the selection menu.
+                    if not frozen and view != 'menu':
                         nextp = (page + 1) % NETDIAG_PAGE_COUNT
                         if bl is not None:
                             bl.netdiag_page = nextp
+                            if hasattr(bl, 'netdiag_func_idx'):
+                                bl.netdiag_func_idx = 0
                         else:
                             self._netdiag_page = nextp
                     self._commit_netdiag_frame(image)

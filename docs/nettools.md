@@ -126,7 +126,7 @@ into a switch and read the essentials off the screen with **no laptop and no
 internet**. Everything shown is gathered locally (`ip` / `ethtool` /
 `lldpctl` / `resolv.conf`), so it works on an isolated or dead network.
 
-The display auto-cycles four pages every **5 seconds**:
+The display auto-cycles six pages every **5 seconds**:
 
 1. **LINK** — the physical wired port: interface, link up/down, negotiated
    speed, duplex, auto-negotiation, MAC. (Instantly spot a port that fell back
@@ -140,11 +140,18 @@ The display auto-cycles four pages every **5 seconds**:
    how many DHCP servers answered, the server-id and gateway it offers vs. your
    active gateway, and a **ROGUE!** count if a fake server is present. The scan
    runs in the background so the page never blocks the cycle.
+5. **WIFI** — the wireless link you're on: **SSID**, **RSSI** (dBm) + quality %,
+   band/channel and TX rate, with a live signal bar under the facts (walk around
+   to find dead spots). Read passively from `iw dev … link` — no scan.
+6. **SIGNAL** — a bar chart of the **strongest nearby networks' signal
+   strengths** (SSID + RSSI), from a background [passive Wi-Fi
+   scan](wifi-analyzer.md) so the page never blocks.
 
-It focuses on the **physical** wired NIC (`eth*` / `en*`), ignoring VPN,
-tunnel, bridge and container interfaces. Toggle it off to restore the normal
-Ragnar display. The setting is persisted (`network_diagnostic_mode` in the
-config) and shared across sessions.
+The wired pages focus on the **physical** wired NIC (`eth*` / `en*`), ignoring
+VPN, tunnel, bridge and container interfaces; the WIFI/SIGNAL pages use the
+wireless interface. Toggle it off to restore the normal Ragnar display. The
+setting is persisted (`network_diagnostic_mode` in the config) and shared across
+sessions.
 
 #### Field-test key pad (2.7" HAT)
 
@@ -172,25 +179,36 @@ waiting out the 5 s cycle.
 
 The Waveshare **1.44" LCD HAT** (ST7735S, 128×128) carries **3 keys plus a
 5-way joystick**. On this HAT **KEY1 is the mode switch** — it toggles On-Screen
-Network Diagnostic Mode on/off directly (no web UI needed), so the two gateway/
-internet pings live on the joystick instead. Select the HAT in **Display
-settings** as *"1.44" ST7735S LCD HAT + joystick"*. While the mode is on:
+Network Diagnostic Mode on/off directly (no web UI needed). Select the HAT in
+**Display settings** as *"1.44" ST7735S LCD HAT + joystick"*.
+
+The mode is navigated as a stack of **cards** — `LINK · IP · SWITCH · DHCP ·
+WIFI · SIGNAL`. **Left/Right move between cards; Up/Down cycle the test functions
+*inside* a card; the centre press runs the highlighted one** (the footer shows
+`>` + its name). While the mode is on:
 
 | Input | Action |
 |-------|--------|
-| **KEY1** | **Toggle the mode off** — back to the normal screens |
-| **Joystick ↑ / ↓** | Previous / next diagnostic page |
-| **Joystick ←** | **Ping the gateway** (LAN) |
-| **Joystick →** | **Ping the internet** (`8.8.8.8`, WAN) |
-| **Joystick press** | Dismiss a shown result, else **pause / resume** the auto-cycle |
-| **KEY2** short / long | **Locate port** — blink the switch link LED / **L2 health** capture (~12 s) |
-| **KEY3** short / long | **Speed test** / **DNS Doctor** — poisoning/hijack verdict |
+| **KEY1** | **Switch to Ragnar** — toggle the mode off, back to the normal screens |
+| **Joystick ← / →** | Previous / next **card** |
+| **Joystick ↑ / ↓** | Cycle the highlighted **function** inside the card |
+| **Joystick press** | **OK / select** — run the highlighted function (or dismiss a shown result) |
+| **KEY2** | **Card-selection menu** — an overview list of the six cards; press again to leave it |
+| **KEY3** | **Pause / start auto-switch** — auto-cycle the cards every 5 s (off by default) |
 
-The joystick arrows above are **as you read them on the screen**: the HAT's
-joystick is physically mounted 90° clockwise of the panel's text, so the listener
-remaps each push into the on-screen frame (and re-aligns automatically when
-**KEY2** rotates the display) — up/down page, left/right ping, whichever way the
-panel is turned.
+The functions selectable inside each card (Up/Down, then press):
+
+| Card | Functions |
+|------|-----------|
+| **LINK** / **SWITCH** | **Locate port** (blink the switch link LED) · **L2 health** capture (~12 s) |
+| **IP** | **Ping gateway** (LAN) · **Ping internet** (`8.8.8.8`, WAN) · **DNS Doctor** (poison/hijack verdict) · **Speed test** |
+| **DHCP** / **WIFI** / **SIGNAL** | read-only (no functions) |
+
+In the **card-selection menu** any joystick direction moves the highlight and
+press opens that card. The joystick arrows above are **as you read them on the
+screen**: the HAT's joystick is physically mounted 90° clockwise of the panel's
+text, so the listener remaps each push into the on-screen frame and re-aligns
+automatically when the display is rotated.
 
 Outside net-diag mode the joystick pages through the normal Ragnar screens and a
 **joystick press starts/stops page autoscroll** (auto-cycle every 5 s); **KEY1**

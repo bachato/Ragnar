@@ -75,9 +75,19 @@ GPIO pins (BCM), fixed by the HAT: `KEY1=21`, `KEY2=20`, `KEY3=16`; joystick
 
 ### Network Diagnostic mode
 
-**KEY1** toggles the mode back off. The joystick navigates (↑/↓ page) and runs
-the two pings (← gateway, → internet); **KEY2**/**KEY3** fire the other tests
-(short/long) — see the full
+Navigated as **cards**: `LINK · IP · SWITCH · DHCP · WIFI · SIGNAL`.
+
+| Input | Action |
+|-------|--------|
+| **Joystick ← / →** | Previous / next **card** |
+| **Joystick ↑ / ↓** | Cycle the highlighted **function** inside the card |
+| **Joystick press** | **OK / select** — run the highlighted function (or dismiss a result) |
+| **KEY1** | **Switch to Ragnar** — toggle the mode off |
+| **KEY2** | **Card-selection menu** (press again to leave) |
+| **KEY3** | **Pause / start auto-switch** — auto-cycle the cards every 5 s |
+
+Functions: **LINK/SWITCH** → Locate Port · L2 Health; **IP** → Ping GW · Ping
+WAN · DNS Doctor · Speedtest; **DHCP/WIFI/SIGNAL** are read-only. See the full
 [field‑test pad](nettools.md#field-test-pad-144-lcd-hat--joystick) table.
 
 ---
