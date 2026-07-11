@@ -100,6 +100,26 @@ def _valid_bssid(mac):
     return bool(mac) and re.match(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$", mac or "") is not None
 
 
+def _iface_is_up(iface):
+    """True if the interface's admin state is up (has IFF_UP flag)."""
+    try:
+        with open("/sys/class/net/%s/flags" % iface) as f:
+            return bool(int(f.read().strip(), 16) & 0x1)  # IFF_UP
+    except Exception:
+        return True  # assume up if we can't tell; don't block on it
+
+
+def _bring_iface_up(iface):
+    """Bring the link up (needed to scan a freshly-plugged, DOWN dongle).
+
+    Non-destructive: only sets the link admin-up, never associates. Requires
+    root; the webapp runs as root so this succeeds in production.
+    """
+    _run(["/usr/bin/rfkill", "unblock", "all"], timeout=5)
+    rc, _, _ = _run(["ip", "link", "set", iface, "up"], timeout=5)
+    return rc == 0
+
+
 # --------------------------------------------------------------------------
 # Frequency <-> channel <-> band
 # --------------------------------------------------------------------------
@@ -184,6 +204,18 @@ def radio_capabilities(iface):
         _commit_channel(caps, cur)
     for b in caps["bands"]:
         caps["bands"][b] = sorted(set(caps["bands"][b]))
+    # Band *support* is more reliably read from `iw phy info`, which lists every
+    # frequency the radio can do regardless of whether the interface is up or a
+    # channel is regulatory-disabled. This keeps the band labels correct for a
+    # freshly-plugged, still-down dongle (channels would otherwise be empty).
+    rc2, info, _ = _run([_IW, "phy", phy, "info"], timeout=8)
+    if rc2 == 0:
+        for m in re.finditer(r"\*\s*(\d+)(?:\.\d+)?\s*MHz\s*\[(\d+)\]", info):
+            band, ch = freq_to_channel(int(m.group(1)))
+            if band in caps["bands"] and ch not in caps["bands"][band]:
+                caps["bands"][band].append(ch)
+        for b in caps["bands"]:
+            caps["bands"][b] = sorted(set(caps["bands"][b]))
     return caps
 
 
@@ -199,37 +231,61 @@ def _commit_channel(caps, cur):
         caps["radar_channels"][band].add(ch)
 
 
+def _sysfs_wifi_interfaces():
+    """Every wireless netdev in /sys/class/net (nl80211 *and* wext dongles)."""
+    names = set()
+    try:
+        for name in os.listdir("/sys/class/net/"):
+            base = "/sys/class/net/" + name
+            if os.path.exists(base + "/wireless") or os.path.exists(base + "/phy80211"):
+                names.add(name)
+    except Exception:
+        pass
+    return names
+
+
 def list_wifi_interfaces():
-    """Return [{iface, phy, type, bands:[...]}] for every wireless interface."""
+    """Return [{iface, phy, type, bands:[...]}] for every wireless interface.
+
+    Interfaces are enumerated from BOTH ``iw dev`` (nl80211) and
+    ``/sys/class/net`` so a dongle still shows up if it reports an unusual
+    interface type or uses a wext-only driver that ``iw dev`` doesn't list.
+    We deliberately do NOT filter by interface type — the only entries ``iw
+    dev`` omits from a name are the "Unnamed/non-netdev" P2P-device stanzas,
+    which never carry an ``Interface <name>`` line in the first place.
+    """
+    by_name = {}
+    order = []
     rc, out, _ = _run([_IW, "dev"], timeout=5)
-    ifaces = []
-    if rc != 0:
-        return ifaces
-    cur_phy = None
-    cur = None
-    for line in out.splitlines():
-        m = re.match(r"^(phy#\d+)", line)
-        if m:
-            cur_phy = m.group(1).replace("#", "")
-            continue
-        m = re.match(r"^\s*Interface\s+(\S+)", line)
-        if m:
+    if rc == 0:
+        cur_phy = None
+        cur = None
+        for line in out.splitlines():
+            m = re.match(r"^(phy#\d+)", line)
+            if m:
+                cur_phy = m.group(1).replace("#", "")
+                continue
+            m = re.match(r"^\s*Interface\s+(\S+)", line)
+            if m:
+                cur = {"iface": m.group(1), "phy": cur_phy, "type": None, "bands": []}
+                by_name[cur["iface"]] = cur
+                order.append(cur["iface"])
+                continue
             if cur:
-                ifaces.append(cur)
-            cur = {"iface": m.group(1), "phy": cur_phy, "type": None, "bands": []}
-            continue
-        if cur:
-            mt = re.match(r"^\s*type\s+(\S+)", line)
-            if mt:
-                cur["type"] = mt.group(1)
-    if cur:
-        ifaces.append(cur)
-    # Drop P2P/monitor-less non-netdev entries; keep managed/monitor
-    real = [i for i in ifaces if i.get("type") in (None, "managed", "monitor", "AP")]
-    for i in real:
+                mt = re.match(r"^\s*type\s+(\S+)", line)
+                if mt:
+                    cur["type"] = mt.group(1)
+    # Union with sysfs so wext-only / oddly-typed dongles are never hidden.
+    for name in sorted(_sysfs_wifi_interfaces()):
+        if name not in by_name:
+            entry = {"iface": name, "phy": _phy_for_iface(name), "type": None, "bands": []}
+            by_name[name] = entry
+            order.append(name)
+    ifaces = [by_name[n] for n in order]
+    for i in ifaces:
         caps = radio_capabilities(i["iface"])
         i["bands"] = [b for b in ("2.4", "5", "6") if caps["bands"].get(b)]
-    return real
+    return ifaces
 
 
 # --------------------------------------------------------------------------
@@ -551,14 +607,30 @@ def do_scan(interface="wlan0", band="all", passive=True):
     """Run a passive scan and return the full analysed survey."""
     if not _valid_iface(interface):
         return {"error": "invalid interface"}
+    # A freshly-plugged dongle is usually admin-down; you can't scan a down
+    # radio. Bring the link up first (link-up only, never associates).
+    if not _iface_is_up(interface):
+        _bring_iface_up(interface)
     caps = radio_capabilities(interface)
     args = [_IW, "dev", interface, "scan"]
     if passive:
         args.append("passive")
     rc, out, err = _run(args)
+    if rc != 0 and re.search(r"not ready|network is down|no such device", err or "", re.I):
+        # Down/asleep radio: try once more after forcing the link up.
+        if _bring_iface_up(interface):
+            rc, out, err = _run(args)
     if rc != 0:
         # 'Device or resource busy' / 'Operation not permitted' are common
-        return {"error": (err or "scan failed").strip(), "rc": rc,
+        hint = (err or "scan failed").strip()
+        low = hint.lower()
+        if "busy" in low:
+            hint += " — the radio is mid-scan or connecting; retry in a moment."
+        elif "not permitted" in low or "operation not permitted" in low:
+            hint += " — passive scan needs root (the Ragnar service runs as root)."
+        elif "down" in low or "not ready" in low:
+            hint += " — bring the interface up: sudo ip link set %s up" % interface
+        return {"error": hint, "rc": rc,
                 "interface": interface, "supported_bands": caps["bands"]}
     bss_list = parse_scan(out)
     # Flag radar/DFS occupancy
