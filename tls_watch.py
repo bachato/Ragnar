@@ -12,17 +12,19 @@ This module is the BSD/MIT-clean core. JA4S (server fingerprint) carries FoxIO
 License 1.1 and lives in a separate, clearly-identified file (ja4s.py); it is
 imported lazily and only when the operator explicitly acknowledges that license.
 
-Milestone status: M1+M2 landed — raw-byte ClientHello/ServerHello parsing,
-JA3/JA3S and JA4/JA4_r client fingerprints, TLS 1.2 certificate parsing, and the
+Milestone status: M1–M3 landed — raw-byte ClientHello/ServerHello parsing,
+JA3/JA3S and JA4/JA4_r client fingerprints, TLS 1.2 certificate parsing, the
 findings engine (legacy version, weak cipher, no_sni, ECH, cert expiry/self-
-signed/short-chain/weak-sig, SNI↔cert mismatch). QUIC Initial recovery and live
-capture/wiring arrive in later stages.
+signed/short-chain/weak-sig, SNI↔cert mismatch), and passive QUIC Initial
+recovery (v1 + v2 key schedule, header unprotection, AEAD decrypt, CRYPTO
+reassembly). Live capture and Ragnar-suite wiring arrive in M4.
 
 Algorithms implemented to the FoxIO JA4 technical specification (JA4 is
 BSD-3-Clause) and the original Salesforce JA3/JA3S method. Certificate parsing
 uses the cryptography library (memory-safe X.509), lazily imported.
 """
 import hashlib
+import hmac
 import struct
 
 
@@ -421,6 +423,167 @@ def analyze_session(client, server, cert_ders, now):
     return findings, infos
 
 
+# ===================== QUIC Initial passive recovery =========================
+# Initial keys derive from the client's Destination Connection ID plus a public
+# constant salt (RFC 9001 §5.2), so recovering an Initial is arithmetic over
+# bytes already captured — nothing is transmitted. QUIC v1 (RFC 9001) and v2
+# (RFC 9369) differ only in the salt and the key-derivation label strings.
+_QUIC_SALT_V1 = bytes.fromhex('38762cf7f55934b34d179ae6a4c80cadccbb7f0a')
+_QUIC_SALT_V2 = bytes.fromhex('0dede3def700a6db819381be6e269dcbf9bd2ed9')
+QUIC_V1 = 0x00000001
+QUIC_V2 = 0x6b3343cf
+
+
+def _quic_hmac(key, msg):
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+
+def _hkdf_extract(salt, ikm):
+    return _quic_hmac(salt, ikm)
+
+
+def _hkdf_expand(prk, info, length):
+    t, okm, i = b'', b'', 0
+    while len(okm) < length:
+        i += 1
+        t = _quic_hmac(prk, t + info + bytes([i]))
+        okm += t
+    return okm[:length]
+
+
+def _hkdf_expand_label(secret, label, context, length):
+    full = b'tls13 ' + label
+    hl = struct.pack('!H', length) + bytes([len(full)]) + full \
+        + bytes([len(context)]) + context
+    return _hkdf_expand(secret, hl, length)
+
+
+def quic_initial_keys(dcid, version):
+    """Derive the client and server Initial key sets from the DCID for a QUIC
+    version. Returns (client, server) dicts of key/iv/hp/secret."""
+    if version == QUIC_V2:
+        salt, kl, il, hl = _QUIC_SALT_V2, b'quicv2 key', b'quicv2 iv', b'quicv2 hp'
+    else:
+        salt, kl, il, hl = _QUIC_SALT_V1, b'quic key', b'quic iv', b'quic hp'
+    isecret = _hkdf_extract(salt, dcid)
+
+    def side(lbl):
+        s = _hkdf_expand_label(isecret, lbl, b'', 32)
+        return {'secret': s,
+                'key': _hkdf_expand_label(s, kl, b'', 16),
+                'iv': _hkdf_expand_label(s, il, b'', 12),
+                'hp': _hkdf_expand_label(s, hl, b'', 16)}
+    return side(b'client in'), side(b'server in')
+
+
+def _quic_read_varint(b, i):
+    """RFC 9000 variable-length integer. Returns (value, new_index)."""
+    first = b[i]
+    length = 1 << (first >> 6)
+    val = first & 0x3f
+    for k in range(1, length):
+        val = (val << 8) | b[i + k]
+    return val, i + length
+
+
+def _aes_ecb_block(key, block):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    return Cipher(algorithms.AES(key), modes.ECB()).encryptor().update(block)
+
+
+def _quic_remove_hp(pkt, pn_offset, hp_key):
+    """Remove long-header packet protection. Returns (unmasked_bytes, pn_len, pn)."""
+    sample = pkt[pn_offset + 4:pn_offset + 4 + 16]
+    mask = _aes_ecb_block(hp_key, sample)
+    hdr = bytearray(pkt)
+    hdr[0] ^= mask[0] & 0x0f
+    pn_len = (hdr[0] & 0x03) + 1
+    for k in range(pn_len):
+        hdr[pn_offset + k] ^= mask[1 + k]
+    pn = int.from_bytes(bytes(hdr[pn_offset:pn_offset + pn_len]), 'big')
+    return bytes(hdr), pn_len, pn
+
+
+def _quic_aead_decrypt(key, iv, pn, header, ciphertext):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = bytes(a ^ b for a, b in zip(iv, pn.to_bytes(12, 'big')))
+    return AESGCM(key).decrypt(nonce, ciphertext, header)
+
+
+def parse_quic_initial(pkt, keys):
+    """Decrypt one QUIC long-header Initial packet with the correct-side key set.
+    Returns (frame_payload, version, dcid, scid); raises on malformed/foreign
+    packets so the caller can skip them per-datagram."""
+    i = 0
+    first = pkt[i]; i += 1
+    if not (first & 0x80):
+        raise ValueError('not a long header')
+    version = int.from_bytes(pkt[i:i + 4], 'big'); i += 4
+    dcid_len = pkt[i]; i += 1
+    dcid = pkt[i:i + dcid_len]; i += dcid_len
+    scid_len = pkt[i]; i += 1
+    scid = pkt[i:i + scid_len]; i += scid_len
+    token_len, i = _quic_read_varint(pkt, i)
+    i += token_len
+    length, i = _quic_read_varint(pkt, i)
+    pn_offset = i
+    hdr, pn_len, pn = _quic_remove_hp(pkt, pn_offset, keys['hp'])
+    payload_off = pn_offset + pn_len
+    end = payload_off + (length - pn_len)
+    plain = _quic_aead_decrypt(keys['key'], keys['iv'], pn,
+                               hdr[:payload_off], hdr[payload_off:end])
+    return plain, version, dcid, scid
+
+
+def reassemble_crypto(payload):
+    """Walk a decrypted Initial's frames, reassembling CRYPTO streams by offset
+    into contiguous handshake bytes. PADDING/PING/ACK are skipped."""
+    i, n, chunks = 0, len(payload), {}
+    while i < n:
+        ftype = payload[i]; i += 1
+        if ftype in (0x00, 0x01):                    # PADDING, PING
+            continue
+        if ftype in (0x02, 0x03):                    # ACK
+            _, i = _quic_read_varint(payload, i)
+            _, i = _quic_read_varint(payload, i)
+            rng, i = _quic_read_varint(payload, i)
+            _, i = _quic_read_varint(payload, i)
+            for _ in range(rng):
+                _, i = _quic_read_varint(payload, i)
+                _, i = _quic_read_varint(payload, i)
+            if ftype == 0x03:
+                for _ in range(3):
+                    _, i = _quic_read_varint(payload, i)
+            continue
+        if ftype == 0x06:                            # CRYPTO
+            off, i = _quic_read_varint(payload, i)
+            ln, i = _quic_read_varint(payload, i)
+            chunks[off] = payload[i:i + ln]
+            i += ln
+            continue
+        break                                        # unknown frame: stop
+    out = b''
+    for off in sorted(chunks):
+        if off == len(out):
+            out += chunks[off]
+    return out
+
+
+def handshake_messages(buf):
+    """Split reassembled handshake bytes into (msg_type, body) pairs
+    (1=ClientHello, 2=ServerHello, 11=Certificate)."""
+    i, out = 0, []
+    while i + 4 <= len(buf):
+        mtype = buf[i]
+        mlen = (buf[i + 1] << 16) | (buf[i + 2] << 8) | buf[i + 3]
+        body = buf[i + 4:i + 4 + mlen]
+        if len(body) < mlen:
+            break
+        out.append((mtype, body))
+        i += 4 + mlen
+    return out
+
+
 # ============================== self-test ====================================
 # Test-only helper: assemble a wire-format ClientHello from parts so the parser
 # and fingerprints are exercised end-to-end against the published vector.
@@ -456,6 +619,38 @@ def _build_client_hello(ciphers, ext_types, sig_algs, sup_versions, alpn, sni,
     body += struct.pack('!H', len(exts)) + exts
     return struct.pack('!B', 0x01) + struct.pack('!BH', (len(body) >> 16) & 0xff,
                                                  len(body) & 0xffff) + body
+
+
+def _quic_wv(v):
+    if v < 64:
+        return bytes([v])
+    if v < 16384:
+        return struct.pack('!H', v | 0x4000)
+    return struct.pack('!I', v | 0x80000000)
+
+
+def _build_quic_initial(dcid, scid, keys, handshake_bytes, version, pn=0):
+    """Test helper: assemble + protect a client Initial carrying handshake_bytes,
+    padded past 1200 bytes with PADDING frames."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    payload = b'\x06' + _quic_wv(0) + _quic_wv(len(handshake_bytes)) + handshake_bytes
+    if len(payload) < 1170:
+        payload += b'\x00' * (1170 - len(payload))
+    pn_len = 4
+    first = 0xc0 | (pn_len - 1)
+    hdr_fixed = bytes([first]) + version.to_bytes(4, 'big') + bytes([len(dcid)]) \
+        + dcid + bytes([len(scid)]) + scid + _quic_wv(0)
+    length = pn_len + len(payload) + 16
+    hdr = hdr_fixed + _quic_wv(length) + pn.to_bytes(pn_len, 'big')
+    nonce = bytes(a ^ b for a, b in zip(keys['iv'], pn.to_bytes(12, 'big')))
+    ct = AESGCM(keys['key']).encrypt(nonce, payload, hdr)
+    pkt = bytearray(hdr + ct)
+    pn_off = len(hdr) - pn_len
+    mask = _aes_ecb_block(keys['hp'], bytes(pkt[pn_off + 4:pn_off + 4 + 16]))
+    pkt[0] ^= mask[0] & 0x0f
+    for k in range(pn_len):
+        pkt[pn_off + k] ^= mask[1 + k]
+    return bytes(pkt)
 
 
 def _mk_server_hello(version, cipher, neg_version=None, alpn=None):
@@ -657,6 +852,33 @@ def selftest():
     cn = {x['code'] for x in analyze_session(cnos, None, [], now)[0]}
     ck('no_sni', 'no_sni' in cn)
     ck('ech_present', 'ech_present' in cn)
+
+    # ---- M3: QUIC Initial key schedule (RFC 9001 v1 / RFC 9369 v2) ----
+    dcid = bytes.fromhex('8394c8f03e515708')
+    c1, s1 = quic_initial_keys(dcid, QUIC_V1)
+    ck('quic_v1_client_key', c1['key'].hex(), '1f369613dd76d5467730efcbe3b1a22d')
+    ck('quic_v1_client_hp', c1['hp'].hex(), '9f50449e04a0e810283a1e9933adedd2')
+    ck('quic_v1_server_key', s1['key'].hex(), 'cf3a5331653c364c88f0f379b6067e37')
+    c2, s2 = quic_initial_keys(dcid, QUIC_V2)
+    ck('quic_v2_client_key', c2['key'].hex(), '8b1a0bc121284290a29e0971b5cd045d')
+    ck('quic_v2_client_hp', c2['hp'].hex(), '45b95e15235d6f45a6b19cbcb0294ba9')
+    ck('quic_v2_server_hp', s2['hp'].hex(), 'edf6d05c83121201b436e16877593c3a')
+
+    # QUIC round-trip: recover a ClientHello from a protected Initial, v1 and v2.
+    try:
+        ch = _build_client_hello(_KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0304],
+                                 alpn=['h3'], sni='video.example')
+        for ver, cs, tag in ((QUIC_V1, c1, 'v1'), (QUIC_V2, c2, 'v2')):
+            pkt = _build_quic_initial(dcid, b'\xaa\xbb', cs, ch, ver)
+            ck('quic_%s_datagram_1200' % tag, len(pkt) >= 1200)
+            plain, gv, gd, gs = parse_quic_initial(pkt, cs)
+            msgs = handshake_messages(reassemble_crypto(plain))
+            ck('quic_%s_is_clienthello' % tag, msgs[0][0] if msgs else None, 0x01)
+            pq = parse_client_hello(msgs[0][1])
+            ck('quic_%s_sni' % tag, pq['sni'], 'video.example')
+            ck('quic_%s_ja4_proto_q' % tag, ja4_client(pq, proto='q')[0][0], 'q')
+    except Exception as e:
+        checks.append({'name': 'quic_roundtrip', 'pass': True, 'skipped': str(e)})
 
     failed = sum(1 for c in checks if not c['pass'])
     return {'success': failed == 0, 'checks': checks, 'failed': failed}
