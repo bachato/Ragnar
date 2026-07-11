@@ -16,13 +16,6 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
 > Authority Verification suite was designed and built in collaboration with Solarflere.
 
-All tools are served under `/api/net/*` by `network_diagnostics.py`, a
-self-contained module wrapped so a failure there can never take down the rest of
-the web app. Every tool executes on demand when you click it — with one opt-in
-exception, the [Network Integrity Monitor](#-network-integrity-monitor), which
-watches for DNS poisoning and ARP spoofing in the background and can push you an
-alert.
-
 <img width="1206" height="1862" alt="image" src="https://github.com/user-attachments/assets/bcf622a8-f8b8-45d8-857d-d214dd724f1e" />
 
 
@@ -1592,7 +1585,12 @@ alone would miss".
   `GET /api/net/vpn-check?interface=<iface>` · binary: `curl`
 
 ---
-
+All tools are served under `/api/net/*` by `network_diagnostics.py`, a
+self-contained module wrapped so a failure there can never take down the rest of
+the web app. Every tool executes on demand when you click it — with one opt-in
+exception, the [Network Integrity Monitor](#-network-integrity-monitor), which
+watches for DNS poisoning and ARP spoofing in the background and can push you an
+alert.
 ## Design notes
 
 - **Never blocks, never crashes the app.** The command runner treats a missing
