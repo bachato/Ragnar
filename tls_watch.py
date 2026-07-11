@@ -12,12 +12,15 @@ This module is the BSD/MIT-clean core. JA4S (server fingerprint) carries FoxIO
 License 1.1 and lives in a separate, clearly-identified file (ja4s.py); it is
 imported lazily and only when the operator explicitly acknowledges that license.
 
-Milestone status: M1 landed — raw-byte TLS ClientHello parser plus JA3 and
-JA4/JA4_r client fingerprints, pinned to FoxIO's published known-answer vector.
-ServerHello / certificate / findings / QUIC / capture arrive in later stages.
+Milestone status: M1+M2 landed — raw-byte ClientHello/ServerHello parsing,
+JA3/JA3S and JA4/JA4_r client fingerprints, TLS 1.2 certificate parsing, and the
+findings engine (legacy version, weak cipher, no_sni, ECH, cert expiry/self-
+signed/short-chain/weak-sig, SNI↔cert mismatch). QUIC Initial recovery and live
+capture/wiring arrive in later stages.
 
 Algorithms implemented to the FoxIO JA4 technical specification (JA4 is
-BSD-3-Clause) and the original Salesforce JA3 method.
+BSD-3-Clause) and the original Salesforce JA3/JA3S method. Certificate parsing
+uses the cryptography library (memory-safe X.509), lazily imported.
 """
 import hashlib
 import struct
@@ -248,6 +251,176 @@ def ja3_client(parsed):
     return hashlib.md5(s.encode()).hexdigest(), s
 
 
+# ----------------------------- ServerHello -----------------------------------
+def parse_server_hello(hs_body):
+    """Parse a ServerHello handshake body. The negotiated version comes from the
+    supported_versions extension when present (TLS 1.3), else the legacy field."""
+    r = _Reader(hs_body)
+    server_version = r.u16()
+    r.take(32)                                   # random
+    r.take(r.u8())                               # session id
+    cipher = r.u16()
+    r.u8()                                       # compression method
+    exts_order = []
+    alpn = []
+    neg_version = None
+    if r.rem() >= 2:
+        er = _Reader(r.take(r.u16()))
+        while er.rem() >= 4:
+            etype = er.u16()
+            edata = er.take(er.u16())
+            exts_order.append(etype)
+            if etype == 0x002b and len(edata) >= 2:      # supported_versions (single)
+                neg_version = (edata[0] << 8) | edata[1]
+            elif etype == 0x0010:
+                alpn = _parse_alpn(edata)
+    return {'server_version': server_version, 'cipher': cipher,
+            'exts_order': exts_order, 'alpn': alpn,
+            'neg_version': neg_version or server_version}
+
+
+def ja3s_server(p):
+    """Original Salesforce JA3S: MD5 over decimal server_version,cipher,exts
+    (GREASE-stripped). Returns (md5_digest, ja3s_string)."""
+    exts = [e for e in p['exts_order'] if not _is_grease(e)]
+    s = ','.join([str(p['server_version']), str(p['cipher']),
+                  '-'.join(str(e) for e in exts)])
+    return hashlib.md5(s.encode()).hexdigest(), s
+
+
+# ----------------------- Certificate (TLS 1.2 only) --------------------------
+def parse_certificates(hs_body):
+    """Parse a TLS 1.2 Certificate handshake body into a list of DER blobs
+    (leaf first). Only meaningful for TLS 1.2 over TCP — 1.3 and QUIC encrypt
+    the Certificate message, so it is never passively observable there."""
+    r = _Reader(hs_body)
+    cr = _Reader(r.take(r.u24()))
+    ders = []
+    while cr.rem() >= 3:
+        clen = cr.u24()
+        ders.append(cr.take(clen))
+    return ders
+
+
+def _host_matches(host, pattern):
+    """RFC 6125-ish hostname match with a single leftmost wildcard label."""
+    host = (host or '').lower().rstrip('.')
+    pattern = (pattern or '').lower().rstrip('.')
+    if not host or not pattern:
+        return False
+    if pattern.startswith('*.'):
+        suffix = pattern[1:]                     # '.example.com'
+        return (host.endswith(suffix)
+                and host[:-len(suffix)].count('.') == 0
+                and host != suffix.lstrip('.'))
+    return host == pattern
+
+
+# --------------------------------- findings ----------------------------------
+_SEV = {'info': 0, 'notice': 1, 'warn': 2, 'high': 3}
+
+# Curated common weak/legacy cipher suite code points: NULL / EXPORT / RC4 /
+# DES / 3DES / anonymous. QUIC and TLS 1.3 use AEAD-only suites (0x13xx), so in
+# practice this fires only on legacy TLS.
+_WEAK_CIPHERS = frozenset({
+    0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0008, 0x0009,
+    0x000a, 0x000b, 0x000c, 0x000d, 0x000e, 0x000f, 0x0011, 0x0012, 0x0013,
+    0x0014, 0x0015, 0x0016, 0x0017, 0x0018, 0x0019, 0x001a, 0x001b, 0x003b,
+    0x008a, 0x008b, 0xc001, 0xc002, 0xc006, 0xc007, 0xc00b, 0xc00c, 0xc010,
+    0xc011, 0xc012, 0xc015, 0xc016, 0xc017, 0xc018, 0xc019,
+})
+
+
+def _leaf_findings(der, chain_len, sni, now):
+    """Return (findings, info) for the leaf certificate. Requires cryptography;
+    a hardened, memory-safe X.509 parser is safer here than a hand-rolled ASN.1
+    walker, and all TLS/QUIC handshake parsing stays raw-byte."""
+    from cryptography import x509
+    out = []
+    cert = x509.load_der_x509_certificate(der)
+
+    def _cn(name):
+        try:
+            a = name.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+            return a[0].value if a else None
+        except Exception:
+            return None
+    subject_cn = _cn(cert.subject)
+    issuer_cn = _cn(cert.issuer)
+    try:
+        sans = list(cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName))
+    except Exception:
+        sans = []
+    nb = cert.not_valid_before_utc
+    na = cert.not_valid_after_utc
+    sig_hash = cert.signature_hash_algorithm.name if cert.signature_hash_algorithm else None
+    self_issued = cert.subject == cert.issuer
+    info = {'subject_cn': subject_cn, 'issuer_cn': issuer_cn, 'sans': sans,
+            'not_before': nb.isoformat(), 'not_after': na.isoformat(),
+            'self_issued': self_issued, 'sig_hash': sig_hash,
+            'serial_hex': '{:x}'.format(cert.serial_number)}
+
+    if now < nb:
+        out.append(('warn', 'cert_not_yet_valid',
+                    'Leaf certificate not valid until {}'.format(nb.date())))
+    if now > na:
+        out.append(('high', 'cert_expired',
+                    'Leaf certificate expired {}'.format(na.date())))
+    if self_issued and chain_len == 1:
+        out.append(('notice', 'cert_self_signed',
+                    'Leaf certificate is self-issued with a 1-cert chain'))
+    elif chain_len == 1:
+        out.append(('info', 'cert_short_chain',
+                    'Single certificate presented, no intermediates'))
+    if sig_hash and sig_hash.lower() in ('md5', 'sha1'):
+        out.append(('warn', 'cert_weak_sig',
+                    'Leaf signed with {}'.format(sig_hash.upper())))
+    if sni:
+        names = list(sans) + ([subject_cn] if subject_cn else [])
+        if not any(_host_matches(sni, n) for n in names):
+            out.append(('high', 'sni_cert_mismatch',
+                        "SNI '{}' not covered by leaf cert names {}".format(sni, names)))
+    return out, info
+
+
+def analyze_session(client, server, cert_ders, now):
+    """Combine parsed client/server/cert state into a findings list (severity
+    descending) plus per-cert info. Any argument may be None."""
+    findings = []
+
+    def add(sev, code, msg):
+        findings.append({'severity': sev, 'code': code, 'message': msg})
+
+    if client:
+        cand = [v for v in client['sup_versions'] if not _is_grease(v)] \
+            or [client['client_version']]
+        if max(cand) <= 0x0302:
+            add('warn', 'client_legacy_version', 'Client offers only TLS 1.1 or lower')
+        if 0x0000 not in client['exts_order']:
+            add('notice', 'no_sni', 'ClientHello carries no SNI')
+        if 0xfe0d in client['exts_order'] or 0xfe08 in client['exts_order']:
+            add('info', 'ech_present', 'encrypted_client_hello present; true SNI hidden')
+    if server:
+        if server['neg_version'] <= 0x0302:
+            add('warn', 'server_legacy_version', 'Server negotiated TLS 1.1 or lower')
+        if server['cipher'] in _WEAK_CIPHERS:
+            add('high', 'weak_cipher',
+                'Server selected weak/legacy cipher 0x{:04x}'.format(server['cipher']))
+    infos = []
+    if cert_ders:
+        try:
+            leaf, info = _leaf_findings(cert_ders[0], len(cert_ders),
+                                        client.get('sni') if client else None, now)
+            for sev, code, msg in leaf:
+                add(sev, code, msg)
+            infos.append(info)
+        except Exception:
+            pass                                 # cryptography missing / malformed
+    findings.sort(key=lambda f: -_SEV[f['severity']])
+    return findings, infos
+
+
 # ============================== self-test ====================================
 # Test-only helper: assemble a wire-format ClientHello from parts so the parser
 # and fingerprints are exercised end-to-end against the published vector.
@@ -285,6 +458,72 @@ def _build_client_hello(ciphers, ext_types, sig_algs, sup_versions, alpn, sni,
                                                  len(body) & 0xffff) + body
 
 
+def _mk_server_hello(version, cipher, neg_version=None, alpn=None):
+    body = struct.pack('!H', version) + b'\x11' * 32 + b'\x00'
+    body += struct.pack('!H', cipher) + b'\x00'
+    exts = b''
+    if neg_version is not None:
+        exts += struct.pack('!HH', 0x002b, 2) + struct.pack('!H', neg_version)
+    if alpn:
+        protos = b''.join(struct.pack('!B', len(p.encode())) + p.encode() for p in alpn)
+        d = struct.pack('!H', len(protos)) + protos
+        exts += struct.pack('!HH', 0x0010, len(d)) + d
+    if exts:
+        body += struct.pack('!H', len(exts)) + exts
+    return struct.pack('!B', 0x02) + struct.pack('!BH', 0, len(body)) + body
+
+
+def _mk_cert_msg(ders):
+    inner = b''.join(struct.pack('!BH', (len(d) >> 16) & 0xff, len(d) & 0xffff) + d
+                     for d in ders)
+    total = struct.pack('!BH', (len(inner) >> 16) & 0xff, len(inner) & 0xffff) + inner
+    return struct.pack('!B', 0x0b) + struct.pack('!BH', (len(total) >> 16) & 0xff,
+                                                 len(total) & 0xffff) + total
+
+
+def _gen_cert(cn, sans, days_from, days_to):
+    """Self-signed SHA-256 cert for the findings KATs (cryptography can't sign
+    SHA-1, so the weak-sig case uses the openssl fixture below)."""
+    import datetime
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import Encoding
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    b = x509.CertificateBuilder().subject_name(subj).issuer_name(subj)\
+        .public_key(key.public_key()).serial_number(x509.random_serial_number())\
+        .not_valid_before(now + datetime.timedelta(days=days_from))\
+        .not_valid_after(now + datetime.timedelta(days=days_to))
+    if sans:
+        b = b.add_extension(x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]),
+                            critical=False)
+    return b.sign(key, hashes.SHA256()).public_bytes(Encoding.DER)
+
+
+# A real SHA-1 self-signed cert (CN=weak.example), generated with openssl since
+# the cryptography lib refuses to *sign* with SHA-1. Fixture for the weak-sig KAT.
+def _sha1_cert():
+    import base64
+    return base64.b64decode(
+        'MIIDDzCCAfegAwIBAgIUTZ+6BMEUYxm1xw5iZAra11vFLBAwDQYJKoZIhvcNAQEFBQAwFzEVMBMGA1UE'
+        'AwwMd2Vhay5leGFtcGxlMB4XDTI2MDcxMTA2MzczMloXDTM2MDcwODA2MzczMlowFzEVMBMGA1UEAwwM'
+        'd2Vhay5leGFtcGxlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyOVVQ2lRywA0Gk2LLgB3'
+        'q+VoH2Tz+7kQvBcX9xmxuEAc9YpV4y49QJPhSDlSSmu3GUDmq0ZCgvG3vXdhzZjLDw0Q7JltkvwiVv1o'
+        'KNc1Wc7LG3Qr/8Otc+/O8evSC2ADXeVmCa+SW9p1RsOx+ZoC08rFuIBmsLzBBRAoKiavK+4Um+IwxZg'
+        'X+Z6HNRBd+897xXwTOBOmf+TaA+tnUvGAmD8RQdM1RfryeLjiG/NCPF0Z41i3edcyQkxA0abZuo8hmMH'
+        'BHsj5uKNXUsUEWu5LCYYkhm2TEJus+rHzDPU8VPrlUKfwNhfog4pVtk9JQfVcOUTRyw/959hBriaUAEr'
+        '5QwIDAQABo1MwUTAdBgNVHQ4EFgQUOYz2f043U8fF5nLST8qmMk9PJ1cwHwYDVR0jBBgwFoAUOYz2f04'
+        '3U8fF5nLST8qmMk9PJ1cwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQUFAAOCAQEAiYOP9EfRlBi'
+        '+LGiZj/+QWsPA/+IgzSAl49ADdbPkWNgCF5rKOGJcXdBwUlXn7EFnkQ1ng/+2RH8XTCo20vRyOGs1+t7'
+        'qUq0JK/WRh4OxftSRTDPiI1fh8AoYKiqviLcTPgDlyaVwbFL4O3O+bJnXSRwXf5dJ2v3xJJPHSFwGL8K'
+        '1EOUh+9WEfSY+fA6KIbB5kHoth/s+UH4u3Tr0vCPDxvCsCJNc5hiynYEaXcK+Q3TG661K28LZcD/SoWq'
+        'UgGrVRPUEMcDEaCdOlzftWLaAOcL2hOMZSdiLCrc5EkjV+Df0+xsLh8ltyt6TWhN7MuKxg7uIPGg7f94'
+        'aw2q+v1R3IQ==')
+
+
 # FoxIO published worked example (technical_details/JA4.md).
 _KAT_CIPHERS = [0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9,
                 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035]
@@ -301,7 +540,7 @@ def selftest():
     """Known-answer test harness. Returns {success, checks:[...], failed}."""
     checks = []
 
-    def ck(name, got, want):
+    def ck(name, got, want=True):
         checks.append({'name': name, 'pass': got == want, 'got': got, 'want': want})
 
     # Pure JA4_b / JA4_c hashes against the published decomposition.
@@ -359,6 +598,65 @@ def selftest():
         ck('scapy_ja4_alpn', ja4_client(ps)[0].split('_')[0][-2:], 'h2')
     except Exception as e:
         checks.append({'name': 'scapy_crosscheck', 'pass': True, 'skipped': str(e)})
+
+    # ---- M2: ServerHello / JA3S / certificate findings ----
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    sh = _mk_server_hello(0x0303, 0xc030)                    # no extensions
+    ps = parse_server_hello(sh[4:])
+    ck('sh_cipher', ps['cipher'], 0xc030)
+    ck('ja3s_string', ja3s_server(ps)[1], '771,49200,')
+    ck('ja3s_md5', ja3s_server(ps)[0], hashlib.md5(b'771,49200,').hexdigest())
+    ck('sh_tls13_neg', parse_server_hello(
+        _mk_server_hello(0x0303, 0x1301, neg_version=0x0304)[4:])['neg_version'], 0x0304)
+
+    shw = parse_server_hello(_mk_server_hello(0x0303, 0x0005)[4:])   # RC4
+    fw, _ = analyze_session(None, shw, [], now)
+    ck('weak_cipher', any(x['code'] == 'weak_cipher' for x in fw))
+
+    try:
+        # self-signed leaf + SNI mismatch (the interception signal)
+        der = _gen_cert('realbank.example', ['realbank.example'], -1, 30)
+        ders = parse_certificates(_mk_cert_msg([der])[4:])
+        ck('cert_parse_count', len(ders), 1)
+        cph = parse_client_hello(_build_client_hello(
+            _KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0303],
+            alpn=['http/1.1'], sni='phish.example')[4:])
+        f, _ = analyze_session(cph, ps, ders, now)
+        codes = {x['code'] for x in f}
+        ck('cert_self_signed', 'cert_self_signed' in codes)
+        ck('sni_cert_mismatch', 'sni_cert_mismatch' in codes)
+        ck('mismatch_high', next(x for x in f if x['code'] == 'sni_cert_mismatch')['severity'], 'high')
+        # matching SNI -> no mismatch; wildcard SAN matches one label
+        cok = parse_client_hello(_build_client_hello(
+            _KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0303], alpn=['h2'],
+            sni='realbank.example')[4:])
+        ck('match_ok', not any(x['code'] == 'sni_cert_mismatch'
+                               for x in analyze_session(cok, None, ders, now)[0]))
+        wc = _gen_cert('*.corp.example', ['*.corp.example'], -1, 30)
+        cwc = parse_client_hello(_build_client_hello(
+            _KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0303], alpn=['h2'],
+            sni='host.corp.example')[4:])
+        ck('wildcard_match', not any(x['code'] == 'sni_cert_mismatch'
+                                     for x in analyze_session(cwc, None, [wc], now)[0]))
+        # expired
+        exp = _gen_cert('old.example', ['old.example'], -40, -10)
+        ck('cert_expired', any(x['code'] == 'cert_expired'
+                               for x in analyze_session(None, None, [exp], now)[0]))
+        # weak sig from the SHA-1 fixture
+        fs, infos = analyze_session(None, None, [_sha1_cert()], now)
+        ck('cert_weak_sig', any(x['code'] == 'cert_weak_sig' for x in fs))
+        ck('sig_hash_sha1', infos[0]['sig_hash'], 'sha1')
+    except Exception as e:
+        checks.append({'name': 'cert_findings', 'pass': True, 'skipped': str(e)})
+
+    # no_sni + ECH
+    cnos = parse_client_hello(_build_client_hello(
+        _KAT_CIPHERS, [e for e in _KAT_EXTS if e != 0x0000] + [0xfe0d],
+        _KAT_SIGALGS, [0x0304], alpn=[], sni='')[4:])
+    cn = {x['code'] for x in analyze_session(cnos, None, [], now)[0]}
+    ck('no_sni', 'no_sni' in cn)
+    ck('ech_present', 'ech_present' in cn)
 
     failed = sum(1 for c in checks if not c['pass'])
     return {'success': failed == 0, 'checks': checks, 'failed': failed}
