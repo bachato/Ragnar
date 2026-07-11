@@ -1499,6 +1499,21 @@
                     </div>
                     <div id="ipv6-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
                 </div>
+                <!-- NDP Watch -->
+                <div class="glass rounded-xl p-4 sm:p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-1">NDP Watch <span class="text-xs font-normal text-gray-500">(IPv6 neighbor spoofing · the v6 ARP-poison twin)</span></h3>
+                    <p class="text-xs text-amber-300/90 mb-2">The <strong>IPv6 twin of ARP Watch.</strong> <em>ARP Watch</em> catches IPv4 cache poisoning and <em>IPv6 First-Hop Watch</em> catches rogue RA / DHCPv6 — but neither catches the direct v6 analogue of ARP poisoning: a forged <strong>Neighbor Advertisement</strong> claiming someone else's address, which poisons every neighbour's ND cache and puts an attacker on-path (<span class="font-mono">parasite6</span>). On any dual-stack LAN this is the open door a v4-only defender never sees. <strong>Detection-only</strong> — never sends an NA, never answers a solicit.</p>
+                    <p class="text-sm text-gray-400 mb-3">Passively captures ICMPv6 <span class="font-mono">Neighbor Solicitation / Advertisement</span> (135/136) and flags <strong>spoofed</strong> (two MACs claiming one address, the default router advertised by a rogue MAC, or a learned host's owner-MAC changing), <strong>dad-dos</strong> (one MAC answering every Duplicate Address Detection probe — <span class="font-mono">dos-new-ip6</span>, so no host can pick an address), and an NA <strong>flood</strong>. First scan learns the trusted target→MAC bindings + default router (<span class="font-mono">data/ndp_watch.json</span>); "Trust current" re-learns. Mitigate with switch <strong>IPv6 Snooping / ND Inspection</strong> (SAVI, RFC 6620).</p>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <select id="ndp-iface" title="Interface for the NDP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                            <option value="">Auto (default route)</option>
+                        </select>
+                        <input id="ndp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                        <button onclick="runNdpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan NDP</button>
+                        <button onclick="ndpTrustBaseline()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Learn the current neighbour bindings + default router as the trusted baseline — use after a legitimate device/router change">Trust current</button>
+                    </div>
+                    <div id="ndp-results" class="hidden mt-3 overflow-x-auto text-sm"></div>
+                </div>
                 <!-- ICMP Watch -->
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <h3 class="text-lg font-semibold mb-1">ICMP Watch <span class="text-xs font-normal text-gray-500">(ICMP redirect · L3 route injection)</span></h3>
@@ -6024,7 +6039,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260711-tlswatch"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260711-ndpwatch"></script>
 
 </body>
 </html>

@@ -47,6 +47,7 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 | [IGMP Watch](#igmp-watch) | Switch & L2/L3 | `GET /api/net/igmp-watch`, `POST /api/net/igmp-baseline` |
 | [TLS Watch](#tls-watch) | Switch & L2/L3 | `GET /api/net/tls-watch` |
 | [IPv6 First-Hop Watch](#ipv6-first-hop-watch) | Switch & L2/L3 | `GET /api/net/ipv6-watch`, `POST /api/net/ipv6-baseline` |
+| [NDP Watch](#ndp-watch) | Switch & L2/L3 | `GET /api/net/ndp-watch`, `POST /api/net/ndp-baseline` |
 | [IPv6 RA Guard](#ipv6-ra-guard) | Diagnostics | `GET /api/net/raguard`, `POST /api/net/raguard` `{action: harden}` |
 | [NTP Watch](#ntp-watch) | Diagnostics | `GET /api/net/ntp-watch`, `POST /api/net/ntp-baseline` |
 | [ICMP Watch](#icmp-watch) | Switch & L2/L3 | `GET /api/net/icmp-watch`, `POST /api/net/icmp-baseline` |
@@ -98,7 +99,7 @@ leg that crafts real packets → pcap → `tcpdump` → parse to exercise the wh
 capture path.
 
 ### Detector Self-Test (Switch & L2/L3)
-A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **RA Guard**,
+A one-click **Run self-test** that validates the IGMP, **IPv6 first-hop**, **NDP**, **RA Guard**,
 **NTP**, **ICMP**, **SNMP**, **TLS-cert**, **STP**, **DTP**, **SMB**, **Relay/Coercion**, **EIGRP**, **IS-IS**, **FHRP**, OSPF and BGP detectors — plus the **BGP speaker** (codec/framer/FSM/RIB) and
 **path-asymmetry / OWD** engine — by running each classifier against crafted attack
 captures (no root, no external network) and reports per-suite pass/fail. With Scapy
@@ -364,7 +365,7 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
-STP · DTP · IGMP · IPv6 first-hop · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
+STP · DTP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
 Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
 `tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
 cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
@@ -953,6 +954,52 @@ exercising the capture→parse path end to end.
 
 - Endpoint: `GET /api/net/ipv6-watch` `{interface, seconds}`,
   `POST /api/net/ipv6-baseline` `{action: reset}` · binary: `tcpdump`
+
+### NDP Watch
+The **IPv6 twin of [ARP Watch](#arp-poisoning--mitm-detection)**, and the missing half
+of a capability most toolkits only ship for IPv4. ARP Watch catches IPv4 cache
+poisoning; [IPv6 First-Hop Watch](#ipv6-first-hop-watch) catches rogue RA / DHCPv6
+(mitm6) — but **neither catches the direct IPv6 analogue of ARP poisoning**: a forged
+**Neighbor Advertisement** (ICMPv6 type 136) that claims someone else's address,
+poisons every neighbour's **ND cache**, and puts an attacker **on-path** (THC
+`parasite6`). On any dual-stack LAN — i.e. almost every LAN — that's an open door a
+v4-only defender never sees. This scanner is **passive and detection-only**: it never
+sends an NA and never answers a solicit. One short `tcpdump` window over ICMPv6
+Neighbor Solicitation / Advertisement (135/136, captured with Ethernet source MACs)
+is parsed and classified:
+
+- **Spoofed** — two or more **different MACs claim one target IPv6 address**
+  (`parasite6`); the **default router** advertised by a MAC other than the trusted
+  one (**NDP router poisoning** / IPv6 MITM); or a **learned host's owner-MAC
+  changing** (ND cache takeover). The binding a spoofer forges is the NA's *target
+  link-layer address* option — the watch reads that, not just the Ethernet source.
+- **dad-dos** — one MAC answering the **Duplicate Address Detection** probe (NA) for
+  many addresses it doesn't own: THC **`dos-new-ip6`**, which defends *every* claim so
+  no host on the segment can pick an IPv6 address — a SLAAC **denial of service**.
+- **Storm** — a Neighbor Advertisement **flood** (e.g. `flood_advertise6`), by rate.
+
+The **first scan learns** the trusted target→MAC bindings and seeds the **default
+router** binding from the kernel neighbour table into `data/ndp_watch.json`; after a
+legitimate device/router change, click **Trust current** to re-learn. Every result
+carries a **mitigation advisory**: enable switch **IPv6 Snooping / ND Inspection**
+(the RA-Guard family, RFC 6620 **SAVI**) on access ports; if IPv6 is genuinely unused,
+disable it on hosts to remove the neighbour-cache attack surface entirely.
+
+Small **CLI** (no web app needed):
+
+```
+python3 network_diagnostics.py ndp-watch [--iface eth0] [--seconds 12] [--json]
+python3 network_diagnostics.py ndp-selftest     # self-test the detectors, no root
+```
+
+`ndp-selftest` drives the real parser + classifier with synthetic captures (clean /
+spoofed-conflict / router-poison / binding-changed / dad-dos / storm, plus NA and DAD
+parse checks), and — when [Scapy](https://scapy.net) is installed — crafts a real
+Neighbor Advertisement (with the target link-layer address option) into a pcap and
+parses it back through `tcpdump -e`, exercising the capture→parse path end to end.
+
+- Endpoint: `GET /api/net/ndp-watch` `{interface, seconds}`,
+  `POST /api/net/ndp-baseline` `{action: reset}` · binary: `tcpdump`
 
 ### ICMP Watch
 The **ICMP Redirect** (type 5) is the classic **Layer-3 man-in-the-middle**. Any

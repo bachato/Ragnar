@@ -1300,6 +1300,7 @@ def _net_integrity_check_once():
         ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch)),
         ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch)),
         ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch)),
+        ('ndp', 'NDP', lambda: watch(nd.do_ndp_watch)),
         ('fhrp', 'FHRP', lambda: watch(nd.do_fhrp_watch)),
         ('ospf', 'OSPF', lambda: watch(nd.do_ospf_watch)),
         ('eigrp', 'EIGRP', lambda: watch(nd.do_eigrp_watch)),

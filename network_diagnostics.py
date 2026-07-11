@@ -3982,6 +3982,440 @@ def _ipv6_selftest():
 
 
 # --------------------------------------------------------------------------
+# NDP Watch: passive IPv6 Neighbor Discovery spoofing detector (detection-only)
+# --------------------------------------------------------------------------
+# The IPv6 twin of ARP Watch. ARP Watch catches IPv4 cache poisoning; IPv6
+# First-Hop Watch catches rogue RA / DHCPv6 (mitm6) — but neither catches the
+# direct IPv6 analogue of ARP poisoning: a forged Neighbor Advertisement (ICMPv6
+# type 136) claiming someone else's address, which poisons every neighbour's ND
+# cache and puts an attacker on-path (THC parasite6). On any dual-stack LAN this
+# is the open door a v4-only defender never sees. This scanner is PASSIVE: one
+# short tcpdump window over Neighbor Solicitation/Advertisement (135/136), parsed
+# and classified. It never sends an NA, never answers a solicit. What it flags:
+#   * spoofed  — two+ MACs claim one target address (parasite6), the default
+#     router advertised by a MAC other than the trusted one (router poisoning /
+#     MITM), or a learned host's owner-MAC changing (ND cache takeover).
+#   * dad-dos  — one MAC answering the Duplicate Address Detection probe for many
+#     addresses it doesn't own (THC dos-new-ip6): defends every claim so no host
+#     can pick an IPv6 address — a SLAAC denial of service.
+#   * storm    — a Neighbor Advertisement flood (flood_advertise6) by rate.
+# First run learns the trusted target->MAC bindings + the default router into
+# data/ndp_watch.json; "Trust current" re-learns after a legitimate change.
+# Mitigation advisory points at switch IPv6 Snooping / ND Inspection (SAVI, RFC
+# 6620) — the RA-Guard family that also binds the neighbour table.
+
+_NDP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'data', 'ndp_watch.json')
+_ndp_watch_lock = threading.Lock()
+
+# One MAC that NA-defends at least this many distinct DAD targets is running the
+# dos-new-ip6 attack (answering every address claim so no host can join).
+_NDP_DAD_DEFENDER_MIN = 4
+# Sustained NA rate at/above this is a flood (parasite6 / flood_advertise6). NAs
+# are normally rare (a handful per host as caches refresh), so the floor is high.
+_NDP_NA_FLOOD_RATE = 20.0
+# Keep at most this many anomaly events in the store (newest wins).
+_NDP_EVENTS_CAP = 200
+
+_NDP_MAC_RE = r'([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})'
+
+
+def _default_gateway6():
+    """Return (ipv6_gateway, dev) for the IPv6 default route, or (None, None).
+    The gateway is usually a link-local fe80:: address."""
+    res = _run(['ip', '-6', 'route', 'show', 'default'], timeout=5)
+    addr = re.search(r'default\s+via\s+' + _IPV6_ADDR_RE, res['out'])
+    dev = re.search(r'default\b.*?\bdev\s+(\S+)', res['out'])
+    return (addr.group(1) if addr else None, dev.group(1) if dev else None)
+
+
+def _neigh6_mac(ip):
+    """Current MAC bound to an IPv6 `ip` in the kernel neighbour table, or None."""
+    if not ip:
+        return None
+    res = _run(['ip', '-6', 'neigh', 'show'], timeout=5)
+    for line in res['out'].splitlines():
+        m = re.match(r'^' + _IPV6_ADDR_RE + r'\b.*?\blladdr\s+' + _NDP_MAC_RE, line)
+        if m and m.group(1) == ip:
+            return m.group(2).lower()
+    return None
+
+
+def _ndp_watch_load():
+    try:
+        with open(_NDP_WATCH_PATH) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ndp_watch_save(d):
+    try:
+        os.makedirs(os.path.dirname(_NDP_WATCH_PATH), exist_ok=True)
+        tmp = _NDP_WATCH_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _NDP_WATCH_PATH)
+    except OSError:
+        pass
+
+
+def do_ndp_baseline(action='get'):
+    """Manage the learned NDP baseline (trusted target->MAC bindings + the default
+    router's MAC). action='reset' re-learns the current segment on the next scan
+    (use after a legitimate device/router change)."""
+    with _ndp_watch_lock:
+        if action == 'reset':
+            _ndp_watch_save({})
+            return {'success': True, 'reset': True, 'baseline': {}}
+        b = _ndp_watch_load()
+        return {'success': True, 'baseline': {
+            'bindings': b.get('bindings') or {},
+            'router': b.get('router') or {},
+        }}
+
+
+def _parse_ndp_capture(output):
+    """Parse `tcpdump -e -nn -t -v` NS/NA text into events.
+
+    With -e each packet's header line begins with the Ethernet src/dst MAC and
+    carries ', ethertype '; option lines are indented. Events:
+      na : {kind, eth_src, src, tgt, flags{router,solicited,override}, lladdr}
+      ns : {kind, eth_src, src, tgt, dad, lladdr}
+    `lladdr` for an NA is the *claimed owner* of tgt (target link-layer address
+    option, which tcpdump prints as 'destination link-address option (2)'); it
+    falls back to the Ethernet source when the option is absent. That binding
+    (tgt -> lladdr) is exactly what a spoofer forges.
+    """
+    events = []
+    blocks, cur = [], []
+    for raw in output.splitlines():
+        if not raw.strip():
+            continue
+        if not raw[0].isspace() and ', ethertype ' in raw:
+            if cur:
+                blocks.append(cur)
+            cur = [raw]
+        elif cur:
+            cur.append(raw)
+    if cur:
+        blocks.append(cur)
+
+    hdr_re = re.compile(r'^' + _NDP_MAC_RE + r'\s*>\s*' + _NDP_MAC_RE)
+    inner_re = re.compile(r'ethertype IPv6[^:]*:\s*' + _IPV6_ADDR_RE +
+                          r'\s*>\s*' + _IPV6_ADDR_RE + r':')
+    for block in blocks:
+        head = block[0]
+        text = '\n'.join(block)
+        low = text.lower()
+        hm = hdr_re.match(head.strip())
+        eth_src = hm.group(1).lower() if hm else None
+        im = inner_re.search(head)
+        src = im.group(1) if im else None
+
+        if 'neighbor advertisement' in low:
+            tm = re.search(r'tgt is\s+' + _IPV6_ADDR_RE, text)
+            fl = re.search(r'flags\s+\[([^\]]*)\]', low)
+            flags = fl.group(1) if fl else ''
+            om = re.search(r'destination link-address option \(2\).*?:\s*' +
+                           _NDP_MAC_RE, low, re.S)
+            events.append({'kind': 'na', 'eth_src': eth_src, 'src': src,
+                           'tgt': tm.group(1) if tm else None,
+                           'lladdr': (om.group(1).lower() if om else eth_src),
+                           'flags': {'router': 'router' in flags,
+                                     'solicited': 'solicited' in flags,
+                                     'override': 'override' in flags}})
+        elif 'neighbor solicitation' in low:
+            wm = re.search(r'who has\s+' + _IPV6_ADDR_RE, text)
+            om = re.search(r'source link-address option \(1\).*?:\s*' +
+                           _NDP_MAC_RE, low, re.S)
+            events.append({'kind': 'ns', 'eth_src': eth_src, 'src': src,
+                           'tgt': wm.group(1) if wm else None,
+                           'dad': (src == '::'),
+                           'lladdr': (om.group(1).lower() if om else eth_src)})
+    return events
+
+
+def _ndp_analyze(events, seconds, baseline, learn=True):
+    """Pure classifier over parsed NS/NA events. Returns the result payload (minus
+    interface). Separated from capture so the self-test can drive it with
+    synthetic packets. May mutate+persist `baseline` when learn=True."""
+    seconds = max(1, int(seconds))
+    na = [e for e in events if e['kind'] == 'na' and e.get('tgt')]
+    ns = [e for e in events if e['kind'] == 'ns' and e.get('tgt')]
+    na_count = len(na)
+    na_rate = round(na_count / seconds, 2)
+
+    known = dict(baseline.get('bindings') or {})          # ipv6 -> mac
+    router = baseline.get('router') or {}                  # {addr, mac}
+    had_baseline = bool(known or router.get('mac'))
+
+    # tgt -> set of MACs claiming to own it (from each NA's target-lladdr).
+    claims = {}
+    for e in na:
+        claims.setdefault(e['tgt'], set()).add(e['lladdr'])
+
+    # Learn-on-first-run: adopt every *unambiguous* binding on the wire.
+    learned = False
+    if learn and not had_baseline and claims:
+        known = {ip: next(iter(macs)) for ip, macs in claims.items()
+                 if len(macs) == 1}
+        baseline['bindings'] = dict(known)
+        learned = True
+
+    reasons = []
+    verdict = 'clean'
+
+    # --- storm: NA flood (parasite6 / flood_advertise6) ---
+    if na_rate >= _NDP_NA_FLOOD_RATE and na_count >= _NDP_NA_FLOOD_RATE * seconds:
+        verdict = 'storm'
+        reasons.append(f"Neighbor Advertisement flood: {na_count} NAs in {seconds}s "
+                       f"({na_rate}/s) — NDP flood DoS (e.g. flood_advertise6)")
+
+    # --- spoofed: two+ MACs claim one target, a baseline binding changed, or the
+    # default router is advertised by a MAC other than the trusted one ---
+    conflicts = {ip: sorted(macs) for ip, macs in claims.items() if len(macs) > 1}
+    changed = {ip: (known[ip], next(iter(macs)))
+               for ip, macs in claims.items()
+               if ip in known and len(macs) == 1 and next(iter(macs)) != known[ip]}
+    router_hit = None
+    if router.get('addr') and router['addr'] in claims:
+        rmacs = claims[router['addr']]
+        if router.get('mac') and (len(rmacs) > 1 or
+                                  next(iter(rmacs)) != router['mac']):
+            router_hit = sorted(rmacs)
+
+    if conflicts or changed or router_hit:
+        verdict = 'spoofed' if verdict == 'clean' else verdict
+        if router_hit:
+            reasons.append(f"Default router {router['addr']} advertised by "
+                           f"{', '.join(router_hit)} (trusted {router['mac']}) — "
+                           f"NDP router poisoning / IPv6 MITM")
+        for ip, macs in conflicts.items():
+            if router_hit and ip == router.get('addr'):
+                continue
+            reasons.append(f"{ip} claimed by {len(macs)} MACs ({', '.join(macs)}) "
+                           f"— spoofed Neighbor Advertisement (parasite6), the IPv6 "
+                           f"twin of ARP cache poisoning")
+        for ip, (was, now) in changed.items():
+            reasons.append(f"{ip} owner MAC changed from trusted {was} to {now} "
+                           f"— NDP cache poisoning / MITM")
+
+    # --- dad-dos: one MAC NA-defends many distinct DAD'd targets (dos-new-ip6) ---
+    dad_targets = {e['tgt'] for e in ns if e.get('dad')}
+    defender = {}                                          # mac -> set(targets)
+    for e in na:
+        if e['tgt'] in dad_targets and not e['flags'].get('solicited'):
+            defender.setdefault(e['lladdr'], set()).add(e['tgt'])
+    dad_dos = {mac: sorted(t) for mac, t in defender.items()
+               if len(t) >= _NDP_DAD_DEFENDER_MIN}
+    if dad_dos and verdict == 'clean':
+        verdict = 'dad-dos'
+    for mac, tgts in dad_dos.items():
+        reasons.append(f"MAC {mac} defends {len(tgts)} address claims via NA "
+                       f"(DAD responses) — dos-new-ip6: blocks every host from "
+                       f"picking an IPv6 address (SLAAC DoS)")
+
+    advisories = []
+    if claims or dad_targets:
+        advisories.append("Enable IPv6 Snooping / ND Inspection (RA-Guard family, "
+                          "RFC 6620 SAVI) on access ports; if IPv6 is unused, disable "
+                          "it on hosts to remove the neighbour-cache attack surface.")
+
+    hosts = [{'ip': ip, 'macs': sorted(macs),
+              'baseline': known.get(ip), 'conflict': len(macs) > 1}
+             for ip, macs in sorted(claims.items())]
+
+    return {
+        'success': True,
+        'verdict': verdict,
+        'reasons': reasons or (['No Neighbor Discovery traffic seen — segment quiet']
+                               if not (na or ns) else
+                               ['All neighbour bindings consistent; no NA conflicts']),
+        'learned': learned,
+        'na_count': na_count,
+        'ns_count': len(ns),
+        'dad_count': len(dad_targets),
+        'rate': na_rate,
+        'hosts': hosts,
+        'advisories': advisories,
+    }
+
+
+def _ndp_capture(interface, seconds):
+    """Run one passive tcpdump window over Neighbor Solicitation/Advertisement
+    (ICMPv6 135/136) and return (raw_text, error). -e keeps the Ethernet source
+    MAC, which the spoof correlation needs."""
+    if not _have('tcpdump'):
+        return '', 'tcpdump is not installed. Click Install to add it.'
+    # ip6[40] is the ICMPv6 type when there are no extension headers, which NS/NA
+    # never carry.
+    bpf = 'icmp6 and (ip6[40] == 135 or ip6[40] == 136)'
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
+                '-e', '-nn', '-t', '-v', '-s', '512', '-c', '20000', bpf],
+               timeout=seconds + 8)
+    out = res['out']
+    if not out and res['err'] and ('permission' in res['err'].lower()
+                                   or "couldn't" in res['err'].lower()
+                                   or 'no such device' in res['err'].lower()
+                                   or 'syntax error' in res['err'].lower()):
+        return '', res['err'].strip()[:200]
+    return out, None
+
+
+def do_ndp_watch(interface=None, seconds=12, learn=True, quick=False):
+    """Passive IPv6 Neighbor Discovery spoofing scanner (detection-only). Captures
+    NS/NA for a few seconds and classifies the segment: storm / spoofed / dad-dos
+    / clean. Learns the trusted target->MAC bindings + default router on first
+    run. The IPv6 twin of ARP Watch."""
+    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    if not iface:
+        return {'success': False, 'error': 'no interface to capture on'}
+    if iface not in _list_iface_names(include_virtual=True):
+        return {'success': False, 'error': f'unknown interface: {iface}'}
+    seconds = _clamp_int(seconds, 12, 4, 40)
+
+    text, err = _ndp_capture(iface, seconds)
+    if err:
+        return {'success': False, 'interface': iface, 'error': err,
+                'missing_tool': 'tcpdump' if 'not installed' in err else None}
+    events = _parse_ndp_capture(text)
+
+    with _ndp_watch_lock:
+        baseline = _ndp_watch_load()
+        # Seed the trusted default-router binding from the kernel on first run so
+        # router poisoning is named even before we see the router advertise.
+        if learn and not (baseline.get('router') or {}).get('mac'):
+            gw6, _ = _default_gateway6()
+            gw_mac = _neigh6_mac(gw6) if gw6 else None
+            if gw6 and gw_mac:
+                baseline['router'] = {'addr': gw6, 'mac': gw_mac}
+        result = _ndp_analyze(events, seconds, baseline, learn=learn)
+        if result.get('learned') or (baseline.get('router') or {}).get('mac'):
+            _ndp_watch_save(baseline)
+        if result['verdict'] != 'clean':
+            b = _ndp_watch_load()
+            evs = b.get('events') or []
+            evs.append({'ts': int(time.time()), 'verdict': result['verdict'],
+                        'reasons': result['reasons'][:6]})
+            b['events'] = evs[-_NDP_EVENTS_CAP:]
+            _ndp_watch_save(b)
+
+    result['interface'] = iface
+    return result
+
+
+def _ndp_selftest():
+    """Self-test the NDP spoofing detectors with synthetic captures (no root, no
+    live traffic). Feeds crafted tcpdump text through the real parser + classifier,
+    and — if Scapy is available — builds a real NA into a pcap and parses it back
+    through tcpdump end to end. Returns a results dict."""
+    scenarios = []
+
+    def run(name, text, seconds, baseline, expect):
+        events = _parse_ndp_capture(text)
+        res = _ndp_analyze(events, seconds, dict(baseline), learn=not baseline)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(events), 'pass': ok})
+        return res
+
+    def na(eth, tgt, lladdr=None, flags='router, solicited, override', src=None):
+        src = src or tgt
+        ll = lladdr or eth
+        return (f"{eth} > 11:22:33:44:55:66, ethertype IPv6 (0x86dd), length 86: "
+                f"{src} > ff02::1: ICMP6, neighbor advertisement, length 32, "
+                f"tgt is {tgt}, Flags [{flags}]\n"
+                f"\t  destination link-address option (2), length 8 (1): {ll}")
+
+    def ns(eth, tgt, src=None):
+        src = src or 'fe80::aaaa'
+        line = (f"{eth} > 33:33:ff:00:00:01, ethertype IPv6 (0x86dd), length 86: "
+                f"{src} > ff02::1:ff00:1: ICMP6, neighbor solicitation, length 32, "
+                f"who has {tgt}")
+        if src != '::':
+            line += f"\n\t  source link-address option (1), length 8 (1): {eth}"
+        return line
+
+    base = {'bindings': {'2001:db8::10': 'aa:bb:cc:00:00:10'},
+            'router': {'addr': 'fe80::1', 'mac': 'aa:bb:cc:00:00:01'}}
+
+    # 1. clean: the known host re-advertises its own address with its own MAC.
+    run('clean', na('aa:bb:cc:00:00:10', '2001:db8::10'), 12, base, 'clean')
+    # 2. spoofed: two MACs both claim one target (parasite6).
+    run('spoofed-conflict',
+        na('aa:bb:cc:00:00:10', '2001:db8::10') + "\n" +
+        na('de:ad:be:ef:00:99', '2001:db8::10'), 12, base, 'spoofed')
+    # 3. spoofed: the default router advertised by a rogue MAC (router poison).
+    run('spoofed-router', na('de:ad:be:ef:00:99', 'fe80::1'), 12, base, 'spoofed')
+    # 4. spoofed: a known host's binding changed to a new single MAC.
+    run('spoofed-changed',
+        na('de:ad:be:ef:00:99', '2001:db8::10'), 12, base, 'spoofed')
+    # 5. dad-dos: one MAC answers NA (unsolicited) for many DAD'd targets.
+    dad = "\n".join(
+        ns('00:00:00:00:00:00', f'2001:db8::{i}', src='::') + "\n" +
+        na('de:ad:be:ef:00:99', f'2001:db8::{i}', flags='override')
+        for i in range(1, 7))
+    run('dad-dos', dad, 12, base, 'dad-dos')
+    # 6. storm: an NA flood.
+    flood = "\n".join(na(f'aa:bb:cc:00:{i//256:02x}:{i%256:02x}',
+                         f'2001:db8:f::{i}', flags='override')
+                      for i in range(300))
+    run('storm', flood, 5, base, 'storm')
+
+    # 7. parse: NA target-lladdr option is read as the claimed owner, not eth_src.
+    pev = _parse_ndp_capture(na('aa:bb:cc:00:00:10', '2001:db8::10',
+                                lladdr='aa:bb:cc:00:00:aa'))
+    p_ok = (len(pev) == 1 and pev[0]['kind'] == 'na'
+            and pev[0]['tgt'] == '2001:db8::10'
+            and pev[0]['lladdr'] == 'aa:bb:cc:00:00:aa'
+            and pev[0]['flags']['override'])
+    scenarios.append({'name': 'na-parse', 'expect': 'tgt+lladdr+flags',
+                      'got': str(pev[0] if pev else None)[:80], 'pass': p_ok})
+    # 8. parse: DAD NS (unspecified source ::) is flagged.
+    dev = _parse_ndp_capture(ns('00:00:00:00:00:00', '2001:db8::9', src='::'))
+    d_ok = len(dev) == 1 and dev[0]['kind'] == 'ns' and dev[0]['dad']
+    scenarios.append({'name': 'dad-parse', 'expect': 'dad=True',
+                      'got': str(dev[0] if dev else None)[:80], 'pass': d_ok})
+
+    # Optional Scapy end-to-end: craft a real NA -> pcap -> tcpdump -e -> parse.
+    scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
+    try:
+        import tempfile
+        from scapy.all import Ether, wrpcap
+        from scapy.layers.inet6 import IPv6, ICMPv6ND_NA, ICMPv6NDOptDstLLAddr
+        if _have('tcpdump'):
+            pkt = (Ether(src='de:ad:be:ef:00:99') /
+                   IPv6(src='fe80::99', dst='ff02::1') /
+                   ICMPv6ND_NA(tgt='fe80::1', R=1, S=0, O=1) /
+                   ICMPv6NDOptDstLLAddr(lladdr='de:ad:be:ef:00:99'))
+            with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
+                pcap_path = tf.name
+            wrpcap(pcap_path, [pkt])
+            res = _run(['tcpdump', '-e', '-nn', '-t', '-v', '-r', pcap_path],
+                       timeout=10)
+            evs = _parse_ndp_capture(res['out'])
+            nas = [e for e in evs if e['kind'] == 'na']
+            scapy_result = {'ran': True,
+                            'tgt': nas[0]['tgt'] if nas else None,
+                            'lladdr': nas[0]['lladdr'] if nas else None,
+                            'pass': bool(nas) and nas[0]['tgt'] == 'fe80::1'
+                                    and nas[0]['lladdr'] == 'de:ad:be:ef:00:99',
+                            'tcpdump_out': res['out'].strip()[:200]}
+            try:
+                os.remove(pcap_path)
+            except OSError:
+                pass
+    except Exception as e:
+        scapy_result = {'ran': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    passed = all(s['pass'] for s in scenarios) and \
+        (not scapy_result.get('ran') or scapy_result.get('pass'))
+    return {'success': passed, 'scenarios': scenarios, 'scapy': scapy_result}
+
+
+# --------------------------------------------------------------------------
 # IPv6 RA Guard: host first-hop posture check + hardening (active, local)
 # --------------------------------------------------------------------------
 # Where IPv6 First-Hop Watch *detects* a rogue RA / DHCPv6 / ICMPv6-Redirect on the
@@ -10797,7 +11231,7 @@ def do_routing_selftest():
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
     the web 'validate detectors' panel. No root, no live traffic, no persistence."""
     suites = {'igmp': _igmp_selftest(), 'ipv6': _ipv6_selftest(),
-              'raguard': _raguard_selftest(),
+              'ndp': _ndp_selftest(), 'raguard': _raguard_selftest(),
               'ntp': _ntp_selftest(), 'icmp': _icmp_selftest(),
               'snmp': _snmp_selftest(), 'cert': _cert_selftest(),
               'stp': _stp_selftest(), 'isis': _isis_selftest(),
@@ -11603,6 +12037,24 @@ def register_network_diagnostics(app, logger=None):
         _log(f"net/ipv6-baseline {action}")
         return jsonify(do_ipv6_baseline(action))
 
+    @app.route('/api/net/ndp-watch', methods=['GET'])
+    def net_ndp_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        secs = _clamp_int(request.args.get('seconds'), 12, 4, 40)
+        _log(f"net/ndp-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ndp_watch(interface=iface, seconds=secs))
+
+    @app.route('/api/net/ndp-baseline', methods=['GET', 'POST'])
+    def net_ndp_baseline():
+        action = 'get'
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            action = 'reset' if (data.get('action') == 'reset') else 'get'
+        _log(f"net/ndp-baseline {action}")
+        return jsonify(do_ndp_baseline(action))
+
     @app.route('/api/net/raguard', methods=['GET', 'POST'])
     def net_raguard():
         action = 'check'
@@ -12045,6 +12497,15 @@ def _cli(argv=None):
     v6st = sub.add_parser('ipv6-selftest', help='self-test the IPv6 first-hop detectors (no root)')
     v6st.add_argument('--json', action='store_true', help='emit JSON')
 
+    ndp = sub.add_parser('ndp-watch', help='passive IPv6 Neighbor Discovery spoofing scan')
+    ndp.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    ndp.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
+    ndp.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
+    ndp.add_argument('--json', action='store_true', help='emit JSON')
+
+    ndpst = sub.add_parser('ndp-selftest', help='self-test the NDP spoofing detectors (no root)')
+    ndpst.add_argument('--json', action='store_true', help='emit JSON')
+
     rg = sub.add_parser('raguard', help='IPv6 RA Guard: audit (and optionally harden) host first-hop posture')
     rg.add_argument('--harden', action='store_true', help='apply + persist the safe sysctls')
     rg.add_argument('--json', action='store_true', help='emit JSON')
@@ -12284,6 +12745,43 @@ def _cli(argv=None):
             else:
                 print(f"  [skip] scapy-e2e: {sc.get('reason')}")
             print(f"IPv6 first-hop self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ndp-watch':
+        r = do_ndp_watch(interface=args.iface, seconds=args.seconds,
+                         learn=not args.no_learn)
+        if args.json:
+            print(json.dumps(r, indent=2))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            print(f"NDP Watch [{r['interface']}]: {r['verdict'].upper()}  "
+                  f"({r['na_count']} NA @ {r['rate']}/s, {r['ns_count']} NS, "
+                  f"{r['dad_count']} DAD)")
+            if r.get('learned'):
+                print("  (baseline learned this run)")
+            for h in r.get('hosts', []):
+                tag = ' *CONFLICT*' if h['conflict'] else ''
+                print(f"  {h['ip']} -> {', '.join(h['macs'])}{tag}")
+            for reason in r.get('reasons', []):
+                print(f"  - {reason}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ndp-selftest':
+        r = _ndp_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2))
+        else:
+            for s in r['scenarios']:
+                print(f"  [{'PASS' if s['pass'] else 'FAIL'}] {s['name']}: "
+                      f"expect={s['expect']} got={s['got']}")
+            sc = r['scapy']
+            if sc.get('ran'):
+                print(f"  [{'PASS' if sc.get('pass') else 'FAIL'}] scapy-e2e: "
+                      f"tgt={sc.get('tgt')} lladdr={sc.get('lladdr')}")
+            else:
+                print(f"  [skip] scapy-e2e: {sc.get('reason')}")
+            print(f"NDP self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'raguard':
