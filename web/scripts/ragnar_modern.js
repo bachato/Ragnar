@@ -1817,7 +1817,7 @@ function _wifiDrawRadius(d) {
 // ---- WiFi coverage heatmap (walk-around survey) ----------------------------
 const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi',
     mode: 'survey', tool: 'wall', walls: [], predictAps: [], predicting: false,
-    wallStart: null, mesh: false };
+    wallStart: null, mesh: false, drag: null, dragMoved: false, suppressClick: false };
 
 // Distinct colours for mesh nodes (serving-node map + legend).
 const _WIFI_MESH_COLORS = ['#38bdf8', '#a78bfa', '#f472b6', '#34d399', '#fbbf24',
@@ -1924,6 +1924,9 @@ function wifiHeatmapInit() {
     });
     const cv = document.getElementById('wifi-heatmap');
     if (cv) cv.addEventListener('click', (e) => {
+        // A just-finished drag (or a press on an existing object) must not also
+        // place a new AP / sample here.
+        if (_wifiHm.suppressClick) { _wifiHm.suppressClick = false; return; }
         const rect = cv.getBoundingClientRect();
         const x = (e.clientX - rect.left) / rect.width;
         const y = (e.clientY - rect.top) / rect.height;
@@ -1952,6 +1955,49 @@ function wifiHeatmapInit() {
                 wifiHeatmapLoad();
             }).catch(() => { st.textContent = 'sample failed'; });
     });
+    // --- Drag existing AP nodes + walls (design mode only) ---
+    if (cv) {
+        const norm = (e) => {
+            const r = cv.getBoundingClientRect();
+            return { nx: (e.clientX - r.left) / r.width, ny: (e.clientY - r.top) / r.height,
+                     rw: r.width, rh: r.height };
+        };
+        cv.addEventListener('pointerdown', (e) => {
+            _wifiHm.suppressClick = false;  // fresh press — never carry a stale flag
+            // Don't hijack survey sampling, or the 2nd click that finishes a wall.
+            if (_wifiHm.mode !== 'design' || _wifiHm.wallStart) return;
+            const p = norm(e);
+            const hit = _wifiHmHitTest(p.nx, p.ny, p.rw, p.rh);
+            if (!hit) return;
+            _wifiHm.drag = hit; _wifiHm.dragMoved = false;
+            try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+            cv.style.cursor = 'grabbing';
+            e.preventDefault();
+        });
+        cv.addEventListener('pointermove', (e) => {
+            const p = norm(e);
+            if (!_wifiHm.drag) {
+                if (_wifiHm.mode === 'design' && !_wifiHm.wallStart)
+                    cv.style.cursor = _wifiHmHitTest(p.nx, p.ny, p.rw, p.rh) ? 'grab' : '';
+                return;
+            }
+            _wifiHmApplyDrag(p.nx, p.ny);
+            _wifiHm.dragMoved = true;
+            _wifiHmDragRender();
+        });
+        const endDrag = (e) => {
+            if (!_wifiHm.drag) return;
+            if (_wifiHm.dragMoved) {
+                if (_wifiHm.drag.kind === 'ap') _wifiHmPersistAp(); else _wifiHmPersistWalls();
+            }
+            _wifiHm.suppressClick = true;   // swallow the click that follows this press
+            _wifiHm.drag = null; cv.style.cursor = '';
+            try { cv.releasePointerCapture(e.pointerId); } catch (_) {}
+            wifiHeatmapRender();
+        };
+        cv.addEventListener('pointerup', endDrag);
+        cv.addEventListener('pointercancel', endDrag);
+    }
 }
 
 function wifiThroughputTest() {
@@ -1992,8 +2038,67 @@ function wifiHmSetTool(t) {
     document.getElementById('wifi-hm-tool-ap').className =
         'px-2.5 py-1 rounded text-xs ' + (t === 'ap' ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300');
     const st = document.getElementById('wifi-hm-design-status');
-    if (st) st.textContent = t === 'wall' ? 'Click two points to draw a wall.'
-        : 'Click the plan to drop an AP node — add several to plan a mesh.';
+    if (st) st.textContent = t === 'wall' ? 'Click two points to draw a wall — or drag an existing wall to move it.'
+        : 'Click the plan to drop an AP node (add several for a mesh) — or drag a node to move it.';
+}
+
+// ---- Drag existing objects (AP nodes + walls) ------------------------------
+function _wifiPtSegDistPx(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 ? ((px - x1) * dx + (py - y1) * dy) / len2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+// Hit-test a normalized point against AP nodes (top), then wall endpoints, then
+// wall bodies. Returns a drag descriptor or null. Distances are in CSS pixels.
+function _wifiHmHitTest(nx, ny, rw, rh) {
+    const px = nx * rw, py = ny * rh, R = 12;
+    for (let i = _wifiHm.predictAps.length - 1; i >= 0; i--) {
+        const ap = _wifiHm.predictAps[i];
+        if (Math.hypot(ap.x * rw - px, ap.y * rh - py) <= R)
+            return { kind: 'ap', idx: i, ox: ap.x - nx, oy: ap.y - ny };
+    }
+    for (let i = _wifiHm.walls.length - 1; i >= 0; i--) {
+        const w = _wifiHm.walls[i];
+        if (Math.hypot(w.x1 * rw - px, w.y1 * rh - py) <= R)
+            return { kind: 'wall-end', idx: i, end: 1, ox: w.x1 - nx, oy: w.y1 - ny };
+        if (Math.hypot(w.x2 * rw - px, w.y2 * rh - py) <= R)
+            return { kind: 'wall-end', idx: i, end: 2, ox: w.x2 - nx, oy: w.y2 - ny };
+    }
+    for (let i = _wifiHm.walls.length - 1; i >= 0; i--) {
+        const w = _wifiHm.walls[i];
+        if (_wifiPtSegDistPx(px, py, w.x1 * rw, w.y1 * rh, w.x2 * rw, w.y2 * rh) <= 8)
+            return { kind: 'wall', idx: i, ox: nx, oy: ny };  // ox/oy = last anchor
+    }
+    return null;
+}
+
+const _clamp01 = v => Math.max(0, Math.min(1, v));
+
+function _wifiHmApplyDrag(nx, ny) {
+    const d = _wifiHm.drag; if (!d) return;
+    if (d.kind === 'ap') {
+        const ap = _wifiHm.predictAps[d.idx]; if (!ap) return;
+        ap.x = _clamp01(nx + d.ox); ap.y = _clamp01(ny + d.oy);
+    } else if (d.kind === 'wall-end') {
+        const w = _wifiHm.walls[d.idx]; if (!w) return;
+        if (d.end === 1) { w.x1 = _clamp01(nx + d.ox); w.y1 = _clamp01(ny + d.oy); }
+        else { w.x2 = _clamp01(nx + d.ox); w.y2 = _clamp01(ny + d.oy); }
+    } else if (d.kind === 'wall') {
+        const w = _wifiHm.walls[d.idx]; if (!w) return;
+        const mx = nx - d.ox, my = ny - d.oy;  // incremental delta from last anchor
+        w.x1 = _clamp01(w.x1 + mx); w.y1 = _clamp01(w.y1 + my);
+        w.x2 = _clamp01(w.x2 + mx); w.y2 = _clamp01(w.y2 + my);
+        d.ox = nx; d.oy = ny;
+    }
+}
+
+function _wifiHmDragRender() {
+    if (_wifiHm._rafPending) return;
+    _wifiHm._rafPending = true;
+    requestAnimationFrame(() => { _wifiHm._rafPending = false; wifiHeatmapRender(); });
 }
 
 function _wifiHmDesignClick(x, y) {
@@ -2285,6 +2390,12 @@ function _wifiHmDrawDesign(ctx, W, H) {
         ctx.moveTo(w.x1 * W, w.y1 * H); ctx.lineTo(w.x2 * W, w.y2 * H);
         ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 3; ctx.stroke();
         ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5; ctx.stroke();
+        // Draggable endpoint handles.
+        [[w.x1, w.y1], [w.x2, w.y2]].forEach(([ex, ey]) => {
+            ctx.beginPath(); ctx.arc(ex * W, ey * H, 3.5, 0, 2 * Math.PI);
+            ctx.fillStyle = '#f8fafc'; ctx.fill();
+            ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5; ctx.stroke();
+        });
     });
     // Wall-in-progress preview
     if (_wifiHm.wallStart) {

@@ -200,6 +200,13 @@ measuring it — Ekahau's predictive-design feature in miniature:
    log-distance path-loss model **minus the summed loss of every wall the
    node→point line crosses**. Move nodes or edit walls and it updates live.
 
+**Drag to rearrange:** in Design mode you can **grab and drag** any placed
+object — drag an **AP node** to move it, drag a **wall endpoint** (the small
+handles) to re-angle a wall, or drag a **wall's body** to slide the whole wall.
+The cursor shows a grab hand over anything draggable, and the predicted coverage
+re-renders live as you move. (Dragging never drops a new object; click empty
+space to add one.)
+
 Walls and the modelled AP nodes persist with the heatmap (and inside saved
 surveys). The prediction math (`predict_point_rssi` per node,
 `predict_point_rssi_multi` for the best-node mesh combine, segment-crossing
