@@ -35,6 +35,7 @@ import bgp_speaker
 import path_asymmetry
 import tls_watch
 import wifi_analyzer
+import wifi_defense
 from tls_watch import do_tls_watch
 
 try:
@@ -13264,6 +13265,65 @@ def register_network_diagnostics(app, logger=None):
     def net_wifi_selftest():
         _log("net/wifi/selftest")
         return jsonify(wifi_analyzer.selftest())
+
+    # ------------------------------------------------------------------
+    # WiFi Defense — 802.11 frame monitor / WIDS (wifi_defense.py).
+    # Detection-only; needs a monitor-mode adapter. Never transmits.
+    # ------------------------------------------------------------------
+    @app.route('/api/wifidef/interfaces', methods=['GET'])
+    def wifidef_interfaces():
+        _log("wifidef/interfaces")
+        return jsonify(wifi_defense.list_monitor_capable())
+
+    @app.route('/api/wifidef/monitor', methods=['POST'])
+    def wifidef_monitor():
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip()
+        action = data.get('action')
+        if action == 'disable':
+            _log("wifidef/monitor disable")
+            return jsonify(wifi_defense.disable_monitor())
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"wifidef/monitor enable {iface}")
+        return jsonify(wifi_defense.enable_monitor(iface))
+
+    @app.route('/api/wifidef/scan', methods=['GET'])
+    def wifidef_scan():
+        iface = (request.args.get('interface') or '').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        try:
+            secs = int(request.args.get('seconds', 15))
+        except (TypeError, ValueError):
+            return _bad('Invalid seconds')
+        ch = request.args.get('channel')
+        try:
+            ch = int(ch) if ch not in (None, '', 'auto') else None
+        except (TypeError, ValueError):
+            return _bad('Invalid channel')
+        _log(f"wifidef/scan {iface} {secs}s ch={ch}")
+        return jsonify(wifi_defense.do_scan(iface, seconds=secs, channel=ch))
+
+    @app.route('/api/wifidef/baseline', methods=['GET', 'POST'])
+    def wifidef_baseline():
+        if request.method == 'GET':
+            return jsonify({"baseline": wifi_defense.get_baseline()})
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        try:
+            secs = int(data.get('seconds', 20))
+        except (TypeError, ValueError):
+            return _bad('Invalid seconds')
+        _log(f"wifidef/baseline learn {iface}")
+        return jsonify(wifi_defense.learn_baseline(iface, seconds=secs))
+
+    @app.route('/api/wifidef/selftest', methods=['GET'])
+    def wifidef_selftest():
+        _log("wifidef/selftest")
+        return jsonify(wifi_defense.selftest())
 
     @app.route('/api/net/isp', methods=['GET'])
     def net_isp():
