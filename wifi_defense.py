@@ -32,6 +32,7 @@ CLI:
     python3 wifi_defense.py selftest
 """
 
+import errno
 import json
 import os
 import re
@@ -140,6 +141,35 @@ def _iw_dev_list():
     return devs
 
 
+def _iface_exists(name):
+    """True if a network interface by this name is currently present."""
+    return bool(name) and os.path.exists("/sys/class/net/" + name)
+
+
+def _resolve_monitor(interface, auto_enable=True):
+    """Return a live monitor interface name for `interface`, or {"error": ...}.
+
+    The persisted mon_iface can go stale after a reboot / service restart / the
+    dongle being re-plugged — the vif named in the state file no longer exists,
+    and sniffing it raises ENODEV ("Errno 19 no such device"). Validate that the
+    persisted interface is actually present; if not, drop the stale state and
+    re-enable monitor mode from scratch.
+    """
+    state = _load_state()
+    mon = state.get("mon_iface")
+    if mon and _iface_exists(mon):
+        return mon
+    # Stale or absent — clear the dead bookkeeping (keeps baseline/thresholds).
+    if mon:
+        _save_state({})
+    if not auto_enable:
+        return {"error": "monitor mode not enabled"}
+    res = enable_monitor(interface)
+    if "error" in res:
+        return res
+    return res["mon_iface"]
+
+
 def list_monitor_capable():
     """Wireless interfaces whose radio can do monitor mode, plus current state."""
     devs = _iw_dev_list()
@@ -155,7 +185,13 @@ def list_monitor_capable():
             "monitor_capable": seen_phys[phy],
             "is_monitor": info["type"] == "monitor",
         })
-    return {"interfaces": out, "active_monitor": state.get("mon_iface"),
+    # Only advertise a monitor the kernel still knows about — a stale mon_iface
+    # (vif gone after reboot/replug) would otherwise show as "active" in the UI
+    # yet fail every capture with ENODEV.
+    active = state.get("mon_iface")
+    if active and not _iface_exists(active):
+        active = None
+    return {"interfaces": out, "active_monitor": active,
             "base_iface": state.get("base_iface")}
 
 
@@ -242,12 +278,13 @@ def _load_state():
 
 
 def _save_state(extra):
-    state = _load_state()
-    # Preserve the baseline across monitor start/stop bookkeeping writes.
-    baseline = state.get("baseline")
+    old = _load_state()
+    # Replace bookkeeping (mon_iface/base_iface/mode) but PRESERVE the persistent
+    # user data (trusted baseline + tuned thresholds) across monitor start/stop.
     state = dict(extra)
-    if baseline is not None and "baseline" not in state:
-        state["baseline"] = baseline
+    for key in ("baseline", "thresholds"):
+        if key in old and key not in state:
+            state[key] = old[key]
     os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
     tmp = _STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -551,6 +588,15 @@ def analyze_airtime(events, seconds=None):
 # Live capture
 # --------------------------------------------------------------------------
 
+def _capture_error(mon_iface, exc):
+    """Friendly, actionable message for a sniff failure."""
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENODEV:
+        return {"error": f"capture failed: monitor interface '{mon_iface}' "
+                         "disappeared (Errno 19). The adapter may have been "
+                         "unplugged or reset — disable and re-enable monitor mode."}
+    return {"error": f"capture failed: {exc}"}
+
+
 def _capture(mon_iface, seconds, channel=None):
     """Sniff management frames on `mon_iface` for `seconds`, hopping channels
     unless a fixed `channel` is given. Returns a list of event dicts."""
@@ -584,7 +630,7 @@ def _capture(mon_iface, seconds, channel=None):
             sniff(iface=mon_iface, prn=_cb, timeout=seconds, store=False)
         except Exception as exc:
             stop.set()
-            return {"error": f"capture failed: {exc}"}
+            return _capture_error(mon_iface, exc)
     stop.set()
     return events
 
@@ -618,7 +664,7 @@ def _capture_all(mon_iface, seconds, channel=None):
             sniff(iface=mon_iface, prn=_cb, timeout=seconds, store=False)
         except Exception as exc:
             stop.set()
-            return {"error": f"capture failed: {exc}"}
+            return _capture_error(mon_iface, exc)
     stop.set()
     return events
 
@@ -629,15 +675,9 @@ def do_airtime(interface, seconds=10, channel=None, auto_enable=True):
     if not _valid_iface(interface):
         return {"error": "invalid interface"}
     seconds = max(3, min(60, int(seconds)))
-    state = _load_state()
-    mon = state.get("mon_iface")
-    if not mon:
-        if not auto_enable:
-            return {"error": "monitor mode not enabled"}
-        res = enable_monitor(interface)
-        if "error" in res:
-            return res
-        mon = res["mon_iface"]
+    mon = _resolve_monitor(interface, auto_enable=auto_enable)
+    if isinstance(mon, dict):
+        return mon
     events = _capture_all(mon, seconds, channel=channel)
     if isinstance(events, dict) and "error" in events:
         return events
@@ -794,16 +834,9 @@ def do_scan(interface, seconds=15, channel=None, auto_enable=True):
     if not _valid_iface(interface):
         return {"error": "invalid interface"}
     seconds = max(3, min(120, int(seconds)))
-    state = _load_state()
-    mon = state.get("mon_iface")
-    # Enable monitor on demand if none is active for this radio.
-    if not mon:
-        if not auto_enable:
-            return {"error": "monitor mode not enabled"}
-        res = enable_monitor(interface)
-        if "error" in res:
-            return res
-        mon = res["mon_iface"]
+    mon = _resolve_monitor(interface, auto_enable=auto_enable)
+    if isinstance(mon, dict):
+        return mon
     events = _capture(mon, seconds, channel=channel)
     if isinstance(events, dict) and "error" in events:
         return events
@@ -999,6 +1032,30 @@ def selftest():
         set_baseline({"X": ["aa:bb:cc:dd:ee:ff"]})
         check("threshold survives a later baseline write",
               get_thresholds()["beacon_ssids"] == 250)
+        # --- ENODEV fix: monitor bookkeeping writes must not drop persistent data,
+        # and a stale mon_iface (vif gone after reboot/replug) must be detected. ---
+        _save_state({"mon_iface": "ragmon0", "base_iface": "wlan0", "mode": "vif"})
+        check("monitor bookkeeping write preserves baseline + thresholds",
+              get_thresholds()["beacon_ssids"] == 250
+              and get_baseline().get("X") == ["aa:bb:cc:dd:ee:ff"],
+              json.dumps({"th": get_thresholds(), "base": get_baseline()}))
+        # ragmon0 does not exist on this box → _resolve_monitor must reject it
+        # (auto_enable=False) rather than hand a dead iface to sniff() → ENODEV.
+        check("_iface_exists is False for a phantom vif",
+              not _iface_exists("ragmon0__nope"))
+        stale = _resolve_monitor("wlan0__nope", auto_enable=False)
+        check("_resolve_monitor rejects stale mon_iface instead of returning it",
+              isinstance(stale, dict) and "error" in stale, json.dumps(stale))
+        check("_resolve_monitor cleared the stale bookkeeping",
+              _load_state().get("mon_iface") is None)
+        check("clearing stale monitor still kept baseline + thresholds",
+              get_thresholds()["beacon_ssids"] == 250
+              and get_baseline().get("X") == ["aa:bb:cc:dd:ee:ff"])
+        # ENODEV during capture yields a friendly, actionable message.
+        enod = _capture_error("ragmon0", OSError(errno.ENODEV, "No such device"))
+        check("ENODEV capture error is friendly + actionable",
+              "Errno 19" in enod["error"] and "re-enable" in enod["error"],
+              enod["error"])
     finally:
         try:
             os.unlink(_STATE_FILE)

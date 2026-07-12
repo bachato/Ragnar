@@ -106,3 +106,17 @@ clean traffic stays **CLEAR**) — 11 checks, all offline.
 
 Requires `iw` and **Scapy** (both installed by `install_ragnar.sh` /
 `requirements.txt`).
+
+---
+
+## Troubleshooting
+
+**"capture failed: … Errno 19 no such device" (ENODEV).** The monitor vif named
+in the saved state (`ragmon0`) no longer exists — this happens after a **reboot,
+a service restart, or the USB adapter being unplugged/reset**, since the vif is
+not persistent but the bookmark is. Scan / Airtime now **detect a stale monitor
+interface automatically**: they verify the interface is still present before
+sniffing, drop the dead bookmark, and re-enable monitor mode from scratch. If it
+still fails, **Disable monitor** then **Enable monitor** to rebuild the vif. Your
+trusted-AP baseline and tuned thresholds are preserved across all monitor
+enable/disable bookkeeping.
