@@ -13294,6 +13294,8 @@ def register_network_diagnostics(app, logger=None):
             return jsonify(wifi_analyzer.heatmap_set_walls(data.get('walls') or []))
         if action == 'predict_ap':
             return jsonify(wifi_analyzer.heatmap_set_predict_ap(data.get('ap')))
+        if action == 'predict_aps':
+            return jsonify(wifi_analyzer.heatmap_set_predict_aps(data.get('aps') or []))
         if action == 'sample_live':
             iface = (data.get('interface') or 'wlan0').strip()
             if not _valid_iface(iface):

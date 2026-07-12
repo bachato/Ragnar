@@ -1180,9 +1180,13 @@ def _heatmap_load():
     except Exception:
         data = {"floorplan": None, "target_bssid": None, "target_ssid": None,
                 "samples": []}
-    # Predictive-design layer (walls + a modelled AP) lives alongside the survey.
+    # Predictive-design layer (walls + modelled AP nodes) lives alongside the
+    # survey. `predict_aps` is a list so you can plan a whole mesh; a legacy
+    # single `predict_ap` is migrated into it.
     data.setdefault("walls", [])
     data.setdefault("predict_ap", None)
+    if "predict_aps" not in data:
+        data["predict_aps"] = [data["predict_ap"]] if data.get("predict_ap") else []
     # Mesh survey: registry of the nodes (BSSIDs) seen for the surveyed SSID.
     data.setdefault("mesh_nodes", {})
     return data
@@ -1237,27 +1241,43 @@ def heatmap_set_walls(walls):
     return data
 
 
-def heatmap_set_predict_ap(ap):
-    """Persist the modelled AP for predictive coverage (or None to clear).
+def _clean_predict_ap(ap):
+    """Validate + normalize one modelled AP, or None if it's malformed.
     `width_m`/`height_m` give the floorplan's real size so normalized distances
     become metres for the path-loss model."""
+    try:
+        return {
+            "x": float(ap["x"]), "y": float(ap["y"]),
+            "tx_dbm": float(ap.get("tx_dbm", _DEFAULT_TX_DBM)),
+            "freq": float(ap.get("freq", 5200)),
+            "ple": float(ap.get("ple", _DEFAULT_PLE)),
+            "width_m": float(ap.get("width_m", 10.0)),
+            "height_m": float(ap.get("height_m", 10.0)),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def heatmap_set_predict_aps(aps):
+    """Persist the list of modelled AP nodes for predictive coverage (a planned
+    mesh). Empty list clears them. Keeps a legacy single `predict_ap` in sync."""
     data = _heatmap_load()
-    if ap is None:
-        data["predict_ap"] = None
-    else:
-        try:
-            data["predict_ap"] = {
-                "x": float(ap["x"]), "y": float(ap["y"]),
-                "tx_dbm": float(ap.get("tx_dbm", _DEFAULT_TX_DBM)),
-                "freq": float(ap.get("freq", 5200)),
-                "ple": float(ap.get("ple", _DEFAULT_PLE)),
-                "width_m": float(ap.get("width_m", 10.0)),
-                "height_m": float(ap.get("height_m", 10.0)),
-            }
-        except (KeyError, TypeError, ValueError):
+    clean = []
+    for ap in aps or []:
+        c = _clean_predict_ap(ap)
+        if c is None:
             return {"error": "invalid predict AP"}
+        clean.append(c)
+    data["predict_aps"] = clean
+    data["predict_ap"] = clean[0] if clean else None  # back-compat
     _heatmap_save(data)
     return data
+
+
+def heatmap_set_predict_ap(ap):
+    """Persist a single modelled AP (or None to clear). Back-compat wrapper over
+    heatmap_set_predict_aps."""
+    return heatmap_set_predict_aps([] if ap is None else [ap])
 
 
 # --- Predictive-coverage geometry (mirrored client-side in ragnar_modern.js) ---
@@ -1289,6 +1309,15 @@ def predict_point_rssi(px, py, ap, walls):
         if _segments_cross(a, b, (w["x1"], w["y1"]), (w["x2"], w["y2"])):
             rssi -= w.get("loss_db", 5)
     return round(rssi, 1)
+
+
+def predict_point_rssi_multi(px, py, aps, walls):
+    """Predicted RSSI at (px,py) from a set of modelled AP nodes: the BEST
+    signal any node delivers (each spot served by its strongest node), matching
+    real mesh behaviour. None if no nodes. Mirrored in the JS renderer."""
+    if not aps:
+        return None
+    return round(max(predict_point_rssi(px, py, ap, walls) for ap in aps), 1)
 
 
 # --------------------------------------------------------------------------
@@ -1958,6 +1987,41 @@ def selftest():
     r_sidewall = predict_point_rssi(0.6, 0.5, ap_pred, [wall])  # point before the wall
     check("a wall not crossed has no effect",
           abs(r_sidewall - predict_point_rssi(0.6, 0.5, ap_pred, [])) < 0.01)
+
+    # --- Multi-node predictive coverage (planned mesh: best node wins) ---
+    ap_a = dict(ap_pred, x=0.1, y=0.5)
+    ap_b = dict(ap_pred, x=0.9, y=0.5)
+    check("no nodes => no prediction",
+          predict_point_rssi_multi(0.5, 0.5, [], []) is None)
+    # A point near node B must be served by B (single-node A would be far/weak).
+    near_b = predict_point_rssi_multi(0.85, 0.5, [ap_a, ap_b], [])
+    check("mesh coverage = best of all nodes (near B served by B)",
+          near_b == predict_point_rssi(0.85, 0.5, ap_b, [])
+          and near_b > predict_point_rssi(0.85, 0.5, ap_a, []),
+          f"{near_b}")
+    # A second node lifts coverage where one node was weak.
+    one = predict_point_rssi_multi(0.85, 0.5, [ap_a], [])
+    two = predict_point_rssi_multi(0.85, 0.5, [ap_a, ap_b], [])
+    check("adding a node never lowers predicted coverage", two >= one, f"{one}->{two}")
+    # Persistence round-trips a list and keeps legacy predict_ap in sync.
+    _oh3, _HEATMAP_FILE = _HEATMAP_FILE, _tf.mktemp(suffix=".json")
+    try:
+        heatmap_set_predict_aps([ap_a, ap_b])
+        hd = heatmap_get()
+        check("predict_aps persists the full node list",
+              len(hd.get("predict_aps", [])) == 2)
+        check("legacy predict_ap kept in sync with first node",
+              hd.get("predict_ap", {}).get("x") == 0.1)
+        heatmap_set_predict_aps([])
+        check("clearing nodes empties predict_aps and predict_ap",
+              heatmap_get().get("predict_aps") == []
+              and heatmap_get().get("predict_ap") is None)
+    finally:
+        try:
+            os.unlink(_HEATMAP_FILE)
+        except OSError:
+            pass
+        _HEATMAP_FILE = _oh3
 
     # --- Mesh survey node selection (serving node = strongest of the ESS) ---
     mesh_aps = [

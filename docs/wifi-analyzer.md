@@ -191,15 +191,20 @@ measuring it — Ekahau's predictive-design feature in miniature:
 1. **Draw walls** on the floorplan (click two points per wall) and pick the
    **material** — each carries a real attenuation: drywall 3 dB, wood 4, glass 6,
    brick 10, concrete 15, metal 20.
-2. **Place AP** — click where an AP would go; set the **floor width (m)** so
-   distances are metric.
-3. Tick **Predict coverage** — the map fills with **modelled RSSI** everywhere,
-   using the log-distance path-loss model **minus the summed loss of every wall
-   the AP→point line crosses**. Move the AP or edit walls and it updates live.
+2. **Place AP nodes** — click where an AP would go. **Click again to drop more
+   nodes and plan a whole mesh** (they're labelled AP1, AP2, …); **Undo AP** /
+   **Clear APs** manage them. Set the **floor width (m)** so distances are metric.
+3. Tick **Predict coverage** — the map fills with **modelled RSSI** everywhere.
+   With several nodes, each spot shows the **best signal any node delivers**
+   (served by its strongest node — exactly how a real mesh behaves), using the
+   log-distance path-loss model **minus the summed loss of every wall the
+   node→point line crosses**. Move nodes or edit walls and it updates live.
 
-Walls and the modelled AP persist with the heatmap (and inside saved surveys).
-The prediction math (`predict_point_rssi`, segment-crossing attenuation) is
-identical in the Python backend and the JS renderer, and is covered by selftest.
+Walls and the modelled AP nodes persist with the heatmap (and inside saved
+surveys). The prediction math (`predict_point_rssi` per node,
+`predict_point_rssi_multi` for the best-node mesh combine, segment-crossing
+attenuation) is identical in the Python backend and the JS renderer, and is
+covered by selftest.
 
 Live samples persist in `data/wifi_heatmap.json`; **Clear** starts a fresh
 survey.

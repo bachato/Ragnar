@@ -2046,11 +2046,13 @@
                                 <option value="concrete">Concrete (15 dB)</option>
                                 <option value="metal">Metal (20 dB)</option>
                             </select>
-                            <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to place the modelled AP">📶 Place AP</button>
+                            <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to drop AP nodes — add as many as you like to plan a mesh">📶 Place AP nodes</button>
                             <label class="text-[11px] text-gray-400" title="Real width of the floorplan, so predicted distances are in metres">Floor width <input id="wifi-hm-scale" type="number" value="10" min="1" max="500" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
                             <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-600"> Predict coverage</label>
-                            <button onclick="wifiHmUndoWall()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo</button>
+                            <button onclick="wifiHmUndoWall()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo wall</button>
                             <button onclick="wifiHmClearWalls()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear walls</button>
+                            <button onclick="wifiHmUndoAp()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo AP</button>
+                            <button onclick="wifiHmClearAps()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear APs</button>
                             <span id="wifi-hm-design-status" class="text-[11px] text-gray-500"></span>
                         </span>
                     </div>
@@ -6374,7 +6376,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifimesh"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-meshplan"></script>
 
 </body>
 </html>
