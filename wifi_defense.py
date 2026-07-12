@@ -46,9 +46,15 @@ _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Detection thresholds (per capture window)
 _DEAUTH_FLOOD_MIN = 15      # deauth+disassoc frames => flood
-_BEACON_FLOOD_SSIDS = 30    # distinct beaconed SSIDs => beacon flood
-_BEACON_FLOOD_BSSIDS = 50   # distinct beaconing BSSIDs => beacon flood
-_KARMA_SSID_MIN = 5         # distinct SSIDs answered by ONE bssid => KARMA
+# Beacon flood. Raw SSID/BSSID counts alone false-positive badly in dense/urban
+# airspace (a normal apartment block easily has 30+ SSIDs / 50+ BSSIDs), so the
+# primary signal is randomized/locally-administered BSSIDs — real vendor APs use
+# globally-unique OUIs, whereas mdk3/mdk4/ESP32 beacon spammers spray SSIDs from
+# random MACs. Raw counts are kept only as a very-high safety net.
+_BEACON_FLOOD_RANDOM_BSSIDS = 6   # AP-beaconing randomized MACs => flood (real ~0)
+_BEACON_FLOOD_SSIDS = 80          # extreme distinct-SSID safety net
+_BEACON_FLOOD_BSSIDS = 120        # extreme distinct-BSSID safety net
+_KARMA_SSID_MIN = 5               # distinct SSIDs answered by ONE bssid => KARMA
 
 # Channels the hopper cycles when no fixed channel is requested (2.4 GHz + the
 # common U-NII-1/3 5 GHz set). Kept short so each channel gets real dwell time.
@@ -363,6 +369,18 @@ def _frame_to_event(pkt):
     return ev
 
 
+def _is_locally_administered(mac):
+    """True if a MAC is locally-administered (the 0x02 bit of the first octet) —
+    i.e. randomized/spoofed rather than a vendor-assigned (global) address. Real
+    APs almost always use global OUIs; beacon-flood tools use random MACs."""
+    if not mac:
+        return False
+    try:
+        return bool(int(mac.split(":")[0], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
 def _freq_to_channel(freq):
     if 2412 <= freq <= 2484:
         return 14 if freq == 2484 else (freq - 2407) // 5
@@ -450,15 +468,25 @@ def analyze(events, baseline=None, window_secs=None):
         })
 
     # --- Beacon flood ---
+    # Distinguish a real flood from a merely-crowded neighbourhood: the telltale
+    # sign is a swarm of SSIDs from *randomized* (locally-administered) BSSIDs.
     if beacons:
         ssids = {e["ssid"] for e in beacons if e.get("ssid")}
         bssids = {e["src"] for e in beacons if e.get("src")}
-        if len(ssids) >= _BEACON_FLOOD_SSIDS or len(bssids) >= _BEACON_FLOOD_BSSIDS:
+        rnd_bssids = {b for b in bssids if _is_locally_administered(b)}
+        reasons = []
+        if len(rnd_bssids) >= _BEACON_FLOOD_RANDOM_BSSIDS:
+            reasons.append(f"{len(rnd_bssids)} randomized-MAC APs")
+        if len(ssids) >= _BEACON_FLOOD_SSIDS:
+            reasons.append(f"{len(ssids)} distinct SSIDs")
+        if len(bssids) >= _BEACON_FLOOD_BSSIDS:
+            reasons.append(f"{len(bssids)} distinct BSSIDs")
+        if reasons:
             detections.append({
                 "type": "beacon_flood", "severity": "flood",
                 "ssids": len(ssids), "bssids": len(bssids),
-                "detail": f"{len(ssids)} SSIDs from {len(bssids)} BSSIDs — "
-                          "fake-AP/beacon flood",
+                "random_bssids": len(rnd_bssids),
+                "detail": "fake-AP/beacon flood — " + ", ".join(reasons),
             })
 
     # --- KARMA / MANA: one BSSID answering many SSIDs ---
@@ -671,6 +699,17 @@ def selftest():
               types.get("deauth", {}).get("attackers", [])))
     check("beacon flood detected", "beacon_flood" in types,
           str(types.get("beacon_flood")))
+    check("beacon flood attributed to randomized MACs",
+          types.get("beacon_flood", {}).get("random_bssids", 0) >= _BEACON_FLOOD_RANDOM_BSSIDS,
+          str(types.get("beacon_flood")))
+    # A dense-but-legit airspace (many SSIDs from GLOBAL/vendor MACs) must NOT
+    # trip beacon flood — this is the false positive the user hit.
+    dense = [{"kind": "beacon", "src": "00:1a:2b:%02x:%02x:00" % (i // 256, i % 256),
+              "ssid": "Neighbour_%d" % i} for i in range(45)]
+    dense_res = analyze(dense, baseline={})
+    check("dense legit airspace is NOT a beacon flood",
+          not any(d["type"] == "beacon_flood" for d in dense_res["detections"]),
+          json.dumps([d["detail"] for d in dense_res["detections"]]))
     check("KARMA detected", "karma" in types and types["karma"]["ssid_count"] >= 5,
           str(types.get("karma")))
     check("evil twin detected against baseline",
