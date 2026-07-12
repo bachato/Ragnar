@@ -897,6 +897,87 @@ def estimate_radius(bss, tx_dbm=None, ple=_DEFAULT_PLE):
 # Top-level scan orchestration
 # --------------------------------------------------------------------------
 
+_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", "wifi_analyzer_db.json")
+_DB_HISTORY_CAP = 60      # RSSI samples kept per BSSID
+_WEAKENED_DROP = 18       # dB below an AP's own max => "weakened"
+
+
+def _db_load():
+    try:
+        with open(_DB_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"aps": {}, "last_bssids": []}
+
+
+def _db_save(db):
+    os.makedirs(os.path.dirname(_DB_FILE), exist_ok=True)
+    tmp = _DB_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(db, f)
+    os.replace(tmp, _DB_FILE)
+
+
+def _db_update(aps):
+    """Persist per-BSSID history, annotate each AP with it, and diff against the
+    previous scan to surface new / disappeared / weakened APs."""
+    db = _db_load()
+    recs = db.get("aps", {})
+    now = int(time.time())
+    prev = set(db.get("last_bssids", []))
+    cur = set()
+    new_aps, weakened = [], []
+    for a in aps:
+        b = a["bssid"]
+        cur.add(b)
+        r = recs.get(b)
+        if r is None:
+            r = recs[b] = {"first_seen": now, "seen_count": 0,
+                           "max_rssi": a.get("signal"), "min_rssi": a.get("signal"),
+                           "history": []}
+            if b not in prev:
+                new_aps.append({"bssid": b, "ssid": a.get("ssid"),
+                                "vendor": a.get("vendor"), "band": a.get("band"),
+                                "channel": a.get("channel"), "signal": a.get("signal")})
+        r["seen_count"] += 1
+        r["last_seen"] = now
+        r["ssid"] = a.get("ssid")
+        r["vendor"] = a.get("vendor")
+        s = a.get("signal")
+        if s is not None:
+            r["max_rssi"] = max(r.get("max_rssi") or s, s)
+            r["min_rssi"] = min(r.get("min_rssi") if r.get("min_rssi") is not None else s, s)
+            r["history"] = (r.get("history", []) + [[now, s, a.get("channel_util")]])[-_DB_HISTORY_CAP:]
+            if (r["max_rssi"] - s) >= _WEAKENED_DROP and r["seen_count"] > 2:
+                weakened.append({"bssid": b, "ssid": a.get("ssid"),
+                                 "band": a.get("band"), "channel": a.get("channel"),
+                                 "signal": s, "rssi_max": r["max_rssi"],
+                                 "drop": r["max_rssi"] - s})
+        # Annotate the live AP with its tracked history
+        a["first_seen"] = r["first_seen"]
+        a["seen_count"] = r["seen_count"]
+        a["is_new"] = b not in prev and r["seen_count"] <= 1
+        a["rssi_history"] = [h[1] for h in r.get("history", [])]
+        a["rssi_max"] = r.get("max_rssi")
+        a["rssi_min"] = r.get("min_rssi")
+    gone = [{"bssid": b, "ssid": recs.get(b, {}).get("ssid")}
+            for b in (prev - cur)]
+    db["aps"] = recs
+    db["last_bssids"] = sorted(cur)
+    _db_save(db)
+    return {"new_aps": new_aps, "gone_aps": gone, "weakened": weakened}
+
+
+def db_get():
+    return _db_load().get("aps", {})
+
+
+def db_reset():
+    _db_save({"aps": {}, "last_bssids": []})
+    return {"ok": True}
+
+
 def _survey_noise(interface):
     """Return {freq_mhz: noise_dbm} from `iw survey dump` (best-effort; some
     drivers, incl. brcmfmac, don't report a noise floor)."""
@@ -960,6 +1041,7 @@ def do_scan(interface="wlan0", band="all", passive=True):
     if band in ("2.4", "5", "6"):
         bss_list = [b for b in bss_list if b["band"] == band]
     bss_list.sort(key=lambda b: (b["band"], b["channel"], -(b["signal"] or -999)))
+    changes = _db_update(bss_list)
     spectrum = analyze_spectrum(bss_list, caps)
     interference = find_interference(bss_list)
     groups = group_aps(bss_list)
@@ -977,6 +1059,7 @@ def do_scan(interface="wlan0", band="all", passive=True):
         "spectrum": spectrum,
         "interference": interference,
         "groups": groups,
+        "changes": changes,
     }
 
 
@@ -1265,6 +1348,35 @@ def selftest():
           "width_advice" in spec.get("5", {})
           and spec["2.4"]["width_advice"]["mhz"] == 20,
           json.dumps(spec.get("5", {}).get("width_advice")))
+
+    # --- AP history DB + change detection (Tier 3) — temp file, no real state ---
+    global _DB_FILE
+    _orig_db, _DB_FILE = _DB_FILE, __import__("tempfile").mktemp(suffix=".json")
+    try:
+        db_reset()
+        base = {"bssid": "a0:00:00:00:00:01", "ssid": "H", "channel_util": 10,
+                "band": "2.4", "channel": 1, "vendor": None}
+        first = dict(base, signal=-40)
+        c1 = _db_update([first])
+        check("new AP detected on first sighting",
+              any(n["bssid"] == base["bssid"] for n in c1["new_aps"])
+              and first.get("is_new") is True)
+        check("rssi history annotated", first.get("rssi_history") == [-40])
+        _db_update([dict(base, signal=-70)])
+        weak = dict(base, signal=-70)
+        c3 = _db_update([weak])
+        check("weakened AP detected (>=18 dB below its max)",
+              any(w["bssid"] == base["bssid"] for w in c3["weakened"]),
+              json.dumps(c3["weakened"]))
+        c4 = _db_update([])       # AP vanished this scan
+        check("disappeared AP detected",
+              any(g["bssid"] == base["bssid"] for g in c4["gone_aps"]))
+    finally:
+        try:
+            os.unlink(_DB_FILE)
+        except OSError:
+            pass
+        _DB_FILE = _orig_db
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,

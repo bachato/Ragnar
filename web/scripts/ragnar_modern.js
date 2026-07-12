@@ -1374,6 +1374,37 @@ function _wifiSecBadges(a) {
     return b;
 }
 
+function _wifiSparkline(hist) {
+    if (!hist || hist.length < 2) return '';
+    const w = 46, h = 12, n = hist.length;
+    let lo = Math.min(...hist), hi = Math.max(...hist);
+    if (hi - lo < 1) { lo -= 1; hi += 1; }
+    const pts = hist.map((v, i) => {
+        const x = (i / (n - 1)) * (w - 2) + 1;
+        const y = h - 1 - ((v - lo) / (hi - lo)) * (h - 2);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    const last = hist[hist.length - 1];
+    return `<svg width="${w}" height="${h}" class="inline-block align-middle ml-1" title="RSSI history ${lo}…${hi} dBm">
+        <polyline points="${pts}" fill="none" stroke="${_wifiSignalColor(last)}" stroke-width="1" stroke-linejoin="round"/></svg>`;
+}
+
+function wifiRenderChanges() {
+    const el = document.getElementById('wifi-changes');
+    if (!el) return;
+    const c = (_wifiState.data && _wifiState.data.changes) || {};
+    const chips = [];
+    (c.new_aps || []).forEach(a =>
+        chips.push(`<span class="px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-700/50" title="${a.bssid}">＋ new: ${a.ssid || '<hidden>'} <span class="opacity-60">${a.band}G ch${a.channel} ${a.signal}dBm</span></span>`));
+    (c.gone_aps || []).forEach(a =>
+        chips.push(`<span class="px-2 py-1 rounded bg-slate-700/40 text-slate-400 border border-slate-600/50" title="${a.bssid}">－ gone: ${a.ssid || '<hidden>'}</span>`));
+    (c.weakened || []).forEach(a =>
+        chips.push(`<span class="px-2 py-1 rounded bg-amber-600/20 text-amber-300 border border-amber-700/50" title="${a.bssid} — ${a.drop}dB below its peak ${a.rssi_max}dBm">▼ weakened: ${a.ssid || '<hidden>'} <span class="opacity-60">${a.signal}dBm (−${a.drop})</span></span>`));
+    el.innerHTML = chips.length
+        ? `<span class="text-gray-500 self-center mr-1">Since last scan:</span>${chips.join('')}`
+        : '';
+}
+
 function wifiSetApView(v) {
     _wifiState.apView = v;
     document.getElementById('wifi-view-aps').classList.toggle('bg-Ragnar-600', v === 'aps');
@@ -1416,13 +1447,13 @@ function wifiRenderTable() {
         const snr = a.snr != null ? `<span class="text-[10px] text-gray-500"> ${a.snr}dB</span>` : '';
         const rate = (a.nss ? a.nss + 'ss' : '') + (a.max_phy_mbps ? ' ' + (a.max_phy_mbps >= 1000 ? (a.max_phy_mbps / 1000).toFixed(1) + 'G' : a.max_phy_mbps + 'M') : '');
         return `<tr class="border-b border-slate-800/50 hover:bg-slate-800/40 cursor-pointer ${sel} ${issue ? 'border-l-2 border-l-amber-500' : ''}" onclick="wifiSelectAp('${a.bssid}')">
-            <td class="py-1 pr-2 whitespace-nowrap">${issue ? '<span title="' + a.security_findings.join('; ') + '" class="text-amber-400">⚠</span> ' : ''}${(a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>')}${_wifiGenBadge(a.standard)}${a.dfs ? ' <span title="DFS/radar" style="color:#a78bfa">◆</span>' : ''}<div class="text-[10px] text-gray-600 font-mono">${a.bssid}</div></td>
+            <td class="py-1 pr-2 whitespace-nowrap">${issue ? '<span title="' + a.security_findings.join('; ') + '" class="text-amber-400">⚠</span> ' : ''}${(a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>')}${_wifiGenBadge(a.standard)}${a.is_new ? ' <span class="text-[9px] px-1 rounded bg-emerald-600/30 text-emerald-300 align-middle" title="first seen this session">NEW</span>' : ''}${a.dfs ? ' <span title="DFS/radar" style="color:#a78bfa">◆</span>' : ''}<div class="text-[10px] text-gray-600 font-mono">${a.bssid}${a.seen_count > 1 ? ' <span class="text-gray-700">·seen ' + a.seen_count + '×</span>' : ''}</div></td>
             <td class="py-1 pr-2 text-xs text-gray-400 whitespace-nowrap">${a.vendor || '—'}</td>
             <td class="py-1 pr-2"><span style="color:${_WIFI_BAND_COLOR[a.band]}">${a.band}</span></td>
             <td class="py-1 pr-2">${a.channel}</td>
             <td class="py-1 pr-2">${a.width}M</td>
             <td class="py-1 pr-2 text-xs whitespace-nowrap">${rate || '—'}</td>
-            <td class="py-1 pr-2 whitespace-nowrap"><span style="color:${_wifiSignalColor(a.signal)}">${a.signal}</span>${snr}<span style="display:inline-block;height:6px;width:${bar}px;max-width:50px;background:${_wifiSignalColor(a.signal)};border-radius:2px;margin-left:4px"></span></td>
+            <td class="py-1 pr-2 whitespace-nowrap"><span style="color:${_wifiSignalColor(a.signal)}">${a.signal}</span>${snr}<span style="display:inline-block;height:6px;width:${bar}px;max-width:50px;background:${_wifiSignalColor(a.signal)};border-radius:2px;margin-left:4px"></span>${_wifiSparkline(a.rssi_history)}</td>
             <td class="py-1 pr-2 text-xs whitespace-nowrap ${a.security === 'Open' ? 'text-red-400' : 'text-gray-300'}">${a.security}${_wifiSecBadges(a)}</td>
             <td class="py-1 pr-2">${a.channel_util == null ? '—' : a.channel_util + '%'}</td>
         </tr>`;
@@ -1476,6 +1507,7 @@ function wifiRender() {
     }).join('');
     if (d.noise_floor != null) chips += `<span class="px-2 py-1 rounded bg-slate-800 border border-slate-700">noise floor ${d.noise_floor} dBm</span>`;
     summ.innerHTML = chips || '<span class="text-gray-500">No APs heard.</span>';
+    wifiRenderChanges();
     // Legend
     document.getElementById('wifi-legend').innerHTML =
         '<span>Signal:</span>' +

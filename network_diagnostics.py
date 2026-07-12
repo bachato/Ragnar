@@ -13267,6 +13267,13 @@ def register_network_diagnostics(app, logger=None):
         _log("net/wifi/selftest")
         return jsonify(wifi_analyzer.selftest())
 
+    @app.route('/api/net/wifi/history', methods=['GET', 'POST'])
+    def net_wifi_history():
+        if request.method == 'POST':
+            _log("net/wifi/history reset")
+            return jsonify(wifi_analyzer.db_reset())
+        return jsonify({"aps": wifi_analyzer.db_get()})
+
     # ------------------------------------------------------------------
     # WiFi Defense — 802.11 frame monitor / WIDS (wifi_defense.py).
     # Detection-only; needs a monitor-mode adapter. Never transmits.
