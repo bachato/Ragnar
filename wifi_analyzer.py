@@ -71,6 +71,11 @@ _RADIUS_THRESHOLDS = [
 # Default path-loss model parameters (overridable per request).
 _DEFAULT_TX_DBM = 20.0      # assumed AP EIRP; consumer APs are ~17-23 dBm
 _DEFAULT_PLE = 3.0          # path-loss exponent: 2.0 free space, ~3.0 indoor
+# Plausible AP conducted/EIRP transmit power. Anything outside this window in the
+# advertised TPC report is a misconfigured/garbage value (some APs advertise e.g.
+# 63 dBm ≈ 2 kW) and must NOT be trusted as "measured" — it wrecks the range model.
+_TX_PLAUSIBLE_MIN = 0.0
+_TX_PLAUSIBLE_MAX = 36.0    # 36 dBm EIRP = outdoor standard-power ceiling (6 GHz)
 
 # 2.4 GHz channels overlap unless spaced >= 5 apart (1/6/11 are the non-overlap set).
 _NON_OVERLAP_24 = [1, 6, 11]
@@ -545,7 +550,12 @@ def _enrich(block, hdr, bss):
     bss["security_findings"] = _security_findings(bss)
     bss["roaming"] = _parse_roaming(block)
     m = re.search(r"TPC report: TX power:\s*(-?\d+)", block)
-    bss["tx_power_dbm"] = int(m.group(1)) if m else None
+    _tx = int(m.group(1)) if m else None
+    # Only trust the advertised TX power if it's physically plausible; some APs
+    # advertise garbage (e.g. 63 dBm) which would blow up the coverage model.
+    if _tx is not None and not (_TX_PLAUSIBLE_MIN <= _tx <= _TX_PLAUSIBLE_MAX):
+        _tx = None
+    bss["tx_power_dbm"] = _tx
     m = re.search(r"Country:\s*([A-Z]{2})", block)
     bss["country"] = m.group(1) if m else None
     m = re.search(r"beacon interval:\s*(\d+)", block)
@@ -1448,6 +1458,20 @@ def selftest():
           rad1["assumptions"]["tx_source"] == "measured"
           and rad1["assumptions"]["tx_dbm"] == 20,
           json.dumps(rad1["assumptions"]))
+    # An implausible advertised TX power (e.g. 63 dBm ≈ 2 kW) must be rejected so
+    # it can't blow up the range model — falls back to the assumed default.
+    bogus = parse_scan(
+        "BSS de:ad:be:ef:00:01(on wlan0)\n\tfreq: 5180\n\tsignal: -46.00 dBm\n"
+        "\tSSID: Bogus\n\tTPC report: TX power: 63 dBm, link margin: 0 dB\n")[0]
+    check("implausible advertised TX power is rejected",
+          bogus.get("tx_power_dbm") is None, str(bogus.get("tx_power_dbm")))
+    rad_bogus = estimate_radius(bogus)
+    check("radius falls back to assumed TX when advertised is garbage",
+          rad_bogus["assumptions"]["tx_source"] == "assumed"
+          and rad_bogus["assumptions"]["tx_dbm"] == _DEFAULT_TX_DBM
+          and rad_bogus["current_distance_m"] < 20,
+          json.dumps({"src": rad_bogus["assumptions"]["tx_source"],
+                      "d": rad_bogus["current_distance_m"]}))
 
     # --- Path-loss calibration (Tier 4) ---
     cal = calibrate_ple(1, -40, 10, -70)   # 30 dB over a decade => n=3.0
