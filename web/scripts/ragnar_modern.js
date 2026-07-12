@@ -1631,7 +1631,14 @@ function wifiSelectAp(bssid) {
     txBox.onchange = () => { txBox._userset = true; if (_wifiState.selected) wifiSelectAp(_wifiState.selected); };
     ['wifi-ple', 'wifi-rssi-offset', 'wifi-ant-gain', 'wifi-cable-loss'].forEach(id => {
         const el = document.getElementById(id);
-        if (el && !el._wired) { el._wired = true; el.onchange = () => { if (_wifiState.selected) wifiSelectAp(_wifiState.selected); }; }
+        if (el && !el._wired) {
+            el._wired = true;
+            el.onchange = () => {
+                // Typing n directly means the preset no longer matches → mark custom.
+                if (id === 'wifi-ple') _wifiSyncEnvPreset();
+                if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
+            };
+        }
     });
     const tx = txBox.value || 'auto';
     const ple = document.getElementById('wifi-ple').value || 3.0;
@@ -1668,6 +1675,19 @@ function wifiSelectAp(bssid) {
         }).catch(() => {});
 }
 
+function wifiSetEnvPreset(v) {
+    // Preset dropdown → path-loss exponent n. "custom" leaves the field as-is.
+    if (v !== 'custom') document.getElementById('wifi-ple').value = v;
+    if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
+}
+
+function _wifiSyncEnvPreset() {
+    // Reflect a manually-typed n back into the preset dropdown (custom if no match).
+    const sel = document.getElementById('wifi-env-preset'); if (!sel) return;
+    const n = String(parseFloat(document.getElementById('wifi-ple').value));
+    sel.value = [...sel.options].some(o => o.value === n) ? n : 'custom';
+}
+
 function wifiCalibrate() {
     const g = id => document.getElementById(id).value;
     const st = document.getElementById('wifi-cal-status');
@@ -1676,6 +1696,7 @@ function wifiCalibrate() {
         if (d.error) { st.textContent = '⚠ ' + d.error; return; }
         _wifiState.calRssi0 = d.rssi_at_1m;
         document.getElementById('wifi-ple').value = d.path_loss_exponent;
+        _wifiSyncEnvPreset();
         st.innerHTML = `n=<b>${d.path_loss_exponent}</b>, ref <b>${d.rssi_at_1m}</b> dBm@1m — applied`;
         if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
     }).catch(() => { st.textContent = 'calibration failed'; });
