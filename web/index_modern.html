@@ -349,6 +349,9 @@
                     <button onclick="showTab('network')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="network">
                         Network
                     </button>
+                    <button onclick="showTab('wifidef')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="wifidef">
+                        WiFi Defense
+                    </button>
                     <button onclick="showTab('discovered')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="discovered">
                         Discovered
                     </button>
@@ -435,6 +438,7 @@
             <div class="px-2 pt-2 pb-3 space-y-1">
                 <button onclick="showTab('dashboard')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Dashboard</button>
                 <button onclick="showTab('network')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Network</button>
+                <button onclick="showTab('wifidef')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">WiFi Defense</button>
                 <button onclick="showTab('discovered')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Discovered</button>
                 <button onclick="showTab('rusense')" class="rusense-nav block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">RuSense</button>
                 <button onclick="showTab('pentest')"
@@ -954,6 +958,13 @@
                         <span id="monitor-mode-badge" class="hidden inline-flex items-center mt-1 text-xs font-medium px-2 py-0.5 rounded-full"></span>
                     </div>
                     <div class="flex flex-wrap items-center gap-3">
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400">
+                            <span class="whitespace-nowrap">Interface</span>
+                            <select id="threat-sweep-iface" title="WiFi interface to sweep with"
+                                    class="bg-slate-900/70 border border-slate-700 focus:border-red-500 rounded px-2 py-1.5 text-xs text-gray-200 min-w-[110px]">
+                                <option value="">Auto</option>
+                            </select>
+                        </label>
                         <button id="threat-sweep-btn"
                                 onclick="runThreatSweep()"
                                 class="bg-red-700 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap flex items-center space-x-2">
@@ -1899,18 +1910,37 @@
                     <div id="wifi-legend" class="flex flex-wrap gap-4 mt-2 text-xs text-gray-400"></div>
                 </div>
 
+                <div id="wifi-changes" class="flex flex-wrap gap-2 mb-4 text-xs"></div>
+
                 <div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
                     <!-- AP list -->
                     <div class="glass rounded-xl p-4 xl:col-span-2">
-                        <h4 class="font-semibold mb-3 text-sm">Access Points <span id="wifi-ap-count" class="text-gray-500 font-normal"></span></h4>
+                        <div class="flex flex-wrap items-center gap-2 mb-3">
+                            <h4 class="font-semibold text-sm">Access Points <span id="wifi-ap-count" class="text-gray-500 font-normal"></span></h4>
+                            <div class="flex rounded-lg overflow-hidden border border-slate-700 ml-1">
+                                <button id="wifi-view-aps" onclick="wifiSetApView('aps')" class="px-2.5 py-1 text-xs bg-Ragnar-600 text-white">APs</button>
+                                <button id="wifi-view-nets" onclick="wifiSetApView('nets')" class="px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-700">Networks</button>
+                            </div>
+                            <input id="wifi-ap-search" oninput="wifiRenderTable()" placeholder="filter SSID / vendor / BSSID" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs flex-1 min-w-[140px]">
+                            <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifi-ap-issues" onchange="wifiRenderTable()" class="accent-amber-500"> issues only</label>
+                            <button onclick="wifiExportCsv()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Export CSV</button>
+                        </div>
                         <div class="overflow-x-auto">
-                            <table class="w-full text-sm">
-                                <thead><tr class="text-left text-gray-400 border-b border-slate-800">
-                                    <th class="py-1 pr-2">SSID</th><th class="py-1 pr-2">Band</th><th class="py-1 pr-2">Ch</th>
-                                    <th class="py-1 pr-2">Width</th><th class="py-1 pr-2">Signal</th><th class="py-1 pr-2">Util</th><th class="py-1 pr-2">Security</th>
+                            <table class="w-full text-sm" id="wifi-ap-table">
+                                <thead><tr class="text-left text-gray-400 border-b border-slate-800 whitespace-nowrap">
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('ssid')">SSID</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('vendor')">Vendor</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('band')">Band</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('channel')">Ch</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('width')">W</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('max_phy_mbps')">Rate</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('signal')">Signal</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('security')">Security</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('channel_util')">Util</th>
                                 </tr></thead>
-                                <tbody id="wifi-ap-tbody"><tr><td colspan="7" class="py-4 text-center text-gray-500">Click <span class="text-gray-300">Scan</span> to start a passive survey.</td></tr></tbody>
+                                <tbody id="wifi-ap-tbody"><tr><td colspan="9" class="py-4 text-center text-gray-500">Click <span class="text-gray-300">Scan</span> to start a passive survey.</td></tr></tbody>
                             </table>
+                            <div id="wifi-nets-view" class="hidden space-y-2"></div>
                         </div>
                     </div>
 
@@ -1923,10 +1953,33 @@
                         <div class="glass rounded-xl p-4">
                             <h4 class="font-semibold mb-2 text-sm">Signal Radius <span id="wifi-radius-target" class="text-gray-500 font-normal"></span></h4>
                             <p class="text-[11px] text-gray-500 mb-2">Click an AP row to model its coverage (log-distance path-loss estimate).</p>
-                            <div class="flex items-center gap-3 mb-2 text-xs" id="wifi-radius-controls" style="display:none">
-                                <label class="text-gray-400">Tx dBm <input id="wifi-tx" type="number" value="20" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
-                                <label class="text-gray-400">Env n <input id="wifi-ple" type="number" step="0.1" value="3.0" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                            <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mb-2 text-xs" id="wifi-radius-controls" style="display:none">
+                                <label class="text-gray-400" title="AP transmit power (auto = advertised TPC when present)">Tx dBm <input id="wifi-tx" type="number" value="20" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                <label class="text-gray-400" title="Quick preset for the environment — sets the path-loss exponent n">Env <select id="wifi-env-preset" onchange="wifiSetEnvPreset(this.value)" class="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1">
+                                    <option value="2.0">Open / LOS (2.0)</option>
+                                    <option value="2.5">Open indoor (2.5)</option>
+                                    <option value="3.0" selected>Light indoor (3.0)</option>
+                                    <option value="3.5">Office / few walls (3.5)</option>
+                                    <option value="5.0">Heavy walls (5.0)</option>
+                                    <option value="custom">Custom…</option>
+                                </select></label>
+                                <label class="text-gray-400" title="Path-loss exponent: 2.0 free space, ~3.0 indoor, ~4+ dense walls">n <input id="wifi-ple" type="number" step="0.1" value="3.0" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                <label class="text-gray-400" title="Per-adapter RSSI correction, dB (e.g. an Alfa reading 3 dB low → +3)">RSSI offset <input id="wifi-rssi-offset" type="number" step="0.5" value="0" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                <label class="text-gray-400" title="Receive antenna gain, dBi (raises effective reference level)">Ant dBi <input id="wifi-ant-gain" type="number" step="0.5" value="0" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                <label class="text-gray-400" title="Feed/cable loss, dB (lowers effective reference level)">Cable dB <input id="wifi-cable-loss" type="number" step="0.5" value="0" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
                             </div>
+                            <details class="mb-2 text-xs" id="wifi-cal-details" style="display:none">
+                                <summary class="cursor-pointer text-gray-400 hover:text-gray-200">Two-point calibration <span class="text-gray-600">— fit n &amp; ref from two known distances</span></summary>
+                                <div class="flex flex-wrap items-end gap-2 mt-2 pl-1">
+                                    <label class="text-gray-400">d₁ m <input id="wifi-cal-d1" type="number" step="0.1" placeholder="1" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                    <label class="text-gray-400">RSSI₁ <input id="wifi-cal-r1" type="number" placeholder="-40" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                    <label class="text-gray-400">d₂ m <input id="wifi-cal-d2" type="number" step="0.1" placeholder="5" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                    <label class="text-gray-400">RSSI₂ <input id="wifi-cal-r2" type="number" placeholder="-62" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 ml-1"></label>
+                                    <button onclick="wifiCalibrate()" class="bg-Ragnar-600 hover:bg-Ragnar-500 text-white px-2.5 py-1 rounded">Fit &amp; apply</button>
+                                    <button onclick="wifiCalibrateReset()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded">Reset</button>
+                                    <span id="wifi-cal-status" class="text-[11px] text-gray-500"></span>
+                                </div>
+                            </details>
                             <canvas id="wifi-radius-canvas" class="w-full" style="height:220px; display:none;"></canvas>
                             <div id="wifi-radius-info" class="text-xs text-gray-400 mt-2"></div>
                         </div>
@@ -1945,24 +1998,96 @@
                                 <label class="block text-[11px] text-gray-400 mb-1">Target AP</label>
                                 <select id="wifi-hm-ap" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[160px]"><option value="">Scan first…</option></select>
                             </div>
+                            <div>
+                                <label class="block text-[11px] text-gray-400 mb-1">Metric</label>
+                                <select id="wifi-hm-metric" onchange="wifiHeatmapSetMetric(this.value)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+                                    <option value="rssi">RSSI (dBm)</option>
+                                    <option value="snr">SNR (dB)</option>
+                                </select>
+                            </div>
                             <label class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs cursor-pointer">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
                             <button onclick="wifiHeatmapRender()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Redraw</button>
                             <button onclick="wifiHeatmapClear()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Clear</button>
                             <span id="wifi-hm-status" class="text-[11px] text-gray-500"></span>
                         </div>
                     </div>
+                    <!-- Saved surveys -->
+                    <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
+                        <span class="text-[11px] text-gray-400">Surveys:</span>
+                        <select id="wifi-hm-survey" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[150px]"><option value="">—</option></select>
+                        <button onclick="wifiSurveyLoad()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Load</button>
+                        <button onclick="wifiSurveyDelete()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Delete</button>
+                        <span class="text-gray-700">|</span>
+                        <input id="wifi-hm-survey-name" placeholder="name this survey…" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[150px]">
+                        <button onclick="wifiSurveySave()" class="bg-Ragnar-600 hover:bg-Ragnar-500 text-white px-2.5 py-1 rounded text-xs">Save</button>
+                        <span id="wifi-hm-survey-status" class="text-[11px] text-gray-500"></span>
+                    </div>
                     <div class="w-full overflow-x-auto mt-3">
                         <canvas id="wifi-heatmap" class="w-full rounded border border-slate-800 cursor-crosshair" style="height:380px; min-width:520px; background:#0b1220;"></canvas>
                     </div>
-                    <div class="flex items-center gap-4 mt-2 text-[11px] text-gray-400">
-                        <span>Coverage:</span>
-                        <span class="flex items-center gap-1"><span style="width:40px;height:8px;display:inline-block;border-radius:2px;background:linear-gradient(90deg,#ef4444,#f59e0b,#eab308,#84cc16,#22c55e)"></span></span>
-                        <span>weak → strong</span>
-                        <span class="ml-2">● live sample</span>
-                    </div>
+                    <div id="wifi-hm-legend" class="flex items-center flex-wrap gap-2 mt-2 text-[11px] text-gray-400"></div>
                 </div>
             </div><!-- /#net-sub-wifi -->
         </div><!-- /#network-tab -->
+
+        <!-- ============================ WiFi Defense Tab ============================ -->
+        <div id="wifidef-tab" class="tab-content hidden">
+            <div class="glass rounded-xl p-6 mb-5">
+                <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+                    <div>
+                        <h2 class="text-xl font-semibold flex items-center gap-2">🛡️ WiFi Defense <span class="text-xs font-normal px-2 py-0.5 rounded bg-slate-700 text-slate-300">802.11 WIDS</span></h2>
+                        <p class="text-sm text-gray-400 mt-1 max-w-3xl">A passive <strong>wireless intrusion-detection</strong> monitor. Listens on a <strong>monitor-mode</strong> adapter for 802.11 management frames and flags <strong>deauth/disassoc floods</strong>, <strong>beacon floods</strong> (fake-AP storms), <strong>rogue APs / evil twins</strong>, and <strong>KARMA/MANA</strong> rogue APs. <strong>Receive-only</strong> — it never transmits a frame or deauths anyone back. Needs an adapter that supports monitor mode (e.g. the Alfa AWUS036AXM); the Pi's onboard radio does not.</p>
+                    </div>
+                    <span id="wifidef-threat" class="shrink-0 px-4 py-2 rounded-lg text-sm font-bold bg-slate-700 text-slate-300">— idle —</span>
+                </div>
+                <!-- Controls -->
+                <div class="flex flex-wrap items-end gap-3 mt-4">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Monitor adapter</label>
+                        <select id="wifidef-iface" class="bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-sm min-w-[150px]"><option value="">Loading…</option></select>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Channel</label>
+                        <input id="wifidef-channel" type="text" value="hop" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm w-20" title="a channel number, or 'hop' to cycle channels">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Capture (s)</label>
+                        <input id="wifidef-secs" type="number" value="15" min="3" max="120" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm w-20">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1" title="Distinct SSIDs in one capture that count as a beacon flood. Raise it above your local density so a crowded neighbourhood doesn't false-positive; a real flood is in the hundreds.">Flood ≥ SSIDs</label>
+                        <input id="wifidef-flood-ssids" type="number" value="100" min="10" max="2000" onchange="wifidefSetThreshold()" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm w-20" title="Beacon-flood SSID threshold">
+                    </div>
+                    <button onclick="wifidefToggleMonitor()" id="wifidef-mon-btn" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Enable monitor</button>
+                    <button onclick="wifidefScan()" id="wifidef-scan-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm font-semibold">Scan</button>
+                    <button onclick="wifidefStopContinuous()" id="wifidef-stop-btn" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-semibold hidden">■ Stop</button>
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifidef-auto" class="accent-Ragnar-600"> Continuous</label>
+                    <button onclick="wifidefTrust()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap" title="Add the currently-visible APs to the trusted baseline (accumulates) for evil-twin detection. Run a few times / across bands to capture every BSSID of each SSID.">Trust current APs</button>
+                    <button onclick="wifidefResetBaseline()" class="bg-slate-800 hover:bg-slate-700 text-gray-400 px-3 py-2 rounded text-sm whitespace-nowrap" title="Clear the trusted-AP baseline and start over">Reset baseline</button>
+                    <span id="wifidef-status" class="text-xs text-gray-500 ml-auto"></span>
+                </div>
+                <p class="text-[11px] text-amber-300/80 mt-2" id="wifidef-mon-note">Enabling monitor mode adds a separate capture interface where the driver allows it; otherwise it takes the adapter off your network. Only run on an adapter you can dedicate to sensing.</p>
+            </div>
+
+            <!-- Threat detections -->
+            <div id="wifidef-detections" class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5"></div>
+
+            <!-- Counts -->
+            <div id="wifidef-counts" class="flex flex-wrap gap-3 mb-5 text-sm"></div>
+
+            <!-- AP inventory -->
+            <div class="glass rounded-xl p-4">
+                <h3 class="font-semibold mb-3 text-sm">Access Points seen <span id="wifidef-ap-count" class="text-gray-500 font-normal"></span></h3>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead><tr class="text-left text-gray-400 border-b border-slate-800">
+                            <th class="py-1 pr-2">SSID</th><th class="py-1 pr-2">BSSID</th><th class="py-1 pr-2">Ch</th><th class="py-1 pr-2">RSSI</th><th class="py-1 pr-2">Beacons</th>
+                        </tr></thead>
+                        <tbody id="wifidef-ap-tbody"><tr><td colspan="5" class="py-4 text-center text-gray-500">Enable monitor mode and press <span class="text-gray-300">Scan</span>.</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div><!-- /#wifidef-tab -->
 
         <!-- Connect Tab -->
         <div id="connect-tab" class="tab-content hidden">
@@ -6180,7 +6305,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260711-wifiheatmap"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefflood"></script>
 
 </body>
 </html>

@@ -1354,40 +1354,172 @@ function wifiScan() {
         }).catch(e => { if (btn) btn.disabled = false; st.textContent = 'Scan failed'; });
 }
 
+function _wifiGenBadge(std) {
+    const map = { 'Wi-Fi 7': '#22d3ee', 'Wi-Fi 6E': '#34d399', 'Wi-Fi 6': '#34d399',
+        'Wi-Fi 5': '#60a5fa', 'Wi-Fi 4': '#94a3b8', 'legacy': '#f87171' };
+    if (!std) return '';
+    const c = map[std] || '#94a3b8';
+    return `<span class="text-[9px] px-1 rounded ml-1 align-middle" style="background:${c}22;color:${c};border:1px solid ${c}66">${std.replace('Wi-Fi ', 'Wi‑Fi ')}</span>`;
+}
+
+function _wifiSecBadges(a) {
+    let b = '';
+    if (a.enterprise) b += '<span class="text-[9px] px-1 rounded bg-blue-600/20 text-blue-300 ml-1">802.1X</span>';
+    if (a.pmf === 'required') b += '<span class="text-[9px] px-1 rounded bg-green-600/20 text-green-300 ml-1" title="PMF required">PMF</span>';
+    else if (a.pmf === 'disabled' && a.security !== 'Open') b += '<span class="text-[9px] px-1 rounded bg-amber-600/20 text-amber-300 ml-1" title="Protected Mgmt Frames off">PMF✗</span>';
+    if (a.wps) b += '<span class="text-[9px] px-1 rounded bg-red-600/20 text-red-300 ml-1" title="WPS enabled">WPS</span>';
+    const r = a.roaming || {};
+    const rf = ['k', 'v', 'r'].filter(x => r[x]);
+    if (rf.length) b += `<span class="text-[9px] px-1 rounded bg-slate-600/40 text-slate-300 ml-1" title="802.11 roaming">11${rf.join('/')}</span>`;
+    return b;
+}
+
+function _wifiSparkline(hist) {
+    if (!hist || hist.length < 2) return '';
+    const w = 46, h = 12, n = hist.length;
+    let lo = Math.min(...hist), hi = Math.max(...hist);
+    if (hi - lo < 1) { lo -= 1; hi += 1; }
+    const pts = hist.map((v, i) => {
+        const x = (i / (n - 1)) * (w - 2) + 1;
+        const y = h - 1 - ((v - lo) / (hi - lo)) * (h - 2);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    const last = hist[hist.length - 1];
+    return `<svg width="${w}" height="${h}" class="inline-block align-middle ml-1" title="RSSI history ${lo}…${hi} dBm">
+        <polyline points="${pts}" fill="none" stroke="${_wifiSignalColor(last)}" stroke-width="1" stroke-linejoin="round"/></svg>`;
+}
+
+function wifiRenderChanges() {
+    const el = document.getElementById('wifi-changes');
+    if (!el) return;
+    const c = (_wifiState.data && _wifiState.data.changes) || {};
+    const chips = [];
+    (c.new_aps || []).forEach(a =>
+        chips.push(`<span class="px-2 py-1 rounded bg-emerald-600/20 text-emerald-300 border border-emerald-700/50" title="${a.bssid}">＋ new: ${a.ssid || '<hidden>'} <span class="opacity-60">${a.band}G ch${a.channel} ${a.signal}dBm</span></span>`));
+    (c.gone_aps || []).forEach(a =>
+        chips.push(`<span class="px-2 py-1 rounded bg-slate-700/40 text-slate-400 border border-slate-600/50" title="${a.bssid}">－ gone: ${a.ssid || '<hidden>'}</span>`));
+    (c.weakened || []).forEach(a =>
+        chips.push(`<span class="px-2 py-1 rounded bg-amber-600/20 text-amber-300 border border-amber-700/50" title="${a.bssid} — ${a.drop}dB below its peak ${a.rssi_max}dBm">▼ weakened: ${a.ssid || '<hidden>'} <span class="opacity-60">${a.signal}dBm (−${a.drop})</span></span>`));
+    el.innerHTML = chips.length
+        ? `<span class="text-gray-500 self-center mr-1">Since last scan:</span>${chips.join('')}`
+        : '';
+}
+
+function wifiSetApView(v) {
+    _wifiState.apView = v;
+    document.getElementById('wifi-view-aps').classList.toggle('bg-Ragnar-600', v === 'aps');
+    document.getElementById('wifi-view-aps').classList.toggle('text-white', v === 'aps');
+    document.getElementById('wifi-view-nets').classList.toggle('bg-Ragnar-600', v === 'nets');
+    document.getElementById('wifi-view-nets').classList.toggle('text-white', v === 'nets');
+    document.getElementById('wifi-ap-table').classList.toggle('hidden', v !== 'aps');
+    document.getElementById('wifi-nets-view').classList.toggle('hidden', v !== 'nets');
+    wifiRenderTable();
+}
+
+function wifiSort(key) {
+    if (_wifiState.sortKey === key) _wifiState.sortDir *= -1;
+    else { _wifiState.sortKey = key; _wifiState.sortDir = (key === 'ssid' || key === 'vendor') ? 1 : -1; }
+    wifiRenderTable();
+}
+
+function wifiRenderTable() {
+    const d = _wifiState.data; if (!d) return;
+    if (_wifiState.apView === 'nets') return wifiRenderNets();
+    const q = (document.getElementById('wifi-ap-search').value || '').toLowerCase();
+    const issuesOnly = document.getElementById('wifi-ap-issues').checked;
+    let aps = d.aps.filter(a =>
+        (!q || (a.ssid || '').toLowerCase().includes(q) || (a.vendor || '').toLowerCase().includes(q) || a.bssid.includes(q))
+        && (!issuesOnly || (a.security_findings && a.security_findings.length)));
+    const k = _wifiState.sortKey, dir = _wifiState.sortDir;
+    aps = aps.slice().sort((x, y) => {
+        let a = x[k], b = y[k];
+        if (a == null) a = (typeof b === 'number') ? -9999 : '';
+        if (b == null) b = (typeof a === 'number') ? -9999 : '';
+        return (a < b ? -1 : a > b ? 1 : 0) * dir;
+    });
+    const tb = document.getElementById('wifi-ap-tbody');
+    document.getElementById('wifi-ap-count').textContent = `(${aps.length}/${d.ap_count})`;
+    if (!aps.length) { tb.innerHTML = '<tr><td colspan="9" class="py-4 text-center text-gray-500">No APs match.</td></tr>'; return; }
+    tb.innerHTML = aps.map(a => {
+        const isSel = _wifiState.selected === a.bssid;
+        const bar = a.signal == null ? 0 : Math.max(4, Math.min(100, (a.signal + 100) / 70 * 100));
+        const issue = a.security_findings && a.security_findings.length;
+        // Selected row: inline Ragnar accent (custom-colour opacity classes aren't
+        // in the prebuilt tailwind.css). Selection wins the left bar over amber.
+        const rowCls = isSel ? '' : 'hover:bg-slate-800/40' + (issue ? ' border-l-2 border-l-amber-500' : '');
+        const rowStyle = isSel ? ' style="background-color:rgba(2,132,199,0.25);border-left:3px solid rgb(56,189,248)"' : '';
+        const snr = a.snr != null ? `<span class="text-[10px] text-gray-500"> ${a.snr}dB</span>` : '';
+        const rate = (a.nss ? a.nss + 'ss' : '') + (a.max_phy_mbps ? ' ' + (a.max_phy_mbps >= 1000 ? (a.max_phy_mbps / 1000).toFixed(1) + 'G' : a.max_phy_mbps + 'M') : '');
+        const marker = isSel ? '<span style="color:rgb(56,189,248)" class="mr-0.5" title="selected — modelled in Signal Radius">►</span>' : '';
+        return `<tr class="border-b border-slate-800/50 cursor-pointer ${rowCls}"${rowStyle} onclick="wifiSelectAp('${a.bssid}')">
+            <td class="py-1 pr-2 whitespace-nowrap">${marker}${issue ? '<span title="' + a.security_findings.join('; ') + '" class="text-amber-400">⚠</span> ' : ''}${(a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>')}${_wifiGenBadge(a.standard)}${a.is_new ? ' <span class="text-[9px] px-1 rounded bg-emerald-600/30 text-emerald-300 align-middle" title="first seen this session">NEW</span>' : ''}${a.dfs ? ' <span title="DFS/radar" style="color:#a78bfa">◆</span>' : ''}<div class="text-[10px] text-gray-600 font-mono">${a.bssid}${a.seen_count > 1 ? ' <span class="text-gray-700">·seen ' + a.seen_count + '×</span>' : ''}</div></td>
+            <td class="py-1 pr-2 text-xs text-gray-400 whitespace-nowrap">${a.vendor || '—'}</td>
+            <td class="py-1 pr-2"><span style="color:${_WIFI_BAND_COLOR[a.band]}">${a.band}</span></td>
+            <td class="py-1 pr-2">${a.channel}</td>
+            <td class="py-1 pr-2">${a.width}M</td>
+            <td class="py-1 pr-2 text-xs whitespace-nowrap">${rate || '—'}</td>
+            <td class="py-1 pr-2 whitespace-nowrap"><span style="color:${_wifiSignalColor(a.signal)}">${a.signal}</span>${snr}<span style="display:inline-block;height:6px;width:${bar}px;max-width:50px;background:${_wifiSignalColor(a.signal)};border-radius:2px;margin-left:4px"></span>${_wifiSparkline(a.rssi_history)}</td>
+            <td class="py-1 pr-2 text-xs whitespace-nowrap ${a.security === 'Open' ? 'text-red-400' : 'text-gray-300'}">${a.security}${_wifiSecBadges(a)}</td>
+            <td class="py-1 pr-2">${a.channel_util == null ? '—' : a.channel_util + '%'}</td>
+        </tr>`;
+    }).join('');
+}
+
+function wifiRenderNets() {
+    const d = _wifiState.data; if (!d || !d.groups) return;
+    const q = (document.getElementById('wifi-ap-search').value || '').toLowerCase();
+    let nets = d.groups.networks.filter(n => !q || n.ssid.toLowerCase().includes(q));
+    const el = document.getElementById('wifi-nets-view');
+    document.getElementById('wifi-ap-count').textContent = `(${nets.length} networks · ${d.groups.device_count} devices)`;
+    el.innerHTML = nets.map(n => `<div class="flex items-center justify-between gap-2 py-1.5 border-b border-slate-800/50">
+        <div class="min-w-0"><span class="font-medium">${n.ssid}</span>${_wifiGenBadge(n.standard)}
+            <div class="text-[10px] text-gray-500">${n.vendor || ''}</div></div>
+        <div class="flex items-center gap-3 text-xs text-gray-400 shrink-0">
+            <span>${n.bands.map(b => `<span style="color:${_WIFI_BAND_COLOR[b]}">${b}</span>`).join(' ')} GHz</span>
+            <span>${n.ap_count} AP${n.ap_count > 1 ? 's' : ''}</span>
+            <span>${n.security}</span>
+            <span style="color:${_wifiSignalColor(n.best_signal)}">${n.best_signal}dBm</span>
+        </div></div>`).join('') || '<div class="py-4 text-center text-gray-500">No networks.</div>';
+}
+
+function wifiExportCsv() {
+    const d = _wifiState.data; if (!d) return;
+    const cols = ['ssid', 'bssid', 'vendor', 'band', 'channel', 'width', 'standard', 'nss', 'max_phy_mbps', 'signal', 'snr', 'security', 'pmf', 'enterprise', 'wps', 'channel_util', 'tx_power_dbm', 'country'];
+    const rows = [cols.join(',')].concat(d.aps.map(a => cols.map(c => {
+        let v = a[c]; if (v == null) v = ''; v = String(v).replace(/"/g, '""');
+        return /[",\n]/.test(v) ? `"${v}"` : v;
+    }).join(',')));
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `wifi-survey-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+}
+
 function wifiRender() {
     const d = _wifiState.data; if (!d) return;
-    // Band summary chips
+    if (!_wifiState.apView) _wifiState.apView = 'aps';
+    if (!_wifiState.sortKey) { _wifiState.sortKey = 'signal'; _wifiState.sortDir = -1; }
+    // Band summary chips (+ noise floor + width advice)
     const summ = document.getElementById('wifi-band-summary');
     const ratingColor = { clear: '#22c55e', moderate: '#eab308', congested: '#ef4444' };
-    summ.innerHTML = Object.keys(d.spectrum).sort().map(b => {
+    let chips = Object.keys(d.spectrum).sort().map(b => {
         const s = d.spectrum[b];
+        const wa = s.width_advice ? ` · <span title="${s.width_advice.reason}">→ ${s.width_advice.mhz}MHz</span>` : '';
         return `<span class="px-2 py-1 rounded" style="background:${_WIFI_BAND_COLOR[b]}22;border:1px solid ${_WIFI_BAND_COLOR[b]}66">
             <b style="color:${_WIFI_BAND_COLOR[b]}">${b} GHz</b> · ${s.ap_count} AP ·
-            <span style="color:${ratingColor[s.rating]}">${s.rating}</span> · best ch ${s.recommend.join(', ')}</span>`;
-    }).join('') || '<span class="text-gray-500">No APs heard.</span>';
+            <span style="color:${ratingColor[s.rating]}">${s.rating}</span> · best ch ${s.recommend.join(', ')}${wa}</span>`;
+    }).join('');
+    if (d.noise_floor != null) chips += `<span class="px-2 py-1 rounded bg-slate-800 border border-slate-700">noise floor ${d.noise_floor} dBm</span>`;
+    summ.innerHTML = chips || '<span class="text-gray-500">No APs heard.</span>';
+    wifiRenderChanges();
     // Legend
     document.getElementById('wifi-legend').innerHTML =
         '<span>Signal:</span>' +
         [['#22c55e', 'strong'], ['#84cc16', 'good'], ['#eab308', 'fair'], ['#f97316', 'weak'], ['#ef4444', 'v.weak']]
             .map(([c, l]) => `<span class="flex items-center gap-1"><span style="width:10px;height:10px;background:${c};border-radius:2px;display:inline-block"></span>${l}</span>`).join('') +
-        '<span class="ml-2">◆ DFS/radar channel</span>';
-    document.getElementById('wifi-ap-count').textContent = `(${d.ap_count})`;
-    // Table
-    const tb = document.getElementById('wifi-ap-tbody');
-    if (!d.aps.length) { tb.innerHTML = '<tr><td colspan="7" class="py-4 text-center text-gray-500">No beacons heard on this band.</td></tr>'; }
-    else tb.innerHTML = d.aps.map(a => {
-        const sel = _wifiState.selected === a.bssid ? 'bg-slate-800/70' : '';
-        const bar = a.signal == null ? 0 : Math.max(4, Math.min(100, (a.signal + 100) / 70 * 100));
-        return `<tr class="border-b border-slate-800/50 hover:bg-slate-800/40 cursor-pointer ${sel}" onclick="wifiSelectAp('${a.bssid}')">
-            <td class="py-1 pr-2">${(a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>')}${a.dfs ? ' <span title="DFS/radar channel" style="color:#a78bfa">◆</span>' : ''}<div class="text-[10px] text-gray-600 font-mono">${a.bssid}</div></td>
-            <td class="py-1 pr-2"><span style="color:${_WIFI_BAND_COLOR[a.band]}">${a.band}</span></td>
-            <td class="py-1 pr-2">${a.channel}</td>
-            <td class="py-1 pr-2">${a.width}M</td>
-            <td class="py-1 pr-2"><div class="flex items-center gap-1"><span style="color:${_wifiSignalColor(a.signal)}">${a.signal}</span><span style="display:inline-block;height:6px;width:${bar}px;max-width:60px;background:${_wifiSignalColor(a.signal)};border-radius:2px"></span></div></td>
-            <td class="py-1 pr-2">${a.channel_util == null ? '—' : a.channel_util + '%'}</td>
-            <td class="py-1 pr-2 text-xs ${a.security === 'Open' ? 'text-red-400' : 'text-gray-400'}">${a.security}</td>
-        </tr>`;
-    }).join('');
+        '<span class="ml-2">◆ DFS/radar</span><span>⚠ security issue</span>';
+    wifiRenderTable();
     // Interference
     const inf = d.interference; const ip = document.getElementById('wifi-interference');
     let html = '';
@@ -1497,19 +1629,91 @@ function wifiSelectAp(bssid) {
     _wifiState.selected = bssid;
     wifiRender();
     const iface = _wifiState.iface;
-    const tx = document.getElementById('wifi-tx').value || 20;
+    // Prefill TX with the AP's advertised power (TPC report) when it has one.
+    const ap = (_wifiState.data && _wifiState.data.aps || []).find(a => a.bssid === bssid);
+    const txBox = document.getElementById('wifi-tx');
+    if (ap && ap.tx_power_dbm != null && !txBox._userset) txBox.value = ap.tx_power_dbm;
+    txBox.onchange = () => { txBox._userset = true; if (_wifiState.selected) wifiSelectAp(_wifiState.selected); };
+    ['wifi-ple', 'wifi-rssi-offset', 'wifi-ant-gain', 'wifi-cable-loss'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && !el._wired) {
+            el._wired = true;
+            el.onchange = () => {
+                // Typing n directly means the preset no longer matches → mark custom.
+                if (id === 'wifi-ple') _wifiSyncEnvPreset();
+                if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
+            };
+        }
+    });
+    const tx = txBox.value || 'auto';
     const ple = document.getElementById('wifi-ple').value || 3.0;
+    const rssiOffset = document.getElementById('wifi-rssi-offset').value || 0;
+    const antGain = document.getElementById('wifi-ant-gain').value || 0;
+    const cableLoss = document.getElementById('wifi-cable-loss').value || 0;
+    const rssi0 = _wifiState.calRssi0 != null ? `&rssi0=${_wifiState.calRssi0}` : '';
+    // Hand back the row we're already showing so the server needn't re-scan
+    // (a fresh scan can momentarily miss the AP → "bssid not found").
+    let known = '';
+    if (ap && ap.signal != null) {
+        known = `&signal=${ap.signal}&freq=${ap.freq || ''}&center_freq=${ap.center_freq || ''}`
+            + `&band=${encodeURIComponent(ap.band || '')}&channel=${ap.channel != null ? ap.channel : ''}`
+            + `&ssid=${encodeURIComponent(ap.ssid || '')}`
+            + `&tx_measured=${ap.tx_power_dbm != null ? ap.tx_power_dbm : ''}`;
+    }
     document.getElementById('wifi-radius-controls').style.display = 'flex';
-    fetch(`/api/net/wifi/radius?interface=${encodeURIComponent(iface)}&bssid=${encodeURIComponent(bssid)}&tx=${tx}&ple=${ple}`)
+    document.getElementById('wifi-cal-details').style.display = 'block';
+    fetch(`/api/net/wifi/radius?interface=${encodeURIComponent(iface)}&bssid=${encodeURIComponent(bssid)}&tx=${tx}&ple=${ple}&rssi_offset=${rssiOffset}&antenna_gain=${antGain}&cable_loss=${cableLoss}${rssi0}${known}`)
         .then(r => r.json()).then(d => {
             if (d.error) { document.getElementById('wifi-radius-info').innerHTML = '<span class="text-amber-400">' + d.error + '</span>'; return; }
             _wifiDrawRadius(d);
             document.getElementById('wifi-radius-target').textContent = '· ' + (d.ssid || bssid);
+            const srcMap = { measured: '<span class="text-green-400">measured</span>', calibrated: '<span class="text-cyan-400">calibrated</span>' };
+            const src = srcMap[d.assumptions.tx_source] || 'assumed';
+            const a = d.assumptions;
+            const adj = (d.signal_adjusted != null && d.signal_adjusted !== d.signal) ? ` (adj ${d.signal_adjusted})` : '';
+            const cal = (a.rssi_offset || a.antenna_gain || a.cable_loss)
+                ? `<div class="text-[10px] text-gray-600">Cal: offset ${a.rssi_offset || 0} dB · ant ${a.antenna_gain || 0} dBi · cable ${a.cable_loss || 0} dB</div>` : '';
             document.getElementById('wifi-radius-info').innerHTML =
-                `<div class="mb-1">Measured <b style="color:${_wifiSignalColor(d.signal)}">${d.signal} dBm</b> → you are ~<b>${d.current_distance_m} m</b> from this AP.</div>` +
+                `<div class="mb-1">Measured <b style="color:${_wifiSignalColor(d.signal)}">${d.signal} dBm</b>${adj} → you are ~<b>${d.current_distance_m} m</b> from this AP.</div>` +
                 d.rings.map(r => `<div>• <b>${r.radius_m} m</b> — ${r.label} (≤${r.threshold_dbm} dBm)</div>`).join('') +
-                `<div class="text-[10px] text-gray-600 mt-1">Model: Tx ${d.assumptions.tx_dbm} dBm, n=${d.assumptions.path_loss_exponent}, ref ${d.assumptions.rssi_at_1m} dBm@1m. Estimate only.</div>`;
+                `<div class="text-[10px] text-gray-600 mt-1">Model: Tx ${a.tx_dbm} dBm (${src}), n=${a.path_loss_exponent}, ref ${a.rssi_at_1m} dBm@1m. Estimate only.</div>` + cal;
         }).catch(() => {});
+}
+
+function wifiSetEnvPreset(v) {
+    // Preset dropdown → path-loss exponent n. "custom" leaves the field as-is.
+    if (v !== 'custom') document.getElementById('wifi-ple').value = v;
+    if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
+}
+
+function _wifiSyncEnvPreset() {
+    // Reflect a manually-typed n back into the preset dropdown (custom if no match).
+    // Compare numerically so 5, 5.0 and "5.0" all match the same option.
+    const sel = document.getElementById('wifi-env-preset'); if (!sel) return;
+    const n = parseFloat(document.getElementById('wifi-ple').value);
+    const match = [...sel.options].find(o => o.value !== 'custom' && parseFloat(o.value) === n);
+    sel.value = match ? match.value : 'custom';
+}
+
+function wifiCalibrate() {
+    const g = id => document.getElementById(id).value;
+    const st = document.getElementById('wifi-cal-status');
+    const qs = `d1=${g('wifi-cal-d1')}&rssi1=${g('wifi-cal-r1')}&d2=${g('wifi-cal-d2')}&rssi2=${g('wifi-cal-r2')}`;
+    fetch(`/api/net/wifi/calibrate?${qs}`).then(r => r.json()).then(d => {
+        if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+        _wifiState.calRssi0 = d.rssi_at_1m;
+        document.getElementById('wifi-ple').value = d.path_loss_exponent;
+        _wifiSyncEnvPreset();
+        st.innerHTML = `n=<b>${d.path_loss_exponent}</b>, ref <b>${d.rssi_at_1m}</b> dBm@1m — applied`;
+        if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
+    }).catch(() => { st.textContent = 'calibration failed'; });
+}
+
+function wifiCalibrateReset() {
+    _wifiState.calRssi0 = null;
+    const st = document.getElementById('wifi-cal-status');
+    if (st) st.textContent = 'cleared — using TX/FSPL model';
+    if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
 }
 
 function _wifiDrawRadius(d) {
@@ -1545,11 +1749,26 @@ function _wifiDrawRadius(d) {
 }
 
 // ---- WiFi coverage heatmap (walk-around survey) ----------------------------
-const _wifiHm = { floorplan: null, data: null, inited: false };
+const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi' };
 
-function _wifiHeatColor(rssi) {
-    // -90 (red) .. -40 (green) along red->orange->yellow->lime->green
-    const t = Math.max(0, Math.min(1, (rssi + 90) / 50));
+// Calibrated metric scales: [lo (red), hi (green)] and labelled break points.
+const _WIFI_HM_METRICS = {
+    rssi: { lo: -90, hi: -30, unit: 'dBm',
+        marks: [[-30, 'excellent'], [-67, 'good'], [-72, 'fair'], [-80, 'weak'], [-90, 'dead']] },
+    snr:  { lo: 5, hi: 40, unit: 'dB',
+        marks: [[40, 'excellent'], [25, 'good'], [15, 'fair'], [10, 'marginal'], [5, 'unusable']] },
+};
+
+function _wifiHmValue(sp) {
+    // Selected metric value for a sample, falling back to rssi if snr missing.
+    if (_wifiHm.metric === 'snr' && sp.snr != null) return sp.snr;
+    if (_wifiHm.metric === 'snr') return null;     // no SNR on this sample
+    return sp.rssi;
+}
+
+function _wifiHeatColor(val) {
+    const m = _WIFI_HM_METRICS[_wifiHm.metric] || _WIFI_HM_METRICS.rssi;
+    const t = Math.max(0, Math.min(1, (val - m.lo) / (m.hi - m.lo)));
     const stops = [[239, 68, 68], [245, 158, 11], [234, 179, 8], [132, 204, 22], [34, 197, 94]];
     const seg = Math.min(stops.length - 2, Math.floor(t * (stops.length - 1)));
     const f = t * (stops.length - 1) - seg;
@@ -1557,9 +1776,25 @@ function _wifiHeatColor(rssi) {
     return c;
 }
 
+function wifiHeatmapSetMetric(v) {
+    _wifiHm.metric = (v === 'snr') ? 'snr' : 'rssi';
+    wifiHeatmapRender();
+}
+
+function wifiHeatmapRenderLegend() {
+    const el = document.getElementById('wifi-hm-legend'); if (!el) return;
+    const m = _WIFI_HM_METRICS[_wifiHm.metric] || _WIFI_HM_METRICS.rssi;
+    const bar = '<span style="width:56px;height:8px;display:inline-block;border-radius:2px;background:linear-gradient(90deg,#ef4444,#f59e0b,#eab308,#84cc16,#22c55e)"></span>';
+    const marks = m.marks.map(([v, l]) =>
+        `<span class="flex items-center gap-1"><span style="width:9px;height:9px;border-radius:2px;display:inline-block;background:rgb(${_wifiHeatColor(v).join(',')})"></span>${v}${m.unit === 'dBm' ? '' : ''} <span class="text-gray-600">${l}</span></span>`
+    ).join('');
+    el.innerHTML = `<span>${_wifiHm.metric.toUpperCase()} (${m.unit}):</span> ${bar} <span class="text-gray-600">${m.lo}→${m.hi}</span> ${marks} <span class="ml-1 text-gray-500">● live sample</span>`;
+}
+
 function wifiHeatmapInit() {
     if (_wifiHm.inited) return;
     _wifiHm.inited = true;
+    wifiSurveyRefresh();
     const file = document.getElementById('wifi-hm-file');
     if (file) file.addEventListener('change', (e) => {
         const f = e.target.files[0]; if (!f) return;
@@ -1632,7 +1867,9 @@ function wifiHeatmapRender() {
         const iw = im.width * s, ih = im.height * s;
         ctx.globalAlpha = 0.85; ctx.drawImage(im, (W - iw) / 2, (H - ih) / 2, iw, ih); ctx.globalAlpha = 1;
     }
-    const samples = (_wifiHm.data && _wifiHm.data.samples) || [];
+    const allSamples = (_wifiHm.data && _wifiHm.data.samples) || [];
+    // Only samples that have a value for the selected metric feed interpolation.
+    const samples = allSamples.filter(sp => _wifiHmValue(sp) != null);
     if (samples.length >= 1) {
         // IDW interpolation over a coarse grid
         const cell = 12;
@@ -1644,11 +1881,11 @@ function wifiHeatmapRender() {
                     const dx = (sp.x - px) * W, dy = (sp.y - py) * H;
                     const d2 = dx * dx + dy * dy; near = Math.min(near, d2);
                     const w = 1 / (d2 + 40);
-                    num += w * sp.rssi; den += w;
+                    num += w * _wifiHmValue(sp); den += w;
                 });
                 if (den === 0) continue;
-                const rssi = num / den;
-                const [r, g, b] = _wifiHeatColor(rssi);
+                const val = num / den;
+                const [r, g, b] = _wifiHeatColor(val);
                 // fade out far from any sample so we don't paint the whole floor
                 const a = Math.max(0.08, Math.min(0.5, 1 - Math.sqrt(near) / (Math.max(W, H) * 0.6)));
                 ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
@@ -1656,16 +1893,18 @@ function wifiHeatmapRender() {
             }
         }
     }
-    // Sample dots
-    samples.forEach(sp => {
+    // Sample dots — every sample; grey if it has no value for this metric.
+    allSamples.forEach(sp => {
         const x = sp.x * W, y = sp.y * H;
-        const [r, g, b] = _wifiHeatColor(sp.rssi);
+        const val = _wifiHmValue(sp);
+        const [r, g, b] = val == null ? [100, 116, 139] : _wifiHeatColor(val);
         ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI);
         ctx.fillStyle = `rgb(${r},${g},${b})`; ctx.fill();
         ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
         ctx.fillStyle = '#e2e8f0'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
-        ctx.fillText(Math.round(sp.rssi), x, y - 8);
+        ctx.fillText(val == null ? '—' : Math.round(val), x, y - 8);
     });
+    wifiHeatmapRenderLegend();
     if (!samples.length && !_wifiHm.floorplan) {
         ctx.fillStyle = '#475569'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText('Pick a target AP, then click on the plan where you are standing to drop RSSI samples.', W / 2, H / 2);
@@ -1675,6 +1914,306 @@ function wifiHeatmapRender() {
 function wifiHeatmapClear() {
     fetch('/api/net/wifi/heatmap', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'clear' }) }).then(() => wifiHeatmapLoad());
+}
+
+// ---- Named surveys (save / load / delete a floorplan+samples set) ----------
+function wifiSurveyRefresh(list) {
+    const done = (d) => {
+        const sel = document.getElementById('wifi-hm-survey'); if (!sel) return;
+        const cur = sel.value;
+        const surveys = (d && d.surveys) || [];
+        sel.innerHTML = surveys.length
+            ? surveys.map(s => `<option value="${s.name}">${s.name} · ${s.samples} pts${s.target_ssid ? ' · ' + s.target_ssid : ''}</option>`).join('')
+            : '<option value="">— none saved —</option>';
+        if (cur && surveys.some(s => s.name === cur)) sel.value = cur;
+    };
+    if (list) return done(list);
+    fetch('/api/net/wifi/surveys').then(r => r.json()).then(done).catch(() => {});
+}
+
+function wifiSurveySave() {
+    const name = (document.getElementById('wifi-hm-survey-name').value || '').trim();
+    const st = document.getElementById('wifi-hm-survey-status');
+    if (!name) { if (st) st.textContent = 'name it first'; return; }
+    fetch('/api/net/wifi/surveys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'save', name }) })
+        .then(r => r.json()).then(d => {
+            if (d.error) { if (st) st.textContent = '⚠ ' + d.error; return; }
+            if (st) st.textContent = 'saved “' + name + '”';
+            document.getElementById('wifi-hm-survey-name').value = '';
+            wifiSurveyRefresh(d);
+        }).catch(() => { if (st) st.textContent = 'save failed'; });
+}
+
+function wifiSurveyLoad() {
+    const name = document.getElementById('wifi-hm-survey').value;
+    const st = document.getElementById('wifi-hm-survey-status');
+    if (!name) return;
+    fetch('/api/net/wifi/surveys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'load', name }) })
+        .then(r => r.json()).then(d => {
+            if (d.error) { if (st) st.textContent = '⚠ ' + d.error; return; }
+            if (st) st.textContent = 'loaded “' + name + '”';
+            wifiHeatmapLoad();
+        }).catch(() => { if (st) st.textContent = 'load failed'; });
+}
+
+function wifiSurveyDelete() {
+    const name = document.getElementById('wifi-hm-survey').value;
+    const st = document.getElementById('wifi-hm-survey-status');
+    if (!name) return;
+    fetch('/api/net/wifi/surveys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', name }) })
+        .then(r => r.json()).then(d => { if (st) st.textContent = 'deleted “' + name + '”'; wifiSurveyRefresh(d); })
+        .catch(() => { if (st) st.textContent = 'delete failed'; });
+}
+
+// ============================================================================
+// WiFi Defense — 802.11 frame monitor / WIDS (top-level tab)
+// Backend: /api/wifidef/* (wifi_defense.py)
+// ============================================================================
+const _wifidef = { iface: '', monitor: null, data: null, continuous: false, timer: null, abort: null };
+
+const _WIFIDEF_THREAT = {
+    clear: ['CLEAR', 'bg-green-600/20 text-green-300 border border-green-600/50'],
+    warning: ['WARNING', 'bg-amber-600/20 text-amber-300 border border-amber-600/50'],
+    critical: ['⚠ UNDER ATTACK', 'bg-red-600/25 text-red-300 border border-red-600/60'],
+};
+
+function initWifiDefense() {
+    _wifidefFillIfaces();
+    // Load the persisted beacon-flood threshold into the control.
+    fetch('/api/wifidef/thresholds').then(r => r.json()).then(t => {
+        const el = document.getElementById('wifidef-flood-ssids');
+        if (el && t && t.beacon_ssids) el.value = t.beacon_ssids;
+    }).catch(() => {});
+    const auto = document.getElementById('wifidef-auto');
+    if (auto && !auto._wired) {
+        auto._wired = true;
+        auto.addEventListener('change', (e) => {
+            if (e.target.checked) _wifidefStartContinuous();
+            else wifidefStopContinuous();
+        });
+    }
+    _wifidefUpdateRunUI();
+}
+
+// Continuous mode chains scans: the next capture starts only after the previous
+// one finishes (each capture already runs for `seconds`), instead of a fixed
+// interval that would stack overlapping captures.
+function _wifidefStartContinuous() {
+    if (_wifidef.continuous) return;
+    _wifidef.continuous = true;
+    _wifidefUpdateRunUI();
+    _wifidefLoop();
+}
+
+function _wifidefLoop() {
+    if (!_wifidef.continuous) return;
+    wifidefScan().finally(() => {
+        if (_wifidef.continuous) _wifidef.timer = setTimeout(_wifidefLoop, 800);
+    });
+}
+
+function wifidefStopContinuous() {
+    _wifidef.continuous = false;
+    if (_wifidef.timer) { clearTimeout(_wifidef.timer); _wifidef.timer = null; }
+    if (_wifidef.abort) { try { _wifidef.abort.abort(); } catch (e) {} _wifidef.abort = null; }
+    const cb = document.getElementById('wifidef-auto'); if (cb) cb.checked = false;
+    _wifidefUpdateRunUI();
+    const st = document.getElementById('wifidef-status');
+    if (st) st.textContent = 'Continuous scan stopped';
+}
+
+function _wifidefUpdateRunUI() {
+    const scan = document.getElementById('wifidef-scan-btn');
+    const stop = document.getElementById('wifidef-stop-btn');
+    if (scan) scan.classList.toggle('hidden', _wifidef.continuous);
+    if (stop) stop.classList.toggle('hidden', !_wifidef.continuous);
+}
+
+function _wifidefFillIfaces() {
+    fetch('/api/wifidef/interfaces').then(r => r.json()).then(d => {
+        const sel = document.getElementById('wifidef-iface');
+        const ifs = (d && d.interfaces) || [];
+        _wifidef.monitor = d.active_monitor || null;
+        if (!ifs.length) { sel.innerHTML = '<option value="">No wireless adapter</option>'; }
+        else {
+            sel.innerHTML = ifs.map(i =>
+                `<option value="${i.iface}"${i.monitor_capable ? '' : ' disabled'}>${i.iface}${i.monitor_capable ? '' : ' (no monitor)'}${i.is_monitor ? ' • MONITOR' : ''}</option>`).join('');
+            const cap = ifs.find(i => i.monitor_capable) || ifs[0];
+            if (!_wifidef.iface || !ifs.some(i => i.iface === _wifidef.iface && i.monitor_capable)) _wifidef.iface = (d.base_iface) || cap.iface;
+            sel.value = _wifidef.iface;
+            sel.onchange = () => { _wifidef.iface = sel.value; };
+        }
+        _wifidefUpdateMonBtn();
+    }).catch(() => {});
+}
+
+function _wifidefUpdateMonBtn() {
+    const btn = document.getElementById('wifidef-mon-btn');
+    if (!btn) return;
+    if (_wifidef.monitor) {
+        btn.textContent = 'Disable monitor (' + _wifidef.monitor + ')';
+        btn.classList.add('text-red-300');
+    } else {
+        btn.textContent = 'Enable monitor';
+        btn.classList.remove('text-red-300');
+    }
+}
+
+function wifidefToggleMonitor() {
+    const st = document.getElementById('wifidef-status');
+    if (_wifidef.monitor) {
+        st.textContent = 'Disabling monitor…';
+        fetch('/api/wifidef/monitor', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'disable' }) })
+            .then(r => r.json()).then(d => { _wifidef.monitor = null; _wifidefUpdateMonBtn(); st.textContent = 'Monitor disabled'; }).catch(() => {});
+        return;
+    }
+    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+    if (!iface) return;
+    st.textContent = 'Enabling monitor…';
+    fetch('/api/wifidef/monitor', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'enable', interface: iface }) })
+        .then(r => r.json()).then(d => {
+            if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+            _wifidef.monitor = d.mon_iface;
+            _wifidefUpdateMonBtn();
+            st.textContent = d.warning ? ('⚠ ' + d.warning) : ('Monitor up on ' + d.mon_iface + (d.mode === 'vif' ? ' (link kept)' : ''));
+        }).catch(() => { st.textContent = 'Enable failed'; });
+}
+
+function wifidefScan() {
+    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+    if (!iface) return Promise.resolve();
+    const secs = document.getElementById('wifidef-secs').value || 15;
+    let ch = (document.getElementById('wifidef-channel').value || 'hop').trim();
+    const chParam = /^\d+$/.test(ch) ? ch : 'auto';
+    const st = document.getElementById('wifidef-status');
+    const btn = document.getElementById('wifidef-scan-btn');
+    const ctrl = new AbortController();
+    _wifidef.abort = ctrl;
+    st.textContent = (_wifidef.continuous ? 'Continuous — capturing ' : 'Capturing ') + secs + 's…';
+    if (btn) btn.disabled = true;
+    return fetch(`/api/wifidef/scan?interface=${encodeURIComponent(iface)}&seconds=${secs}&channel=${chParam}`,
+        { signal: ctrl.signal })
+        .then(r => r.json()).then(d => {
+            if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+            _wifidef.monitor = d.monitor || _wifidef.monitor;
+            _wifidefUpdateMonBtn();
+            _wifidef.data = d;
+            st.textContent = `${d.frames} frames · ${new Date(d.timestamp * 1000).toLocaleTimeString()}`
+                + (_wifidef.continuous ? ' · live' : '');
+            wifidefRender();
+        }).catch((e) => {
+            if (e && e.name === 'AbortError') return;   // stopped by user; leave status
+            st.textContent = 'Scan failed';
+        }).finally(() => {
+            if (_wifidef.abort === ctrl) _wifidef.abort = null;
+            if (btn) btn.disabled = false;
+        });
+}
+
+function wifidefTrust() {
+    const st = document.getElementById('wifidef-status');
+    // Prefer trusting exactly what the last scan showed (accumulates into the
+    // baseline, no separate capture that would see a different set of BSSIDs).
+    const aps = (_wifidef.data && _wifidef.data.aps) || [];
+    let body;
+    if (aps.length) {
+        st.textContent = `Trusting ${aps.length} shown AP(s)…`;
+        body = { aps: aps.map(a => ({ ssid: a.ssid, bssid: a.bssid })) };
+    } else {
+        const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+        if (!iface) { st.textContent = 'Run a scan first, then Trust.'; return; }
+        st.textContent = 'Learning trusted APs (20s capture)…';
+        body = { interface: iface, seconds: 20 };
+    }
+    fetch('/api/wifidef/baseline', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body) })
+        .then(r => r.json()).then(d => {
+            st.textContent = d.error ? ('⚠ ' + d.error)
+                : (`✓ Trusted — baseline now covers ${d.ssids} SSID(s)` + (d.added ? ` (+${d.added} added)` : '') + '. Hit Scan to re-check.');
+        }).catch(() => { st.textContent = 'Baseline failed'; });
+}
+
+function wifidefSetThreshold() {
+    const el = document.getElementById('wifidef-flood-ssids');
+    const st = document.getElementById('wifidef-status');
+    const v = parseInt(el.value);
+    if (!v || v < 10) return;
+    fetch('/api/wifidef/thresholds', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ beacon_ssids: v }) })
+        .then(r => r.json()).then(t => {
+            if (t && t.beacon_ssids) el.value = t.beacon_ssids;
+            if (st) st.textContent = `Beacon-flood threshold = ${t.beacon_ssids} SSIDs (applies on next scan)`;
+        }).catch(() => {});
+}
+
+function wifidefResetBaseline() {
+    const st = document.getElementById('wifidef-status');
+    if (!confirm('Clear the trusted-AP baseline? Evil-twin detection will have nothing to compare against until you Trust again.')) return;
+    fetch('/api/wifidef/baseline', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'clear' }) })
+        .then(r => r.json()).then(() => { st.textContent = 'Baseline cleared'; })
+        .catch(() => { st.textContent = 'Clear failed'; });
+}
+
+function wifidefRender() {
+    const d = _wifidef.data; if (!d) return;
+    const [label, cls] = _WIFIDEF_THREAT[d.threat] || ['—', 'bg-slate-700 text-slate-300'];
+    const tb = document.getElementById('wifidef-threat');
+    tb.textContent = label; tb.className = 'shrink-0 px-4 py-2 rounded-lg text-sm font-bold ' + cls;
+    // Detection cards
+    const det = document.getElementById('wifidef-detections');
+    if (!d.detections.length) {
+        det.innerHTML = '<div class="glass rounded-xl p-4 text-sm text-green-300 md:col-span-2">✓ No wireless attacks detected in this capture.</div>';
+    } else {
+        det.innerHTML = d.detections.map(x => {
+            const crit = ['flood', 'evil_twin', 'karma'].includes(x.severity);
+            const border = crit ? 'border-l-4 border-red-500' : 'border-l-4 border-amber-500';
+            let title = '', body = '';
+            if (x.type === 'deauth') {
+                title = x.severity === 'flood' ? '💥 Deauth/Disassoc FLOOD' : 'Deauth/Disassoc frames seen';
+                body = `<div>${x.count} frames.</div>` + (x.attackers || []).map(a =>
+                    `<div class="font-mono text-[11px] text-gray-400">${a.src} → ${a.dst} ×${a.count}</div>`).join('');
+            } else if (x.type === 'beacon_flood') {
+                title = '📡 Beacon flood (fake APs)';
+                body = `<div>${x.ssids} fake SSIDs from ${x.bssids} BSSIDs.</div>`;
+            } else if (x.type === 'karma') {
+                title = '🎣 KARMA / MANA rogue AP';
+                body = `<div class="font-mono text-[11px] text-gray-400">${x.bssid}</div><div>answered ${x.ssid_count} SSIDs: ${(x.ssids || []).join(', ')}</div>`;
+            } else if (x.type === 'rogue_ap') {
+                title = x.severity === 'evil_twin' ? '👿 Evil twin (untrusted BSSID)' : '⚠ Duplicate SSID';
+                body = `<div>SSID <b>${x.ssid}</b></div><div class="font-mono text-[11px] text-gray-400">${(x.rogue_bssids || x.bssids || []).join(', ')}</div>`;
+            }
+            return `<div class="glass rounded-xl p-4 ${border}"><div class="font-semibold text-sm mb-1">${title}</div><div class="text-sm text-gray-300">${body}</div><div class="text-[11px] text-gray-500 mt-1">${x.detail || ''}</div></div>`;
+        }).join('');
+    }
+    // Counts
+    const c = d.counts || {};
+    let chips = [['frames', d.frames], ['deauth', c.deauth], ['beacons', c.beacon], ['probe-req', c.probe_req], ['probe-resp', c.probe_resp]]
+        .map(([k, v]) => `<span class="px-3 py-1 rounded bg-slate-800 border border-slate-700"><b>${v || 0}</b> <span class="text-gray-400">${k}</span></span>`).join('');
+    // Airspace density vs the flood threshold — lets the user calibrate.
+    const a = d.airspace;
+    if (a) {
+        const near = a.ssids >= a.beacon_ssid_threshold;
+        chips += `<span class="px-3 py-1 rounded bg-slate-800 border ${near ? 'border-red-600/60 text-red-300' : 'border-slate-700'}" title="Distinct SSIDs / BSSIDs heard this capture, vs the beacon-flood threshold. Raise the threshold above your normal density.">`
+            + `<b>${a.ssids}</b> SSIDs · <b>${a.bssids}</b> BSSIDs <span class="text-gray-500">(flood ≥ ${a.beacon_ssid_threshold})</span></span>`;
+    }
+    document.getElementById('wifidef-counts').innerHTML = chips;
+    // AP table
+    document.getElementById('wifidef-ap-count').textContent = `(${(d.aps || []).length})`;
+    const body = document.getElementById('wifidef-ap-tbody');
+    const trusted = null;
+    if (!d.aps || !d.aps.length) body.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-gray-500">No beacons captured (wrong channel? try “hop”).</td></tr>';
+    else body.innerHTML = d.aps.map(a => `<tr class="border-b border-slate-800/50">
+        <td class="py-1 pr-2">${a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>'}</td>
+        <td class="py-1 pr-2 font-mono text-[11px]">${a.bssid}</td>
+        <td class="py-1 pr-2">${a.channel == null ? '—' : a.channel}</td>
+        <td class="py-1 pr-2">${a.rssi == null ? '—' : a.rssi + ' dBm'}</td>
+        <td class="py-1 pr-2">${a.beacons}</td></tr>`).join('');
 }
 
 // ============================================================================
@@ -5831,6 +6370,9 @@ async function loadTabData(tabName) {
             // Always refresh network data when switching to this tab
             await loadNetworkData();
             break;
+        case 'wifidef':
+            initWifiDefense();
+            break;
         case 'networks':
             if (!alreadyPreloaded) {
                 await loadAllNetworksData();
@@ -7697,7 +8239,13 @@ async function runThreatSweep() {
     panel.innerHTML = `<div class="flex items-center space-x-2 text-gray-300 text-sm"><svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg><span>Scanning WiFi airspace for rogue APs, evil twins, and suspicious devices… (~10s)</span></div>`;
 
     try {
-        const resp = await fetch('/api/network/threat-sweep', { method: 'POST' });
+        const ifSel = document.getElementById('threat-sweep-iface');
+        const iface = ifSel ? ifSel.value : '';
+        const resp = await fetch('/api/network/threat-sweep', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(iface ? { interface: iface } : {}),
+        });
         const data = await resp.json();
 
         if (!data.success) {
@@ -7734,23 +8282,27 @@ async function toggleThreatMonitor() {
     interval = Math.max(10, Math.min(600, interval));
     if (intervalInput) intervalInput.value = interval;
 
+    const ifSel = document.getElementById('threat-sweep-iface');
+    const iface = ifSel ? ifSel.value : '';
     try {
         const resp = await fetch('/api/network/threat-monitor/toggle', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interval })
+            body: JSON.stringify(iface ? { interval, interface: iface } : { interval })
         });
         const data = await resp.json();
 
         if (data.enabled) {
             if (toggle) toggle.checked = true;
             if (intervalInput) intervalInput.disabled = true;
+            if (ifSel) ifSel.disabled = true;
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = 'Monitoring…'; statusEl.classList.remove('hidden'); }
             _startThreatMonitorPoll(panel);
         } else {
             if (toggle) toggle.checked = false;
             if (intervalInput) intervalInput.disabled = false;
+            if (ifSel) ifSel.disabled = false;
             if (warning) warning.classList.add('hidden');
             if (statusEl) { statusEl.textContent = ''; statusEl.classList.add('hidden'); }
             _stopThreatMonitorPoll();
@@ -7813,6 +8365,7 @@ async function clearThreatMonitorFindings() {
 
 // Restore toggle state on page load
 async function _restoreThreatMonitorState() {
+    await _threatFillIfaces();   // populate the selector before we set its value
     try {
         const resp = await fetch('/api/network/threat-monitor');
         const data = await resp.json();
@@ -7825,6 +8378,8 @@ async function _restoreThreatMonitorState() {
 
             if (toggle) toggle.checked = true;
             if (intervalInput) { intervalInput.value = data.interval || 60; intervalInput.disabled = true; }
+            const ifSel = document.getElementById('threat-sweep-iface');
+            if (ifSel) { if (data.interface) ifSel.value = data.interface; ifSel.disabled = true; }
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = `Sweep #${data.sweep_count || 0}`; statusEl.classList.remove('hidden'); }
             _updateMonitorModeBadge(data.monitor_mode);
@@ -7839,6 +8394,25 @@ async function _restoreThreatMonitorState() {
     } catch (e) { /* not critical */ }
 }
 document.addEventListener('DOMContentLoaded', _restoreThreatMonitorState);
+
+// Populate the External Threat Detection interface selector from the WiFi
+// interfaces the analyzer sees (same source as the WiFi Analyzer tab).
+async function _threatFillIfaces() {
+    const sel = document.getElementById('threat-sweep-iface');
+    if (!sel) return;
+    try {
+        const resp = await fetch('/api/net/wifi/interfaces');
+        const d = await resp.json();
+        const ifs = (d && d.interfaces) || [];
+        const cur = sel.value;
+        sel.innerHTML = '<option value="">Auto</option>' + ifs.map(i => {
+            const bands = (i.bands || []).length ? ' · ' + i.bands.join('/') + 'GHz' : '';
+            const mon = i.type === 'monitor' ? ' • MONITOR' : '';
+            return `<option value="${i.iface}">${i.iface}${bands}${mon}</option>`;
+        }).join('');
+        if (cur && ifs.some(i => i.iface === cur)) sel.value = cur;
+    } catch (e) { /* leave Auto */ }
+}
 
 function formatThreatBadge(threats) {
     if (!threats || threats.length === 0) return '';

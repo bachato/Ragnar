@@ -35,6 +35,7 @@ import bgp_speaker
 import path_asymmetry
 import tls_watch
 import wifi_analyzer
+import wifi_defense
 from tls_watch import do_tls_watch
 
 try:
@@ -13230,12 +13231,53 @@ def register_network_diagnostics(app, logger=None):
         if not _valid_iface(iface):
             return _bad('Invalid interface')
         try:
-            tx = float(request.args.get('tx', wifi_analyzer._DEFAULT_TX_DBM))
+            _tx = request.args.get('tx')
+            tx = float(_tx) if _tx not in (None, '', 'auto') else None
             ple = float(request.args.get('ple', wifi_analyzer._DEFAULT_PLE))
+            rssi_offset = float(request.args.get('rssi_offset', 0) or 0)
+            antenna_gain = float(request.args.get('antenna_gain', 0) or 0)
+            cable_loss = float(request.args.get('cable_loss', 0) or 0)
+            _r0 = request.args.get('rssi0')
+            rssi0 = float(_r0) if _r0 not in (None, '', 'auto') else None
+            _sig = request.args.get('signal')
+            sig = float(_sig) if _sig not in (None, '', 'auto') else None
         except (TypeError, ValueError):
-            return _bad('Invalid tx/ple')
+            return _bad('Invalid calibration parameter')
         _log(f"net/wifi/radius {iface} {bssid}")
-        return jsonify(wifi_analyzer.do_radius(iface, bssid, tx_dbm=tx, ple=ple))
+        cal = dict(tx_dbm=tx, ple=ple, rssi_offset=rssi_offset,
+                   antenna_gain=antenna_gain, cable_loss=cable_loss,
+                   rssi0_override=rssi0)
+        # Prefer the already-known reading the client is displaying (no re-scan,
+        # no race with a fresh scan that might not hear the AP this instant).
+        if sig is not None:
+            def _f(name, cast=float):
+                v = request.args.get(name)
+                if v in (None, '', 'auto'):
+                    return None
+                try:
+                    return cast(v)
+                except (TypeError, ValueError):
+                    return None
+            fields = {
+                "bssid": bssid, "ssid": request.args.get('ssid'),
+                "band": request.args.get('band'), "channel": _f('channel', int),
+                "freq": _f('freq'), "center_freq": _f('center_freq'),
+                "signal": sig, "tx_power_dbm": _f('tx_measured'),
+            }
+            return jsonify(wifi_analyzer.radius_from_fields(fields, **cal))
+        return jsonify(wifi_analyzer.do_radius(iface, bssid, **cal))
+
+    @app.route('/api/net/wifi/calibrate', methods=['GET'])
+    def net_wifi_calibrate():
+        """Two-point path-loss calibration: solve ple + rssi@1m from two
+        (distance_m, rssi) measurements."""
+        try:
+            r = wifi_analyzer.calibrate_ple(
+                request.args.get('d1'), request.args.get('rssi1'),
+                request.args.get('d2'), request.args.get('rssi2'))
+        except (TypeError, ValueError):
+            return _bad('Invalid calibration points')
+        return jsonify(r)
 
     @app.route('/api/net/wifi/heatmap', methods=['GET', 'POST'])
     def net_wifi_heatmap():
@@ -13260,10 +13302,114 @@ def register_network_diagnostics(app, logger=None):
                 data.get('bssid'), data.get('ssid')))
         return _bad('Unknown action')
 
+    @app.route('/api/net/wifi/surveys', methods=['GET', 'POST'])
+    def net_wifi_surveys():
+        if request.method == 'GET':
+            return jsonify(wifi_analyzer.survey_list())
+        data = request.get_json(silent=True) or {}
+        action = data.get('action')
+        name = data.get('name')
+        if action == 'save':
+            return jsonify(wifi_analyzer.survey_save(name))
+        if action == 'load':
+            return jsonify(wifi_analyzer.survey_load(name))
+        if action == 'delete':
+            return jsonify(wifi_analyzer.survey_delete(name))
+        return _bad('Unknown action')
+
     @app.route('/api/net/wifi/selftest', methods=['GET'])
     def net_wifi_selftest():
         _log("net/wifi/selftest")
         return jsonify(wifi_analyzer.selftest())
+
+    @app.route('/api/net/wifi/history', methods=['GET', 'POST'])
+    def net_wifi_history():
+        if request.method == 'POST':
+            _log("net/wifi/history reset")
+            return jsonify(wifi_analyzer.db_reset())
+        return jsonify({"aps": wifi_analyzer.db_get()})
+
+    # ------------------------------------------------------------------
+    # WiFi Defense — 802.11 frame monitor / WIDS (wifi_defense.py).
+    # Detection-only; needs a monitor-mode adapter. Never transmits.
+    # ------------------------------------------------------------------
+    @app.route('/api/wifidef/interfaces', methods=['GET'])
+    def wifidef_interfaces():
+        _log("wifidef/interfaces")
+        return jsonify(wifi_defense.list_monitor_capable())
+
+    @app.route('/api/wifidef/monitor', methods=['POST'])
+    def wifidef_monitor():
+        data = request.get_json(silent=True) or {}
+        iface = (data.get('interface') or '').strip()
+        action = data.get('action')
+        if action == 'disable':
+            _log("wifidef/monitor disable")
+            return jsonify(wifi_defense.disable_monitor())
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"wifidef/monitor enable {iface}")
+        return jsonify(wifi_defense.enable_monitor(iface))
+
+    @app.route('/api/wifidef/scan', methods=['GET'])
+    def wifidef_scan():
+        iface = (request.args.get('interface') or '').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        try:
+            secs = int(request.args.get('seconds', 15))
+        except (TypeError, ValueError):
+            return _bad('Invalid seconds')
+        ch = request.args.get('channel')
+        try:
+            ch = int(ch) if ch not in (None, '', 'auto') else None
+        except (TypeError, ValueError):
+            return _bad('Invalid channel')
+        _log(f"wifidef/scan {iface} {secs}s ch={ch}")
+        return jsonify(wifi_defense.do_scan(iface, seconds=secs, channel=ch))
+
+    @app.route('/api/wifidef/baseline', methods=['GET', 'POST'])
+    def wifidef_baseline():
+        if request.method == 'GET':
+            return jsonify({"baseline": wifi_defense.get_baseline()})
+        data = request.get_json(silent=True) or {}
+        action = data.get('action')
+        if action == 'clear':
+            _log("wifidef/baseline clear")
+            return jsonify({"ok": True, "baseline": wifi_defense.clear_baseline(),
+                            "ssids": 0})
+        # Trust the AP inventory the client is already showing (no re-capture) —
+        # trusts exactly what's on screen and merges into the baseline.
+        aps = data.get('aps')
+        if isinstance(aps, list) and aps:
+            _log(f"wifidef/baseline trust {len(aps)} shown APs")
+            return jsonify(wifi_defense.trust_aps(aps))
+        iface = (data.get('interface') or '').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        try:
+            secs = int(data.get('seconds', 20))
+        except (TypeError, ValueError):
+            return _bad('Invalid seconds')
+        _log(f"wifidef/baseline learn {iface}")
+        return jsonify(wifi_defense.learn_baseline(iface, seconds=secs))
+
+    @app.route('/api/wifidef/thresholds', methods=['GET', 'POST'])
+    def wifidef_thresholds():
+        if request.method == 'GET':
+            return jsonify(wifi_defense.get_thresholds())
+        data = request.get_json(silent=True) or {}
+        try:
+            return jsonify(wifi_defense.set_thresholds(
+                beacon_ssids=data.get('beacon_ssids'),
+                beacon_bssids=data.get('beacon_bssids')))
+        except (TypeError, ValueError):
+            return _bad('Invalid threshold')
+
+    @app.route('/api/wifidef/selftest', methods=['GET'])
+    def wifidef_selftest():
+        _log("wifidef/selftest")
+        return jsonify(wifi_defense.selftest())
 
     @app.route('/api/net/isp', methods=['GET'])
     def net_isp():

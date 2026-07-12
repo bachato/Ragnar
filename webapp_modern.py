@@ -11640,7 +11640,20 @@ def network_threat_sweep():
     try:
         import re as _re
 
+        # Allow the caller to choose which WiFi interface to sweep with; fall
+        # back to the configured/auto-detected one. Validate against real wireless
+        # interfaces so we never shell out with an arbitrary string.
+        req = request.get_json(silent=True) or {}
+        _req_iface = (req.get('interface') or '').strip()
         iface = _get_wifi_iface()
+        if _req_iface:
+            try:
+                import wifi_analyzer as _wa
+                _valid = {i.get('iface') for i in _wa.list_wifi_interfaces()}
+            except Exception:
+                _valid = set()
+            if _req_iface in _valid and re.match(r'^[a-zA-Z0-9._-]+$', _req_iface):
+                iface = _req_iface
 
         # Trigger a fresh scan
         subprocess.run(
@@ -11999,6 +12012,7 @@ _threat_monitor_state = {
     'sweep_count': 0,
     'interval': 60,  # seconds between sweeps
     'monitor_mode': False,
+    'interface': None,  # chosen WiFi interface (None = auto-detect)
 }
 _threat_monitor_lock = threading.Lock()
 
@@ -12011,10 +12025,14 @@ def _threat_monitor_loop():
             if not _threat_monitor_state['enabled']:
                 break
             interval = _threat_monitor_state['interval']
+            mon_iface = _threat_monitor_state.get('interface')
 
         try:
-            # Use the Flask test client to call our own endpoint
-            with app.test_request_context():
+            # Use the Flask test client to call our own endpoint, passing the
+            # chosen interface (if any) so sweeps use the same adapter as manual.
+            ctx_kwargs = {'json': {'interface': mon_iface}} if mon_iface else {}
+            with app.test_request_context('/api/network/threat-sweep',
+                                          method='POST', **ctx_kwargs):
                 resp = network_threat_sweep()
                 # resp is a Flask Response or tuple
                 if isinstance(resp, tuple):
@@ -12063,6 +12081,7 @@ def get_threat_monitor_status():
             'last_sweep': _threat_monitor_state['last_sweep'],
             'sweep_count': _threat_monitor_state['sweep_count'],
             'interval': _threat_monitor_state['interval'],
+            'interface': _threat_monitor_state.get('interface'),
             'monitor_mode': _threat_monitor_state['monitor_mode'],
         })
 
@@ -12077,6 +12096,17 @@ def toggle_threat_monitor():
     except (ValueError, TypeError):
         interval = 60
 
+    # Validate the optional chosen interface against real wireless interfaces.
+    req_iface = (payload.get('interface') or '').strip()
+    mon_iface = None
+    if req_iface and re.match(r'^[a-zA-Z0-9._-]+$', req_iface):
+        try:
+            import wifi_analyzer as _wa
+            if req_iface in {i.get('iface') for i in _wa.list_wifi_interfaces()}:
+                mon_iface = req_iface
+        except Exception:
+            mon_iface = None
+
     with _threat_monitor_lock:
         if _threat_monitor_state['enabled']:
             # Disable
@@ -12090,6 +12120,7 @@ def toggle_threat_monitor():
             _threat_monitor_state['sweep_count'] = 0
             _threat_monitor_state['last_sweep'] = None
             _threat_monitor_state['interval'] = interval
+            _threat_monitor_state['interface'] = mon_iface
 
             t = threading.Thread(target=_threat_monitor_loop, daemon=True, name='threat-monitor')
             _threat_monitor_state['thread'] = t

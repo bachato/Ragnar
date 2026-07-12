@@ -57,6 +57,9 @@ _SCAN_TIMEOUT = 20          # seconds; a passive scan of all channels is slow
 _HEATMAP_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "wifi_heatmap.json"
 )
+_SURVEYS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "wifi_surveys.json"
+)
 
 # Coverage thresholds (dBm) used for the signal-radius rings.
 _RADIUS_THRESHOLDS = [
@@ -68,6 +71,11 @@ _RADIUS_THRESHOLDS = [
 # Default path-loss model parameters (overridable per request).
 _DEFAULT_TX_DBM = 20.0      # assumed AP EIRP; consumer APs are ~17-23 dBm
 _DEFAULT_PLE = 3.0          # path-loss exponent: 2.0 free space, ~3.0 indoor
+# Plausible AP conducted/EIRP transmit power. Anything outside this window in the
+# advertised TPC report is a misconfigured/garbage value (some APs advertise e.g.
+# 63 dBm ≈ 2 kW) and must NOT be trusted as "measured" — it wrecks the range model.
+_TX_PLAUSIBLE_MIN = 0.0
+_TX_PLAUSIBLE_MAX = 36.0    # 36 dBm EIRP = outdoor standard-power ceiling (6 GHz)
 
 # 2.4 GHz channels overlap unless spaced >= 5 apart (1/6/11 are the non-overlap set).
 _NON_OVERLAP_24 = [1, 6, 11]
@@ -335,6 +343,229 @@ def _parse_width(block):
 
 
 # --------------------------------------------------------------------------
+# Per-AP enrichment  (802.11 generation, streams, vendor, security, roaming …)
+# --------------------------------------------------------------------------
+
+# Vendor OUI lookup: prefer the system IEEE/nmap databases, fall back to a small
+# curated map of common Wi-Fi AP makers. Loaded once, lazily.
+_OUI_CACHE = None
+_OUI_FALLBACK = {
+    "00:0b:86": "Aruba", "6c:f3:7f": "Aruba", "d8:c7:c8": "Aruba",
+    "00:1a:1e": "Aruba", "00:24:6c": "Aruba",
+    "00:0c:29": "VMware", "00:1b:0c": "Cisco", "00:1e:14": "Cisco",
+    "00:1e:bd": "Cisco", "58:97:bd": "Cisco", "e0:cb:bc": "Cisco",
+    "00:18:0a": "Meraki", "88:15:44": "Meraki", "e0:55:3d": "Meraki",
+    "24:a4:3c": "Ubiquiti", "78:8a:20": "Ubiquiti", "fc:ec:da": "Ubiquiti",
+    "68:d7:9a": "Ubiquiti", "b4:fb:e4": "Ubiquiti", "e0:63:da": "Ubiquiti",
+    "00:13:92": "Ruckus", "c0:c5:20": "Ruckus", "2c:c5:d3": "Ruckus",
+    "00:24:b2": "Netgear", "a0:40:a0": "Netgear", "b0:7f:b9": "Netgear",
+    "50:c7:bf": "TP-Link", "00:25:86": "TP-Link", "60:32:b1": "TP-Link",
+    "4c:5e:0c": "TP-Link", "c4:6e:1f": "TP-Link",
+    "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi", "e4:5f:01": "Raspberry Pi",
+    "24:0a:c4": "Espressif", "a4:cf:12": "Espressif", "7c:9e:bd": "Espressif",
+    "3c:71:bf": "Espressif", "84:0d:8e": "Espressif",
+    "00:03:93": "Apple", "a4:83:e7": "Apple", "f0:18:98": "Apple",
+    "00:09:5b": "Netgear", "48:8f:5a": "Mikrotik", "cc:2d:e0": "Mikrotik",
+    "dc:2c:6e": "Mikrotik", "18:fd:74": "Mikrotik", "d4:ca:6d": "Mikrotik",
+}
+_OUI_FILES = ("/usr/share/nmap/nmap-mac-prefixes",
+              "/usr/share/ieee-data/oui.txt")
+
+
+def _load_oui():
+    global _OUI_CACHE
+    if _OUI_CACHE is not None:
+        return _OUI_CACHE
+    table = {}
+    # nmap format: "AABBCC Vendor Name" (one per line).
+    try:
+        with open("/usr/share/nmap/nmap-mac-prefixes") as f:
+            for line in f:
+                if line.startswith("#") or len(line) < 8:
+                    continue
+                pfx, _, name = line.partition(" ")
+                if len(pfx) == 6:
+                    table[pfx.lower()] = name.strip()
+    except Exception:
+        pass
+    # IEEE oui.txt fallback: "AA-BB-CC   (hex)\t\tVendor".
+    if not table:
+        try:
+            with open("/usr/share/ieee-data/oui.txt") as f:
+                for line in f:
+                    m = re.match(r"^([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})"
+                                 r"\s+\(hex\)\s+(.+)$", line)
+                    if m:
+                        table[(m.group(1) + m.group(2) + m.group(3)).lower()] = m.group(4).strip()
+        except Exception:
+            pass
+    if not table:
+        table = {k.replace(":", ""): v for k, v in _OUI_FALLBACK.items()}
+    _OUI_CACHE = table
+    return table
+
+
+def _oui_lookup(bssid):
+    """Vendor for a BSSID, or 'Randomized' for a locally-administered MAC."""
+    if not bssid or len(bssid) < 8:
+        return None
+    try:
+        first = int(bssid[:2], 16)
+    except ValueError:
+        return None
+    if first & 0x02:                       # locally-administered bit
+        return "Randomized/private"
+    pfx = bssid.replace(":", "")[:6].lower()
+    return _load_oui().get(pfx) or _OUI_FALLBACK.get(bssid[:8])
+
+
+def _parse_generation(block, band):
+    """(standard label, phy_mode) from the capability IEs present."""
+    if re.search(r"\bEHT (capabilities|Operation)", block):
+        return ("Wi-Fi 7", "be")
+    if re.search(r"\bHE (capabilities|operation)", block):
+        return ("Wi-Fi 6E" if band == "6" else "Wi-Fi 6", "ax")
+    if "VHT capabilities" in block or "VHT Capabilities" in block:
+        return ("Wi-Fi 5", "ac")
+    if "HT capabilities" in block:
+        return ("Wi-Fi 4", "n")
+    return ("legacy", "abg")
+
+
+def _parse_nss(block):
+    """Best-effort spatial-stream count from MCS/NSS sets."""
+    nss = None
+    # VHT/HE print 'N streams: MCS 0-9' — the highest supported N is the NSS.
+    streams = [int(m.group(1)) for m in
+               re.finditer(r"(\d+) streams: MCS", block)]
+    if streams:
+        nss = max(streams)
+    # HT: 'HT RX MCS rate indexes supported: 0-31' -> (31+1)/8 streams.
+    mh = re.search(r"HT RX MCS rate indexes supported:\s*0-(\d+)", block)
+    if mh:
+        nss = max(nss or 0, (int(mh.group(1)) + 1) // 8)
+    return nss or None
+
+
+# Approximate top PHY rate (Mbps) per spatial stream at 20 MHz, short-GI, top MCS.
+_PHY_BASE = {"n": 72.2, "ac": 86.7, "ax": 143.4, "be": 172.1, "abg": 54.0}
+_WIDTH_MULT = {20: 1.0, 40: 2.08, 80: 4.5, 160: 9.0, 320: 18.0}
+
+
+def _estimate_max_phy(phy_mode, width, nss):
+    """Rough 'up to' PHY rate — width x streams x per-stream base. Estimate only."""
+    if not nss:
+        return None
+    base = _PHY_BASE.get(phy_mode)
+    if base is None:
+        return None
+    return int(round(base * _WIDTH_MULT.get(width, 1.0) * nss))
+
+
+def _parse_security(block, hdr):
+    """Detailed security posture: mode, AKM, PMF, enterprise, WPS."""
+    has_rsn = "RSN:" in block
+    has_wpa = "WPA:" in block
+    privacy = "Privacy" in (hdr or "")
+    akms = ""
+    m = re.search(r"Authentication suites:\s*(.+)", block)
+    if m:
+        akms = m.group(1)
+    sae = "SAE" in akms
+    owe = "OWE" in akms
+    dot1x = "802.1X" in akms or "8021X" in akms.replace(".", "").replace(" ", "")
+    ft = "FT/" in akms or "FT over" in block or "Mobility Domain" in block
+    enterprise = dot1x
+    # PMF / 802.11w
+    if re.search(r"MFP-required", block):
+        pmf = "required"
+    elif re.search(r"MFP-capable", block):
+        pmf = "capable"
+    else:
+        pmf = "disabled"
+    # Mode label
+    if owe:
+        mode = "OWE"
+    elif sae and has_rsn:
+        mode = "WPA3-Enterprise" if enterprise else "WPA3"
+    elif has_rsn:
+        mode = "WPA2-Enterprise" if enterprise else "WPA2"
+    elif has_wpa:
+        mode = "WPA"
+    elif privacy:
+        mode = "WEP"
+    else:
+        mode = "Open"
+    wps = "WPS:" in block
+    wps_ver = None
+    if wps:
+        mv = re.search(r"WPS:\s*\*\s*Version:\s*([\d.]+)", block)
+        wps_ver = mv.group(1) if mv else None
+    return {
+        "security": mode,
+        "akm": akms.strip() or None,
+        "pmf": pmf,
+        "enterprise": enterprise,
+        "wps": wps,
+        "wps_version": wps_ver,
+        "ft": ft,
+    }
+
+
+def _security_findings(bss):
+    """Weak-posture flags for one AP (list of short strings)."""
+    out = []
+    sec = bss.get("security")
+    if sec == "Open":
+        out.append("open (no encryption)")
+    elif sec == "WEP":
+        out.append("WEP (broken)")
+    elif sec == "WPA":
+        out.append("WPA/TKIP (legacy)")
+    if bss.get("wps"):
+        out.append("WPS enabled")
+    if bss.get("pmf") == "disabled" and sec not in ("Open", "WEP", None):
+        out.append("PMF off (deauth-exposed)")
+    return out
+
+
+def _parse_roaming(block):
+    """802.11k / v / r assisted-roaming support."""
+    k = "RM enabled capabilities" in block
+    v = "BSS Transition" in block
+    r = ("Mobility Domain" in block) or ("FT/" in block) or ("FT over" in block)
+    return {"k": k, "v": v, "r": r}
+
+
+def _enrich(block, hdr, bss):
+    """Attach the enterprise-grade fields to a parsed BSS dict (in place)."""
+    band = bss["band"]
+    bss["vendor"] = _oui_lookup(bss["bssid"])
+    bss["standard"], phy = _parse_generation(block, band)
+    bss["phy_mode"] = phy
+    bss["nss"] = _parse_nss(block)
+    bss["max_phy_mbps"] = _estimate_max_phy(phy, bss.get("width", 20), bss["nss"])
+    sec = _parse_security(block, hdr)
+    bss.update(sec)
+    bss["security_findings"] = _security_findings(bss)
+    bss["roaming"] = _parse_roaming(block)
+    m = re.search(r"TPC report: TX power:\s*(-?\d+)", block)
+    _tx = int(m.group(1)) if m else None
+    # Only trust the advertised TX power if it's physically plausible; some APs
+    # advertise garbage (e.g. 63 dBm) which would blow up the coverage model.
+    if _tx is not None and not (_TX_PLAUSIBLE_MIN <= _tx <= _TX_PLAUSIBLE_MAX):
+        _tx = None
+    bss["tx_power_dbm"] = _tx
+    m = re.search(r"Country:\s*([A-Z]{2})", block)
+    bss["country"] = m.group(1) if m else None
+    m = re.search(r"beacon interval:\s*(\d+)", block)
+    bss["beacon_interval"] = int(m.group(1)) if m else None
+    m = re.search(r"DTIM Period\s*(\d+)", block)
+    bss["dtim"] = int(m.group(1)) if m else None
+    return bss
+
+
+# --------------------------------------------------------------------------
 # iw scan parser
 # --------------------------------------------------------------------------
 
@@ -397,24 +628,12 @@ def parse_scan(text):
         m = re.search(r"station count:\s*(\d+)", block)
         bss["stations"] = int(m.group(1)) if m else None
 
-        # Security summary
-        has_rsn = "RSN:" in block
-        has_wpa = "WPA:" in block
-        privacy = "Privacy" in (b["_hdr"] or "")
-        if re.search(r"Authentication suites:.*SAE", block):
-            sec = "WPA3"
-        elif has_rsn:
-            sec = "WPA2"
-        elif has_wpa:
-            sec = "WPA"
-        elif privacy:
-            sec = "WEP"
-        else:
-            sec = "Open"
-        bss["security"] = sec
-
         m = re.search(r"last seen:\s*(\d+)\s*ms ago", block)
         bss["last_seen_ms"] = int(m.group(1)) if m else None
+
+        # Enterprise enrichment: generation, streams, vendor, security depth,
+        # roaming (11k/v/r), tx-power, country, DTIM.
+        _enrich(block, b["_hdr"], bss)
 
         results.append(bss)
     return results
@@ -517,14 +736,94 @@ def analyze_spectrum(bss_list, caps=None):
             rating = "moderate"
         else:
             rating = "congested"
+        # Width advice: dense bands should narrow their channels so more
+        # non-overlapping channels exist; empty bands can go wide.
+        if band == "2.4":
+            width_advice = (20, "2.4 GHz only has 3 non-overlapping channels — "
+                                "use 20 MHz and stick to 1/6/11")
+        else:
+            avg_w = sum(a["width"] for a in aps) / len(aps)
+            if prim_aps >= 12:
+                width_advice = (40, "dense band — 40 MHz keeps enough clear "
+                                    "channels")
+            elif prim_aps >= 6:
+                width_advice = (80, "80 MHz is a good balance here")
+            else:
+                width_advice = (160, "few APs — 160 MHz is viable for peak speed")
+            width_advice = (width_advice[0],
+                            width_advice[1] + f" (APs average {int(avg_w)} MHz now)")
         out[band] = {
             "ap_count": prim_aps,
             "channels": channels,
             "recommend": [c["channel"] for c in recommend],
             "rating": rating,
             "score": round(total_score, 2),
+            "width_advice": {"mhz": width_advice[0], "reason": width_advice[1]},
         }
     return out
+
+
+def _mac_prefix(bssid, octets=5):
+    return ":".join(bssid.split(":")[:octets])
+
+
+def group_aps(bss_list):
+    """Collapse the flat BSS list into two enterprise views:
+
+    * **networks** — one entry per SSID (an ESS): how many BSSIDs serve it,
+      which bands it spans, its security/best signal. The "how many APs is this
+      network on" view.
+    * **devices** — physical radios: BSSIDs that share their top-5 MAC octets
+      (an enterprise AP hands out consecutive BSSIDs per SSID/band) collapsed
+      into one logical AP.
+    """
+    networks = {}
+    for a in bss_list:
+        if a.get("hidden") or not a.get("ssid"):
+            continue
+        n = networks.setdefault(a["ssid"], {
+            "ssid": a["ssid"], "bssids": [], "bands": set(),
+            "security": a.get("security"), "best_signal": None,
+            "vendor": a.get("vendor"), "standard": a.get("standard")})
+        n["bssids"].append(a["bssid"])
+        n["bands"].add(a["band"])
+        if a.get("signal") is not None and (n["best_signal"] is None
+                                            or a["signal"] > n["best_signal"]):
+            n["best_signal"] = a["signal"]
+    net_list = []
+    for n in networks.values():
+        n["bands"] = sorted(n["bands"])
+        n["ap_count"] = len(n["bssids"])
+        net_list.append(n)
+    net_list.sort(key=lambda n: -(n["best_signal"] or -999))
+
+    devices = {}
+    for a in bss_list:
+        key = _mac_prefix(a["bssid"])
+        d = devices.setdefault(key, {
+            "mac_prefix": key, "bssids": [], "ssids": set(), "bands": set(),
+            "vendor": a.get("vendor"), "best_signal": None})
+        d["bssids"].append(a["bssid"])
+        if a.get("ssid"):
+            d["ssids"].add(a["ssid"])
+        d["bands"].add(a["band"])
+        if a.get("signal") is not None and (d["best_signal"] is None
+                                            or a["signal"] > d["best_signal"]):
+            d["best_signal"] = a["signal"]
+    dev_list = []
+    for d in devices.values():
+        d["ssids"] = sorted(d["ssids"])
+        d["bands"] = sorted(d["bands"])
+        d["radio_count"] = len(d["bssids"])
+        dev_list.append(d)
+    dev_list.sort(key=lambda d: -(d["best_signal"] or -999))
+
+    return {
+        "networks": net_list,
+        "network_count": len(net_list),
+        "devices": dev_list,
+        "device_count": len(dev_list),
+    }
 
 
 def find_interference(bss_list):
@@ -570,10 +869,63 @@ def _rssi_at_1m(freq_mhz, tx_dbm):
     return tx_dbm - fspl_1m
 
 
-def estimate_radius(bss, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
-    """Coverage rings + your current distance for one BSS (from its measured RSSI)."""
+def calibrate_ple(d1, rssi1, d2, rssi2):
+    """Two-point calibration of the log-distance model.
+
+    Given two measured (distance_m, RSSI) points, solve for the path-loss
+    exponent and the reference RSSI at 1 m so the model matches *this* site/
+    adapter rather than a textbook assumption.
+        rssi = rssi0 - 10*n*log10(d)
+        n    = (rssi1 - rssi2) / (10 * (log10(d2) - log10(d1)))
+        rssi0 = rssi1 + 10*n*log10(d1)
+    """
+    try:
+        d1, rssi1, d2, rssi2 = float(d1), float(rssi1), float(d2), float(rssi2)
+    except (TypeError, ValueError):
+        return {"error": "two (distance, rssi) points required"}
+    if d1 <= 0 or d2 <= 0:
+        return {"error": "distances must be > 0 m"}
+    if d1 == d2:
+        return {"error": "the two distances must differ"}
+    denom = 10.0 * (math.log10(d2) - math.log10(d1))
+    if denom == 0:
+        return {"error": "the two distances must differ"}
+    ple = (rssi1 - rssi2) / denom
+    rssi0 = rssi1 + 10.0 * ple * math.log10(d1)
+    return {"path_loss_exponent": round(ple, 3), "rssi_at_1m": round(rssi0, 2),
+            "points": [{"d": d1, "rssi": rssi1}, {"d": d2, "rssi": rssi2}]}
+
+
+def estimate_radius(bss, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
+                    antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
+    """Coverage rings + your current distance for one BSS (from its measured RSSI).
+
+    Uses the AP's *advertised* TX power (TPC report IE) when it published one, so
+    the model is measured rather than assumed; falls back to `tx_dbm` / the
+    default otherwise.
+
+    Calibration knobs:
+      * ``rssi_offset``  — per-adapter correction added to every measured RSSI
+        (e.g. an Alfa that reads 3 dB low → +3).
+      * ``antenna_gain`` / ``cable_loss`` — receive-chain EIRP correction (dBi /
+        dB) folded into the reference level.
+      * ``rssi0_override`` — a reference RSSI@1m from :func:`calibrate_ple`,
+        which (with a calibrated ``ple``) replaces the TX/FSPL derivation.
+    """
+    rssi_offset = float(rssi_offset or 0.0)
+    antenna_gain = float(antenna_gain or 0.0)
+    cable_loss = float(cable_loss or 0.0)
+    tx_measured = bss.get("tx_power_dbm")
+    tx_source = "measured" if tx_measured is not None else "assumed"
+    if tx_dbm is None:
+        tx_dbm = tx_measured if tx_measured is not None else _DEFAULT_TX_DBM
     freq = bss.get("center_freq") or bss.get("freq")
-    rssi0 = _rssi_at_1m(freq, tx_dbm)
+    if rssi0_override is not None:
+        rssi0 = float(rssi0_override)
+        tx_source = "calibrated"
+    else:
+        # antenna gain raises the effective reference level; cable loss lowers it
+        rssi0 = _rssi_at_1m(freq, tx_dbm) + antenna_gain - cable_loss
 
     def dist_for(rssi):
         # rssi = rssi0 - 10*n*log10(d)  =>  d = 10^((rssi0-rssi)/(10n))
@@ -584,16 +936,22 @@ def estimate_radius(bss, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
         for name, thr, label in _RADIUS_THRESHOLDS
     ]
     cur = None
-    if bss.get("signal") is not None:
-        cur = dist_for(bss["signal"])
+    sig = bss.get("signal")
+    sig_adj = None
+    if sig is not None:
+        sig_adj = sig + rssi_offset
+        cur = dist_for(sig_adj)
     return {
         "bssid": bss.get("bssid"),
         "ssid": bss.get("ssid"),
         "band": bss.get("band"),
         "channel": bss.get("channel"),
-        "signal": bss.get("signal"),
-        "assumptions": {"tx_dbm": tx_dbm, "path_loss_exponent": ple,
-                        "rssi_at_1m": round(rssi0, 1)},
+        "signal": sig,
+        "signal_adjusted": sig_adj,
+        "assumptions": {"tx_dbm": tx_dbm, "tx_source": tx_source,
+                        "path_loss_exponent": ple, "rssi_at_1m": round(rssi0, 1),
+                        "rssi_offset": rssi_offset, "antenna_gain": antenna_gain,
+                        "cable_loss": cable_loss},
         "current_distance_m": cur,
         "rings": rings,
     }
@@ -602,6 +960,106 @@ def estimate_radius(bss, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
 # --------------------------------------------------------------------------
 # Top-level scan orchestration
 # --------------------------------------------------------------------------
+
+_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", "wifi_analyzer_db.json")
+_DB_HISTORY_CAP = 60      # RSSI samples kept per BSSID
+_WEAKENED_DROP = 18       # dB below an AP's own max => "weakened"
+
+
+def _db_load():
+    try:
+        with open(_DB_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"aps": {}, "last_bssids": []}
+
+
+def _db_save(db):
+    os.makedirs(os.path.dirname(_DB_FILE), exist_ok=True)
+    tmp = _DB_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(db, f)
+    os.replace(tmp, _DB_FILE)
+
+
+def _db_update(aps):
+    """Persist per-BSSID history, annotate each AP with it, and diff against the
+    previous scan to surface new / disappeared / weakened APs."""
+    db = _db_load()
+    recs = db.get("aps", {})
+    now = int(time.time())
+    prev = set(db.get("last_bssids", []))
+    cur = set()
+    new_aps, weakened = [], []
+    for a in aps:
+        b = a["bssid"]
+        cur.add(b)
+        r = recs.get(b)
+        if r is None:
+            r = recs[b] = {"first_seen": now, "seen_count": 0,
+                           "max_rssi": a.get("signal"), "min_rssi": a.get("signal"),
+                           "history": []}
+            if b not in prev:
+                new_aps.append({"bssid": b, "ssid": a.get("ssid"),
+                                "vendor": a.get("vendor"), "band": a.get("band"),
+                                "channel": a.get("channel"), "signal": a.get("signal")})
+        r["seen_count"] += 1
+        r["last_seen"] = now
+        r["ssid"] = a.get("ssid")
+        r["vendor"] = a.get("vendor")
+        s = a.get("signal")
+        if s is not None:
+            r["max_rssi"] = max(r.get("max_rssi") or s, s)
+            r["min_rssi"] = min(r.get("min_rssi") if r.get("min_rssi") is not None else s, s)
+            r["history"] = (r.get("history", []) + [[now, s, a.get("channel_util")]])[-_DB_HISTORY_CAP:]
+            if (r["max_rssi"] - s) >= _WEAKENED_DROP and r["seen_count"] > 2:
+                weakened.append({"bssid": b, "ssid": a.get("ssid"),
+                                 "band": a.get("band"), "channel": a.get("channel"),
+                                 "signal": s, "rssi_max": r["max_rssi"],
+                                 "drop": r["max_rssi"] - s})
+        # Annotate the live AP with its tracked history
+        a["first_seen"] = r["first_seen"]
+        a["seen_count"] = r["seen_count"]
+        a["is_new"] = b not in prev and r["seen_count"] <= 1
+        a["rssi_history"] = [h[1] for h in r.get("history", [])]
+        a["rssi_max"] = r.get("max_rssi")
+        a["rssi_min"] = r.get("min_rssi")
+    gone = [{"bssid": b, "ssid": recs.get(b, {}).get("ssid")}
+            for b in (prev - cur)]
+    db["aps"] = recs
+    db["last_bssids"] = sorted(cur)
+    _db_save(db)
+    return {"new_aps": new_aps, "gone_aps": gone, "weakened": weakened}
+
+
+def db_get():
+    return _db_load().get("aps", {})
+
+
+def db_reset():
+    _db_save({"aps": {}, "last_bssids": []})
+    return {"ok": True}
+
+
+def _survey_noise(interface):
+    """Return {freq_mhz: noise_dbm} from `iw survey dump` (best-effort; some
+    drivers, incl. brcmfmac, don't report a noise floor)."""
+    rc, out, _ = _run([_IW, "dev", interface, "survey", "dump"], timeout=8)
+    if rc != 0:
+        return {}
+    noise = {}
+    cur_freq = None
+    for line in out.splitlines():
+        m = re.search(r"frequency:\s*(\d+)\s*MHz", line)
+        if m:
+            cur_freq = int(m.group(1))
+            continue
+        m = re.search(r"noise:\s*(-?\d+)\s*dBm", line)
+        if m and cur_freq is not None:
+            noise[cur_freq] = int(m.group(1))
+    return noise
+
 
 def do_scan(interface="wlan0", band="all", passive=True):
     """Run a passive scan and return the full analysed survey."""
@@ -633,14 +1091,24 @@ def do_scan(interface="wlan0", band="all", passive=True):
         return {"error": hint, "rc": rc,
                 "interface": interface, "supported_bands": caps["bands"]}
     bss_list = parse_scan(out)
-    # Flag radar/DFS occupancy
+    noise = _survey_noise(interface)
+    noise_floor = round(sum(noise.values()) / len(noise), 1) if noise else None
+    # Flag radar/DFS occupancy + compute SNR from the noise floor where known.
     for b in bss_list:
         b["dfs"] = b["channel"] in caps["radar_channels"].get(b["band"], set())
+        nf = noise.get(int(round(b["freq"])))
+        if nf is None and noise_floor is not None:
+            nf = noise_floor
+        b["noise"] = nf
+        b["snr"] = (round(b["signal"] - nf, 1)
+                    if (b.get("signal") is not None and nf is not None) else None)
     if band in ("2.4", "5", "6"):
         bss_list = [b for b in bss_list if b["band"] == band]
     bss_list.sort(key=lambda b: (b["band"], b["channel"], -(b["signal"] or -999)))
+    changes = _db_update(bss_list)
     spectrum = analyze_spectrum(bss_list, caps)
     interference = find_interference(bss_list)
+    groups = group_aps(bss_list)
     return {
         "interface": interface,
         "phy": caps["phy"],
@@ -649,15 +1117,44 @@ def do_scan(interface="wlan0", band="all", passive=True):
         "supported_bands": {b: bool(caps["bands"].get(b)) for b in ("2.4", "5", "6")},
         "radar_channels": {b: sorted(caps["radar_channels"].get(b, set()))
                            for b in ("2.4", "5", "6")},
+        "noise_floor": noise_floor,
         "ap_count": len(bss_list),
         "aps": bss_list,
         "spectrum": spectrum,
         "interference": interference,
+        "groups": groups,
+        "changes": changes,
     }
 
 
-def do_radius(interface, bssid, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
-    """Passive scan then compute the signal radius for one BSSID."""
+def radius_from_fields(fields, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
+                       antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
+    """Compute the coverage rings from an AP's already-known scan fields — no
+    re-scan. The frontend hands back the row it's showing (signal/freq/…), so the
+    estimate stays consistent with the table and never races a fresh scan."""
+    freq = fields.get("center_freq") or fields.get("freq")
+    if fields.get("signal") is None or not freq:
+        return {"error": "missing signal/freq for radius estimate"}
+    tx_meas = fields.get("tx_power_dbm")
+    # Re-validate the advertised TX power (client could be stale/tampered).
+    if tx_meas is not None and not (_TX_PLAUSIBLE_MIN <= tx_meas <= _TX_PLAUSIBLE_MAX):
+        tx_meas = None
+    bss = {
+        "bssid": fields.get("bssid"), "ssid": fields.get("ssid"),
+        "band": fields.get("band"), "channel": fields.get("channel"),
+        "freq": fields.get("freq") or freq, "center_freq": freq,
+        "signal": fields.get("signal"), "tx_power_dbm": tx_meas,
+    }
+    return estimate_radius(bss, tx_dbm=tx_dbm, ple=ple, rssi_offset=rssi_offset,
+                           antenna_gain=antenna_gain, cable_loss=cable_loss,
+                           rssi0_override=rssi0_override)
+
+
+def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
+              antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
+    """Passive scan then compute the signal radius for one BSSID. tx_dbm=None
+    lets estimate_radius use the AP's advertised TX power when it has one.
+    Calibration knobs are forwarded to estimate_radius."""
     if not _valid_bssid(bssid):
         return {"error": "invalid bssid"}
     survey = do_scan(interface=interface, band="all")
@@ -665,8 +1162,11 @@ def do_radius(interface, bssid, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
         return survey
     for b in survey["aps"]:
         if b["bssid"] == bssid.lower():
-            return estimate_radius(b, tx_dbm=tx_dbm, ple=ple)
-    return {"error": "bssid not found in latest scan", "bssid": bssid}
+            return estimate_radius(b, tx_dbm=tx_dbm, ple=ple,
+                                   rssi_offset=rssi_offset, antenna_gain=antenna_gain,
+                                   cable_loss=cable_loss, rssi0_override=rssi0_override)
+    return {"error": "bssid not found in latest scan — rescan and try again",
+            "bssid": bssid}
 
 
 # --------------------------------------------------------------------------
@@ -704,12 +1204,22 @@ def heatmap_set_floorplan(floorplan_data_uri, target_bssid=None, target_ssid=Non
     return data
 
 
-def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None):
+def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None,
+                       snr=None, noise=None, band=None, channel=None):
     data = _heatmap_load()
-    data["samples"].append({
+    sample = {
         "x": float(x), "y": float(y), "rssi": float(rssi),
         "bssid": bssid, "ssid": ssid, "t": int(time.time()),
-    })
+    }
+    if snr is not None:
+        sample["snr"] = float(snr)
+    if noise is not None:
+        sample["noise"] = float(noise)
+    if band is not None:
+        sample["band"] = band
+    if channel is not None:
+        sample["channel"] = channel
+    data["samples"].append(sample)
     _heatmap_save(data)
     return data
 
@@ -722,7 +1232,10 @@ def heatmap_sample_live(interface, x, y, bssid):
     match = next((b for b in survey["aps"] if b["bssid"] == (bssid or "").lower()), None)
     if not match:
         return {"error": "target bssid not heard in this reading", "bssid": bssid}
-    return heatmap_add_sample(x, y, match["signal"], match["bssid"], match["ssid"])
+    return heatmap_add_sample(
+        x, y, match["signal"], match["bssid"], match["ssid"],
+        snr=match.get("snr"), noise=match.get("noise_floor") or survey.get("noise_floor"),
+        band=match.get("band"), channel=match.get("channel"))
 
 
 def heatmap_clear():
@@ -730,6 +1243,86 @@ def heatmap_clear():
     data["samples"] = []
     _heatmap_save(data)
     return data
+
+
+# --------------------------------------------------------------------------
+# Named surveys — save / restore a completed floorplan+samples set so several
+# sites (or before/after changes) can be kept and compared.
+# --------------------------------------------------------------------------
+
+def _surveys_load():
+    try:
+        with open(_SURVEYS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _surveys_save(data):
+    os.makedirs(os.path.dirname(_SURVEYS_FILE), exist_ok=True)
+    tmp = _SURVEYS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, _SURVEYS_FILE)
+
+
+def survey_list():
+    """Return survey names with light metadata (no floorplan payload)."""
+    surveys = _surveys_load()
+    out = []
+    for name, s in surveys.items():
+        out.append({
+            "name": name,
+            "samples": len(s.get("samples", [])),
+            "target_ssid": s.get("target_ssid"),
+            "has_floorplan": bool(s.get("floorplan")),
+            "saved": s.get("saved"),
+        })
+    out.sort(key=lambda x: x.get("saved") or 0, reverse=True)
+    return {"surveys": out}
+
+
+def survey_save(name):
+    """Snapshot the current heatmap (floorplan + samples) under `name`."""
+    name = (name or "").strip()
+    if not name:
+        return {"error": "survey name required"}
+    cur = _heatmap_load()
+    if not cur.get("samples") and not cur.get("floorplan"):
+        return {"error": "nothing to save — capture a floorplan/samples first"}
+    surveys = _surveys_load()
+    surveys[name] = {
+        "floorplan": cur.get("floorplan"),
+        "target_bssid": cur.get("target_bssid"),
+        "target_ssid": cur.get("target_ssid"),
+        "samples": cur.get("samples", []),
+        "saved": int(time.time()),
+    }
+    _surveys_save(surveys)
+    return survey_list()
+
+
+def survey_load(name):
+    """Restore a saved survey into the active heatmap store."""
+    surveys = _surveys_load()
+    s = surveys.get(name)
+    if s is None:
+        return {"error": "no such survey", "name": name}
+    _heatmap_save({
+        "floorplan": s.get("floorplan"),
+        "target_bssid": s.get("target_bssid"),
+        "target_ssid": s.get("target_ssid"),
+        "samples": s.get("samples", []),
+    })
+    return _heatmap_load()
+
+
+def survey_delete(name):
+    surveys = _surveys_load()
+    if name in surveys:
+        del surveys[name]
+        _surveys_save(surveys)
+    return survey_list()
 
 
 # --------------------------------------------------------------------------
@@ -741,18 +1334,30 @@ _SELFTEST_SCAN = r"""BSS aa:bb:cc:00:00:01(on wlan0) -- associated
 	signal: -45.00 dBm
 	SSID: HomeNet
 	last seen: 0 ms ago
+	beacon interval: 100 TUs
+	TIM: DTIM Count 0 DTIM Period 2
+	Country: SE	Environment: Indoor/Outdoor
+	TPC report: TX power: 20 dBm
 	RSN:	 * Version: 1
 		 * Authentication suites: PSK
+		 * Capabilities: 16-PTKSA-RC 1-GTKSA-RC (0x000c)
+	WPS:	 * Version: 1.0
 	BSS Load:
 		 * station count: 4
 		 * channel utilisation: 128/255
+	HT capabilities:
+		HT RX MCS rate indexes supported: 0-15
 	HT operation:
 		 * primary channel: 1
 		 * secondary channel offset: no secondary
+	RM enabled capabilities:
+	Extended capabilities:
+		 * BSS Transition
 BSS aa:bb:cc:00:00:02(on wlan0)
 	freq: 2412.0
 	signal: -70.00 dBm
 	SSID: Neighbour
+	HT capabilities:
 	HT operation:
 		 * primary channel: 1
 		 * secondary channel offset: above
@@ -762,16 +1367,32 @@ BSS aa:bb:cc:00:00:03(on wlan0)
 	SSID: HomeNet_5G
 	RSN:	 * Version: 1
 		 * Authentication suites: SAE
+		 * Capabilities: MFP-required 16-PTKSA-RC (0x00cc)
+	Mobility Domain:
+		 * MDID: 0x1234
 	HT operation:
 		 * primary channel: 52
 		 * secondary channel offset: above
+	VHT capabilities:
 	VHT operation:
 		 * channel width: 1 (80 MHz)
 		 * center freq segment 1: 58
+	VHT RX MCS set:
+		1 streams: MCS 0-9
+		2 streams: MCS 0-9
+		3 streams: MCS 0-9
+		4 streams: MCS 0-9
 BSS aa:bb:cc:00:00:04(on wlan0)
 	freq: 5955.0
 	signal: -60.00 dBm
 	SSID: HomeNet_6G
+	RSN:	 * Version: 1
+		 * Authentication suites: IEEE 802.1X
+		 * Capabilities: MFP-capable (0x0080)
+	HE capabilities:
+		HE RX MCS and NSS set <= 80 MHz
+			1 streams: MCS 0-11
+			2 streams: MCS 0-11
 	HE operation
 		 * primary channel: 1
 		 * channel width: 160
@@ -848,7 +1469,7 @@ def selftest():
           any(g["channel"] == 1 and g["count"] == 2 for g in inter["co_channel"]),
           json.dumps(inter["co_channel"]))
 
-    # Radius model
+    # Radius model — should use the AP's advertised TX power (a1 has TPC 20 dBm)
     rad = estimate_radius(a3)
     check("radius rings computed (3 thresholds)", len(rad["rings"]) == 3)
     check("closer threshold => smaller radius",
@@ -856,6 +1477,163 @@ def selftest():
           str([r["radius_m"] for r in rad["rings"]]))
     check("current distance positive", (rad["current_distance_m"] or 0) > 0,
           str(rad["current_distance_m"]))
+    rad1 = estimate_radius(a1)
+    check("radius uses measured TX power",
+          rad1["assumptions"]["tx_source"] == "measured"
+          and rad1["assumptions"]["tx_dbm"] == 20,
+          json.dumps(rad1["assumptions"]))
+    # An implausible advertised TX power (e.g. 63 dBm ≈ 2 kW) must be rejected so
+    # it can't blow up the range model — falls back to the assumed default.
+    bogus = parse_scan(
+        "BSS de:ad:be:ef:00:01(on wlan0)\n\tfreq: 5180\n\tsignal: -46.00 dBm\n"
+        "\tSSID: Bogus\n\tTPC report: TX power: 63 dBm, link margin: 0 dB\n")[0]
+    check("implausible advertised TX power is rejected",
+          bogus.get("tx_power_dbm") is None, str(bogus.get("tx_power_dbm")))
+    rad_bogus = estimate_radius(bogus)
+    check("radius falls back to assumed TX when advertised is garbage",
+          rad_bogus["assumptions"]["tx_source"] == "assumed"
+          and rad_bogus["assumptions"]["tx_dbm"] == _DEFAULT_TX_DBM
+          and rad_bogus["current_distance_m"] < 20,
+          json.dumps({"src": rad_bogus["assumptions"]["tx_source"],
+                      "d": rad_bogus["current_distance_m"]}))
+    # radius_from_fields: compute from a known row without re-scanning, and it
+    # must apply the same TX-power plausibility guard.
+    rf = radius_from_fields({"bssid": "a0:0:0:0:0:1", "band": "5", "channel": 36,
+                             "freq": 5180, "center_freq": 5180, "signal": -46,
+                             "tx_power_dbm": 63})
+    check("radius_from_fields ignores garbage advertised TX",
+          rf["assumptions"]["tx_source"] == "assumed" and rf["current_distance_m"] < 20,
+          json.dumps({"src": rf["assumptions"]["tx_source"], "d": rf["current_distance_m"]}))
+    check("radius_from_fields needs signal+freq",
+          "error" in radius_from_fields({"bssid": "x", "freq": 5180}))
+
+    # --- Path-loss calibration (Tier 4) ---
+    cal = calibrate_ple(1, -40, 10, -70)   # 30 dB over a decade => n=3.0
+    check("two-point calibration solves n from a decade",
+          abs(cal["path_loss_exponent"] - 3.0) < 1e-6
+          and abs(cal["rssi_at_1m"] - (-40)) < 1e-6, json.dumps(cal))
+    check("calibration rejects equal distances",
+          "error" in calibrate_ple(5, -40, 5, -70))
+    rad_off = estimate_radius(a3, rssi_offset=5)
+    check("rssi offset shifts adjusted signal",
+          rad_off["signal_adjusted"] == a3["signal"] + 5)
+    rad_cal = estimate_radius(a3, ple=cal["path_loss_exponent"],
+                              rssi0_override=cal["rssi_at_1m"])
+    check("rssi0 override marks model calibrated",
+          rad_cal["assumptions"]["tx_source"] == "calibrated"
+          and abs(rad_cal["assumptions"]["rssi_at_1m"] - (-40)) < 1e-6,
+          json.dumps(rad_cal["assumptions"]))
+
+    # --- Enterprise enrichment (Tier 1) ---
+    check("802.11 generation: Wi-Fi 4/5/6E",
+          a1.get("standard") == "Wi-Fi 4" and a3.get("standard") == "Wi-Fi 5"
+          and a4.get("standard") == "Wi-Fi 6E",
+          f"{a1.get('standard')}/{a3.get('standard')}/{a4.get('standard')}")
+    check("spatial streams (NSS) parsed",
+          a1.get("nss") == 2 and a3.get("nss") == 4 and a4.get("nss") == 2,
+          f"{a1.get('nss')}/{a3.get('nss')}/{a4.get('nss')}")
+    check("max PHY rate estimated", (a3.get("max_phy_mbps") or 0) > 1000,
+          str(a3.get("max_phy_mbps")))
+    check("security depth: WPA2 / WPA3 / WPA2-Enterprise",
+          a1.get("security") == "WPA2" and a3.get("security") == "WPA3"
+          and a4.get("security") == "WPA2-Enterprise",
+          f"{a1.get('security')}/{a3.get('security')}/{a4.get('security')}")
+    check("PMF parsed (disabled/required/capable)",
+          a1.get("pmf") == "disabled" and a3.get("pmf") == "required"
+          and a4.get("pmf") == "capable",
+          f"{a1.get('pmf')}/{a3.get('pmf')}/{a4.get('pmf')}")
+    check("enterprise (802.1X) flagged", a4.get("enterprise") is True,
+          str(a4.get("enterprise")))
+    check("WPS enabled detected", a1.get("wps") is True and not a3.get("wps"),
+          f"{a1.get('wps')}/{a3.get('wps')}")
+    check("weak-security findings (WPS + PMF-off on a1)",
+          "WPS enabled" in a1.get("security_findings", [])
+          and any("PMF off" in f for f in a1.get("security_findings", [])),
+          str(a1.get("security_findings")))
+    check("roaming 11k/v on a1, 11r on a3",
+          a1["roaming"]["k"] and a1["roaming"]["v"] and a3["roaming"]["r"],
+          f"{a1.get('roaming')} / {a3.get('roaming')}")
+    check("country + DTIM + beacon parsed",
+          a1.get("country") == "SE" and a1.get("dtim") == 2
+          and a1.get("beacon_interval") == 100,
+          f"{a1.get('country')}/{a1.get('dtim')}/{a1.get('beacon_interval')}")
+    check("locally-administered MAC => Randomized",
+          a1.get("vendor") == "Randomized/private", str(a1.get("vendor")))
+    check("OUI vendor lookup (TP-Link)",
+          _oui_lookup("00:25:86:11:22:33") in ("TP-Link", "TP-Link Technologies",
+                                               "Tp-Link Technologies Co.,Ltd."),
+          str(_oui_lookup("00:25:86:11:22:33")))
+
+    # --- Grouping + width advice (Tier 2) ---
+    grp = group_aps(aps)
+    homenet = next((n for n in grp["networks"] if n["ssid"] == "HomeNet"), None)
+    check("networks grouped by SSID", grp["network_count"] >= 4, str(grp["network_count"]))
+    check("device grouping by MAC prefix", grp["device_count"] >= 1,
+          str(grp["device_count"]))
+    check("width advice present per band",
+          "width_advice" in spec.get("5", {})
+          and spec["2.4"]["width_advice"]["mhz"] == 20,
+          json.dumps(spec.get("5", {}).get("width_advice")))
+
+    # --- AP history DB + change detection (Tier 3) — temp file, no real state ---
+    global _DB_FILE
+    _orig_db, _DB_FILE = _DB_FILE, __import__("tempfile").mktemp(suffix=".json")
+    try:
+        db_reset()
+        base = {"bssid": "a0:00:00:00:00:01", "ssid": "H", "channel_util": 10,
+                "band": "2.4", "channel": 1, "vendor": None}
+        first = dict(base, signal=-40)
+        c1 = _db_update([first])
+        check("new AP detected on first sighting",
+              any(n["bssid"] == base["bssid"] for n in c1["new_aps"])
+              and first.get("is_new") is True)
+        check("rssi history annotated", first.get("rssi_history") == [-40])
+        _db_update([dict(base, signal=-70)])
+        weak = dict(base, signal=-70)
+        c3 = _db_update([weak])
+        check("weakened AP detected (>=18 dB below its max)",
+              any(w["bssid"] == base["bssid"] for w in c3["weakened"]),
+              json.dumps(c3["weakened"]))
+        c4 = _db_update([])       # AP vanished this scan
+        check("disappeared AP detected",
+              any(g["bssid"] == base["bssid"] for g in c4["gone_aps"]))
+    finally:
+        try:
+            os.unlink(_DB_FILE)
+        except OSError:
+            pass
+        _DB_FILE = _orig_db
+
+    # --- Named surveys save/load (Tier 3) — temp files, no real state ---
+    global _HEATMAP_FILE, _SURVEYS_FILE
+    _oh, _os_ = _HEATMAP_FILE, _SURVEYS_FILE
+    import tempfile as _tf
+    _HEATMAP_FILE = _tf.mktemp(suffix=".json")
+    _SURVEYS_FILE = _tf.mktemp(suffix=".json")
+    try:
+        heatmap_add_sample(0.5, 0.5, -55, "b0:00:00:00:00:01", "SurveyNet",
+                           snr=25, noise=-90, band="5", channel=36)
+        check("survey save requires a name", "error" in survey_save(""))
+        survey_save("siteA")
+        lst = survey_list()
+        check("saved survey listed with sample count",
+              any(s["name"] == "siteA" and s["samples"] == 1 for s in lst["surveys"]),
+              json.dumps(lst))
+        heatmap_clear()
+        check("heatmap cleared before load", len(_heatmap_load()["samples"]) == 0)
+        loaded = survey_load("siteA")
+        check("survey load restores samples (with snr)",
+              len(loaded["samples"]) == 1 and loaded["samples"][0].get("snr") == 25)
+        survey_delete("siteA")
+        check("survey delete removes it",
+              not any(s["name"] == "siteA" for s in survey_list()["surveys"]))
+    finally:
+        for _f in (_HEATMAP_FILE, _SURVEYS_FILE):
+            try:
+                os.unlink(_f)
+            except OSError:
+                pass
+        _HEATMAP_FILE, _SURVEYS_FILE = _oh, _os_
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,
