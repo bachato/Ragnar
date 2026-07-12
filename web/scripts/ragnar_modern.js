@@ -2665,6 +2665,9 @@ function _wifidefUpdateMonBtn() {
 function wifidefToggleMonitor() {
     const st = document.getElementById('wifidef-status');
     if (_wifidef.monitor) {
+        // Stop any continuous scan first — otherwise its next loop would
+        // immediately auto-re-enable the monitor and "disable" would look broken.
+        if (_wifidef.continuous) wifidefStopContinuous();
         st.textContent = 'Disabling monitor…';
         fetch('/api/wifidef/monitor', { method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'disable' }) })

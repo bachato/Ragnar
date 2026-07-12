@@ -52,7 +52,12 @@ it (best when you already know where the attack is).
 ## Using it
 
 1. Plug in a monitor-capable adapter and pick it in **Monitor adapter**.
-2. **Enable monitor** (adds `ragmon0`, or switches the adapter).
+2. **Enable monitor** (adds `ragmon0`, or switches the adapter). The **same
+   button toggles it off** — it reads *Disable monitor (ragmon0)* while active.
+   Enabling always rebuilds a **fresh, channel-primed** vif (tearing down any
+   lingering one first), so disable→re-enable reliably comes back working rather
+   than a vif that exists but hears nothing. Disabling also stops a running
+   **Continuous** scan (otherwise its next loop would just re-enable monitor).
 3. **Trust current APs** in a known-good environment — this **adds** the
    currently-shown APs to the SSID→BSSID baseline that powers **evil-twin**
    detection. It *accumulates* (union), so run it a few times / across a scan or

@@ -200,6 +200,18 @@ def _mon_name(base):
     return "ragmon0"
 
 
+def _monitor_ready(mon):
+    """Bring a freshly-created monitor vif up on a known channel and confirm the
+    kernel really made it a monitor. Priming the channel matters: a just-added
+    (or just re-added) vif can sit on channel 0 and hear NOTHING — the classic
+    'ragmon0 is back but detects nothing after a re-enable' symptom."""
+    if not _iface_exists(mon):
+        return False
+    _run(["ip", "link", "set", mon, "up"], timeout=5)
+    _set_channel(mon, 6)          # common 2.4 GHz channel; capture re-sets/hops later
+    return _iw_dev_list().get(mon, {}).get("type") == "monitor"
+
+
 def enable_monitor(iface):
     """Put a monitor interface up for `iface`'s radio.
 
@@ -215,19 +227,24 @@ def enable_monitor(iface):
     _run(["/usr/bin/rfkill", "unblock", "all"], timeout=5)
     mon = _mon_name(iface)
 
-    # Already have it?
+    # Always rebuild a FRESH vif. A ragmon0 left over from a previous
+    # enable/disable cycle can exist yet be in a half-dead state that captures
+    # nothing — so tear any lingering one down and recreate, letting the driver
+    # settle in between (the del→add race is what breaks mt7921u re-enables).
     if mon in _iw_dev_list():
-        _run(["ip", "link", "set", mon, "up"], timeout=5)
-        _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
-        return {"mon_iface": mon, "mode": "vif"}
+        _run(["ip", "link", "set", mon, "down"], timeout=5)
+        _run([_IW, "dev", mon, "del"], timeout=8)
+        time.sleep(0.3)
 
     # Try a concurrent monitor vif first.
     rc, _, err = _run([_IW, "phy", phy, "interface", "add", mon,
                        "type", "monitor"], timeout=8)
-    if rc == 0:
-        _run(["ip", "link", "set", mon, "up"], timeout=5)
+    if rc == 0 and _monitor_ready(mon):
         _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
         return {"mon_iface": mon, "mode": "vif"}
+    # Half-created / not-a-monitor vif — clean it up before the fallback.
+    if mon in _iw_dev_list():
+        _run([_IW, "dev", mon, "del"], timeout=8)
 
     # Fallback: switch the interface itself to monitor (disrupts its link).
     _run(["ip", "link", "set", iface, "down"], timeout=5)
@@ -252,6 +269,7 @@ def disable_monitor(mon_iface=None):
     if mode == "vif" or (mon in _iw_dev_list() and _iw_dev_list().get(mon, {}).get("type") == "monitor" and mon == _mon_name(base)):
         _run(["ip", "link", "set", mon, "down"], timeout=5)
         _run([_IW, "dev", mon, "del"], timeout=8)
+        time.sleep(0.3)  # let the delete settle so a quick re-enable doesn't race
     else:
         # We switched the base iface into monitor; switch it back to managed.
         _run(["ip", "link", "set", mon, "down"], timeout=5)
@@ -1102,6 +1120,46 @@ def selftest():
                   json.dumps({"calls": calls["n"]}))
         finally:
             globals()["_resolve_monitor"] = _orig_resolve
+
+        # --- Robust re-enable: a lingering vif is torn down, rebuilt, primed
+        #     on a channel, and verified — the disable→re-enable "comes back but
+        #     detects nothing" fix. Stub the shell primitives. ---
+        _names = ("_run", "_iw_dev_list", "_iface_exists", "_phy_for_iface",
+                  "_phy_supports_monitor", "_set_channel", "_valid_iface")
+        _saved_fns = {n: globals()[n] for n in _names}
+        _real_sleep = time.sleep
+        try:
+            devs = {"wlan9": {"phy": "phy9", "type": "managed"},
+                    "ragmon0": {"phy": "phy9", "type": "monitor"}}  # stale leftover
+            cmds = []
+
+            def _fake_run(args, **kw):
+                cmds.append(list(args))
+                a = list(args)
+                if len(a) >= 6 and a[1] == "phy" and a[3] == "interface" and a[4] == "add":
+                    devs[a[5]] = {"phy": "phy9", "type": "monitor"}
+                if len(a) >= 4 and a[0] == _IW and a[1] == "dev" and a[3] == "del":
+                    devs.pop(a[2], None)
+                return (0, "", "")
+
+            globals().update(
+                _run=_fake_run, _iw_dev_list=lambda: {k: dict(v) for k, v in devs.items()},
+                _iface_exists=lambda n: n in devs, _phy_for_iface=lambda i: "phy9",
+                _phy_supports_monitor=lambda p: True, _set_channel=lambda m, c: None,
+                _valid_iface=lambda i: True)
+            time.sleep = lambda *_a, **_k: None
+            res = enable_monitor("wlan9")
+            check("re-enable yields a working vif monitor",
+                  res.get("mon_iface") == "ragmon0" and res.get("mode") == "vif",
+                  json.dumps(res))
+            check("re-enable tears the stale vif down before recreating (fresh)",
+                  any(c[0] == _IW and c[1:2] == ["dev"] and c[-1] == "del" for c in cmds))
+            check("re-enable re-adds the vif and primes a channel",
+                  any(len(c) >= 5 and c[4] == "add" for c in cmds)
+                  and _load_state().get("mon_iface") == "ragmon0")
+        finally:
+            time.sleep = _real_sleep
+            globals().update(_saved_fns)
     finally:
         try:
             os.unlink(_STATE_FILE)
