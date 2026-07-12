@@ -589,12 +589,36 @@ def analyze_airtime(events, seconds=None):
 # --------------------------------------------------------------------------
 
 def _capture_error(mon_iface, exc):
-    """Friendly, actionable message for a sniff failure."""
-    if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENODEV:
+    """Friendly, actionable message for a sniff failure. ENODEV (the monitor vif
+    vanished) is flagged so callers can rebuild it and retry."""
+    enodev = isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENODEV
+    # Some scapy/libpcap builds surface ENODEV as a plain error string, not OSError.
+    if not enodev and re.search(r"No such device|errno 19|\[Errno 19\]", str(exc), re.I):
+        enodev = True
+    if enodev:
         return {"error": f"capture failed: monitor interface '{mon_iface}' "
                          "disappeared (Errno 19). The adapter may have been "
-                         "unplugged or reset — disable and re-enable monitor mode."}
+                         "unplugged or reset — rebuilding monitor mode.",
+                "enodev": True}
     return {"error": f"capture failed: {exc}"}
+
+
+def _capture_recover(capture_fn, interface, seconds, channel, auto_enable):
+    """Resolve a live monitor, capture, and — if the vif dies around capture time
+    (ENODEV) — rebuild it once and retry. Returns an events list, or an
+    {"error": …} dict. This is what makes 'ragmon0 is gone again' self-heal for
+    both the WIDS scan and the airtime/link-quality capture."""
+    mon = _resolve_monitor(interface, auto_enable=auto_enable)
+    if isinstance(mon, dict):
+        return mon
+    events = capture_fn(mon, seconds, channel=channel)
+    if isinstance(events, dict) and events.get("enodev") and auto_enable:
+        _save_state({})                       # drop the dead vif bookkeeping
+        mon = _resolve_monitor(interface, auto_enable=True)   # force a rebuild
+        if isinstance(mon, dict):
+            return mon
+        events = capture_fn(mon, seconds, channel=channel)
+    return events
 
 
 def _capture(mon_iface, seconds, channel=None):
@@ -675,12 +699,10 @@ def do_airtime(interface, seconds=10, channel=None, auto_enable=True):
     if not _valid_iface(interface):
         return {"error": "invalid interface"}
     seconds = max(3, min(60, int(seconds)))
-    mon = _resolve_monitor(interface, auto_enable=auto_enable)
-    if isinstance(mon, dict):
-        return mon
-    events = _capture_all(mon, seconds, channel=channel)
+    events = _capture_recover(_capture_all, interface, seconds, channel, auto_enable)
     if isinstance(events, dict) and "error" in events:
         return events
+    mon = _load_state().get("mon_iface")
     result = analyze_airtime(events, seconds=seconds)
     result.update({"interface": interface, "monitor": mon, "channel": channel,
                    "hopping": channel is None, "timestamp": int(time.time())})
@@ -834,12 +856,10 @@ def do_scan(interface, seconds=15, channel=None, auto_enable=True):
     if not _valid_iface(interface):
         return {"error": "invalid interface"}
     seconds = max(3, min(120, int(seconds)))
-    mon = _resolve_monitor(interface, auto_enable=auto_enable)
-    if isinstance(mon, dict):
-        return mon
-    events = _capture(mon, seconds, channel=channel)
+    events = _capture_recover(_capture, interface, seconds, channel, auto_enable)
     if isinstance(events, dict) and "error" in events:
         return events
+    mon = _load_state().get("mon_iface")
     result = analyze(events, baseline=get_baseline(), window_secs=seconds,
                      thresholds=get_thresholds())
     result.update({"interface": interface, "monitor": mon,
@@ -1051,11 +1071,37 @@ def selftest():
         check("clearing stale monitor still kept baseline + thresholds",
               get_thresholds()["beacon_ssids"] == 250
               and get_baseline().get("X") == ["aa:bb:cc:dd:ee:ff"])
-        # ENODEV during capture yields a friendly, actionable message.
+        # ENODEV during capture yields a friendly message flagged for recovery.
         enod = _capture_error("ragmon0", OSError(errno.ENODEV, "No such device"))
-        check("ENODEV capture error is friendly + actionable",
-              "Errno 19" in enod["error"] and "re-enable" in enod["error"],
-              enod["error"])
+        check("ENODEV capture error is friendly + flagged for rebuild",
+              "Errno 19" in enod["error"] and enod.get("enodev") is True,
+              json.dumps(enod))
+        # ENODEV surfaced as a plain string (some libpcap builds) is still caught.
+        enod_str = _capture_error("ragmon0", RuntimeError("[Errno 19] No such device exists"))
+        check("ENODEV detected even from a string error", enod_str.get("enodev") is True)
+        # _capture_recover: a vif that dies once (ENODEV) is rebuilt and retried.
+        _save_state({"mon_iface": "ragmonX", "base_iface": "wlan0", "mode": "vif"})
+        calls = {"n": 0}
+        def _flaky(mon, seconds, channel=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"error": "capture failed: … (Errno 19)", "enodev": True}
+            return [{"kind": "beacon", "src": "aa:aa:aa:00:00:01", "ssid": "OK"}]
+        _orig_resolve = _resolve_monitor
+        try:
+            globals()["_resolve_monitor"] = lambda interface, auto_enable=True: "ragmon0"
+            rec = _capture_recover(_flaky, "wlan0", 5, None, True)
+            check("_capture_recover rebuilds + retries after one ENODEV",
+                  isinstance(rec, list) and len(rec) == 1 and calls["n"] == 2,
+                  json.dumps({"calls": calls["n"], "rec": rec}))
+            # With auto_enable off it must NOT retry — surfaces the error once.
+            calls["n"] = 0
+            rec2 = _capture_recover(_flaky, "wlan0", 5, None, False)
+            check("_capture_recover does not retry when auto_enable is off",
+                  isinstance(rec2, dict) and rec2.get("enodev") and calls["n"] == 1,
+                  json.dumps({"calls": calls["n"]}))
+        finally:
+            globals()["_resolve_monitor"] = _orig_resolve
     finally:
         try:
             os.unlink(_STATE_FILE)

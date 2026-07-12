@@ -111,12 +111,16 @@ Requires `iw` and **Scapy** (both installed by `install_ragnar.sh` /
 
 ## Troubleshooting
 
-**"capture failed: … Errno 19 no such device" (ENODEV).** The monitor vif named
-in the saved state (`ragmon0`) no longer exists — this happens after a **reboot,
-a service restart, or the USB adapter being unplugged/reset**, since the vif is
-not persistent but the bookmark is. Scan / Airtime now **detect a stale monitor
-interface automatically**: they verify the interface is still present before
-sniffing, drop the dead bookmark, and re-enable monitor mode from scratch. If it
-still fails, **Disable monitor** then **Enable monitor** to rebuild the vif. Your
-trusted-AP baseline and tuned thresholds are preserved across all monitor
-enable/disable bookkeeping.
+**"capture failed: … Errno 19 no such device" (ENODEV) / "ragmon0 is gone".**
+The monitor vif named in the saved state (`ragmon0`) no longer exists — this
+happens after a **reboot, a service restart, or the USB adapter being
+unplugged/reset**, since the vif is not persistent but the bookmark is. This
+breaks **both** the WIDS scan (AP/beacon-flood detection) *and* the
+airtime/link-quality capture, because both need that monitor. Recovery is now
+**automatic and two-layered**: Scan / Airtime verify the interface still exists
+*before* sniffing (dropping a dead bookmark and re-enabling from scratch), and if
+the vif dies *during* a capture they **rebuild it once and retry the capture** in
+the same call. Continuous mode keeps looping through a recovery, so live
+monitoring self-heals. If it still fails after that, **Disable monitor** then
+**Enable monitor** to force a fresh vif. Your trusted-AP baseline and tuned
+thresholds are preserved across all monitor bookkeeping.
