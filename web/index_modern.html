@@ -349,6 +349,9 @@
                     <button onclick="showTab('network')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="network">
                         Network
                     </button>
+                    <button onclick="showTab('wifidef')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="wifidef">
+                        WiFi Defense
+                    </button>
                     <button onclick="showTab('discovered')" class="nav-btn px-3 py-1.5 rounded-lg hover:bg-slate-700 transition-colors text-[15px] whitespace-nowrap" data-tab="discovered">
                         Discovered
                     </button>
@@ -435,6 +438,7 @@
             <div class="px-2 pt-2 pb-3 space-y-1">
                 <button onclick="showTab('dashboard')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Dashboard</button>
                 <button onclick="showTab('network')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Network</button>
+                <button onclick="showTab('wifidef')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">WiFi Defense</button>
                 <button onclick="showTab('discovered')" class="block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">Discovered</button>
                 <button onclick="showTab('rusense')" class="rusense-nav block w-full text-left px-3 py-2 rounded-lg hover:bg-slate-700">RuSense</button>
                 <button onclick="showTab('pentest')"
@@ -1963,6 +1967,59 @@
                 </div>
             </div><!-- /#net-sub-wifi -->
         </div><!-- /#network-tab -->
+
+        <!-- ============================ WiFi Defense Tab ============================ -->
+        <div id="wifidef-tab" class="tab-content hidden">
+            <div class="glass rounded-xl p-6 mb-5">
+                <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+                    <div>
+                        <h2 class="text-xl font-semibold flex items-center gap-2">🛡️ WiFi Defense <span class="text-xs font-normal px-2 py-0.5 rounded bg-slate-700 text-slate-300">802.11 WIDS</span></h2>
+                        <p class="text-sm text-gray-400 mt-1 max-w-3xl">A passive <strong>wireless intrusion-detection</strong> monitor. Listens on a <strong>monitor-mode</strong> adapter for 802.11 management frames and flags <strong>deauth/disassoc floods</strong>, <strong>beacon floods</strong> (fake-AP storms), <strong>rogue APs / evil twins</strong>, and <strong>KARMA/MANA</strong> rogue APs. <strong>Receive-only</strong> — it never transmits a frame or deauths anyone back. Needs an adapter that supports monitor mode (e.g. the Alfa AWUS036AXM); the Pi's onboard radio does not.</p>
+                    </div>
+                    <span id="wifidef-threat" class="shrink-0 px-4 py-2 rounded-lg text-sm font-bold bg-slate-700 text-slate-300">— idle —</span>
+                </div>
+                <!-- Controls -->
+                <div class="flex flex-wrap items-end gap-3 mt-4">
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Monitor adapter</label>
+                        <select id="wifidef-iface" class="bg-slate-800 border border-slate-700 rounded px-3 py-1.5 text-sm min-w-[150px]"><option value="">Loading…</option></select>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Channel</label>
+                        <input id="wifidef-channel" type="text" value="hop" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm w-20" title="a channel number, or 'hop' to cycle channels">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Capture (s)</label>
+                        <input id="wifidef-secs" type="number" value="15" min="3" max="120" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm w-20">
+                    </div>
+                    <button onclick="wifidefToggleMonitor()" id="wifidef-mon-btn" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Enable monitor</button>
+                    <button onclick="wifidefScan()" id="wifidef-scan-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm font-semibold">Scan</button>
+                    <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifidef-auto" class="accent-Ragnar-600"> Continuous</label>
+                    <button onclick="wifidefTrust()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap" title="Record the currently-visible APs as the trusted baseline for evil-twin detection">Trust current APs</button>
+                    <span id="wifidef-status" class="text-xs text-gray-500 ml-auto"></span>
+                </div>
+                <p class="text-[11px] text-amber-300/80 mt-2" id="wifidef-mon-note">Enabling monitor mode adds a separate capture interface where the driver allows it; otherwise it takes the adapter off your network. Only run on an adapter you can dedicate to sensing.</p>
+            </div>
+
+            <!-- Threat detections -->
+            <div id="wifidef-detections" class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5"></div>
+
+            <!-- Counts -->
+            <div id="wifidef-counts" class="flex flex-wrap gap-3 mb-5 text-sm"></div>
+
+            <!-- AP inventory -->
+            <div class="glass rounded-xl p-4">
+                <h3 class="font-semibold mb-3 text-sm">Access Points seen <span id="wifidef-ap-count" class="text-gray-500 font-normal"></span></h3>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead><tr class="text-left text-gray-400 border-b border-slate-800">
+                            <th class="py-1 pr-2">SSID</th><th class="py-1 pr-2">BSSID</th><th class="py-1 pr-2">Ch</th><th class="py-1 pr-2">RSSI</th><th class="py-1 pr-2">Beacons</th>
+                        </tr></thead>
+                        <tbody id="wifidef-ap-tbody"><tr><td colspan="5" class="py-4 text-center text-gray-500">Enable monitor mode and press <span class="text-gray-300">Scan</span>.</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div><!-- /#wifidef-tab -->
 
         <!-- Connect Tab -->
         <div id="connect-tab" class="tab-content hidden">
@@ -6180,7 +6237,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260711-wifiheatmap"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefense"></script>
 
 </body>
 </html>

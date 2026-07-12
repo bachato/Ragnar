@@ -1678,6 +1678,164 @@ function wifiHeatmapClear() {
 }
 
 // ============================================================================
+// WiFi Defense — 802.11 frame monitor / WIDS (top-level tab)
+// Backend: /api/wifidef/* (wifi_defense.py)
+// ============================================================================
+const _wifidef = { iface: '', monitor: null, data: null, auto: null };
+
+const _WIFIDEF_THREAT = {
+    clear: ['CLEAR', 'bg-green-600/20 text-green-300 border border-green-600/50'],
+    warning: ['WARNING', 'bg-amber-600/20 text-amber-300 border border-amber-600/50'],
+    critical: ['⚠ UNDER ATTACK', 'bg-red-600/25 text-red-300 border border-red-600/60'],
+};
+
+function initWifiDefense() {
+    _wifidefFillIfaces();
+    const auto = document.getElementById('wifidef-auto');
+    if (auto && !auto._wired) {
+        auto._wired = true;
+        auto.addEventListener('change', (e) => {
+            if (_wifidef.auto) { clearInterval(_wifidef.auto); _wifidef.auto = null; }
+            if (e.target.checked) _wifidef.auto = setInterval(wifidefScan, 2000);
+        });
+    }
+}
+
+function _wifidefFillIfaces() {
+    fetch('/api/wifidef/interfaces').then(r => r.json()).then(d => {
+        const sel = document.getElementById('wifidef-iface');
+        const ifs = (d && d.interfaces) || [];
+        _wifidef.monitor = d.active_monitor || null;
+        if (!ifs.length) { sel.innerHTML = '<option value="">No wireless adapter</option>'; }
+        else {
+            sel.innerHTML = ifs.map(i =>
+                `<option value="${i.iface}"${i.monitor_capable ? '' : ' disabled'}>${i.iface}${i.monitor_capable ? '' : ' (no monitor)'}${i.is_monitor ? ' • MONITOR' : ''}</option>`).join('');
+            const cap = ifs.find(i => i.monitor_capable) || ifs[0];
+            if (!_wifidef.iface || !ifs.some(i => i.iface === _wifidef.iface && i.monitor_capable)) _wifidef.iface = (d.base_iface) || cap.iface;
+            sel.value = _wifidef.iface;
+            sel.onchange = () => { _wifidef.iface = sel.value; };
+        }
+        _wifidefUpdateMonBtn();
+    }).catch(() => {});
+}
+
+function _wifidefUpdateMonBtn() {
+    const btn = document.getElementById('wifidef-mon-btn');
+    if (!btn) return;
+    if (_wifidef.monitor) {
+        btn.textContent = 'Disable monitor (' + _wifidef.monitor + ')';
+        btn.classList.add('text-red-300');
+    } else {
+        btn.textContent = 'Enable monitor';
+        btn.classList.remove('text-red-300');
+    }
+}
+
+function wifidefToggleMonitor() {
+    const st = document.getElementById('wifidef-status');
+    if (_wifidef.monitor) {
+        st.textContent = 'Disabling monitor…';
+        fetch('/api/wifidef/monitor', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'disable' }) })
+            .then(r => r.json()).then(d => { _wifidef.monitor = null; _wifidefUpdateMonBtn(); st.textContent = 'Monitor disabled'; }).catch(() => {});
+        return;
+    }
+    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+    if (!iface) return;
+    st.textContent = 'Enabling monitor…';
+    fetch('/api/wifidef/monitor', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'enable', interface: iface }) })
+        .then(r => r.json()).then(d => {
+            if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+            _wifidef.monitor = d.mon_iface;
+            _wifidefUpdateMonBtn();
+            st.textContent = d.warning ? ('⚠ ' + d.warning) : ('Monitor up on ' + d.mon_iface + (d.mode === 'vif' ? ' (link kept)' : ''));
+        }).catch(() => { st.textContent = 'Enable failed'; });
+}
+
+function wifidefScan() {
+    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+    if (!iface) return;
+    const secs = document.getElementById('wifidef-secs').value || 15;
+    let ch = (document.getElementById('wifidef-channel').value || 'hop').trim();
+    const chParam = /^\d+$/.test(ch) ? ch : 'auto';
+    const st = document.getElementById('wifidef-status');
+    const btn = document.getElementById('wifidef-scan-btn');
+    st.textContent = 'Capturing ' + secs + 's…'; if (btn) btn.disabled = true;
+    fetch(`/api/wifidef/scan?interface=${encodeURIComponent(iface)}&seconds=${secs}&channel=${chParam}`)
+        .then(r => r.json()).then(d => {
+            if (btn) btn.disabled = false;
+            if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+            _wifidef.monitor = d.monitor || _wifidef.monitor;
+            _wifidefUpdateMonBtn();
+            _wifidef.data = d;
+            st.textContent = `${d.frames} frames · ${new Date(d.timestamp * 1000).toLocaleTimeString()}`;
+            wifidefRender();
+        }).catch(() => { if (btn) btn.disabled = false; st.textContent = 'Scan failed'; });
+}
+
+function wifidefTrust() {
+    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+    if (!iface) return;
+    const st = document.getElementById('wifidef-status');
+    st.textContent = 'Learning trusted APs (20s capture)…';
+    fetch('/api/wifidef/baseline', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interface: iface, seconds: 20 }) })
+        .then(r => r.json()).then(d => {
+            st.textContent = d.error ? ('⚠ ' + d.error) : (`Trusted ${d.ssids} SSID(s) as baseline`);
+        }).catch(() => { st.textContent = 'Baseline failed'; });
+}
+
+function wifidefRender() {
+    const d = _wifidef.data; if (!d) return;
+    const [label, cls] = _WIFIDEF_THREAT[d.threat] || ['—', 'bg-slate-700 text-slate-300'];
+    const tb = document.getElementById('wifidef-threat');
+    tb.textContent = label; tb.className = 'shrink-0 px-4 py-2 rounded-lg text-sm font-bold ' + cls;
+    // Detection cards
+    const det = document.getElementById('wifidef-detections');
+    if (!d.detections.length) {
+        det.innerHTML = '<div class="glass rounded-xl p-4 text-sm text-green-300 md:col-span-2">✓ No wireless attacks detected in this capture.</div>';
+    } else {
+        det.innerHTML = d.detections.map(x => {
+            const crit = ['flood', 'evil_twin', 'karma'].includes(x.severity);
+            const border = crit ? 'border-l-4 border-red-500' : 'border-l-4 border-amber-500';
+            let title = '', body = '';
+            if (x.type === 'deauth') {
+                title = x.severity === 'flood' ? '💥 Deauth/Disassoc FLOOD' : 'Deauth/Disassoc frames seen';
+                body = `<div>${x.count} frames.</div>` + (x.attackers || []).map(a =>
+                    `<div class="font-mono text-[11px] text-gray-400">${a.src} → ${a.dst} ×${a.count}</div>`).join('');
+            } else if (x.type === 'beacon_flood') {
+                title = '📡 Beacon flood (fake APs)';
+                body = `<div>${x.ssids} fake SSIDs from ${x.bssids} BSSIDs.</div>`;
+            } else if (x.type === 'karma') {
+                title = '🎣 KARMA / MANA rogue AP';
+                body = `<div class="font-mono text-[11px] text-gray-400">${x.bssid}</div><div>answered ${x.ssid_count} SSIDs: ${(x.ssids || []).join(', ')}</div>`;
+            } else if (x.type === 'rogue_ap') {
+                title = x.severity === 'evil_twin' ? '👿 Evil twin (untrusted BSSID)' : '⚠ Duplicate SSID';
+                body = `<div>SSID <b>${x.ssid}</b></div><div class="font-mono text-[11px] text-gray-400">${(x.rogue_bssids || x.bssids || []).join(', ')}</div>`;
+            }
+            return `<div class="glass rounded-xl p-4 ${border}"><div class="font-semibold text-sm mb-1">${title}</div><div class="text-sm text-gray-300">${body}</div><div class="text-[11px] text-gray-500 mt-1">${x.detail || ''}</div></div>`;
+        }).join('');
+    }
+    // Counts
+    const c = d.counts || {};
+    document.getElementById('wifidef-counts').innerHTML =
+        [['frames', d.frames], ['deauth', c.deauth], ['beacons', c.beacon], ['probe-req', c.probe_req], ['probe-resp', c.probe_resp]]
+            .map(([k, v]) => `<span class="px-3 py-1 rounded bg-slate-800 border border-slate-700"><b>${v || 0}</b> <span class="text-gray-400">${k}</span></span>`).join('');
+    // AP table
+    document.getElementById('wifidef-ap-count').textContent = `(${(d.aps || []).length})`;
+    const body = document.getElementById('wifidef-ap-tbody');
+    const trusted = null;
+    if (!d.aps || !d.aps.length) body.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-gray-500">No beacons captured (wrong channel? try “hop”).</td></tr>';
+    else body.innerHTML = d.aps.map(a => `<tr class="border-b border-slate-800/50">
+        <td class="py-1 pr-2">${a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>'}</td>
+        <td class="py-1 pr-2 font-mono text-[11px]">${a.bssid}</td>
+        <td class="py-1 pr-2">${a.channel == null ? '—' : a.channel}</td>
+        <td class="py-1 pr-2">${a.rssi == null ? '—' : a.rssi + ' dBm'}</td>
+        <td class="py-1 pr-2">${a.beacons}</td></tr>`).join('');
+}
+
+// ============================================================================
 // Network diagnostics (Diagnostics / Switch & L2 / Interfaces sub-tabs)
 // Backend: /api/net/* (see network_diagnostics.py)
 // ============================================================================
@@ -5830,6 +5988,9 @@ async function loadTabData(tabName) {
         case 'network':
             // Always refresh network data when switching to this tab
             await loadNetworkData();
+            break;
+        case 'wifidef':
+            initWifiDefense();
             break;
         case 'networks':
             if (!alreadyPreloaded) {
