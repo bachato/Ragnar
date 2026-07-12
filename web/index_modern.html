@@ -2020,7 +2020,7 @@
                         <label class="flex items-center gap-1.5 text-[11px] text-gray-300 cursor-pointer select-none" title="Also measure throughput + latency at each click (a few seconds per point), Ekahau-style active survey. Off = fast RSSI-only.">
                             <input type="checkbox" id="wifi-hm-active" class="accent-Ragnar-600"> Active test on click
                         </label>
-                        <input id="wifi-hm-iperf" placeholder="iperf3 server (LAN, optional)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[190px]" title="A LAN iperf3 server IP/host measures true up+down. Leave blank to use a WAN download speed test instead.">
+                        <input id="wifi-hm-iperf" placeholder="iperf3 server IP (LAN, optional)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs w-64 min-w-[16rem]" title="A LAN iperf3 server IP/host measures true up+down. Leave blank to use a WAN download speed test instead.">
                         <label class="text-[11px] text-gray-400">for <input id="wifi-hm-tp-secs" type="number" value="5" min="2" max="30" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> s</label>
                         <button onclick="wifiThroughputTest()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs" title="Run one throughput/latency test here without dropping a sample">Test now</button>
                         <span id="wifi-hm-tp-status" class="text-[11px] text-gray-500"></span>
@@ -6369,7 +6369,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifireport"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifiiperfbox"></script>
 
 </body>
 </html>
