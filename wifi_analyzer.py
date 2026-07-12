@@ -859,18 +859,63 @@ def _rssi_at_1m(freq_mhz, tx_dbm):
     return tx_dbm - fspl_1m
 
 
-def estimate_radius(bss, tx_dbm=None, ple=_DEFAULT_PLE):
+def calibrate_ple(d1, rssi1, d2, rssi2):
+    """Two-point calibration of the log-distance model.
+
+    Given two measured (distance_m, RSSI) points, solve for the path-loss
+    exponent and the reference RSSI at 1 m so the model matches *this* site/
+    adapter rather than a textbook assumption.
+        rssi = rssi0 - 10*n*log10(d)
+        n    = (rssi1 - rssi2) / (10 * (log10(d2) - log10(d1)))
+        rssi0 = rssi1 + 10*n*log10(d1)
+    """
+    try:
+        d1, rssi1, d2, rssi2 = float(d1), float(rssi1), float(d2), float(rssi2)
+    except (TypeError, ValueError):
+        return {"error": "two (distance, rssi) points required"}
+    if d1 <= 0 or d2 <= 0:
+        return {"error": "distances must be > 0 m"}
+    if d1 == d2:
+        return {"error": "the two distances must differ"}
+    denom = 10.0 * (math.log10(d2) - math.log10(d1))
+    if denom == 0:
+        return {"error": "the two distances must differ"}
+    ple = (rssi1 - rssi2) / denom
+    rssi0 = rssi1 + 10.0 * ple * math.log10(d1)
+    return {"path_loss_exponent": round(ple, 3), "rssi_at_1m": round(rssi0, 2),
+            "points": [{"d": d1, "rssi": rssi1}, {"d": d2, "rssi": rssi2}]}
+
+
+def estimate_radius(bss, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
+                    antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
     """Coverage rings + your current distance for one BSS (from its measured RSSI).
 
     Uses the AP's *advertised* TX power (TPC report IE) when it published one, so
     the model is measured rather than assumed; falls back to `tx_dbm` / the
-    default otherwise."""
+    default otherwise.
+
+    Calibration knobs:
+      * ``rssi_offset``  — per-adapter correction added to every measured RSSI
+        (e.g. an Alfa that reads 3 dB low → +3).
+      * ``antenna_gain`` / ``cable_loss`` — receive-chain EIRP correction (dBi /
+        dB) folded into the reference level.
+      * ``rssi0_override`` — a reference RSSI@1m from :func:`calibrate_ple`,
+        which (with a calibrated ``ple``) replaces the TX/FSPL derivation.
+    """
+    rssi_offset = float(rssi_offset or 0.0)
+    antenna_gain = float(antenna_gain or 0.0)
+    cable_loss = float(cable_loss or 0.0)
     tx_measured = bss.get("tx_power_dbm")
     tx_source = "measured" if tx_measured is not None else "assumed"
     if tx_dbm is None:
         tx_dbm = tx_measured if tx_measured is not None else _DEFAULT_TX_DBM
     freq = bss.get("center_freq") or bss.get("freq")
-    rssi0 = _rssi_at_1m(freq, tx_dbm)
+    if rssi0_override is not None:
+        rssi0 = float(rssi0_override)
+        tx_source = "calibrated"
+    else:
+        # antenna gain raises the effective reference level; cable loss lowers it
+        rssi0 = _rssi_at_1m(freq, tx_dbm) + antenna_gain - cable_loss
 
     def dist_for(rssi):
         # rssi = rssi0 - 10*n*log10(d)  =>  d = 10^((rssi0-rssi)/(10n))
@@ -881,16 +926,22 @@ def estimate_radius(bss, tx_dbm=None, ple=_DEFAULT_PLE):
         for name, thr, label in _RADIUS_THRESHOLDS
     ]
     cur = None
-    if bss.get("signal") is not None:
-        cur = dist_for(bss["signal"])
+    sig = bss.get("signal")
+    sig_adj = None
+    if sig is not None:
+        sig_adj = sig + rssi_offset
+        cur = dist_for(sig_adj)
     return {
         "bssid": bss.get("bssid"),
         "ssid": bss.get("ssid"),
         "band": bss.get("band"),
         "channel": bss.get("channel"),
-        "signal": bss.get("signal"),
+        "signal": sig,
+        "signal_adjusted": sig_adj,
         "assumptions": {"tx_dbm": tx_dbm, "tx_source": tx_source,
-                        "path_loss_exponent": ple, "rssi_at_1m": round(rssi0, 1)},
+                        "path_loss_exponent": ple, "rssi_at_1m": round(rssi0, 1),
+                        "rssi_offset": rssi_offset, "antenna_gain": antenna_gain,
+                        "cable_loss": cable_loss},
         "current_distance_m": cur,
         "rings": rings,
     }
@@ -1066,9 +1117,11 @@ def do_scan(interface="wlan0", band="all", passive=True):
     }
 
 
-def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE):
+def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
+              antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
     """Passive scan then compute the signal radius for one BSSID. tx_dbm=None
-    lets estimate_radius use the AP's advertised TX power when it has one."""
+    lets estimate_radius use the AP's advertised TX power when it has one.
+    Calibration knobs are forwarded to estimate_radius."""
     if not _valid_bssid(bssid):
         return {"error": "invalid bssid"}
     survey = do_scan(interface=interface, band="all")
@@ -1076,7 +1129,9 @@ def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE):
         return survey
     for b in survey["aps"]:
         if b["bssid"] == bssid.lower():
-            return estimate_radius(b, tx_dbm=tx_dbm, ple=ple)
+            return estimate_radius(b, tx_dbm=tx_dbm, ple=ple,
+                                   rssi_offset=rssi_offset, antenna_gain=antenna_gain,
+                                   cable_loss=cable_loss, rssi0_override=rssi0_override)
     return {"error": "bssid not found in latest scan", "bssid": bssid}
 
 
@@ -1393,6 +1448,23 @@ def selftest():
           rad1["assumptions"]["tx_source"] == "measured"
           and rad1["assumptions"]["tx_dbm"] == 20,
           json.dumps(rad1["assumptions"]))
+
+    # --- Path-loss calibration (Tier 4) ---
+    cal = calibrate_ple(1, -40, 10, -70)   # 30 dB over a decade => n=3.0
+    check("two-point calibration solves n from a decade",
+          abs(cal["path_loss_exponent"] - 3.0) < 1e-6
+          and abs(cal["rssi_at_1m"] - (-40)) < 1e-6, json.dumps(cal))
+    check("calibration rejects equal distances",
+          "error" in calibrate_ple(5, -40, 5, -70))
+    rad_off = estimate_radius(a3, rssi_offset=5)
+    check("rssi offset shifts adjusted signal",
+          rad_off["signal_adjusted"] == a3["signal"] + 5)
+    rad_cal = estimate_radius(a3, ple=cal["path_loss_exponent"],
+                              rssi0_override=cal["rssi_at_1m"])
+    check("rssi0 override marks model calibrated",
+          rad_cal["assumptions"]["tx_source"] == "calibrated"
+          and abs(rad_cal["assumptions"]["rssi_at_1m"] - (-40)) < 1e-6,
+          json.dumps(rad_cal["assumptions"]))
 
     # --- Enterprise enrichment (Tier 1) ---
     check("802.11 generation: Wi-Fi 4/5/6E",

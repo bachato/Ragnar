@@ -1629,20 +1629,54 @@ function wifiSelectAp(bssid) {
     const txBox = document.getElementById('wifi-tx');
     if (ap && ap.tx_power_dbm != null && !txBox._userset) txBox.value = ap.tx_power_dbm;
     txBox.onchange = () => { txBox._userset = true; if (_wifiState.selected) wifiSelectAp(_wifiState.selected); };
+    ['wifi-ple', 'wifi-rssi-offset', 'wifi-ant-gain', 'wifi-cable-loss'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && !el._wired) { el._wired = true; el.onchange = () => { if (_wifiState.selected) wifiSelectAp(_wifiState.selected); }; }
+    });
     const tx = txBox.value || 'auto';
     const ple = document.getElementById('wifi-ple').value || 3.0;
+    const rssiOffset = document.getElementById('wifi-rssi-offset').value || 0;
+    const antGain = document.getElementById('wifi-ant-gain').value || 0;
+    const cableLoss = document.getElementById('wifi-cable-loss').value || 0;
+    const rssi0 = _wifiState.calRssi0 != null ? `&rssi0=${_wifiState.calRssi0}` : '';
     document.getElementById('wifi-radius-controls').style.display = 'flex';
-    fetch(`/api/net/wifi/radius?interface=${encodeURIComponent(iface)}&bssid=${encodeURIComponent(bssid)}&tx=${tx}&ple=${ple}`)
+    document.getElementById('wifi-cal-details').style.display = 'block';
+    fetch(`/api/net/wifi/radius?interface=${encodeURIComponent(iface)}&bssid=${encodeURIComponent(bssid)}&tx=${tx}&ple=${ple}&rssi_offset=${rssiOffset}&antenna_gain=${antGain}&cable_loss=${cableLoss}${rssi0}`)
         .then(r => r.json()).then(d => {
             if (d.error) { document.getElementById('wifi-radius-info').innerHTML = '<span class="text-amber-400">' + d.error + '</span>'; return; }
             _wifiDrawRadius(d);
             document.getElementById('wifi-radius-target').textContent = '· ' + (d.ssid || bssid);
-            const src = d.assumptions.tx_source === 'measured' ? '<span class="text-green-400">measured</span>' : 'assumed';
+            const srcMap = { measured: '<span class="text-green-400">measured</span>', calibrated: '<span class="text-cyan-400">calibrated</span>' };
+            const src = srcMap[d.assumptions.tx_source] || 'assumed';
+            const a = d.assumptions;
+            const adj = (d.signal_adjusted != null && d.signal_adjusted !== d.signal) ? ` (adj ${d.signal_adjusted})` : '';
+            const cal = (a.rssi_offset || a.antenna_gain || a.cable_loss)
+                ? `<div class="text-[10px] text-gray-600">Cal: offset ${a.rssi_offset || 0} dB · ant ${a.antenna_gain || 0} dBi · cable ${a.cable_loss || 0} dB</div>` : '';
             document.getElementById('wifi-radius-info').innerHTML =
-                `<div class="mb-1">Measured <b style="color:${_wifiSignalColor(d.signal)}">${d.signal} dBm</b> → you are ~<b>${d.current_distance_m} m</b> from this AP.</div>` +
+                `<div class="mb-1">Measured <b style="color:${_wifiSignalColor(d.signal)}">${d.signal} dBm</b>${adj} → you are ~<b>${d.current_distance_m} m</b> from this AP.</div>` +
                 d.rings.map(r => `<div>• <b>${r.radius_m} m</b> — ${r.label} (≤${r.threshold_dbm} dBm)</div>`).join('') +
-                `<div class="text-[10px] text-gray-600 mt-1">Model: Tx ${d.assumptions.tx_dbm} dBm (${src}), n=${d.assumptions.path_loss_exponent}, ref ${d.assumptions.rssi_at_1m} dBm@1m. Estimate only.</div>`;
+                `<div class="text-[10px] text-gray-600 mt-1">Model: Tx ${a.tx_dbm} dBm (${src}), n=${a.path_loss_exponent}, ref ${a.rssi_at_1m} dBm@1m. Estimate only.</div>` + cal;
         }).catch(() => {});
+}
+
+function wifiCalibrate() {
+    const g = id => document.getElementById(id).value;
+    const st = document.getElementById('wifi-cal-status');
+    const qs = `d1=${g('wifi-cal-d1')}&rssi1=${g('wifi-cal-r1')}&d2=${g('wifi-cal-d2')}&rssi2=${g('wifi-cal-r2')}`;
+    fetch(`/api/net/wifi/calibrate?${qs}`).then(r => r.json()).then(d => {
+        if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+        _wifiState.calRssi0 = d.rssi_at_1m;
+        document.getElementById('wifi-ple').value = d.path_loss_exponent;
+        st.innerHTML = `n=<b>${d.path_loss_exponent}</b>, ref <b>${d.rssi_at_1m}</b> dBm@1m — applied`;
+        if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
+    }).catch(() => { st.textContent = 'calibration failed'; });
+}
+
+function wifiCalibrateReset() {
+    _wifiState.calRssi0 = null;
+    const st = document.getElementById('wifi-cal-status');
+    if (st) st.textContent = 'cleared — using TX/FSPL model';
+    if (_wifiState.selected) wifiSelectAp(_wifiState.selected);
 }
 
 function _wifiDrawRadius(d) {

@@ -13234,10 +13234,29 @@ def register_network_diagnostics(app, logger=None):
             _tx = request.args.get('tx')
             tx = float(_tx) if _tx not in (None, '', 'auto') else None
             ple = float(request.args.get('ple', wifi_analyzer._DEFAULT_PLE))
+            rssi_offset = float(request.args.get('rssi_offset', 0) or 0)
+            antenna_gain = float(request.args.get('antenna_gain', 0) or 0)
+            cable_loss = float(request.args.get('cable_loss', 0) or 0)
+            _r0 = request.args.get('rssi0')
+            rssi0 = float(_r0) if _r0 not in (None, '', 'auto') else None
         except (TypeError, ValueError):
-            return _bad('Invalid tx/ple')
+            return _bad('Invalid calibration parameter')
         _log(f"net/wifi/radius {iface} {bssid}")
-        return jsonify(wifi_analyzer.do_radius(iface, bssid, tx_dbm=tx, ple=ple))
+        return jsonify(wifi_analyzer.do_radius(
+            iface, bssid, tx_dbm=tx, ple=ple, rssi_offset=rssi_offset,
+            antenna_gain=antenna_gain, cable_loss=cable_loss, rssi0_override=rssi0))
+
+    @app.route('/api/net/wifi/calibrate', methods=['GET'])
+    def net_wifi_calibrate():
+        """Two-point path-loss calibration: solve ple + rssi@1m from two
+        (distance_m, rssi) measurements."""
+        try:
+            r = wifi_analyzer.calibrate_ple(
+                request.args.get('d1'), request.args.get('rssi1'),
+                request.args.get('d2'), request.args.get('rssi2'))
+        except (TypeError, ValueError):
+            return _bad('Invalid calibration points')
+        return jsonify(r)
 
     @app.route('/api/net/wifi/heatmap', methods=['GET', 'POST'])
     def net_wifi_heatmap():
