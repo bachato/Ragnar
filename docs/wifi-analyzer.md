@@ -190,7 +190,10 @@ measuring it — Ekahau's predictive-design feature in miniature:
 
 1. **Draw walls** on the floorplan (click two points per wall) and pick the
    **material** — each carries a real attenuation: drywall 3 dB, wood 4, glass 6,
-   brick 10, concrete 15, metal 20.
+   brick 10, concrete 15, metal 20. Walls and columns are **colour-coded by
+   material** so the construction reads at a glance — 🧱 brick red, glass white,
+   concrete grey, steel/metal blue, drywall beige, wood brown (a legend sits
+   under the Design tools).
 2. **Place AP nodes** — click where an AP would go. **Click again to drop more
    nodes and plan a whole mesh** (they're labelled AP1, AP2, …); **Undo AP** /
    **Clear APs** manage them. Set the **floor width (m)** so distances are metric.

@@ -1834,6 +1834,18 @@ function _wifiMeshColor(bssid) {
 
 // Building-material attenuation (dB), mirrors wifi_analyzer._WALL_MATERIALS.
 const _WIFI_WALL_DB = { drywall: 3, wood: 4, glass: 6, brick: 10, concrete: 15, metal: 20 };
+// Colour-code construction materials so walls/columns read at a glance.
+const _WIFI_MAT_COLORS = {
+    brick: '#dc2626',    // red
+    glass: '#f8fafc',    // white
+    concrete: '#9ca3af', // grey
+    metal: '#3b82f6',    // blue (steel)
+    drywall: '#d8c39a',  // beige
+    wood: '#8b5a2b',     // brown
+};
+const _WIFI_MAT_LABELS = { brick: 'Brick', glass: 'Glass', concrete: 'Concrete',
+    metal: 'Steel', drywall: 'Drywall', wood: 'Wood' };
+function _wifiMatColor(mat) { return _WIFI_MAT_COLORS[mat] || '#0ea5e9'; }
 
 // Calibrated metric scales: [lo (red), hi (green)] and labelled break points.
 // (For latency, lo>hi so lower = greener.)
@@ -2436,31 +2448,35 @@ function _wifiHmDrawDesign(ctx, W, H) {
     // Walls
     ctx.lineCap = 'round';
     _wifiHm.walls.forEach(w => {
+        const col = _wifiMatColor(w.material);
         ctx.beginPath();
         ctx.moveTo(w.x1 * W, w.y1 * H); ctx.lineTo(w.x2 * W, w.y2 * H);
-        ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 3; ctx.stroke();
-        ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5; ctx.stroke();
-        // Draggable endpoint handles.
+        // Dark casing for contrast on any floorplan, then the material colour.
+        ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 4.5; ctx.stroke();
+        ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke();
+        // Draggable endpoint handles, tinted to the material.
         [[w.x1, w.y1], [w.x2, w.y2]].forEach(([ex, ey]) => {
             ctx.beginPath(); ctx.arc(ex * W, ey * H, 3.5, 0, 2 * Math.PI);
-            ctx.fillStyle = '#f8fafc'; ctx.fill();
-            ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5; ctx.stroke();
+            ctx.fillStyle = col; ctx.fill();
+            ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 1.5; ctx.stroke();
         });
     });
-    // Wall-in-progress preview
+    // Wall-in-progress preview (tinted to the currently-selected material)
     if (_wifiHm.wallStart) {
         const s = _wifiHm.wallStart;
+        const matEl = document.getElementById('wifi-hm-wall-mat');
         ctx.beginPath(); ctx.arc(s.x * W, s.y * H, 4, 0, 2 * Math.PI);
-        ctx.fillStyle = '#0ea5e9'; ctx.fill();
+        ctx.fillStyle = _wifiMatColor(matEl && matEl.value); ctx.fill();
+        ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 1.5; ctx.stroke();
     }
-    // Structural columns — round pillars drawn to scale (amber, distinct from APs)
+    // Structural columns — round pillars drawn to scale, coloured by material
     const wMeters = parseFloat(document.getElementById('wifi-hm-scale') && document.getElementById('wifi-hm-scale').value) || 10;
     const pxPerM = W / wMeters;
     _wifiHm.columns.forEach(c => {
         const x = c.x * W, y = c.y * H;
         const rpx = Math.max(5, (c.radius_m || 0.3) * pxPerM);
         ctx.beginPath(); ctx.arc(x, y, rpx, 0, 2 * Math.PI);
-        ctx.fillStyle = 'rgba(245,158,11,0.85)'; ctx.fill();
+        ctx.fillStyle = _wifiMatColor(c.material); ctx.globalAlpha = 0.9; ctx.fill(); ctx.globalAlpha = 1;
         ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 2; ctx.stroke();
         // cross-hatch to read as "solid structure"
         ctx.strokeStyle = 'rgba(11,18,32,0.5)'; ctx.lineWidth = 1;
