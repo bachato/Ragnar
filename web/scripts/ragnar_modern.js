@@ -1441,13 +1441,18 @@ function wifiRenderTable() {
     document.getElementById('wifi-ap-count').textContent = `(${aps.length}/${d.ap_count})`;
     if (!aps.length) { tb.innerHTML = '<tr><td colspan="9" class="py-4 text-center text-gray-500">No APs match.</td></tr>'; return; }
     tb.innerHTML = aps.map(a => {
-        const sel = _wifiState.selected === a.bssid ? 'bg-slate-800/70' : '';
+        const isSel = _wifiState.selected === a.bssid;
         const bar = a.signal == null ? 0 : Math.max(4, Math.min(100, (a.signal + 100) / 70 * 100));
         const issue = a.security_findings && a.security_findings.length;
+        // Selected row: inline Ragnar accent (custom-colour opacity classes aren't
+        // in the prebuilt tailwind.css). Selection wins the left bar over amber.
+        const rowCls = isSel ? '' : 'hover:bg-slate-800/40' + (issue ? ' border-l-2 border-l-amber-500' : '');
+        const rowStyle = isSel ? ' style="background-color:rgba(2,132,199,0.25);border-left:3px solid rgb(56,189,248)"' : '';
         const snr = a.snr != null ? `<span class="text-[10px] text-gray-500"> ${a.snr}dB</span>` : '';
         const rate = (a.nss ? a.nss + 'ss' : '') + (a.max_phy_mbps ? ' ' + (a.max_phy_mbps >= 1000 ? (a.max_phy_mbps / 1000).toFixed(1) + 'G' : a.max_phy_mbps + 'M') : '');
-        return `<tr class="border-b border-slate-800/50 hover:bg-slate-800/40 cursor-pointer ${sel} ${issue ? 'border-l-2 border-l-amber-500' : ''}" onclick="wifiSelectAp('${a.bssid}')">
-            <td class="py-1 pr-2 whitespace-nowrap">${issue ? '<span title="' + a.security_findings.join('; ') + '" class="text-amber-400">⚠</span> ' : ''}${(a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>')}${_wifiGenBadge(a.standard)}${a.is_new ? ' <span class="text-[9px] px-1 rounded bg-emerald-600/30 text-emerald-300 align-middle" title="first seen this session">NEW</span>' : ''}${a.dfs ? ' <span title="DFS/radar" style="color:#a78bfa">◆</span>' : ''}<div class="text-[10px] text-gray-600 font-mono">${a.bssid}${a.seen_count > 1 ? ' <span class="text-gray-700">·seen ' + a.seen_count + '×</span>' : ''}</div></td>
+        const marker = isSel ? '<span style="color:rgb(56,189,248)" class="mr-0.5" title="selected — modelled in Signal Radius">►</span>' : '';
+        return `<tr class="border-b border-slate-800/50 cursor-pointer ${rowCls}"${rowStyle} onclick="wifiSelectAp('${a.bssid}')">
+            <td class="py-1 pr-2 whitespace-nowrap">${marker}${issue ? '<span title="' + a.security_findings.join('; ') + '" class="text-amber-400">⚠</span> ' : ''}${(a.ssid || '<span class=\'text-gray-500 italic\'>hidden</span>')}${_wifiGenBadge(a.standard)}${a.is_new ? ' <span class="text-[9px] px-1 rounded bg-emerald-600/30 text-emerald-300 align-middle" title="first seen this session">NEW</span>' : ''}${a.dfs ? ' <span title="DFS/radar" style="color:#a78bfa">◆</span>' : ''}<div class="text-[10px] text-gray-600 font-mono">${a.bssid}${a.seen_count > 1 ? ' <span class="text-gray-700">·seen ' + a.seen_count + '×</span>' : ''}</div></td>
             <td class="py-1 pr-2 text-xs text-gray-400 whitespace-nowrap">${a.vendor || '—'}</td>
             <td class="py-1 pr-2"><span style="color:${_WIFI_BAND_COLOR[a.band]}">${a.band}</span></td>
             <td class="py-1 pr-2">${a.channel}</td>
