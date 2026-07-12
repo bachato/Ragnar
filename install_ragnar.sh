@@ -454,6 +454,7 @@ install_dependencies() {
         "iw"
         "iproute2"
         "iputils-ping"
+        "iperf3"
         "rfkill"
         "sqlite3"
         "arp-scan"

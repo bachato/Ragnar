@@ -1991,7 +1991,7 @@
                     <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
                         <div>
                             <h4 class="font-semibold text-sm">Coverage Heatmap</h4>
-                            <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Samples are interpolated (IDW) into a coverage map. Green = strong, red = weak.</p>
+                            <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Enable <strong>Active test</strong> to also measure <strong>throughput + latency</strong> at each point (iperf3 to a LAN server, or a WAN speed test). Samples are interpolated (IDW) into a coverage map; switch the <strong>Metric</strong> to view RSSI, SNR, throughput or latency. Green = good, red = bad.</p>
                         </div>
                         <div class="flex flex-wrap items-end gap-2">
                             <div>
@@ -2003,6 +2003,9 @@
                                 <select id="wifi-hm-metric" onchange="wifiHeatmapSetMetric(this.value)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
                                     <option value="rssi">RSSI (dBm)</option>
                                     <option value="snr">SNR (dB)</option>
+                                    <option value="throughput_down">Throughput ↓ (Mbps)</option>
+                                    <option value="throughput_up">Throughput ↑ (Mbps)</option>
+                                    <option value="latency">Latency (ms)</option>
                                 </select>
                             </div>
                             <label class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs cursor-pointer">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
@@ -2010,6 +2013,16 @@
                             <button onclick="wifiHeatmapClear()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Clear</button>
                             <span id="wifi-hm-status" class="text-[11px] text-gray-500"></span>
                         </div>
+                    </div>
+                    <!-- Active survey (throughput/latency at each point) -->
+                    <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
+                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300 cursor-pointer select-none" title="Also measure throughput + latency at each click (a few seconds per point), Ekahau-style active survey. Off = fast RSSI-only.">
+                            <input type="checkbox" id="wifi-hm-active" class="accent-Ragnar-600"> Active test on click
+                        </label>
+                        <input id="wifi-hm-iperf" placeholder="iperf3 server (LAN, optional)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[190px]" title="A LAN iperf3 server IP/host measures true up+down. Leave blank to use a WAN download speed test instead.">
+                        <label class="text-[11px] text-gray-400">for <input id="wifi-hm-tp-secs" type="number" value="5" min="2" max="30" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> s</label>
+                        <button onclick="wifiThroughputTest()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs" title="Run one throughput/latency test here without dropping a sample">Test now</button>
+                        <span id="wifi-hm-tp-status" class="text-[11px] text-gray-500"></span>
                     </div>
                     <!-- Saved surveys -->
                     <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
@@ -6305,7 +6318,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefflood"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifiactive"></script>
 
 </body>
 </html>

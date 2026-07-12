@@ -152,11 +152,19 @@ The Ekahau workflow, in miniature:
    heatmap with a **calibrated colour scale** and labelled legend
    (excellent/good/fair/weak/dead break points).
 
-**Metric toggle** — map by **RSSI (dBm)** (−90→−30) or **SNR (dB)** (5→40);
-samples lacking the chosen metric render grey and are excluded from
-interpolation. **Named surveys** — save the current floorplan + samples under a
-name, then list/load/delete them (`data/wifi_surveys.json`) to keep several
-sites or before/after comparisons.
+**Active survey (throughput + latency)** — tick **Active test on click** to also
+run an Ekahau-style performance measurement at each point: it pings the gateway
+for **latency / jitter / loss** and measures **throughput**. Give it a LAN
+**iperf3 server** (best — measures both up *and* down) or leave it blank to use a
+WAN **download speed test**. The result is stored on the sample, so the heatmap
+**Metric** toggle can map **RSSI (dBm)** (−90→−30), **SNR (dB)** (5→40),
+**Throughput ↓/↑ (Mbps)** or **Latency (ms)** (lower = greener). **Test now** runs
+a one-off measurement without dropping a sample. Samples lacking the chosen
+metric render grey and are excluded from interpolation.
+
+**Named surveys** — save the current floorplan + samples under a name, then
+list/load/delete them (`data/wifi_surveys.json`) to keep several sites or
+before/after comparisons.
 
 Live samples persist in `data/wifi_heatmap.json`; **Clear** starts a fresh
 survey.
@@ -186,7 +194,7 @@ All endpoints are passive and read-only except the heatmap store.
 | `GET /api/net/wifi/scan?interface=&band=` | passive survey + spectrum + interference + groups + change diff |
 | `GET /api/net/wifi/radius?interface=&bssid=&tx=&ple=&rssi_offset=&antenna_gain=&cable_loss=&rssi0=` | signal-radius rings (with calibration) |
 | `GET /api/net/wifi/calibrate?d1=&rssi1=&d2=&rssi2=` | two-point path-loss fit (n + ref RSSI@1m) |
-| `GET/POST /api/net/wifi/heatmap` | get / add-sample / sample-live / floorplan / clear |
+| `GET/POST /api/net/wifi/heatmap` | get / add-sample / sample-live (optional `active` throughput) / `throughput` one-off / floorplan / clear |
 | `GET/POST /api/net/wifi/surveys` | list / save / load / delete named surveys |
 | `GET/POST /api/net/wifi/history` | get AP history DB / reset it |
 | `GET /api/net/wifi/selftest` | parser + analyzer self-test |

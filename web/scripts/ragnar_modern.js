@@ -1752,18 +1752,25 @@ function _wifiDrawRadius(d) {
 const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi' };
 
 // Calibrated metric scales: [lo (red), hi (green)] and labelled break points.
+// (For latency, lo>hi so lower = greener.)
 const _WIFI_HM_METRICS = {
-    rssi: { lo: -90, hi: -30, unit: 'dBm',
+    rssi: { lo: -90, hi: -30, unit: 'dBm', field: 'rssi',
         marks: [[-30, 'excellent'], [-67, 'good'], [-72, 'fair'], [-80, 'weak'], [-90, 'dead']] },
-    snr:  { lo: 5, hi: 40, unit: 'dB',
+    snr:  { lo: 5, hi: 40, unit: 'dB', field: 'snr',
         marks: [[40, 'excellent'], [25, 'good'], [15, 'fair'], [10, 'marginal'], [5, 'unusable']] },
+    throughput_down: { lo: 0, hi: 500, unit: 'Mbps', field: 'down_mbps',
+        marks: [[500, 'excellent'], [200, 'great'], [50, 'ok'], [10, 'weak'], [1, 'poor']] },
+    throughput_up: { lo: 0, hi: 300, unit: 'Mbps', field: 'up_mbps',
+        marks: [[300, 'excellent'], [100, 'great'], [25, 'ok'], [5, 'weak'], [1, 'poor']] },
+    latency: { lo: 150, hi: 5, unit: 'ms', field: 'latency_ms',
+        marks: [[5, 'excellent'], [20, 'good'], [50, 'fair'], [100, 'poor'], [150, 'bad']] },
 };
 
 function _wifiHmValue(sp) {
-    // Selected metric value for a sample, falling back to rssi if snr missing.
-    if (_wifiHm.metric === 'snr' && sp.snr != null) return sp.snr;
-    if (_wifiHm.metric === 'snr') return null;     // no SNR on this sample
-    return sp.rssi;
+    // Selected metric value for a sample (null if this sample lacks it → grey).
+    const m = _WIFI_HM_METRICS[_wifiHm.metric] || _WIFI_HM_METRICS.rssi;
+    const v = sp[m.field];
+    return v == null ? null : v;
 }
 
 function _wifiHeatColor(val) {
@@ -1818,15 +1825,41 @@ function wifiHeatmapInit() {
         const rect = cv.getBoundingClientRect();
         const x = (e.clientX - rect.left) / rect.width;
         const y = (e.clientY - rect.top) / rect.height;
-        st.textContent = 'Reading…';
+        const active = document.getElementById('wifi-hm-active').checked;
+        const body = { action: 'sample_live', interface: _wifiState.iface, x, y, bssid };
+        if (active) {
+            body.active = true;
+            body.iperf_server = (document.getElementById('wifi-hm-iperf').value || '').trim();
+            body.seconds = parseInt(document.getElementById('wifi-hm-tp-secs').value) || 5;
+            st.textContent = 'Reading + throughput test (~' + (body.seconds * 2 + 5) + 's)…';
+        } else {
+            st.textContent = 'Reading…';
+        }
         fetch('/api/net/wifi/heatmap', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'sample_live', interface: _wifiState.iface, x, y, bssid }) })
+            body: JSON.stringify(body) })
             .then(r => r.json()).then(d => {
                 if (d.error) { st.textContent = '⚠ ' + d.error; return; }
                 st.textContent = (d.samples ? d.samples.length : 0) + ' sample(s)';
                 wifiHeatmapLoad();
             }).catch(() => { st.textContent = 'sample failed'; });
     });
+}
+
+function wifiThroughputTest() {
+    const st = document.getElementById('wifi-hm-tp-status');
+    const iperf = (document.getElementById('wifi-hm-iperf').value || '').trim();
+    const secs = parseInt(document.getElementById('wifi-hm-tp-secs').value) || 5;
+    st.textContent = 'Testing (~' + (iperf ? secs * 2 + 5 : secs + 3) + 's)…';
+    fetch('/api/net/wifi/heatmap', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'throughput', iperf_server: iperf, seconds: secs }) })
+        .then(r => r.json()).then(d => {
+            const dn = d.down_mbps != null ? d.down_mbps + '↓' : '—';
+            const up = d.up_mbps != null ? ' ' + d.up_mbps + '↑' : '';
+            const lat = d.latency_ms != null ? ` · ${d.latency_ms}ms` : '';
+            const loss = d.loss_pct ? ` · ${d.loss_pct}% loss` : '';
+            st.innerHTML = `<b>${dn}${up}</b> Mbps${lat}${loss} <span class="text-gray-600">(${d.method})</span>`
+                + (d.error ? ` <span class="text-amber-400">⚠ ${d.error}</span>` : '');
+        }).catch(() => { st.textContent = 'test failed'; });
 }
 
 function wifiHeatmapPopulateAps() {

@@ -1204,8 +1204,133 @@ def heatmap_set_floorplan(floorplan_data_uri, target_bssid=None, target_ssid=Non
     return data
 
 
+# --------------------------------------------------------------------------
+# Active throughput / latency measurement (Ekahau-style active survey leg)
+# --------------------------------------------------------------------------
+
+def _parse_ping(text):
+    """Pull avg latency (ms), jitter (mdev), and loss (%) out of `ping` output."""
+    out = {"latency_ms": None, "jitter_ms": None, "loss_pct": None}
+    m = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", text)
+    if m:
+        out["loss_pct"] = float(m.group(1))
+    # rtt min/avg/max/mdev = 1.2/3.4/5.6/0.7 ms
+    m = re.search(r"=\s*[\d.]+/([\d.]+)/[\d.]+/([\d.]+)\s*ms", text)
+    if m:
+        out["latency_ms"] = float(m.group(1))
+        out["jitter_ms"] = float(m.group(2))
+    return out
+
+
+def _ping_stats(target, count=5, timeout=10):
+    try:
+        p = subprocess.run(["ping", "-n", "-c", str(count), "-w", str(timeout), target],
+                           capture_output=True, text=True, timeout=timeout + 3)
+        return _parse_ping(p.stdout)
+    except Exception:
+        return {"latency_ms": None, "jitter_ms": None, "loss_pct": None}
+
+
+def _parse_iperf3(js):
+    """Return Mbits/s from an iperf3 --json result (sum_received preferred)."""
+    try:
+        end = js.get("end", {})
+        r = end.get("sum_received") or end.get("sum_sent") or {}
+        bps = r.get("bits_per_second")
+        return round(bps / 1e6, 2) if bps else None
+    except Exception:
+        return None
+
+
+def _iperf3(server, seconds=5, reverse=False, port=None):
+    """One iperf3 run against `server`; reverse=True measures download."""
+    args = ["iperf3", "-c", server, "-t", str(int(seconds)), "-J", "-i", "0"]
+    if reverse:
+        args.append("-R")
+    if port:
+        args += ["-p", str(int(port))]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=int(seconds) + 10)
+        js = json.loads(p.stdout or "{}")
+        if js.get("error"):
+            return {"error": js["error"]}
+        return {"mbps": _parse_iperf3(js)}
+    except Exception as exc:
+        return {"error": f"iperf3 failed: {exc}"}
+
+
+def _http_download_mbps(url, max_secs=6, max_bytes=50 * 1024 * 1024):
+    """WAN throughput fallback: stream a URL, measure bytes/sec (download only).
+    Sends a browser User-Agent — some speed-test endpoints 403 the default one."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Ragnar WiFi Analyzer)",
+            "Accept": "*/*"})
+        t0 = time.time()
+        got = 0
+        with urllib.request.urlopen(req, timeout=max_secs + 6) as resp:
+            while time.time() - t0 < max_secs and got < max_bytes:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+        dt = time.time() - t0
+        if dt <= 0 or got == 0:
+            return {"error": "no data received"}
+        return {"mbps": round(got * 8 / dt / 1e6, 2), "bytes": got, "secs": round(dt, 2)}
+    except Exception as exc:
+        return {"error": f"download failed: {exc}"}
+
+
+# A small, CDN-hosted test file used only when no iperf3 server is configured.
+_DEFAULT_SPEEDTEST_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
+
+
+def measure_throughput(iperf_server=None, url=None, seconds=5, ping_target=None):
+    """Active-survey measurement at the current spot: latency + up/down throughput.
+
+    Uses an iperf3 server when given (best — measures both directions on the LAN);
+    otherwise falls back to an HTTP download speed test (download-only, WAN)."""
+    result = {"method": None, "down_mbps": None, "up_mbps": None,
+              "latency_ms": None, "jitter_ms": None, "loss_pct": None}
+    # Latency: ping the gateway (LAN health) when no explicit target is given.
+    target = ping_target or _default_gateway() or "1.1.1.1"
+    result.update({k: v for k, v in _ping_stats(target).items()})
+    result["ping_target"] = target
+    if iperf_server:
+        result["method"] = "iperf3"
+        result["server"] = iperf_server
+        down = _iperf3(iperf_server, seconds, reverse=True)
+        up = _iperf3(iperf_server, seconds, reverse=False)
+        result["down_mbps"] = down.get("mbps")
+        result["up_mbps"] = up.get("mbps")
+        errs = [d.get("error") for d in (down, up) if d.get("error")]
+        if errs:
+            result["error"] = errs[0]
+    else:
+        result["method"] = "http"
+        dl = _http_download_mbps(url or _DEFAULT_SPEEDTEST_URL, max_secs=seconds)
+        result["down_mbps"] = dl.get("mbps")
+        result["url"] = url or _DEFAULT_SPEEDTEST_URL
+        if dl.get("error"):
+            result["error"] = dl["error"]
+    return result
+
+
+def _default_gateway():
+    try:
+        p = subprocess.run(["ip", "route", "show", "default"],
+                           capture_output=True, text=True, timeout=4)
+        m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", p.stdout)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None,
-                       snr=None, noise=None, band=None, channel=None):
+                       snr=None, noise=None, band=None, channel=None,
+                       throughput=None):
     data = _heatmap_load()
     sample = {
         "x": float(x), "y": float(y), "rssi": float(rssi),
@@ -1219,23 +1344,34 @@ def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None,
         sample["band"] = band
     if channel is not None:
         sample["channel"] = channel
+    if throughput:
+        # flatten the active-survey metrics onto the sample for the heatmap
+        for k in ("down_mbps", "up_mbps", "latency_ms", "jitter_ms", "loss_pct"):
+            if throughput.get(k) is not None:
+                sample[k] = throughput[k]
+        sample["tp_method"] = throughput.get("method")
     data["samples"].append(sample)
     _heatmap_save(data)
     return data
 
 
-def heatmap_sample_live(interface, x, y, bssid):
-    """Take a live passive reading of `bssid` and record it at (x, y)."""
+def heatmap_sample_live(interface, x, y, bssid, active=False,
+                        iperf_server=None, url=None, seconds=5):
+    """Take a live passive reading of `bssid` at (x, y). When `active`, also run
+    an Ekahau-style throughput/latency measurement and store it on the sample."""
     survey = do_scan(interface=interface, band="all")
     if "error" in survey:
         return survey
     match = next((b for b in survey["aps"] if b["bssid"] == (bssid or "").lower()), None)
     if not match:
         return {"error": "target bssid not heard in this reading", "bssid": bssid}
+    tp = None
+    if active:
+        tp = measure_throughput(iperf_server=iperf_server, url=url, seconds=seconds)
     return heatmap_add_sample(
         x, y, match["signal"], match["bssid"], match["ssid"],
         snr=match.get("snr"), noise=match.get("noise_floor") or survey.get("noise_floor"),
-        band=match.get("band"), channel=match.get("channel"))
+        band=match.get("band"), channel=match.get("channel"), throughput=tp)
 
 
 def heatmap_clear():
@@ -1634,6 +1770,39 @@ def selftest():
             except OSError:
                 pass
         _HEATMAP_FILE, _SURVEYS_FILE = _oh, _os_
+
+    # --- Active-survey parsers (Tier: active throughput) ---
+    ping_out = ("5 packets transmitted, 5 received, 0% packet loss, time 4005ms\n"
+                "rtt min/avg/max/mdev = 1.111/2.222/3.333/0.444 ms")
+    ps = _parse_ping(ping_out)
+    check("ping parse: latency/jitter/loss",
+          ps["latency_ms"] == 2.222 and ps["jitter_ms"] == 0.444 and ps["loss_pct"] == 0.0,
+          json.dumps(ps))
+    lossy = _parse_ping("10 packets transmitted, 7 received, 30% packet loss")
+    check("ping parse: loss with no rtt line", lossy["loss_pct"] == 30.0
+          and lossy["latency_ms"] is None, json.dumps(lossy))
+    iperf_json = {"end": {"sum_received": {"bits_per_second": 943000000.0}}}
+    check("iperf3 parse: Mbps from sum_received",
+          _parse_iperf3(iperf_json) == 943.0, str(_parse_iperf3(iperf_json)))
+    check("iperf3 parse: missing data => None", _parse_iperf3({}) is None)
+    # throughput fields flatten onto a heatmap sample (_HEATMAP_FILE already
+    # declared global above in this function)
+    _oh2, _HEATMAP_FILE = _HEATMAP_FILE, __import__("tempfile").mktemp(suffix=".json")
+    try:
+        d = heatmap_add_sample(0.5, 0.5, -55, "aa:bb:cc:00:00:01", "TP",
+                               throughput={"method": "iperf3", "down_mbps": 500.0,
+                                           "up_mbps": 120.0, "latency_ms": 8.0})
+        s = d["samples"][-1]
+        check("throughput flattened onto sample",
+              s.get("down_mbps") == 500.0 and s.get("up_mbps") == 120.0
+              and s.get("latency_ms") == 8.0 and s.get("tp_method") == "iperf3",
+              json.dumps(s))
+    finally:
+        try:
+            os.unlink(_HEATMAP_FILE)
+        except OSError:
+            pass
+        _HEATMAP_FILE = _oh2
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,

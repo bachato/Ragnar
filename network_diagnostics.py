@@ -13294,8 +13294,24 @@ def register_network_diagnostics(app, logger=None):
             iface = (data.get('interface') or 'wlan0').strip()
             if not _valid_iface(iface):
                 return _bad('Invalid interface')
+            try:
+                secs = max(2, min(30, int(data.get('seconds', 5))))
+            except (TypeError, ValueError):
+                secs = 5
             return jsonify(wifi_analyzer.heatmap_sample_live(
-                iface, data.get('x'), data.get('y'), data.get('bssid')))
+                iface, data.get('x'), data.get('y'), data.get('bssid'),
+                active=bool(data.get('active')),
+                iperf_server=(data.get('iperf_server') or None),
+                url=(data.get('url') or None), seconds=secs))
+        if action == 'throughput':
+            # One-off active measurement (for a "Test now" button, no sample).
+            try:
+                secs = max(2, min(30, int(data.get('seconds', 5))))
+            except (TypeError, ValueError):
+                secs = 5
+            return jsonify(wifi_analyzer.measure_throughput(
+                iperf_server=(data.get('iperf_server') or None),
+                url=(data.get('url') or None), seconds=secs))
         if action == 'sample':
             return jsonify(wifi_analyzer.heatmap_add_sample(
                 data.get('x'), data.get('y'), data.get('rssi'),
