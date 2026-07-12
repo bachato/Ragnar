@@ -1968,21 +1968,34 @@
                                 <label class="block text-[11px] text-gray-400 mb-1">Target AP</label>
                                 <select id="wifi-hm-ap" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[160px]"><option value="">Scan first…</option></select>
                             </div>
+                            <div>
+                                <label class="block text-[11px] text-gray-400 mb-1">Metric</label>
+                                <select id="wifi-hm-metric" onchange="wifiHeatmapSetMetric(this.value)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+                                    <option value="rssi">RSSI (dBm)</option>
+                                    <option value="snr">SNR (dB)</option>
+                                </select>
+                            </div>
                             <label class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs cursor-pointer">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
                             <button onclick="wifiHeatmapRender()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Redraw</button>
                             <button onclick="wifiHeatmapClear()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Clear</button>
                             <span id="wifi-hm-status" class="text-[11px] text-gray-500"></span>
                         </div>
                     </div>
+                    <!-- Saved surveys -->
+                    <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
+                        <span class="text-[11px] text-gray-400">Surveys:</span>
+                        <select id="wifi-hm-survey" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[150px]"><option value="">—</option></select>
+                        <button onclick="wifiSurveyLoad()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Load</button>
+                        <button onclick="wifiSurveyDelete()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Delete</button>
+                        <span class="text-gray-700">|</span>
+                        <input id="wifi-hm-survey-name" placeholder="name this survey…" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[150px]">
+                        <button onclick="wifiSurveySave()" class="bg-Ragnar-600 hover:bg-Ragnar-500 text-white px-2.5 py-1 rounded text-xs">Save</button>
+                        <span id="wifi-hm-survey-status" class="text-[11px] text-gray-500"></span>
+                    </div>
                     <div class="w-full overflow-x-auto mt-3">
                         <canvas id="wifi-heatmap" class="w-full rounded border border-slate-800 cursor-crosshair" style="height:380px; min-width:520px; background:#0b1220;"></canvas>
                     </div>
-                    <div class="flex items-center gap-4 mt-2 text-[11px] text-gray-400">
-                        <span>Coverage:</span>
-                        <span class="flex items-center gap-1"><span style="width:40px;height:8px;display:inline-block;border-radius:2px;background:linear-gradient(90deg,#ef4444,#f59e0b,#eab308,#84cc16,#22c55e)"></span></span>
-                        <span>weak → strong</span>
-                        <span class="ml-2">● live sample</span>
-                    </div>
+                    <div id="wifi-hm-legend" class="flex items-center flex-wrap gap-2 mt-2 text-[11px] text-gray-400"></div>
                 </div>
             </div><!-- /#net-sub-wifi -->
         </div><!-- /#network-tab -->
@@ -6256,7 +6269,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifihist"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifisurvey"></script>
 
 </body>
 </html>

@@ -173,6 +173,7 @@ data/igmp_watch.json
 data/ospf_watch.json
 data/bgp_watch.json
 data/wifi_heatmap.json
+data/wifi_surveys.json
 data/wifi_defense.json
 data/wifi_analyzer_db.json
 data/logs/temp_log.txt

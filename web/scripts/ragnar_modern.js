@@ -1678,11 +1678,26 @@ function _wifiDrawRadius(d) {
 }
 
 // ---- WiFi coverage heatmap (walk-around survey) ----------------------------
-const _wifiHm = { floorplan: null, data: null, inited: false };
+const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi' };
 
-function _wifiHeatColor(rssi) {
-    // -90 (red) .. -40 (green) along red->orange->yellow->lime->green
-    const t = Math.max(0, Math.min(1, (rssi + 90) / 50));
+// Calibrated metric scales: [lo (red), hi (green)] and labelled break points.
+const _WIFI_HM_METRICS = {
+    rssi: { lo: -90, hi: -30, unit: 'dBm',
+        marks: [[-30, 'excellent'], [-67, 'good'], [-72, 'fair'], [-80, 'weak'], [-90, 'dead']] },
+    snr:  { lo: 5, hi: 40, unit: 'dB',
+        marks: [[40, 'excellent'], [25, 'good'], [15, 'fair'], [10, 'marginal'], [5, 'unusable']] },
+};
+
+function _wifiHmValue(sp) {
+    // Selected metric value for a sample, falling back to rssi if snr missing.
+    if (_wifiHm.metric === 'snr' && sp.snr != null) return sp.snr;
+    if (_wifiHm.metric === 'snr') return null;     // no SNR on this sample
+    return sp.rssi;
+}
+
+function _wifiHeatColor(val) {
+    const m = _WIFI_HM_METRICS[_wifiHm.metric] || _WIFI_HM_METRICS.rssi;
+    const t = Math.max(0, Math.min(1, (val - m.lo) / (m.hi - m.lo)));
     const stops = [[239, 68, 68], [245, 158, 11], [234, 179, 8], [132, 204, 22], [34, 197, 94]];
     const seg = Math.min(stops.length - 2, Math.floor(t * (stops.length - 1)));
     const f = t * (stops.length - 1) - seg;
@@ -1690,9 +1705,25 @@ function _wifiHeatColor(rssi) {
     return c;
 }
 
+function wifiHeatmapSetMetric(v) {
+    _wifiHm.metric = (v === 'snr') ? 'snr' : 'rssi';
+    wifiHeatmapRender();
+}
+
+function wifiHeatmapRenderLegend() {
+    const el = document.getElementById('wifi-hm-legend'); if (!el) return;
+    const m = _WIFI_HM_METRICS[_wifiHm.metric] || _WIFI_HM_METRICS.rssi;
+    const bar = '<span style="width:56px;height:8px;display:inline-block;border-radius:2px;background:linear-gradient(90deg,#ef4444,#f59e0b,#eab308,#84cc16,#22c55e)"></span>';
+    const marks = m.marks.map(([v, l]) =>
+        `<span class="flex items-center gap-1"><span style="width:9px;height:9px;border-radius:2px;display:inline-block;background:rgb(${_wifiHeatColor(v).join(',')})"></span>${v}${m.unit === 'dBm' ? '' : ''} <span class="text-gray-600">${l}</span></span>`
+    ).join('');
+    el.innerHTML = `<span>${_wifiHm.metric.toUpperCase()} (${m.unit}):</span> ${bar} <span class="text-gray-600">${m.lo}→${m.hi}</span> ${marks} <span class="ml-1 text-gray-500">● live sample</span>`;
+}
+
 function wifiHeatmapInit() {
     if (_wifiHm.inited) return;
     _wifiHm.inited = true;
+    wifiSurveyRefresh();
     const file = document.getElementById('wifi-hm-file');
     if (file) file.addEventListener('change', (e) => {
         const f = e.target.files[0]; if (!f) return;
@@ -1765,7 +1796,9 @@ function wifiHeatmapRender() {
         const iw = im.width * s, ih = im.height * s;
         ctx.globalAlpha = 0.85; ctx.drawImage(im, (W - iw) / 2, (H - ih) / 2, iw, ih); ctx.globalAlpha = 1;
     }
-    const samples = (_wifiHm.data && _wifiHm.data.samples) || [];
+    const allSamples = (_wifiHm.data && _wifiHm.data.samples) || [];
+    // Only samples that have a value for the selected metric feed interpolation.
+    const samples = allSamples.filter(sp => _wifiHmValue(sp) != null);
     if (samples.length >= 1) {
         // IDW interpolation over a coarse grid
         const cell = 12;
@@ -1777,11 +1810,11 @@ function wifiHeatmapRender() {
                     const dx = (sp.x - px) * W, dy = (sp.y - py) * H;
                     const d2 = dx * dx + dy * dy; near = Math.min(near, d2);
                     const w = 1 / (d2 + 40);
-                    num += w * sp.rssi; den += w;
+                    num += w * _wifiHmValue(sp); den += w;
                 });
                 if (den === 0) continue;
-                const rssi = num / den;
-                const [r, g, b] = _wifiHeatColor(rssi);
+                const val = num / den;
+                const [r, g, b] = _wifiHeatColor(val);
                 // fade out far from any sample so we don't paint the whole floor
                 const a = Math.max(0.08, Math.min(0.5, 1 - Math.sqrt(near) / (Math.max(W, H) * 0.6)));
                 ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
@@ -1789,16 +1822,18 @@ function wifiHeatmapRender() {
             }
         }
     }
-    // Sample dots
-    samples.forEach(sp => {
+    // Sample dots — every sample; grey if it has no value for this metric.
+    allSamples.forEach(sp => {
         const x = sp.x * W, y = sp.y * H;
-        const [r, g, b] = _wifiHeatColor(sp.rssi);
+        const val = _wifiHmValue(sp);
+        const [r, g, b] = val == null ? [100, 116, 139] : _wifiHeatColor(val);
         ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI);
         ctx.fillStyle = `rgb(${r},${g},${b})`; ctx.fill();
         ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
         ctx.fillStyle = '#e2e8f0'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
-        ctx.fillText(Math.round(sp.rssi), x, y - 8);
+        ctx.fillText(val == null ? '—' : Math.round(val), x, y - 8);
     });
+    wifiHeatmapRenderLegend();
     if (!samples.length && !_wifiHm.floorplan) {
         ctx.fillStyle = '#475569'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText('Pick a target AP, then click on the plan where you are standing to drop RSSI samples.', W / 2, H / 2);
@@ -1808,6 +1843,58 @@ function wifiHeatmapRender() {
 function wifiHeatmapClear() {
     fetch('/api/net/wifi/heatmap', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'clear' }) }).then(() => wifiHeatmapLoad());
+}
+
+// ---- Named surveys (save / load / delete a floorplan+samples set) ----------
+function wifiSurveyRefresh(list) {
+    const done = (d) => {
+        const sel = document.getElementById('wifi-hm-survey'); if (!sel) return;
+        const cur = sel.value;
+        const surveys = (d && d.surveys) || [];
+        sel.innerHTML = surveys.length
+            ? surveys.map(s => `<option value="${s.name}">${s.name} · ${s.samples} pts${s.target_ssid ? ' · ' + s.target_ssid : ''}</option>`).join('')
+            : '<option value="">— none saved —</option>';
+        if (cur && surveys.some(s => s.name === cur)) sel.value = cur;
+    };
+    if (list) return done(list);
+    fetch('/api/net/wifi/surveys').then(r => r.json()).then(done).catch(() => {});
+}
+
+function wifiSurveySave() {
+    const name = (document.getElementById('wifi-hm-survey-name').value || '').trim();
+    const st = document.getElementById('wifi-hm-survey-status');
+    if (!name) { if (st) st.textContent = 'name it first'; return; }
+    fetch('/api/net/wifi/surveys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'save', name }) })
+        .then(r => r.json()).then(d => {
+            if (d.error) { if (st) st.textContent = '⚠ ' + d.error; return; }
+            if (st) st.textContent = 'saved “' + name + '”';
+            document.getElementById('wifi-hm-survey-name').value = '';
+            wifiSurveyRefresh(d);
+        }).catch(() => { if (st) st.textContent = 'save failed'; });
+}
+
+function wifiSurveyLoad() {
+    const name = document.getElementById('wifi-hm-survey').value;
+    const st = document.getElementById('wifi-hm-survey-status');
+    if (!name) return;
+    fetch('/api/net/wifi/surveys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'load', name }) })
+        .then(r => r.json()).then(d => {
+            if (d.error) { if (st) st.textContent = '⚠ ' + d.error; return; }
+            if (st) st.textContent = 'loaded “' + name + '”';
+            wifiHeatmapLoad();
+        }).catch(() => { if (st) st.textContent = 'load failed'; });
+}
+
+function wifiSurveyDelete() {
+    const name = document.getElementById('wifi-hm-survey').value;
+    const st = document.getElementById('wifi-hm-survey-status');
+    if (!name) return;
+    fetch('/api/net/wifi/surveys', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', name }) })
+        .then(r => r.json()).then(d => { if (st) st.textContent = 'deleted “' + name + '”'; wifiSurveyRefresh(d); })
+        .catch(() => { if (st) st.textContent = 'delete failed'; });
 }
 
 // ============================================================================

@@ -57,6 +57,9 @@ _SCAN_TIMEOUT = 20          # seconds; a passive scan of all channels is slow
 _HEATMAP_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "wifi_heatmap.json"
 )
+_SURVEYS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "wifi_surveys.json"
+)
 
 # Coverage thresholds (dBm) used for the signal-radius rings.
 _RADIUS_THRESHOLDS = [
@@ -1112,12 +1115,22 @@ def heatmap_set_floorplan(floorplan_data_uri, target_bssid=None, target_ssid=Non
     return data
 
 
-def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None):
+def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None,
+                       snr=None, noise=None, band=None, channel=None):
     data = _heatmap_load()
-    data["samples"].append({
+    sample = {
         "x": float(x), "y": float(y), "rssi": float(rssi),
         "bssid": bssid, "ssid": ssid, "t": int(time.time()),
-    })
+    }
+    if snr is not None:
+        sample["snr"] = float(snr)
+    if noise is not None:
+        sample["noise"] = float(noise)
+    if band is not None:
+        sample["band"] = band
+    if channel is not None:
+        sample["channel"] = channel
+    data["samples"].append(sample)
     _heatmap_save(data)
     return data
 
@@ -1130,7 +1143,10 @@ def heatmap_sample_live(interface, x, y, bssid):
     match = next((b for b in survey["aps"] if b["bssid"] == (bssid or "").lower()), None)
     if not match:
         return {"error": "target bssid not heard in this reading", "bssid": bssid}
-    return heatmap_add_sample(x, y, match["signal"], match["bssid"], match["ssid"])
+    return heatmap_add_sample(
+        x, y, match["signal"], match["bssid"], match["ssid"],
+        snr=match.get("snr"), noise=match.get("noise_floor") or survey.get("noise_floor"),
+        band=match.get("band"), channel=match.get("channel"))
 
 
 def heatmap_clear():
@@ -1138,6 +1154,86 @@ def heatmap_clear():
     data["samples"] = []
     _heatmap_save(data)
     return data
+
+
+# --------------------------------------------------------------------------
+# Named surveys — save / restore a completed floorplan+samples set so several
+# sites (or before/after changes) can be kept and compared.
+# --------------------------------------------------------------------------
+
+def _surveys_load():
+    try:
+        with open(_SURVEYS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _surveys_save(data):
+    os.makedirs(os.path.dirname(_SURVEYS_FILE), exist_ok=True)
+    tmp = _SURVEYS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, _SURVEYS_FILE)
+
+
+def survey_list():
+    """Return survey names with light metadata (no floorplan payload)."""
+    surveys = _surveys_load()
+    out = []
+    for name, s in surveys.items():
+        out.append({
+            "name": name,
+            "samples": len(s.get("samples", [])),
+            "target_ssid": s.get("target_ssid"),
+            "has_floorplan": bool(s.get("floorplan")),
+            "saved": s.get("saved"),
+        })
+    out.sort(key=lambda x: x.get("saved") or 0, reverse=True)
+    return {"surveys": out}
+
+
+def survey_save(name):
+    """Snapshot the current heatmap (floorplan + samples) under `name`."""
+    name = (name or "").strip()
+    if not name:
+        return {"error": "survey name required"}
+    cur = _heatmap_load()
+    if not cur.get("samples") and not cur.get("floorplan"):
+        return {"error": "nothing to save — capture a floorplan/samples first"}
+    surveys = _surveys_load()
+    surveys[name] = {
+        "floorplan": cur.get("floorplan"),
+        "target_bssid": cur.get("target_bssid"),
+        "target_ssid": cur.get("target_ssid"),
+        "samples": cur.get("samples", []),
+        "saved": int(time.time()),
+    }
+    _surveys_save(surveys)
+    return survey_list()
+
+
+def survey_load(name):
+    """Restore a saved survey into the active heatmap store."""
+    surveys = _surveys_load()
+    s = surveys.get(name)
+    if s is None:
+        return {"error": "no such survey", "name": name}
+    _heatmap_save({
+        "floorplan": s.get("floorplan"),
+        "target_bssid": s.get("target_bssid"),
+        "target_ssid": s.get("target_ssid"),
+        "samples": s.get("samples", []),
+    })
+    return _heatmap_load()
+
+
+def survey_delete(name):
+    surveys = _surveys_load()
+    if name in surveys:
+        del surveys[name]
+        _surveys_save(surveys)
+    return survey_list()
 
 
 # --------------------------------------------------------------------------
@@ -1377,6 +1473,37 @@ def selftest():
         except OSError:
             pass
         _DB_FILE = _orig_db
+
+    # --- Named surveys save/load (Tier 3) — temp files, no real state ---
+    global _HEATMAP_FILE, _SURVEYS_FILE
+    _oh, _os_ = _HEATMAP_FILE, _SURVEYS_FILE
+    import tempfile as _tf
+    _HEATMAP_FILE = _tf.mktemp(suffix=".json")
+    _SURVEYS_FILE = _tf.mktemp(suffix=".json")
+    try:
+        heatmap_add_sample(0.5, 0.5, -55, "b0:00:00:00:00:01", "SurveyNet",
+                           snr=25, noise=-90, band="5", channel=36)
+        check("survey save requires a name", "error" in survey_save(""))
+        survey_save("siteA")
+        lst = survey_list()
+        check("saved survey listed with sample count",
+              any(s["name"] == "siteA" and s["samples"] == 1 for s in lst["surveys"]),
+              json.dumps(lst))
+        heatmap_clear()
+        check("heatmap cleared before load", len(_heatmap_load()["samples"]) == 0)
+        loaded = survey_load("siteA")
+        check("survey load restores samples (with snr)",
+              len(loaded["samples"]) == 1 and loaded["samples"][0].get("snr") == 25)
+        survey_delete("siteA")
+        check("survey delete removes it",
+              not any(s["name"] == "siteA" for s in survey_list()["surveys"]))
+    finally:
+        for _f in (_HEATMAP_FILE, _SURVEYS_FILE):
+            try:
+                os.unlink(_f)
+            except OSError:
+                pass
+        _HEATMAP_FILE, _SURVEYS_FILE = _oh, _os_
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,

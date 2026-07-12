@@ -13262,6 +13262,21 @@ def register_network_diagnostics(app, logger=None):
                 data.get('bssid'), data.get('ssid')))
         return _bad('Unknown action')
 
+    @app.route('/api/net/wifi/surveys', methods=['GET', 'POST'])
+    def net_wifi_surveys():
+        if request.method == 'GET':
+            return jsonify(wifi_analyzer.survey_list())
+        data = request.get_json(silent=True) or {}
+        action = data.get('action')
+        name = data.get('name')
+        if action == 'save':
+            return jsonify(wifi_analyzer.survey_save(name))
+        if action == 'load':
+            return jsonify(wifi_analyzer.survey_load(name))
+        if action == 'delete':
+            return jsonify(wifi_analyzer.survey_delete(name))
+        return _bad('Unknown action')
+
     @app.route('/api/net/wifi/selftest', methods=['GET'])
     def net_wifi_selftest():
         _log("net/wifi/selftest")
