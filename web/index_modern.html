@@ -1906,15 +1906,32 @@
                 <div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
                     <!-- AP list -->
                     <div class="glass rounded-xl p-4 xl:col-span-2">
-                        <h4 class="font-semibold mb-3 text-sm">Access Points <span id="wifi-ap-count" class="text-gray-500 font-normal"></span></h4>
+                        <div class="flex flex-wrap items-center gap-2 mb-3">
+                            <h4 class="font-semibold text-sm">Access Points <span id="wifi-ap-count" class="text-gray-500 font-normal"></span></h4>
+                            <div class="flex rounded-lg overflow-hidden border border-slate-700 ml-1">
+                                <button id="wifi-view-aps" onclick="wifiSetApView('aps')" class="px-2.5 py-1 text-xs bg-Ragnar-600 text-white">APs</button>
+                                <button id="wifi-view-nets" onclick="wifiSetApView('nets')" class="px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-700">Networks</button>
+                            </div>
+                            <input id="wifi-ap-search" oninput="wifiRenderTable()" placeholder="filter SSID / vendor / BSSID" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs flex-1 min-w-[140px]">
+                            <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifi-ap-issues" onchange="wifiRenderTable()" class="accent-amber-500"> issues only</label>
+                            <button onclick="wifiExportCsv()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Export CSV</button>
+                        </div>
                         <div class="overflow-x-auto">
-                            <table class="w-full text-sm">
-                                <thead><tr class="text-left text-gray-400 border-b border-slate-800">
-                                    <th class="py-1 pr-2">SSID</th><th class="py-1 pr-2">Band</th><th class="py-1 pr-2">Ch</th>
-                                    <th class="py-1 pr-2">Width</th><th class="py-1 pr-2">Signal</th><th class="py-1 pr-2">Util</th><th class="py-1 pr-2">Security</th>
+                            <table class="w-full text-sm" id="wifi-ap-table">
+                                <thead><tr class="text-left text-gray-400 border-b border-slate-800 whitespace-nowrap">
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('ssid')">SSID</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('vendor')">Vendor</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('band')">Band</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('channel')">Ch</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('width')">W</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('max_phy_mbps')">Rate</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('signal')">Signal</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('security')">Security</th>
+                                    <th class="py-1 pr-2 cursor-pointer" onclick="wifiSort('channel_util')">Util</th>
                                 </tr></thead>
-                                <tbody id="wifi-ap-tbody"><tr><td colspan="7" class="py-4 text-center text-gray-500">Click <span class="text-gray-300">Scan</span> to start a passive survey.</td></tr></tbody>
+                                <tbody id="wifi-ap-tbody"><tr><td colspan="9" class="py-4 text-center text-gray-500">Click <span class="text-gray-300">Scan</span> to start a passive survey.</td></tr></tbody>
                             </table>
+                            <div id="wifi-nets-view" class="hidden space-y-2"></div>
                         </div>
                     </div>
 
@@ -6237,7 +6254,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefense"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifient"></script>
 
 </body>
 </html>
