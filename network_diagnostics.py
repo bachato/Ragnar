@@ -13231,7 +13231,8 @@ def register_network_diagnostics(app, logger=None):
         if not _valid_iface(iface):
             return _bad('Invalid interface')
         try:
-            tx = float(request.args.get('tx', wifi_analyzer._DEFAULT_TX_DBM))
+            _tx = request.args.get('tx')
+            tx = float(_tx) if _tx not in (None, '', 'auto') else None
             ple = float(request.args.get('ple', wifi_analyzer._DEFAULT_PLE))
         except (TypeError, ValueError):
             return _bad('Invalid tx/ple')

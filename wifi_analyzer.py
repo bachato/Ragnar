@@ -335,6 +335,224 @@ def _parse_width(block):
 
 
 # --------------------------------------------------------------------------
+# Per-AP enrichment  (802.11 generation, streams, vendor, security, roaming …)
+# --------------------------------------------------------------------------
+
+# Vendor OUI lookup: prefer the system IEEE/nmap databases, fall back to a small
+# curated map of common Wi-Fi AP makers. Loaded once, lazily.
+_OUI_CACHE = None
+_OUI_FALLBACK = {
+    "00:0b:86": "Aruba", "6c:f3:7f": "Aruba", "d8:c7:c8": "Aruba",
+    "00:1a:1e": "Aruba", "00:24:6c": "Aruba",
+    "00:0c:29": "VMware", "00:1b:0c": "Cisco", "00:1e:14": "Cisco",
+    "00:1e:bd": "Cisco", "58:97:bd": "Cisco", "e0:cb:bc": "Cisco",
+    "00:18:0a": "Meraki", "88:15:44": "Meraki", "e0:55:3d": "Meraki",
+    "24:a4:3c": "Ubiquiti", "78:8a:20": "Ubiquiti", "fc:ec:da": "Ubiquiti",
+    "68:d7:9a": "Ubiquiti", "b4:fb:e4": "Ubiquiti", "e0:63:da": "Ubiquiti",
+    "00:13:92": "Ruckus", "c0:c5:20": "Ruckus", "2c:c5:d3": "Ruckus",
+    "00:24:b2": "Netgear", "a0:40:a0": "Netgear", "b0:7f:b9": "Netgear",
+    "50:c7:bf": "TP-Link", "00:25:86": "TP-Link", "60:32:b1": "TP-Link",
+    "4c:5e:0c": "TP-Link", "c4:6e:1f": "TP-Link",
+    "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi", "e4:5f:01": "Raspberry Pi",
+    "24:0a:c4": "Espressif", "a4:cf:12": "Espressif", "7c:9e:bd": "Espressif",
+    "3c:71:bf": "Espressif", "84:0d:8e": "Espressif",
+    "00:03:93": "Apple", "a4:83:e7": "Apple", "f0:18:98": "Apple",
+    "00:09:5b": "Netgear", "48:8f:5a": "Mikrotik", "cc:2d:e0": "Mikrotik",
+    "dc:2c:6e": "Mikrotik", "18:fd:74": "Mikrotik", "d4:ca:6d": "Mikrotik",
+}
+_OUI_FILES = ("/usr/share/nmap/nmap-mac-prefixes",
+              "/usr/share/ieee-data/oui.txt")
+
+
+def _load_oui():
+    global _OUI_CACHE
+    if _OUI_CACHE is not None:
+        return _OUI_CACHE
+    table = {}
+    # nmap format: "AABBCC Vendor Name" (one per line).
+    try:
+        with open("/usr/share/nmap/nmap-mac-prefixes") as f:
+            for line in f:
+                if line.startswith("#") or len(line) < 8:
+                    continue
+                pfx, _, name = line.partition(" ")
+                if len(pfx) == 6:
+                    table[pfx.lower()] = name.strip()
+    except Exception:
+        pass
+    # IEEE oui.txt fallback: "AA-BB-CC   (hex)\t\tVendor".
+    if not table:
+        try:
+            with open("/usr/share/ieee-data/oui.txt") as f:
+                for line in f:
+                    m = re.match(r"^([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})"
+                                 r"\s+\(hex\)\s+(.+)$", line)
+                    if m:
+                        table[(m.group(1) + m.group(2) + m.group(3)).lower()] = m.group(4).strip()
+        except Exception:
+            pass
+    if not table:
+        table = {k.replace(":", ""): v for k, v in _OUI_FALLBACK.items()}
+    _OUI_CACHE = table
+    return table
+
+
+def _oui_lookup(bssid):
+    """Vendor for a BSSID, or 'Randomized' for a locally-administered MAC."""
+    if not bssid or len(bssid) < 8:
+        return None
+    try:
+        first = int(bssid[:2], 16)
+    except ValueError:
+        return None
+    if first & 0x02:                       # locally-administered bit
+        return "Randomized/private"
+    pfx = bssid.replace(":", "")[:6].lower()
+    return _load_oui().get(pfx) or _OUI_FALLBACK.get(bssid[:8])
+
+
+def _parse_generation(block, band):
+    """(standard label, phy_mode) from the capability IEs present."""
+    if re.search(r"\bEHT (capabilities|Operation)", block):
+        return ("Wi-Fi 7", "be")
+    if re.search(r"\bHE (capabilities|operation)", block):
+        return ("Wi-Fi 6E" if band == "6" else "Wi-Fi 6", "ax")
+    if "VHT capabilities" in block or "VHT Capabilities" in block:
+        return ("Wi-Fi 5", "ac")
+    if "HT capabilities" in block:
+        return ("Wi-Fi 4", "n")
+    return ("legacy", "abg")
+
+
+def _parse_nss(block):
+    """Best-effort spatial-stream count from MCS/NSS sets."""
+    nss = None
+    # VHT/HE print 'N streams: MCS 0-9' — the highest supported N is the NSS.
+    streams = [int(m.group(1)) for m in
+               re.finditer(r"(\d+) streams: MCS", block)]
+    if streams:
+        nss = max(streams)
+    # HT: 'HT RX MCS rate indexes supported: 0-31' -> (31+1)/8 streams.
+    mh = re.search(r"HT RX MCS rate indexes supported:\s*0-(\d+)", block)
+    if mh:
+        nss = max(nss or 0, (int(mh.group(1)) + 1) // 8)
+    return nss or None
+
+
+# Approximate top PHY rate (Mbps) per spatial stream at 20 MHz, short-GI, top MCS.
+_PHY_BASE = {"n": 72.2, "ac": 86.7, "ax": 143.4, "be": 172.1, "abg": 54.0}
+_WIDTH_MULT = {20: 1.0, 40: 2.08, 80: 4.5, 160: 9.0, 320: 18.0}
+
+
+def _estimate_max_phy(phy_mode, width, nss):
+    """Rough 'up to' PHY rate — width x streams x per-stream base. Estimate only."""
+    if not nss:
+        return None
+    base = _PHY_BASE.get(phy_mode)
+    if base is None:
+        return None
+    return int(round(base * _WIDTH_MULT.get(width, 1.0) * nss))
+
+
+def _parse_security(block, hdr):
+    """Detailed security posture: mode, AKM, PMF, enterprise, WPS."""
+    has_rsn = "RSN:" in block
+    has_wpa = "WPA:" in block
+    privacy = "Privacy" in (hdr or "")
+    akms = ""
+    m = re.search(r"Authentication suites:\s*(.+)", block)
+    if m:
+        akms = m.group(1)
+    sae = "SAE" in akms
+    owe = "OWE" in akms
+    dot1x = "802.1X" in akms or "8021X" in akms.replace(".", "").replace(" ", "")
+    ft = "FT/" in akms or "FT over" in block or "Mobility Domain" in block
+    enterprise = dot1x
+    # PMF / 802.11w
+    if re.search(r"MFP-required", block):
+        pmf = "required"
+    elif re.search(r"MFP-capable", block):
+        pmf = "capable"
+    else:
+        pmf = "disabled"
+    # Mode label
+    if owe:
+        mode = "OWE"
+    elif sae and has_rsn:
+        mode = "WPA3-Enterprise" if enterprise else "WPA3"
+    elif has_rsn:
+        mode = "WPA2-Enterprise" if enterprise else "WPA2"
+    elif has_wpa:
+        mode = "WPA"
+    elif privacy:
+        mode = "WEP"
+    else:
+        mode = "Open"
+    wps = "WPS:" in block
+    wps_ver = None
+    if wps:
+        mv = re.search(r"WPS:\s*\*\s*Version:\s*([\d.]+)", block)
+        wps_ver = mv.group(1) if mv else None
+    return {
+        "security": mode,
+        "akm": akms.strip() or None,
+        "pmf": pmf,
+        "enterprise": enterprise,
+        "wps": wps,
+        "wps_version": wps_ver,
+        "ft": ft,
+    }
+
+
+def _security_findings(bss):
+    """Weak-posture flags for one AP (list of short strings)."""
+    out = []
+    sec = bss.get("security")
+    if sec == "Open":
+        out.append("open (no encryption)")
+    elif sec == "WEP":
+        out.append("WEP (broken)")
+    elif sec == "WPA":
+        out.append("WPA/TKIP (legacy)")
+    if bss.get("wps"):
+        out.append("WPS enabled")
+    if bss.get("pmf") == "disabled" and sec not in ("Open", "WEP", None):
+        out.append("PMF off (deauth-exposed)")
+    return out
+
+
+def _parse_roaming(block):
+    """802.11k / v / r assisted-roaming support."""
+    k = "RM enabled capabilities" in block
+    v = "BSS Transition" in block
+    r = ("Mobility Domain" in block) or ("FT/" in block) or ("FT over" in block)
+    return {"k": k, "v": v, "r": r}
+
+
+def _enrich(block, hdr, bss):
+    """Attach the enterprise-grade fields to a parsed BSS dict (in place)."""
+    band = bss["band"]
+    bss["vendor"] = _oui_lookup(bss["bssid"])
+    bss["standard"], phy = _parse_generation(block, band)
+    bss["phy_mode"] = phy
+    bss["nss"] = _parse_nss(block)
+    bss["max_phy_mbps"] = _estimate_max_phy(phy, bss.get("width", 20), bss["nss"])
+    sec = _parse_security(block, hdr)
+    bss.update(sec)
+    bss["security_findings"] = _security_findings(bss)
+    bss["roaming"] = _parse_roaming(block)
+    m = re.search(r"TPC report: TX power:\s*(-?\d+)", block)
+    bss["tx_power_dbm"] = int(m.group(1)) if m else None
+    m = re.search(r"Country:\s*([A-Z]{2})", block)
+    bss["country"] = m.group(1) if m else None
+    m = re.search(r"beacon interval:\s*(\d+)", block)
+    bss["beacon_interval"] = int(m.group(1)) if m else None
+    m = re.search(r"DTIM Period\s*(\d+)", block)
+    bss["dtim"] = int(m.group(1)) if m else None
+    return bss
+
+
+# --------------------------------------------------------------------------
 # iw scan parser
 # --------------------------------------------------------------------------
 
@@ -397,24 +615,12 @@ def parse_scan(text):
         m = re.search(r"station count:\s*(\d+)", block)
         bss["stations"] = int(m.group(1)) if m else None
 
-        # Security summary
-        has_rsn = "RSN:" in block
-        has_wpa = "WPA:" in block
-        privacy = "Privacy" in (b["_hdr"] or "")
-        if re.search(r"Authentication suites:.*SAE", block):
-            sec = "WPA3"
-        elif has_rsn:
-            sec = "WPA2"
-        elif has_wpa:
-            sec = "WPA"
-        elif privacy:
-            sec = "WEP"
-        else:
-            sec = "Open"
-        bss["security"] = sec
-
         m = re.search(r"last seen:\s*(\d+)\s*ms ago", block)
         bss["last_seen_ms"] = int(m.group(1)) if m else None
+
+        # Enterprise enrichment: generation, streams, vendor, security depth,
+        # roaming (11k/v/r), tx-power, country, DTIM.
+        _enrich(block, b["_hdr"], bss)
 
         results.append(bss)
     return results
@@ -570,8 +776,16 @@ def _rssi_at_1m(freq_mhz, tx_dbm):
     return tx_dbm - fspl_1m
 
 
-def estimate_radius(bss, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
-    """Coverage rings + your current distance for one BSS (from its measured RSSI)."""
+def estimate_radius(bss, tx_dbm=None, ple=_DEFAULT_PLE):
+    """Coverage rings + your current distance for one BSS (from its measured RSSI).
+
+    Uses the AP's *advertised* TX power (TPC report IE) when it published one, so
+    the model is measured rather than assumed; falls back to `tx_dbm` / the
+    default otherwise."""
+    tx_measured = bss.get("tx_power_dbm")
+    tx_source = "measured" if tx_measured is not None else "assumed"
+    if tx_dbm is None:
+        tx_dbm = tx_measured if tx_measured is not None else _DEFAULT_TX_DBM
     freq = bss.get("center_freq") or bss.get("freq")
     rssi0 = _rssi_at_1m(freq, tx_dbm)
 
@@ -592,8 +806,8 @@ def estimate_radius(bss, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
         "band": bss.get("band"),
         "channel": bss.get("channel"),
         "signal": bss.get("signal"),
-        "assumptions": {"tx_dbm": tx_dbm, "path_loss_exponent": ple,
-                        "rssi_at_1m": round(rssi0, 1)},
+        "assumptions": {"tx_dbm": tx_dbm, "tx_source": tx_source,
+                        "path_loss_exponent": ple, "rssi_at_1m": round(rssi0, 1)},
         "current_distance_m": cur,
         "rings": rings,
     }
@@ -602,6 +816,25 @@ def estimate_radius(bss, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
 # --------------------------------------------------------------------------
 # Top-level scan orchestration
 # --------------------------------------------------------------------------
+
+def _survey_noise(interface):
+    """Return {freq_mhz: noise_dbm} from `iw survey dump` (best-effort; some
+    drivers, incl. brcmfmac, don't report a noise floor)."""
+    rc, out, _ = _run([_IW, "dev", interface, "survey", "dump"], timeout=8)
+    if rc != 0:
+        return {}
+    noise = {}
+    cur_freq = None
+    for line in out.splitlines():
+        m = re.search(r"frequency:\s*(\d+)\s*MHz", line)
+        if m:
+            cur_freq = int(m.group(1))
+            continue
+        m = re.search(r"noise:\s*(-?\d+)\s*dBm", line)
+        if m and cur_freq is not None:
+            noise[cur_freq] = int(m.group(1))
+    return noise
+
 
 def do_scan(interface="wlan0", band="all", passive=True):
     """Run a passive scan and return the full analysed survey."""
@@ -633,9 +866,17 @@ def do_scan(interface="wlan0", band="all", passive=True):
         return {"error": hint, "rc": rc,
                 "interface": interface, "supported_bands": caps["bands"]}
     bss_list = parse_scan(out)
-    # Flag radar/DFS occupancy
+    noise = _survey_noise(interface)
+    noise_floor = round(sum(noise.values()) / len(noise), 1) if noise else None
+    # Flag radar/DFS occupancy + compute SNR from the noise floor where known.
     for b in bss_list:
         b["dfs"] = b["channel"] in caps["radar_channels"].get(b["band"], set())
+        nf = noise.get(int(round(b["freq"])))
+        if nf is None and noise_floor is not None:
+            nf = noise_floor
+        b["noise"] = nf
+        b["snr"] = (round(b["signal"] - nf, 1)
+                    if (b.get("signal") is not None and nf is not None) else None)
     if band in ("2.4", "5", "6"):
         bss_list = [b for b in bss_list if b["band"] == band]
     bss_list.sort(key=lambda b: (b["band"], b["channel"], -(b["signal"] or -999)))
@@ -649,6 +890,7 @@ def do_scan(interface="wlan0", band="all", passive=True):
         "supported_bands": {b: bool(caps["bands"].get(b)) for b in ("2.4", "5", "6")},
         "radar_channels": {b: sorted(caps["radar_channels"].get(b, set()))
                            for b in ("2.4", "5", "6")},
+        "noise_floor": noise_floor,
         "ap_count": len(bss_list),
         "aps": bss_list,
         "spectrum": spectrum,
@@ -656,8 +898,9 @@ def do_scan(interface="wlan0", band="all", passive=True):
     }
 
 
-def do_radius(interface, bssid, tx_dbm=_DEFAULT_TX_DBM, ple=_DEFAULT_PLE):
-    """Passive scan then compute the signal radius for one BSSID."""
+def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE):
+    """Passive scan then compute the signal radius for one BSSID. tx_dbm=None
+    lets estimate_radius use the AP's advertised TX power when it has one."""
     if not _valid_bssid(bssid):
         return {"error": "invalid bssid"}
     survey = do_scan(interface=interface, band="all")
@@ -741,18 +984,30 @@ _SELFTEST_SCAN = r"""BSS aa:bb:cc:00:00:01(on wlan0) -- associated
 	signal: -45.00 dBm
 	SSID: HomeNet
 	last seen: 0 ms ago
+	beacon interval: 100 TUs
+	TIM: DTIM Count 0 DTIM Period 2
+	Country: SE	Environment: Indoor/Outdoor
+	TPC report: TX power: 20 dBm
 	RSN:	 * Version: 1
 		 * Authentication suites: PSK
+		 * Capabilities: 16-PTKSA-RC 1-GTKSA-RC (0x000c)
+	WPS:	 * Version: 1.0
 	BSS Load:
 		 * station count: 4
 		 * channel utilisation: 128/255
+	HT capabilities:
+		HT RX MCS rate indexes supported: 0-15
 	HT operation:
 		 * primary channel: 1
 		 * secondary channel offset: no secondary
+	RM enabled capabilities:
+	Extended capabilities:
+		 * BSS Transition
 BSS aa:bb:cc:00:00:02(on wlan0)
 	freq: 2412.0
 	signal: -70.00 dBm
 	SSID: Neighbour
+	HT capabilities:
 	HT operation:
 		 * primary channel: 1
 		 * secondary channel offset: above
@@ -762,16 +1017,32 @@ BSS aa:bb:cc:00:00:03(on wlan0)
 	SSID: HomeNet_5G
 	RSN:	 * Version: 1
 		 * Authentication suites: SAE
+		 * Capabilities: MFP-required 16-PTKSA-RC (0x00cc)
+	Mobility Domain:
+		 * MDID: 0x1234
 	HT operation:
 		 * primary channel: 52
 		 * secondary channel offset: above
+	VHT capabilities:
 	VHT operation:
 		 * channel width: 1 (80 MHz)
 		 * center freq segment 1: 58
+	VHT RX MCS set:
+		1 streams: MCS 0-9
+		2 streams: MCS 0-9
+		3 streams: MCS 0-9
+		4 streams: MCS 0-9
 BSS aa:bb:cc:00:00:04(on wlan0)
 	freq: 5955.0
 	signal: -60.00 dBm
 	SSID: HomeNet_6G
+	RSN:	 * Version: 1
+		 * Authentication suites: IEEE 802.1X
+		 * Capabilities: MFP-capable (0x0080)
+	HE capabilities:
+		HE RX MCS and NSS set <= 80 MHz
+			1 streams: MCS 0-11
+			2 streams: MCS 0-11
 	HE operation
 		 * primary channel: 1
 		 * channel width: 160
@@ -848,7 +1119,7 @@ def selftest():
           any(g["channel"] == 1 and g["count"] == 2 for g in inter["co_channel"]),
           json.dumps(inter["co_channel"]))
 
-    # Radius model
+    # Radius model — should use the AP's advertised TX power (a1 has TPC 20 dBm)
     rad = estimate_radius(a3)
     check("radius rings computed (3 thresholds)", len(rad["rings"]) == 3)
     check("closer threshold => smaller radius",
@@ -856,6 +1127,51 @@ def selftest():
           str([r["radius_m"] for r in rad["rings"]]))
     check("current distance positive", (rad["current_distance_m"] or 0) > 0,
           str(rad["current_distance_m"]))
+    rad1 = estimate_radius(a1)
+    check("radius uses measured TX power",
+          rad1["assumptions"]["tx_source"] == "measured"
+          and rad1["assumptions"]["tx_dbm"] == 20,
+          json.dumps(rad1["assumptions"]))
+
+    # --- Enterprise enrichment (Tier 1) ---
+    check("802.11 generation: Wi-Fi 4/5/6E",
+          a1.get("standard") == "Wi-Fi 4" and a3.get("standard") == "Wi-Fi 5"
+          and a4.get("standard") == "Wi-Fi 6E",
+          f"{a1.get('standard')}/{a3.get('standard')}/{a4.get('standard')}")
+    check("spatial streams (NSS) parsed",
+          a1.get("nss") == 2 and a3.get("nss") == 4 and a4.get("nss") == 2,
+          f"{a1.get('nss')}/{a3.get('nss')}/{a4.get('nss')}")
+    check("max PHY rate estimated", (a3.get("max_phy_mbps") or 0) > 1000,
+          str(a3.get("max_phy_mbps")))
+    check("security depth: WPA2 / WPA3 / WPA2-Enterprise",
+          a1.get("security") == "WPA2" and a3.get("security") == "WPA3"
+          and a4.get("security") == "WPA2-Enterprise",
+          f"{a1.get('security')}/{a3.get('security')}/{a4.get('security')}")
+    check("PMF parsed (disabled/required/capable)",
+          a1.get("pmf") == "disabled" and a3.get("pmf") == "required"
+          and a4.get("pmf") == "capable",
+          f"{a1.get('pmf')}/{a3.get('pmf')}/{a4.get('pmf')}")
+    check("enterprise (802.1X) flagged", a4.get("enterprise") is True,
+          str(a4.get("enterprise")))
+    check("WPS enabled detected", a1.get("wps") is True and not a3.get("wps"),
+          f"{a1.get('wps')}/{a3.get('wps')}")
+    check("weak-security findings (WPS + PMF-off on a1)",
+          "WPS enabled" in a1.get("security_findings", [])
+          and any("PMF off" in f for f in a1.get("security_findings", [])),
+          str(a1.get("security_findings")))
+    check("roaming 11k/v on a1, 11r on a3",
+          a1["roaming"]["k"] and a1["roaming"]["v"] and a3["roaming"]["r"],
+          f"{a1.get('roaming')} / {a3.get('roaming')}")
+    check("country + DTIM + beacon parsed",
+          a1.get("country") == "SE" and a1.get("dtim") == 2
+          and a1.get("beacon_interval") == 100,
+          f"{a1.get('country')}/{a1.get('dtim')}/{a1.get('beacon_interval')}")
+    check("locally-administered MAC => Randomized",
+          a1.get("vendor") == "Randomized/private", str(a1.get("vendor")))
+    check("OUI vendor lookup (TP-Link)",
+          _oui_lookup("00:25:86:11:22:33") in ("TP-Link", "TP-Link Technologies",
+                                               "Tp-Link Technologies Co.,Ltd."),
+          str(_oui_lookup("00:25:86:11:22:33")))
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,
