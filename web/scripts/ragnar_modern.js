@@ -1595,7 +1595,7 @@ function wifiRender() {
     if (!html) html = '<span class="text-green-400">No significant co-/adjacent-channel interference.</span>';
     ip.innerHTML = html;
     _wifiDrawSpectrum();
-    wifiHeatmapPopulateAps();
+    if (_wifiHm.mesh) wifiHeatmapPopulateSsids(); else wifiHeatmapPopulateAps();
 }
 
 function _wifiDrawSpectrum() {
@@ -1817,7 +1817,20 @@ function _wifiDrawRadius(d) {
 // ---- WiFi coverage heatmap (walk-around survey) ----------------------------
 const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi',
     mode: 'survey', tool: 'wall', walls: [], predictAp: null, predicting: false,
-    wallStart: null };
+    wallStart: null, mesh: false };
+
+// Distinct colours for mesh nodes (serving-node map + legend).
+const _WIFI_MESH_COLORS = ['#38bdf8', '#a78bfa', '#f472b6', '#34d399', '#fbbf24',
+    '#fb7185', '#22d3ee', '#c084fc', '#4ade80', '#f59e0b'];
+function _wifiMeshNodeList() {
+    const reg = (_wifiHm.data && _wifiHm.data.mesh_nodes) || {};
+    return Object.keys(reg).sort();
+}
+function _wifiMeshColor(bssid) {
+    const list = _wifiMeshNodeList();
+    const i = list.indexOf(bssid);
+    return _WIFI_MESH_COLORS[(i < 0 ? 0 : i) % _WIFI_MESH_COLORS.length];
+}
 
 // Building-material attenuation (dB), mirrors wifi_analyzer._WALL_MATERIALS.
 const _WIFI_WALL_DB = { drywall: 3, wood: 4, glass: 6, brick: 10, concrete: 15, metal: 20 };
@@ -1855,12 +1868,29 @@ function _wifiHeatColor(val) {
 }
 
 function wifiHeatmapSetMetric(v) {
-    _wifiHm.metric = _WIFI_HM_METRICS[v] ? v : 'rssi';
+    _wifiHm.metric = (_WIFI_HM_METRICS[v] || v === 'serving' || v === 'handoff') ? v : 'rssi';
     wifiHeatmapRender();
 }
 
 function wifiHeatmapRenderLegend() {
     const el = document.getElementById('wifi-hm-legend'); if (!el) return;
+    // Mesh maps have their own legends (node colours / hand-off bands).
+    if (_wifiHm.mode !== 'design' && (_wifiHm.metric === 'serving' || _wifiHm.metric === 'handoff')) {
+        if (_wifiHm.metric === 'serving') {
+            const nodes = _wifiMeshNodeList();
+            const reg = (_wifiHm.data && _wifiHm.data.mesh_nodes) || {};
+            el.innerHTML = '<span>Serving node:</span> ' + (nodes.length ? nodes.map((b, i) =>
+                `<span class="flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:${_wifiMeshColor(b)}"></span>${String.fromCharCode(65 + i)} <span class="text-gray-500 font-mono text-[10px]">${b.slice(9)}</span><span class="text-gray-600">${reg[b] ? ' ' + reg[b].band + 'G ch' + reg[b].channel : ''}</span></span>`
+            ).join('') : '<span class="text-gray-500">walk the space to map which node serves where</span>');
+        } else {
+            el.innerHTML = '<span>Hand-off overlap:</span>'
+                + '<span class="flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#22c55e"></span>good (&lt;6 dB)</span>'
+                + '<span class="flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#eab308"></span>marginal</span>'
+                + '<span class="flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#ef4444"></span>sticky (&gt;12 dB)</span>'
+                + '<span class="flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#64748b"></span>single node</span>';
+        }
+        return;
+    }
     // While predicting we always colour by modelled RSSI, so show that legend.
     const effMetric = (_wifiHm.mode === 'design' && _wifiHm.predicting) ? 'rssi' : _wifiHm.metric;
     const saved = _wifiHm.metric; _wifiHm.metric = effMetric;
@@ -1899,11 +1929,13 @@ function wifiHeatmapInit() {
         const y = (e.clientY - rect.top) / rect.height;
         if (_wifiHm.mode === 'design') { _wifiHmDesignClick(x, y); return; }
         const sel = document.getElementById('wifi-hm-ap');
-        const bssid = sel.value;
+        const val = sel.value;
         const st = document.getElementById('wifi-hm-status');
-        if (!bssid) { st.textContent = 'Pick a target AP first.'; return; }
+        if (!val) { st.textContent = _wifiHm.mesh ? 'Pick a mesh SSID first.' : 'Pick a target AP first.'; return; }
         const active = document.getElementById('wifi-hm-active').checked;
-        const body = { action: 'sample_live', interface: _wifiState.iface, x, y, bssid };
+        const body = _wifiHm.mesh
+            ? { action: 'sample_mesh', interface: _wifiState.iface, x, y, ssid: val }
+            : { action: 'sample_live', interface: _wifiState.iface, x, y, bssid: val };
         if (active) {
             body.active = true;
             body.iperf_server = (document.getElementById('wifi-hm-iperf').value || '').trim();
@@ -2009,6 +2041,76 @@ function wifiHmTogglePredict() {
     wifiHeatmapRender();
 }
 
+// ---- Mesh survey (whole-SSID, per-node coverage) ---------------------------
+function wifiHmToggleMesh() {
+    _wifiHm.mesh = document.getElementById('wifi-hm-mesh').checked;
+    document.getElementById('wifi-hm-target-label').textContent = _wifiHm.mesh ? 'Mesh SSID' : 'Target AP';
+    document.querySelectorAll('.wifi-hm-mesh-metric').forEach(o => { o.hidden = !_wifiHm.mesh; });
+    const msel = document.getElementById('wifi-hm-metric');
+    if (!_wifiHm.mesh && (msel.value === 'serving' || msel.value === 'handoff')) {
+        msel.value = 'rssi'; _wifiHm.metric = 'rssi';
+    }
+    if (_wifiHm.mesh) wifiHeatmapPopulateSsids(); else wifiHeatmapPopulateAps();
+    wifiHeatmapRender();
+}
+
+function wifiHeatmapPopulateSsids() {
+    const sel = document.getElementById('wifi-hm-ap'); if (!sel) return;
+    const cur = sel.value;
+    const nets = (_wifiState.data && _wifiState.data.groups && _wifiState.data.groups.networks) || [];
+    const named = nets.filter(n => n.ssid);
+    sel.innerHTML = named.length ? named.map(n =>
+        `<option value="${_esc(n.ssid)}">${_esc(n.ssid)} · ${n.ap_count} node${n.ap_count > 1 ? 's' : ''}${n.ap_count > 1 ? ' 🕸' : ''} · ${n.best_signal}dBm</option>`).join('')
+        : '<option value="">No networks — scan first</option>';
+    if (cur && named.some(n => n.ssid === cur)) sel.value = cur;
+}
+
+function _wifiMeshInterp(px, py, bssid, samples, W, H) {
+    let num = 0, den = 0;
+    for (const sp of samples) {
+        const v = sp.nodes && sp.nodes[bssid];
+        if (v == null) continue;
+        const dx = (sp.x - px) * W, dy = (sp.y - py) * H, d2 = dx * dx + dy * dy;
+        const w = 1 / (d2 + 40); num += w * v; den += w;
+    }
+    return den ? num / den : null;
+}
+
+function _wifiRenderMeshGrid(ctx, W, H, mode) {
+    const samples = ((_wifiHm.data && _wifiHm.data.samples) || []).filter(s => s.nodes);
+    if (!samples.length) return;
+    const nodes = _wifiMeshNodeList();
+    const cell = 12;
+    for (let gx = 0; gx < W; gx += cell) {
+        for (let gy = 0; gy < H; gy += cell) {
+            const px = (gx + cell / 2) / W, py = (gy + cell / 2) / H;
+            const est = nodes.map(b => ({ bssid: b, rssi: _wifiMeshInterp(px, py, b, samples, W, H) }))
+                .filter(n => n.rssi != null).sort((a, b) => b.rssi - a.rssi);
+            if (!est.length) continue;
+            const top1 = est[0], top2 = est[1];
+            let fill;
+            if (mode === 'serving') {
+                const [r, g, b] = _wifiHexToRgb(_wifiMeshColor(top1.bssid));
+                const a = Math.max(0.12, Math.min(0.6, (top1.rssi + 90) / 50));
+                fill = `rgba(${r},${g},${b},${a})`;
+            } else { // handoff
+                if (!top2) { fill = 'rgba(100,116,139,0.15)'; }        // single node here
+                else {
+                    const margin = top1.rssi - top2.rssi;
+                    const c = margin < 6 ? [34, 197, 94] : margin < 12 ? [234, 179, 8] : [239, 68, 68];
+                    fill = `rgba(${c[0]},${c[1]},${c[2]},0.4)`;
+                }
+            }
+            ctx.fillStyle = fill; ctx.fillRect(gx, gy, cell, cell);
+        }
+    }
+}
+
+function _wifiHexToRgb(hex) {
+    const n = parseInt(hex.slice(1), 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
 function _wifiHmPersistWalls() {
     fetch('/api/net/wifi/heatmap', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'walls', walls: _wifiHm.walls }) }).catch(() => {});
@@ -2093,9 +2195,12 @@ function wifiHeatmapRender() {
         }
         _wifiHm.metric = savedMetric;
     }
-    // --- Survey samples (survey mode only) ---
+    // --- Mesh serving-node / hand-off map (survey mode, mesh metrics) ---
+    const meshMode = !design && (_wifiHm.metric === 'serving' || _wifiHm.metric === 'handoff');
+    if (meshMode) _wifiRenderMeshGrid(ctx, W, H, _wifiHm.metric);
+    // --- Survey samples (survey mode only; skip IDW when showing a mesh map) ---
     const allSamples = (!design && _wifiHm.data && _wifiHm.data.samples) || [];
-    const samples = allSamples.filter(sp => _wifiHmValue(sp) != null);
+    const samples = (meshMode ? [] : allSamples).filter(sp => _wifiHmValue(sp) != null);
     if (samples.length >= 1) {
         const cell = 12;
         for (let gx = 0; gx < W; gx += cell) {
@@ -2118,9 +2223,18 @@ function wifiHeatmapRender() {
     }
     allSamples.forEach(sp => {
         const x = sp.x * W, y = sp.y * H;
+        ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI);
+        if (meshMode) {
+            // Dot coloured by the node serving that spot; label = node index.
+            ctx.fillStyle = sp.serving ? _wifiMeshColor(sp.serving) : '#64748b';
+            ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+            const idx = _wifiMeshNodeList().indexOf(sp.serving);
+            ctx.fillStyle = '#e2e8f0'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText(idx >= 0 ? String.fromCharCode(65 + idx) : '?', x, y - 8);
+            return;
+        }
         const val = _wifiHmValue(sp);
         const [r, g, b] = val == null ? [100, 116, 139] : _wifiHeatColor(val);
-        ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI);
         ctx.fillStyle = `rgb(${r},${g},${b})`; ctx.fill();
         ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
         ctx.fillStyle = '#e2e8f0'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
@@ -2129,9 +2243,10 @@ function wifiHeatmapRender() {
     // --- Design overlays: walls + modelled AP ---
     if (design) _wifiHmDrawDesign(ctx, W, H);
     wifiHeatmapRenderLegend();
-    if (!samples.length && !_wifiHm.floorplan && !design) {
+    if (!allSamples.length && !_wifiHm.floorplan && !design) {
         ctx.fillStyle = '#475569'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
-        ctx.fillText('Pick a target AP, then click on the plan where you are standing to drop RSSI samples.', W / 2, H / 2);
+        ctx.fillText(_wifiHm.mesh ? 'Pick a mesh SSID, then click where you are standing to map every node.'
+            : 'Pick a target AP, then click on the plan where you are standing to drop RSSI samples.', W / 2, H / 2);
     }
 }
 

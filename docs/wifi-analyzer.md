@@ -168,6 +168,21 @@ before/after comparisons. **📄 Report** opens a printable one-page survey repo
 (heatmap image, coverage stats, band/channel plan, interference, security issues
 and the full AP inventory) — print or "Save as PDF" from the browser dialog.
 
+### Mesh survey (whole-SSID, per-node coverage)
+
+Tick **Mesh** to survey an entire mesh / ESS instead of one AP. Pick the **SSID**
+and each click records the RSSI of **every node (BSSID)** of that network at that
+spot, tagging the **serving** (strongest) node — what a client there would
+associate with. Two mesh-only metrics then light up:
+
+- **Serving node** — colours each area by *which* node owns it (Node A / B / C…),
+  so you can see each node's real coverage footprint and where a client hands off.
+- **Hand-off zones** — colours by the margin between the two strongest nodes:
+  **green** = good overlap (&lt;6 dB, clean roaming), **amber** = marginal,
+  **red** = "sticky"/no overlap (&gt;12 dB — a client may cling to a far node),
+  grey = only one node heard. The node registry + per-point node vectors persist
+  with the survey.
+
 ### Design / predictive coverage
 
 Switch the heatmap to **Design / Predict** mode to *plan* coverage instead of

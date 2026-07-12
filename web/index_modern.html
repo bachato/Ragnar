@@ -1995,9 +1995,12 @@
                         </div>
                         <div class="flex flex-wrap items-end gap-2">
                             <div>
-                                <label class="block text-[11px] text-gray-400 mb-1">Target AP</label>
+                                <label class="block text-[11px] text-gray-400 mb-1" id="wifi-hm-target-label">Target AP</label>
                                 <select id="wifi-hm-ap" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[160px]"><option value="">Scan first…</option></select>
                             </div>
+                            <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer self-end pb-1" title="Survey the whole mesh/ESS — record every node (BSSID) of the SSID at each point, and map serving-node coverage + hand-off zones.">
+                                <input type="checkbox" id="wifi-hm-mesh" onchange="wifiHmToggleMesh()" class="accent-Ragnar-600"> Mesh
+                            </label>
                             <div>
                                 <label class="block text-[11px] text-gray-400 mb-1">Metric</label>
                                 <select id="wifi-hm-metric" onchange="wifiHeatmapSetMetric(this.value)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
@@ -2006,6 +2009,8 @@
                                     <option value="throughput_down">Throughput ↓ (Mbps)</option>
                                     <option value="throughput_up">Throughput ↑ (Mbps)</option>
                                     <option value="latency">Latency (ms)</option>
+                                    <option value="serving" class="wifi-hm-mesh-metric" hidden>Serving node</option>
+                                    <option value="handoff" class="wifi-hm-mesh-metric" hidden>Hand-off zones</option>
                                 </select>
                             </div>
                             <label class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs cursor-pointer">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
@@ -6369,7 +6374,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifiiperfbox"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifimesh"></script>
 
 </body>
 </html>

@@ -1183,6 +1183,8 @@ def _heatmap_load():
     # Predictive-design layer (walls + a modelled AP) lives alongside the survey.
     data.setdefault("walls", [])
     data.setdefault("predict_ap", None)
+    # Mesh survey: registry of the nodes (BSSIDs) seen for the surveyed SSID.
+    data.setdefault("mesh_nodes", {})
     return data
 
 
@@ -1459,9 +1461,58 @@ def heatmap_sample_live(interface, x, y, bssid, active=False,
         band=match.get("band"), channel=match.get("channel"), throughput=tp)
 
 
+def _mesh_nodes_from_scan(aps, ssid):
+    """Every BSSID advertising `ssid` (an ESS / mesh), with the strongest as the
+    'serving' node — what a client at this spot would associate with. Pure."""
+    ssid = (ssid or "")
+    nodes = [{"bssid": a["bssid"], "rssi": a.get("signal"),
+              "snr": a.get("snr"), "band": a.get("band"), "channel": a.get("channel")}
+             for a in aps if (a.get("ssid") or "") == ssid and a.get("signal") is not None]
+    nodes.sort(key=lambda n: -(n["rssi"] if n["rssi"] is not None else -999))
+    serving = nodes[0] if nodes else None
+    return nodes, serving
+
+
+def heatmap_sample_mesh_live(interface, x, y, ssid, active=False,
+                             iperf_server=None, url=None, seconds=5):
+    """Mesh survey: record the RSSI of EVERY node (BSSID) of `ssid` at (x, y),
+    tag the serving (strongest) node, and register the nodes so the UI can map
+    serving-node coverage and hand-off zones. Optional active throughput too."""
+    survey = do_scan(interface=interface, band="all")
+    if "error" in survey:
+        return survey
+    nodes, serving = _mesh_nodes_from_scan(survey["aps"], ssid)
+    if not serving:
+        return {"error": "no node of that SSID heard here", "ssid": ssid}
+    tp = None
+    if active:
+        tp = measure_throughput(iperf_server=iperf_server, url=url, seconds=seconds)
+    data = _heatmap_load()
+    sample = {
+        "x": float(x), "y": float(y), "t": int(time.time()),
+        "ssid": ssid, "rssi": serving["rssi"],           # best-of-nodes = coverage
+        "serving": serving["bssid"], "snr": serving.get("snr"),
+        "band": serving.get("band"), "channel": serving.get("channel"),
+        "nodes": {n["bssid"]: n["rssi"] for n in nodes},
+    }
+    if tp:
+        for k in ("down_mbps", "up_mbps", "latency_ms", "jitter_ms", "loss_pct"):
+            if tp.get(k) is not None:
+                sample[k] = tp[k]
+        sample["tp_method"] = tp.get("method")
+    data["samples"].append(sample)
+    # Register/refresh node metadata (band/channel) for stable colours + labels.
+    reg = data.setdefault("mesh_nodes", {})
+    for n in nodes:
+        reg[n["bssid"]] = {"band": n["band"], "channel": n["channel"], "ssid": ssid}
+    _heatmap_save(data)
+    return data
+
+
 def heatmap_clear():
     data = _heatmap_load()
     data["samples"] = []
+    data["mesh_nodes"] = {}
     _heatmap_save(data)
     return data
 
@@ -1907,6 +1958,20 @@ def selftest():
     r_sidewall = predict_point_rssi(0.6, 0.5, ap_pred, [wall])  # point before the wall
     check("a wall not crossed has no effect",
           abs(r_sidewall - predict_point_rssi(0.6, 0.5, ap_pred, [])) < 0.01)
+
+    # --- Mesh survey node selection (serving node = strongest of the ESS) ---
+    mesh_aps = [
+        {"bssid": "aa:00:00:00:00:01", "ssid": "MeshNet", "signal": -70, "band": "2.4", "channel": 6, "snr": 20},
+        {"bssid": "aa:00:00:00:00:02", "ssid": "MeshNet", "signal": -52, "band": "5", "channel": 36, "snr": 40},
+        {"bssid": "bb:00:00:00:00:03", "ssid": "OtherNet", "signal": -40, "band": "5", "channel": 44, "snr": 45},
+    ]
+    m_nodes, m_serving = _mesh_nodes_from_scan(mesh_aps, "MeshNet")
+    check("mesh: only same-SSID nodes included", len(m_nodes) == 2, str(len(m_nodes)))
+    check("mesh: serving node is the strongest",
+          m_serving["bssid"] == "aa:00:00:00:00:02" and m_serving["rssi"] == -52,
+          json.dumps(m_serving))
+    check("mesh: no node => no serving",
+          _mesh_nodes_from_scan(mesh_aps, "Nonexistent")[1] is None)
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,
