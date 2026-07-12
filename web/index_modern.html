@@ -2024,6 +2024,30 @@
                         <button onclick="wifiThroughputTest()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs" title="Run one throughput/latency test here without dropping a sample">Test now</button>
                         <span id="wifi-hm-tp-status" class="text-[11px] text-gray-500"></span>
                     </div>
+                    <!-- Design / predictive coverage -->
+                    <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
+                        <span class="text-[11px] text-gray-400">Mode:</span>
+                        <button id="wifi-hm-mode-survey" onclick="wifiHmSetMode('survey')" class="bg-Ragnar-600 text-white px-2.5 py-1 rounded text-xs">Survey</button>
+                        <button id="wifi-hm-mode-design" onclick="wifiHmSetMode('design')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs">Design / Predict</button>
+                        <span id="wifi-hm-design-tools" class="hidden flex flex-wrap items-center gap-2">
+                            <span class="text-gray-700">|</span>
+                            <button id="wifi-hm-tool-wall" onclick="wifiHmSetTool('wall')" class="bg-Ragnar-600 text-white px-2.5 py-1 rounded text-xs">✏ Draw wall</button>
+                            <select id="wifi-hm-wall-mat" class="bg-slate-800 border border-slate-700 rounded px-1 py-1 text-xs" title="Wall material — sets its dB attenuation">
+                                <option value="drywall">Drywall (3 dB)</option>
+                                <option value="wood">Wood (4 dB)</option>
+                                <option value="glass">Glass (6 dB)</option>
+                                <option value="brick" selected>Brick (10 dB)</option>
+                                <option value="concrete">Concrete (15 dB)</option>
+                                <option value="metal">Metal (20 dB)</option>
+                            </select>
+                            <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to place the modelled AP">📶 Place AP</button>
+                            <label class="text-[11px] text-gray-400" title="Real width of the floorplan, so predicted distances are in metres">Floor width <input id="wifi-hm-scale" type="number" value="10" min="1" max="500" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
+                            <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-600"> Predict coverage</label>
+                            <button onclick="wifiHmUndoWall()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo</button>
+                            <button onclick="wifiHmClearWalls()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear walls</button>
+                            <span id="wifi-hm-design-status" class="text-[11px] text-gray-500"></span>
+                        </span>
+                    </div>
                     <!-- Saved surveys -->
                     <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
                         <span class="text-[11px] text-gray-400">Surveys:</span>
@@ -6318,7 +6342,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifiactive"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifipredict"></script>
 
 </body>
 </html>

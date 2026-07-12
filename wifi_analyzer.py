@@ -1176,10 +1176,14 @@ def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
 def _heatmap_load():
     try:
         with open(_HEATMAP_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
-        return {"floorplan": None, "target_bssid": None, "target_ssid": None,
+        data = {"floorplan": None, "target_bssid": None, "target_ssid": None,
                 "samples": []}
+    # Predictive-design layer (walls + a modelled AP) lives alongside the survey.
+    data.setdefault("walls", [])
+    data.setdefault("predict_ap", None)
+    return data
 
 
 def _heatmap_save(data):
@@ -1202,6 +1206,87 @@ def heatmap_set_floorplan(floorplan_data_uri, target_bssid=None, target_ssid=Non
     data["samples"] = []  # new floorplan => reset survey
     _heatmap_save(data)
     return data
+
+
+# Common building-material attenuation at 5 GHz (dB per wall). Rough industry
+# figures; users pick the material when drawing a wall.
+_WALL_MATERIALS = {
+    "drywall": 3, "wood": 4, "glass": 6, "brick": 10,
+    "concrete": 15, "metal": 20,
+}
+
+
+def heatmap_set_walls(walls):
+    """Persist the drawn walls (list of {x1,y1,x2,y2 in 0..1, loss_db})."""
+    data = _heatmap_load()
+    clean = []
+    for w in walls or []:
+        try:
+            clean.append({
+                "x1": float(w["x1"]), "y1": float(w["y1"]),
+                "x2": float(w["x2"]), "y2": float(w["y2"]),
+                "loss_db": float(w.get("loss_db", 5)),
+                "material": w.get("material") or "wall",
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    data["walls"] = clean
+    _heatmap_save(data)
+    return data
+
+
+def heatmap_set_predict_ap(ap):
+    """Persist the modelled AP for predictive coverage (or None to clear).
+    `width_m`/`height_m` give the floorplan's real size so normalized distances
+    become metres for the path-loss model."""
+    data = _heatmap_load()
+    if ap is None:
+        data["predict_ap"] = None
+    else:
+        try:
+            data["predict_ap"] = {
+                "x": float(ap["x"]), "y": float(ap["y"]),
+                "tx_dbm": float(ap.get("tx_dbm", _DEFAULT_TX_DBM)),
+                "freq": float(ap.get("freq", 5200)),
+                "ple": float(ap.get("ple", _DEFAULT_PLE)),
+                "width_m": float(ap.get("width_m", 10.0)),
+                "height_m": float(ap.get("height_m", 10.0)),
+            }
+        except (KeyError, TypeError, ValueError):
+            return {"error": "invalid predict AP"}
+    _heatmap_save(data)
+    return data
+
+
+# --- Predictive-coverage geometry (mirrored client-side in ragnar_modern.js) ---
+
+def _ccw(ax, ay, bx, by, cx, cy):
+    return (cy - ay) * (bx - ax) > (by - ay) * (cx - ax)
+
+
+def _segments_cross(a, b, c, d):
+    """True if segment a-b intersects segment c-d (a=(x,y), …)."""
+    return (_ccw(*a, *c, *d) != _ccw(*b, *c, *d)
+            and _ccw(*a, *b, *c) != _ccw(*a, *b, *d))
+
+
+def predict_point_rssi(px, py, ap, walls):
+    """Predicted RSSI (dBm) at normalized point (px,py) from a modelled AP,
+    using log-distance path loss plus the summed loss of every wall the straight
+    AP→point line crosses. Pure + unit-tested; the JS renderer mirrors it."""
+    width_m = ap.get("width_m", 10.0)
+    height_m = ap.get("height_m", 10.0)
+    rssi0 = _rssi_at_1m(ap.get("freq", 5200), ap.get("tx_dbm", _DEFAULT_TX_DBM))
+    ple = ap.get("ple", _DEFAULT_PLE)
+    dx = (px - ap["x"]) * width_m
+    dy = (py - ap["y"]) * height_m
+    d = max(0.5, math.hypot(dx, dy))
+    rssi = rssi0 - 10 * ple * math.log10(d)
+    a, b = (ap["x"], ap["y"]), (px, py)
+    for w in walls or []:
+        if _segments_cross(a, b, (w["x1"], w["y1"]), (w["x2"], w["y2"])):
+            rssi -= w.get("loss_db", 5)
+    return round(rssi, 1)
 
 
 # --------------------------------------------------------------------------
@@ -1803,6 +1888,25 @@ def selftest():
         except OSError:
             pass
         _HEATMAP_FILE = _oh2
+
+    # --- Predictive coverage geometry (Tier: design/planning) ---
+    check("segments cross detected",
+          _segments_cross((0, 0), (1, 1), (0, 1), (1, 0)) is True)
+    check("parallel segments do not cross",
+          _segments_cross((0, 0), (1, 0), (0, 1), (1, 1)) is False)
+    ap_pred = {"x": 0.5, "y": 0.5, "tx_dbm": 20, "freq": 5200, "ple": 3.0,
+               "width_m": 20.0, "height_m": 20.0}
+    r_near = predict_point_rssi(0.55, 0.5, ap_pred, [])
+    r_far = predict_point_rssi(0.95, 0.5, ap_pred, [])
+    check("predicted RSSI weakens with distance", r_far < r_near, f"{r_near} vs {r_far}")
+    wall = {"x1": 0.7, "y1": 0.0, "x2": 0.7, "y2": 1.0, "loss_db": 15}
+    r_nowall = predict_point_rssi(0.95, 0.5, ap_pred, [])
+    r_wall = predict_point_rssi(0.95, 0.5, ap_pred, [wall])
+    check("a crossed wall subtracts its loss (15 dB)",
+          abs((r_nowall - r_wall) - 15) < 0.01, f"{r_nowall} - {r_wall}")
+    r_sidewall = predict_point_rssi(0.6, 0.5, ap_pred, [wall])  # point before the wall
+    check("a wall not crossed has no effect",
+          abs(r_sidewall - predict_point_rssi(0.6, 0.5, ap_pred, [])) < 0.01)
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,

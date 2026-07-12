@@ -1749,7 +1749,12 @@ function _wifiDrawRadius(d) {
 }
 
 // ---- WiFi coverage heatmap (walk-around survey) ----------------------------
-const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi' };
+const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi',
+    mode: 'survey', tool: 'wall', walls: [], predictAp: null, predicting: false,
+    wallStart: null };
+
+// Building-material attenuation (dB), mirrors wifi_analyzer._WALL_MATERIALS.
+const _WIFI_WALL_DB = { drywall: 3, wood: 4, glass: 6, brick: 10, concrete: 15, metal: 20 };
 
 // Calibrated metric scales: [lo (red), hi (green)] and labelled break points.
 // (For latency, lo>hi so lower = greener.)
@@ -1784,18 +1789,23 @@ function _wifiHeatColor(val) {
 }
 
 function wifiHeatmapSetMetric(v) {
-    _wifiHm.metric = (v === 'snr') ? 'snr' : 'rssi';
+    _wifiHm.metric = _WIFI_HM_METRICS[v] ? v : 'rssi';
     wifiHeatmapRender();
 }
 
 function wifiHeatmapRenderLegend() {
     const el = document.getElementById('wifi-hm-legend'); if (!el) return;
-    const m = _WIFI_HM_METRICS[_wifiHm.metric] || _WIFI_HM_METRICS.rssi;
+    // While predicting we always colour by modelled RSSI, so show that legend.
+    const effMetric = (_wifiHm.mode === 'design' && _wifiHm.predicting) ? 'rssi' : _wifiHm.metric;
+    const saved = _wifiHm.metric; _wifiHm.metric = effMetric;
+    const m = _WIFI_HM_METRICS[effMetric] || _WIFI_HM_METRICS.rssi;
     const bar = '<span style="width:56px;height:8px;display:inline-block;border-radius:2px;background:linear-gradient(90deg,#ef4444,#f59e0b,#eab308,#84cc16,#22c55e)"></span>';
     const marks = m.marks.map(([v, l]) =>
-        `<span class="flex items-center gap-1"><span style="width:9px;height:9px;border-radius:2px;display:inline-block;background:rgb(${_wifiHeatColor(v).join(',')})"></span>${v}${m.unit === 'dBm' ? '' : ''} <span class="text-gray-600">${l}</span></span>`
+        `<span class="flex items-center gap-1"><span style="width:9px;height:9px;border-radius:2px;display:inline-block;background:rgb(${_wifiHeatColor(v).join(',')})"></span>${v} <span class="text-gray-600">${l}</span></span>`
     ).join('');
-    el.innerHTML = `<span>${_wifiHm.metric.toUpperCase()} (${m.unit}):</span> ${bar} <span class="text-gray-600">${m.lo}→${m.hi}</span> ${marks} <span class="ml-1 text-gray-500">● live sample</span>`;
+    const tag = effMetric === 'rssi' && _wifiHm.mode === 'design' ? 'Predicted RSSI' : effMetric.toUpperCase();
+    el.innerHTML = `<span>${tag} (${m.unit}):</span> ${bar} <span class="text-gray-600">${m.lo}→${m.hi}</span> ${marks} <span class="ml-1 text-gray-500">● live sample</span>`;
+    _wifiHm.metric = saved;
 }
 
 function wifiHeatmapInit() {
@@ -1818,13 +1828,14 @@ function wifiHeatmapInit() {
     });
     const cv = document.getElementById('wifi-heatmap');
     if (cv) cv.addEventListener('click', (e) => {
+        const rect = cv.getBoundingClientRect();
+        const x = (e.clientX - rect.left) / rect.width;
+        const y = (e.clientY - rect.top) / rect.height;
+        if (_wifiHm.mode === 'design') { _wifiHmDesignClick(x, y); return; }
         const sel = document.getElementById('wifi-hm-ap');
         const bssid = sel.value;
         const st = document.getElementById('wifi-hm-status');
         if (!bssid) { st.textContent = 'Pick a target AP first.'; return; }
-        const rect = cv.getBoundingClientRect();
-        const x = (e.clientX - rect.left) / rect.width;
-        const y = (e.clientY - rect.top) / rect.height;
         const active = document.getElementById('wifi-hm-active').checked;
         const body = { action: 'sample_live', interface: _wifiState.iface, x, y, bssid };
         if (active) {
@@ -1862,6 +1873,105 @@ function wifiThroughputTest() {
         }).catch(() => { st.textContent = 'test failed'; });
 }
 
+// ---- Design / predictive coverage ------------------------------------------
+function wifiHmSetMode(m) {
+    _wifiHm.mode = m;
+    const survey = m === 'survey';
+    document.getElementById('wifi-hm-mode-survey').className =
+        'px-2.5 py-1 rounded text-xs ' + (survey ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300');
+    document.getElementById('wifi-hm-mode-design').className =
+        'px-2.5 py-1 rounded text-xs ' + (!survey ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300');
+    document.getElementById('wifi-hm-design-tools').classList.toggle('hidden', survey);
+    _wifiHm.wallStart = null;
+    wifiHeatmapRender();
+}
+
+function wifiHmSetTool(t) {
+    _wifiHm.tool = t;
+    _wifiHm.wallStart = null;
+    document.getElementById('wifi-hm-tool-wall').className =
+        'px-2.5 py-1 rounded text-xs ' + (t === 'wall' ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300');
+    document.getElementById('wifi-hm-tool-ap').className =
+        'px-2.5 py-1 rounded text-xs ' + (t === 'ap' ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300');
+    const st = document.getElementById('wifi-hm-design-status');
+    if (st) st.textContent = t === 'wall' ? 'Click two points to draw a wall.' : 'Click to place the AP.';
+}
+
+function _wifiHmDesignClick(x, y) {
+    const st = document.getElementById('wifi-hm-design-status');
+    if (_wifiHm.tool === 'ap') {
+        const w_m = parseFloat(document.getElementById('wifi-hm-scale').value) || 10;
+        // Height in metres from the floorplan aspect (square if no image).
+        const fp = _wifiHm.floorplan;
+        const h_m = fp ? w_m * (fp.height / fp.width) : w_m;
+        _wifiHm.predictAp = { x, y, tx_dbm: 20, freq: 5200, ple: 3.0, width_m: w_m, height_m: h_m };
+        _wifiHmPersistAp();
+        if (st) st.textContent = 'AP placed. Tick “Predict coverage”.';
+        wifiHeatmapRender();
+        return;
+    }
+    // Wall tool: first click = start, second = end.
+    if (!_wifiHm.wallStart) {
+        _wifiHm.wallStart = { x, y };
+        if (st) st.textContent = 'Click the wall’s end point…';
+        wifiHeatmapRender();
+    } else {
+        const mat = document.getElementById('wifi-hm-wall-mat').value;
+        _wifiHm.walls.push({ x1: _wifiHm.wallStart.x, y1: _wifiHm.wallStart.y, x2: x, y2: y,
+            loss_db: _WIFI_WALL_DB[mat] || 5, material: mat });
+        _wifiHm.wallStart = null;
+        _wifiHmPersistWalls();
+        if (st) st.textContent = `${_wifiHm.walls.length} wall(s).`;
+        wifiHeatmapRender();
+    }
+}
+
+function wifiHmUndoWall() {
+    _wifiHm.walls.pop(); _wifiHm.wallStart = null;
+    _wifiHmPersistWalls(); wifiHeatmapRender();
+}
+
+function wifiHmClearWalls() {
+    _wifiHm.walls = []; _wifiHm.wallStart = null;
+    _wifiHmPersistWalls(); wifiHeatmapRender();
+}
+
+function wifiHmTogglePredict() {
+    _wifiHm.predicting = document.getElementById('wifi-hm-predict').checked;
+    const st = document.getElementById('wifi-hm-design-status');
+    if (_wifiHm.predicting && !_wifiHm.predictAp && st) st.textContent = 'Place an AP first (Place AP → click plan).';
+    wifiHeatmapRender();
+}
+
+function _wifiHmPersistWalls() {
+    fetch('/api/net/wifi/heatmap', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'walls', walls: _wifiHm.walls }) }).catch(() => {});
+}
+function _wifiHmPersistAp() {
+    fetch('/api/net/wifi/heatmap', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'predict_ap', ap: _wifiHm.predictAp }) }).catch(() => {});
+}
+
+// Segment intersection + predicted RSSI — mirror of wifi_analyzer.py.
+function _wifiSegCross(a, b, c, d) {
+    const ccw = (px, py, qx, qy, rx, ry) => (ry - py) * (qx - px) > (qy - py) * (rx - px);
+    return ccw(a.x, a.y, c.x, c.y, d.x, d.y) !== ccw(b.x, b.y, c.x, c.y, d.x, d.y)
+        && ccw(a.x, a.y, b.x, b.y, c.x, c.y) !== ccw(a.x, a.y, b.x, b.y, d.x, d.y);
+}
+function _wifiPredictRssi(px, py) {
+    const ap = _wifiHm.predictAp; if (!ap) return null;
+    const fspl1m = 20 * Math.log10(ap.freq) - 27.55;
+    const rssi0 = ap.tx_dbm - fspl1m;
+    const dx = (px - ap.x) * ap.width_m, dy = (py - ap.y) * ap.height_m;
+    const dist = Math.max(0.5, Math.hypot(dx, dy));
+    let rssi = rssi0 - 10 * ap.ple * Math.log10(dist);
+    const a = { x: ap.x, y: ap.y }, b = { x: px, y: py };
+    for (const w of _wifiHm.walls) {
+        if (_wifiSegCross(a, b, { x: w.x1, y: w.y1 }, { x: w.x2, y: w.y2 })) rssi -= (w.loss_db || 5);
+    }
+    return rssi;
+}
+
 function wifiHeatmapPopulateAps() {
     const sel = document.getElementById('wifi-hm-ap'); if (!sel) return;
     const cur = sel.value;
@@ -1876,6 +1986,8 @@ function wifiHeatmapPopulateAps() {
 function wifiHeatmapLoad() {
     fetch('/api/net/wifi/heatmap').then(r => r.json()).then(d => {
         _wifiHm.data = d;
+        _wifiHm.walls = d.walls || [];
+        _wifiHm.predictAp = d.predict_ap || null;
         const st = document.getElementById('wifi-hm-status');
         if (st && d.samples) st.textContent = d.samples.length + ' sample(s)';
         if (d.floorplan) {
@@ -1900,11 +2012,25 @@ function wifiHeatmapRender() {
         const iw = im.width * s, ih = im.height * s;
         ctx.globalAlpha = 0.85; ctx.drawImage(im, (W - iw) / 2, (H - ih) / 2, iw, ih); ctx.globalAlpha = 1;
     }
-    const allSamples = (_wifiHm.data && _wifiHm.data.samples) || [];
-    // Only samples that have a value for the selected metric feed interpolation.
+    const design = _wifiHm.mode === 'design';
+    // --- Predicted coverage grid (design mode) — modelled RSSI everywhere ---
+    if (design && _wifiHm.predicting && _wifiHm.predictAp) {
+        const savedMetric = _wifiHm.metric; _wifiHm.metric = 'rssi';
+        const cell = 10;
+        for (let gx = 0; gx < W; gx += cell) {
+            for (let gy = 0; gy < H; gy += cell) {
+                const val = _wifiPredictRssi((gx + cell / 2) / W, (gy + cell / 2) / H);
+                const [r, g, b] = _wifiHeatColor(val);
+                ctx.fillStyle = `rgba(${r},${g},${b},0.45)`;
+                ctx.fillRect(gx, gy, cell, cell);
+            }
+        }
+        _wifiHm.metric = savedMetric;
+    }
+    // --- Survey samples (survey mode only) ---
+    const allSamples = (!design && _wifiHm.data && _wifiHm.data.samples) || [];
     const samples = allSamples.filter(sp => _wifiHmValue(sp) != null);
     if (samples.length >= 1) {
-        // IDW interpolation over a coarse grid
         const cell = 12;
         for (let gx = 0; gx < W; gx += cell) {
             for (let gy = 0; gy < H; gy += cell) {
@@ -1917,16 +2043,13 @@ function wifiHeatmapRender() {
                     num += w * _wifiHmValue(sp); den += w;
                 });
                 if (den === 0) continue;
-                const val = num / den;
-                const [r, g, b] = _wifiHeatColor(val);
-                // fade out far from any sample so we don't paint the whole floor
+                const [r, g, b] = _wifiHeatColor(num / den);
                 const a = Math.max(0.08, Math.min(0.5, 1 - Math.sqrt(near) / (Math.max(W, H) * 0.6)));
                 ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
                 ctx.fillRect(gx, gy, cell, cell);
             }
         }
     }
-    // Sample dots — every sample; grey if it has no value for this metric.
     allSamples.forEach(sp => {
         const x = sp.x * W, y = sp.y * H;
         const val = _wifiHmValue(sp);
@@ -1937,10 +2060,39 @@ function wifiHeatmapRender() {
         ctx.fillStyle = '#e2e8f0'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText(val == null ? '—' : Math.round(val), x, y - 8);
     });
+    // --- Design overlays: walls + modelled AP ---
+    if (design) _wifiHmDrawDesign(ctx, W, H);
     wifiHeatmapRenderLegend();
-    if (!samples.length && !_wifiHm.floorplan) {
+    if (!samples.length && !_wifiHm.floorplan && !design) {
         ctx.fillStyle = '#475569'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText('Pick a target AP, then click on the plan where you are standing to drop RSSI samples.', W / 2, H / 2);
+    }
+}
+
+function _wifiHmDrawDesign(ctx, W, H) {
+    // Walls
+    ctx.lineCap = 'round';
+    _wifiHm.walls.forEach(w => {
+        ctx.beginPath();
+        ctx.moveTo(w.x1 * W, w.y1 * H); ctx.lineTo(w.x2 * W, w.y2 * H);
+        ctx.strokeStyle = '#f8fafc'; ctx.lineWidth = 3; ctx.stroke();
+        ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5; ctx.stroke();
+    });
+    // Wall-in-progress preview
+    if (_wifiHm.wallStart) {
+        const s = _wifiHm.wallStart;
+        ctx.beginPath(); ctx.arc(s.x * W, s.y * H, 4, 0, 2 * Math.PI);
+        ctx.fillStyle = '#0ea5e9'; ctx.fill();
+    }
+    // Modelled AP
+    const ap = _wifiHm.predictAp;
+    if (ap) {
+        const x = ap.x * W, y = ap.y * H;
+        ctx.beginPath(); ctx.arc(x, y, 8, 0, 2 * Math.PI);
+        ctx.fillStyle = '#22d3ee'; ctx.fill();
+        ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('AP', x, y - 12);
     }
 }
 
