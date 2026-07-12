@@ -1991,25 +1991,88 @@
                     <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
                         <div>
                             <h4 class="font-semibold text-sm">Coverage Heatmap</h4>
-                            <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Samples are interpolated (IDW) into a coverage map. Green = strong, red = weak.</p>
+                            <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Enable <strong>Active test</strong> to also measure <strong>throughput + latency</strong> at each point (iperf3 to a LAN server, or a WAN speed test). Samples are interpolated (IDW) into a coverage map; switch the <strong>Metric</strong> to view RSSI, SNR, throughput or latency. Green = good, red = bad.</p>
                         </div>
                         <div class="flex flex-wrap items-end gap-2">
                             <div>
-                                <label class="block text-[11px] text-gray-400 mb-1">Target AP</label>
+                                <label class="block text-[11px] text-gray-400 mb-1" id="wifi-hm-target-label">Target AP</label>
                                 <select id="wifi-hm-ap" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[160px]"><option value="">Scan first…</option></select>
                             </div>
+                            <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer self-end pb-1" title="Survey the whole mesh/ESS — record every node (BSSID) of the SSID at each point, and map serving-node coverage + hand-off zones.">
+                                <input type="checkbox" id="wifi-hm-mesh" onchange="wifiHmToggleMesh()" class="accent-Ragnar-600"> Mesh
+                            </label>
                             <div>
                                 <label class="block text-[11px] text-gray-400 mb-1">Metric</label>
                                 <select id="wifi-hm-metric" onchange="wifiHeatmapSetMetric(this.value)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
                                     <option value="rssi">RSSI (dBm)</option>
                                     <option value="snr">SNR (dB)</option>
+                                    <option value="throughput_down">Throughput ↓ (Mbps)</option>
+                                    <option value="throughput_up">Throughput ↑ (Mbps)</option>
+                                    <option value="latency">Latency (ms)</option>
+                                    <option value="serving" class="wifi-hm-mesh-metric" hidden>Serving node</option>
+                                    <option value="handoff" class="wifi-hm-mesh-metric" hidden>Hand-off zones</option>
                                 </select>
                             </div>
                             <label class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs cursor-pointer">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
                             <button onclick="wifiHeatmapRender()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Redraw</button>
                             <button onclick="wifiHeatmapClear()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Clear</button>
+                            <button onclick="wifiExportReport()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs" title="Generate a printable survey report (save as PDF)">📄 Report</button>
                             <span id="wifi-hm-status" class="text-[11px] text-gray-500"></span>
                         </div>
+                    </div>
+                    <!-- Active survey (throughput/latency at each point) -->
+                    <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
+                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300 cursor-pointer select-none" title="Also measure throughput + latency at each click (a few seconds per point), Ekahau-style active survey. Off = fast RSSI-only.">
+                            <input type="checkbox" id="wifi-hm-active" class="accent-Ragnar-600"> Active test on click
+                        </label>
+                        <input id="wifi-hm-iperf" placeholder="iperf3 server IP (LAN, optional)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs w-64 min-w-[16rem]" title="A LAN iperf3 server IP/host measures true up+down. Leave blank to use a WAN download speed test instead.">
+                        <label class="text-[11px] text-gray-400">for <input id="wifi-hm-tp-secs" type="number" value="5" min="2" max="30" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> s</label>
+                        <button onclick="wifiThroughputTest()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs" title="Run one throughput/latency test here without dropping a sample">Test now</button>
+                        <span id="wifi-hm-tp-status" class="text-[11px] text-gray-500"></span>
+                    </div>
+                    <!-- Design / predictive coverage -->
+                    <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
+                        <span class="text-[11px] text-gray-400">Mode:</span>
+                        <button id="wifi-hm-mode-survey" onclick="wifiHmSetMode('survey')" class="bg-Ragnar-600 text-white px-2.5 py-1 rounded text-xs">Survey</button>
+                        <button id="wifi-hm-mode-design" onclick="wifiHmSetMode('design')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs">Design / Predict</button>
+                        <span id="wifi-hm-design-tools" class="hidden flex flex-wrap items-center gap-2">
+                            <span class="text-gray-700">|</span>
+                            <button id="wifi-hm-tool-wall" onclick="wifiHmSetTool('wall')" class="bg-Ragnar-600 text-white px-2.5 py-1 rounded text-xs">✏ Draw wall</button>
+                            <select id="wifi-hm-wall-mat" class="bg-slate-800 border border-slate-700 rounded px-1 py-1 text-xs" title="Wall material — sets its dB attenuation">
+                                <option value="drywall">Drywall (3 dB)</option>
+                                <option value="wood">Wood (4 dB)</option>
+                                <option value="glass">Glass (6 dB)</option>
+                                <option value="brick" selected>Brick (10 dB)</option>
+                                <option value="concrete">Concrete (15 dB)</option>
+                                <option value="metal">Metal (20 dB)</option>
+                            </select>
+                            <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to drop AP nodes — add as many as you like to plan a mesh">📶 Place AP nodes</button>
+                            <button id="wifi-hm-tool-column" onclick="wifiHmSetTool('column')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to drop structural columns/pillars — they shadow WiFi behind them">⬤ Column</button>
+                            <select id="wifi-hm-col-mat" class="bg-slate-800 border border-slate-700 rounded px-1 py-1 text-xs" title="Column material — sets its dB attenuation">
+                                <option value="concrete" selected>Concrete (15 dB)</option>
+                                <option value="metal">Steel/metal (20 dB)</option>
+                                <option value="brick">Brick (10 dB)</option>
+                            </select>
+                            <label class="text-[11px] text-gray-400" title="Column radius in metres (a typical pillar is ~0.3 m)">⌀ <input id="wifi-hm-col-rad" type="number" value="0.3" min="0.05" max="3" step="0.05" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
+                            <label class="text-[11px] text-gray-400" title="Real width of the floorplan, so predicted distances are in metres">Floor width <input id="wifi-hm-scale" type="number" value="10" min="1" max="500" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
+                            <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-600"> Predict coverage</label>
+                            <button onclick="wifiHmUndoWall()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo wall</button>
+                            <button onclick="wifiHmClearWalls()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear walls</button>
+                            <button onclick="wifiHmUndoAp()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo AP</button>
+                            <button onclick="wifiHmClearAps()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear APs</button>
+                            <button onclick="wifiHmUndoColumn()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo column</button>
+                            <button onclick="wifiHmClearColumns()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear columns</button>
+                            <span id="wifi-hm-design-status" class="text-[11px] text-gray-500"></span>
+                            <span class="basis-full flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-400 pt-1">
+                                <span class="text-gray-500">Materials:</span>
+                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#dc2626;border:1px solid #0b1220"></span>Brick</span>
+                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#f8fafc;border:1px solid #0b1220"></span>Glass</span>
+                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#9ca3af;border:1px solid #0b1220"></span>Concrete</span>
+                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#3b82f6;border:1px solid #0b1220"></span>Steel</span>
+                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#d8c39a;border:1px solid #0b1220"></span>Drywall</span>
+                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#8b5a2b;border:1px solid #0b1220"></span>Wood</span>
+                            </span>
+                        </span>
                     </div>
                     <!-- Saved surveys -->
                     <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
@@ -2086,6 +2149,32 @@
                         <tbody id="wifidef-ap-tbody"><tr><td colspan="5" class="py-4 text-center text-gray-500">Enable monitor mode and press <span class="text-gray-300">Scan</span>.</td></tr></tbody>
                     </table>
                 </div>
+            </div>
+
+            <!-- Airtime / retry / roaming diagnostics -->
+            <div class="glass rounded-xl p-4 mt-5">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+                    <div>
+                        <h3 class="font-semibold text-sm">Airtime &amp; link quality</h3>
+                        <p class="text-[11px] text-gray-500 mt-0.5 max-w-2xl">Passive per-AP <strong>airtime %</strong>, <strong>retry rate</strong> and <strong>PHY-rate</strong> spread, plus roaming churn — the "why is it slow" view. Best on a <strong>fixed channel</strong> (airtime % is only meaningful when not hopping).</p>
+                    </div>
+                    <div class="flex flex-wrap items-end gap-2">
+                        <label class="text-[11px] text-gray-400">Channel <input id="wifidef-at-channel" type="text" value="" placeholder="e.g. 6" class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs" title="Fix a channel for meaningful airtime %; blank = hop (approximate)"></label>
+                        <label class="text-[11px] text-gray-400">for <input id="wifidef-at-secs" type="number" value="10" min="3" max="60" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> s</label>
+                        <button onclick="wifidefAirtime()" id="wifidef-at-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-1.5 rounded text-xs font-semibold">Analyze airtime</button>
+                        <span id="wifidef-at-status" class="text-[11px] text-gray-500"></span>
+                    </div>
+                </div>
+                <div id="wifidef-at-findings" class="flex flex-wrap gap-2 mb-3 text-xs"></div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead><tr class="text-left text-gray-400 border-b border-slate-800">
+                            <th class="py-1 pr-2">BSSID</th><th class="py-1 pr-2">Frames</th><th class="py-1 pr-2">Retry %</th><th class="py-1 pr-2">Airtime %</th><th class="py-1 pr-2">Rate min/med/max</th><th class="py-1 pr-2">RSSI</th>
+                        </tr></thead>
+                        <tbody id="wifidef-at-tbody"><tr><td colspan="6" class="py-4 text-center text-gray-500">Press <span class="text-gray-300">Analyze airtime</span> (needs monitor mode).</td></tr></tbody>
+                    </table>
+                </div>
+                <div id="wifidef-at-roam" class="mt-2 text-xs text-gray-400"></div>
             </div>
         </div><!-- /#wifidef-tab -->
 
@@ -6305,7 +6394,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefflood"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-matcolors"></script>
 
 </body>
 </html>

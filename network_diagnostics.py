@@ -13290,12 +13290,49 @@ def register_network_diagnostics(app, logger=None):
                 data.get('floorplan'), data.get('bssid'), data.get('ssid')))
         if action == 'clear':
             return jsonify(wifi_analyzer.heatmap_clear())
+        if action == 'walls':
+            return jsonify(wifi_analyzer.heatmap_set_walls(data.get('walls') or []))
+        if action == 'columns':
+            return jsonify(wifi_analyzer.heatmap_set_columns(data.get('columns') or []))
+        if action == 'predict_ap':
+            return jsonify(wifi_analyzer.heatmap_set_predict_ap(data.get('ap')))
+        if action == 'predict_aps':
+            return jsonify(wifi_analyzer.heatmap_set_predict_aps(data.get('aps') or []))
         if action == 'sample_live':
             iface = (data.get('interface') or 'wlan0').strip()
             if not _valid_iface(iface):
                 return _bad('Invalid interface')
+            try:
+                secs = max(2, min(30, int(data.get('seconds', 5))))
+            except (TypeError, ValueError):
+                secs = 5
             return jsonify(wifi_analyzer.heatmap_sample_live(
-                iface, data.get('x'), data.get('y'), data.get('bssid')))
+                iface, data.get('x'), data.get('y'), data.get('bssid'),
+                active=bool(data.get('active')),
+                iperf_server=(data.get('iperf_server') or None),
+                url=(data.get('url') or None), seconds=secs))
+        if action == 'sample_mesh':
+            iface = (data.get('interface') or 'wlan0').strip()
+            if not _valid_iface(iface):
+                return _bad('Invalid interface')
+            try:
+                secs = max(2, min(30, int(data.get('seconds', 5))))
+            except (TypeError, ValueError):
+                secs = 5
+            return jsonify(wifi_analyzer.heatmap_sample_mesh_live(
+                iface, data.get('x'), data.get('y'), data.get('ssid'),
+                active=bool(data.get('active')),
+                iperf_server=(data.get('iperf_server') or None),
+                url=(data.get('url') or None), seconds=secs))
+        if action == 'throughput':
+            # One-off active measurement (for a "Test now" button, no sample).
+            try:
+                secs = max(2, min(30, int(data.get('seconds', 5))))
+            except (TypeError, ValueError):
+                secs = 5
+            return jsonify(wifi_analyzer.measure_throughput(
+                iperf_server=(data.get('iperf_server') or None),
+                url=(data.get('url') or None), seconds=secs))
         if action == 'sample':
             return jsonify(wifi_analyzer.heatmap_add_sample(
                 data.get('x'), data.get('y'), data.get('rssi'),
@@ -13393,6 +13430,20 @@ def register_network_diagnostics(app, logger=None):
             return _bad('Invalid seconds')
         _log(f"wifidef/baseline learn {iface}")
         return jsonify(wifi_defense.learn_baseline(iface, seconds=secs))
+
+    @app.route('/api/wifidef/airtime', methods=['GET'])
+    def wifidef_airtime():
+        iface = (request.args.get('interface') or '').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        try:
+            secs = max(3, min(60, int(request.args.get('seconds', 10))))
+        except (TypeError, ValueError):
+            secs = 10
+        ch = request.args.get('channel')
+        channel = int(ch) if (ch and ch.isdigit()) else None
+        _log(f"wifidef/airtime {iface} ch={channel}")
+        return jsonify(wifi_defense.do_airtime(iface, seconds=secs, channel=channel))
 
     @app.route('/api/wifidef/thresholds', methods=['GET', 'POST'])
     def wifidef_thresholds():

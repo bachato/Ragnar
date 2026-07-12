@@ -80,6 +80,7 @@ install_system_packages() {
         "iw"
         "iproute2"
         "iputils-ping"
+        "iperf3"
         "rfkill"
         "sqlite3"
     )

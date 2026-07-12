@@ -1176,10 +1176,22 @@ def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
 def _heatmap_load():
     try:
         with open(_HEATMAP_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
-        return {"floorplan": None, "target_bssid": None, "target_ssid": None,
+        data = {"floorplan": None, "target_bssid": None, "target_ssid": None,
                 "samples": []}
+    # Predictive-design layer (walls + modelled AP nodes) lives alongside the
+    # survey. `predict_aps` is a list so you can plan a whole mesh; a legacy
+    # single `predict_ap` is migrated into it.
+    data.setdefault("walls", [])
+    # Structural columns / pillars — round point-obstacles that shadow signal.
+    data.setdefault("columns", [])
+    data.setdefault("predict_ap", None)
+    if "predict_aps" not in data:
+        data["predict_aps"] = [data["predict_ap"]] if data.get("predict_ap") else []
+    # Mesh survey: registry of the nodes (BSSIDs) seen for the surveyed SSID.
+    data.setdefault("mesh_nodes", {})
+    return data
 
 
 def _heatmap_save(data):
@@ -1204,8 +1216,278 @@ def heatmap_set_floorplan(floorplan_data_uri, target_bssid=None, target_ssid=Non
     return data
 
 
+# Common building-material attenuation at 5 GHz (dB per wall). Rough industry
+# figures; users pick the material when drawing a wall.
+_WALL_MATERIALS = {
+    "drywall": 3, "wood": 4, "glass": 6, "brick": 10,
+    "concrete": 15, "metal": 20,
+}
+
+
+def heatmap_set_walls(walls):
+    """Persist the drawn walls (list of {x1,y1,x2,y2 in 0..1, loss_db})."""
+    data = _heatmap_load()
+    clean = []
+    for w in walls or []:
+        try:
+            clean.append({
+                "x1": float(w["x1"]), "y1": float(w["y1"]),
+                "x2": float(w["x2"]), "y2": float(w["y2"]),
+                "loss_db": float(w.get("loss_db", 5)),
+                "material": w.get("material") or "wall",
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    data["walls"] = clean
+    _heatmap_save(data)
+    return data
+
+
+def heatmap_set_columns(columns):
+    """Persist structural columns/pillars (list of {x,y in 0..1 centre,
+    radius_m, loss_db, material}). A column shadows any AP→point line that
+    passes through it — the classic open-floor coverage killer."""
+    data = _heatmap_load()
+    clean = []
+    for c in columns or []:
+        try:
+            clean.append({
+                "x": float(c["x"]), "y": float(c["y"]),
+                "radius_m": max(0.05, float(c.get("radius_m", 0.3))),
+                "loss_db": float(c.get("loss_db", _WALL_MATERIALS["concrete"])),
+                "material": c.get("material") or "concrete",
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    data["columns"] = clean
+    _heatmap_save(data)
+    return data
+
+
+def _clean_predict_ap(ap):
+    """Validate + normalize one modelled AP, or None if it's malformed.
+    `width_m`/`height_m` give the floorplan's real size so normalized distances
+    become metres for the path-loss model."""
+    try:
+        return {
+            "x": float(ap["x"]), "y": float(ap["y"]),
+            "tx_dbm": float(ap.get("tx_dbm", _DEFAULT_TX_DBM)),
+            "freq": float(ap.get("freq", 5200)),
+            "ple": float(ap.get("ple", _DEFAULT_PLE)),
+            "width_m": float(ap.get("width_m", 10.0)),
+            "height_m": float(ap.get("height_m", 10.0)),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def heatmap_set_predict_aps(aps):
+    """Persist the list of modelled AP nodes for predictive coverage (a planned
+    mesh). Empty list clears them. Keeps a legacy single `predict_ap` in sync."""
+    data = _heatmap_load()
+    clean = []
+    for ap in aps or []:
+        c = _clean_predict_ap(ap)
+        if c is None:
+            return {"error": "invalid predict AP"}
+        clean.append(c)
+    data["predict_aps"] = clean
+    data["predict_ap"] = clean[0] if clean else None  # back-compat
+    _heatmap_save(data)
+    return data
+
+
+def heatmap_set_predict_ap(ap):
+    """Persist a single modelled AP (or None to clear). Back-compat wrapper over
+    heatmap_set_predict_aps."""
+    return heatmap_set_predict_aps([] if ap is None else [ap])
+
+
+# --- Predictive-coverage geometry (mirrored client-side in ragnar_modern.js) ---
+
+def _ccw(ax, ay, bx, by, cx, cy):
+    return (cy - ay) * (bx - ax) > (by - ay) * (cx - ax)
+
+
+def _segments_cross(a, b, c, d):
+    """True if segment a-b intersects segment c-d (a=(x,y), …)."""
+    return (_ccw(*a, *c, *d) != _ccw(*b, *c, *d)
+            and _ccw(*a, *b, *c) != _ccw(*a, *b, *d))
+
+
+def _seg_circle_hit(ax, ay, bx, by, cx, cy, r):
+    """True if segment (ax,ay)-(bx,by) passes within `r` of centre (cx,cy).
+    All coordinates in the same units (metres). Used to shadow a round column."""
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    t = (((cx - ax) * dx + (cy - ay) * dy) / len2) if len2 else 0.0
+    t = max(0.0, min(1.0, t))
+    return math.hypot(cx - (ax + t * dx), cy - (ay + t * dy)) <= r
+
+
+def predict_point_rssi(px, py, ap, walls, columns=None):
+    """Predicted RSSI (dBm) at normalized point (px,py) from a modelled AP,
+    using log-distance path loss plus the summed loss of every wall the straight
+    AP→point line crosses, plus every structural column it passes through.
+    Pure + unit-tested; the JS renderer mirrors it."""
+    width_m = ap.get("width_m", 10.0)
+    height_m = ap.get("height_m", 10.0)
+    rssi0 = _rssi_at_1m(ap.get("freq", 5200), ap.get("tx_dbm", _DEFAULT_TX_DBM))
+    ple = ap.get("ple", _DEFAULT_PLE)
+    dx = (px - ap["x"]) * width_m
+    dy = (py - ap["y"]) * height_m
+    d = max(0.5, math.hypot(dx, dy))
+    rssi = rssi0 - 10 * ple * math.log10(d)
+    a, b = (ap["x"], ap["y"]), (px, py)
+    for w in walls or []:
+        if _segments_cross(a, b, (w["x1"], w["y1"]), (w["x2"], w["y2"])):
+            rssi -= w.get("loss_db", 5)
+    # Columns: test the AP→point line in metres against each pillar's radius.
+    for c in columns or []:
+        if _seg_circle_hit(ap["x"] * width_m, ap["y"] * height_m,
+                           px * width_m, py * height_m,
+                           c["x"] * width_m, c["y"] * height_m,
+                           c.get("radius_m", 0.3)):
+            rssi -= c.get("loss_db", _WALL_MATERIALS["concrete"])
+    return round(rssi, 1)
+
+
+def predict_point_rssi_multi(px, py, aps, walls, columns=None):
+    """Predicted RSSI at (px,py) from a set of modelled AP nodes: the BEST
+    signal any node delivers (each spot served by its strongest node), matching
+    real mesh behaviour. None if no nodes. Mirrored in the JS renderer."""
+    if not aps:
+        return None
+    return round(max(predict_point_rssi(px, py, ap, walls, columns) for ap in aps), 1)
+
+
+# --------------------------------------------------------------------------
+# Active throughput / latency measurement (Ekahau-style active survey leg)
+# --------------------------------------------------------------------------
+
+def _parse_ping(text):
+    """Pull avg latency (ms), jitter (mdev), and loss (%) out of `ping` output."""
+    out = {"latency_ms": None, "jitter_ms": None, "loss_pct": None}
+    m = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", text)
+    if m:
+        out["loss_pct"] = float(m.group(1))
+    # rtt min/avg/max/mdev = 1.2/3.4/5.6/0.7 ms
+    m = re.search(r"=\s*[\d.]+/([\d.]+)/[\d.]+/([\d.]+)\s*ms", text)
+    if m:
+        out["latency_ms"] = float(m.group(1))
+        out["jitter_ms"] = float(m.group(2))
+    return out
+
+
+def _ping_stats(target, count=5, timeout=10):
+    try:
+        p = subprocess.run(["ping", "-n", "-c", str(count), "-w", str(timeout), target],
+                           capture_output=True, text=True, timeout=timeout + 3)
+        return _parse_ping(p.stdout)
+    except Exception:
+        return {"latency_ms": None, "jitter_ms": None, "loss_pct": None}
+
+
+def _parse_iperf3(js):
+    """Return Mbits/s from an iperf3 --json result (sum_received preferred)."""
+    try:
+        end = js.get("end", {})
+        r = end.get("sum_received") or end.get("sum_sent") or {}
+        bps = r.get("bits_per_second")
+        return round(bps / 1e6, 2) if bps else None
+    except Exception:
+        return None
+
+
+def _iperf3(server, seconds=5, reverse=False, port=None):
+    """One iperf3 run against `server`; reverse=True measures download."""
+    args = ["iperf3", "-c", server, "-t", str(int(seconds)), "-J", "-i", "0"]
+    if reverse:
+        args.append("-R")
+    if port:
+        args += ["-p", str(int(port))]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=int(seconds) + 10)
+        js = json.loads(p.stdout or "{}")
+        if js.get("error"):
+            return {"error": js["error"]}
+        return {"mbps": _parse_iperf3(js)}
+    except Exception as exc:
+        return {"error": f"iperf3 failed: {exc}"}
+
+
+def _http_download_mbps(url, max_secs=6, max_bytes=50 * 1024 * 1024):
+    """WAN throughput fallback: stream a URL, measure bytes/sec (download only).
+    Sends a browser User-Agent — some speed-test endpoints 403 the default one."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Ragnar WiFi Analyzer)",
+            "Accept": "*/*"})
+        t0 = time.time()
+        got = 0
+        with urllib.request.urlopen(req, timeout=max_secs + 6) as resp:
+            while time.time() - t0 < max_secs and got < max_bytes:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+        dt = time.time() - t0
+        if dt <= 0 or got == 0:
+            return {"error": "no data received"}
+        return {"mbps": round(got * 8 / dt / 1e6, 2), "bytes": got, "secs": round(dt, 2)}
+    except Exception as exc:
+        return {"error": f"download failed: {exc}"}
+
+
+# A small, CDN-hosted test file used only when no iperf3 server is configured.
+_DEFAULT_SPEEDTEST_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
+
+
+def measure_throughput(iperf_server=None, url=None, seconds=5, ping_target=None):
+    """Active-survey measurement at the current spot: latency + up/down throughput.
+
+    Uses an iperf3 server when given (best — measures both directions on the LAN);
+    otherwise falls back to an HTTP download speed test (download-only, WAN)."""
+    result = {"method": None, "down_mbps": None, "up_mbps": None,
+              "latency_ms": None, "jitter_ms": None, "loss_pct": None}
+    # Latency: ping the gateway (LAN health) when no explicit target is given.
+    target = ping_target or _default_gateway() or "1.1.1.1"
+    result.update({k: v for k, v in _ping_stats(target).items()})
+    result["ping_target"] = target
+    if iperf_server:
+        result["method"] = "iperf3"
+        result["server"] = iperf_server
+        down = _iperf3(iperf_server, seconds, reverse=True)
+        up = _iperf3(iperf_server, seconds, reverse=False)
+        result["down_mbps"] = down.get("mbps")
+        result["up_mbps"] = up.get("mbps")
+        errs = [d.get("error") for d in (down, up) if d.get("error")]
+        if errs:
+            result["error"] = errs[0]
+    else:
+        result["method"] = "http"
+        dl = _http_download_mbps(url or _DEFAULT_SPEEDTEST_URL, max_secs=seconds)
+        result["down_mbps"] = dl.get("mbps")
+        result["url"] = url or _DEFAULT_SPEEDTEST_URL
+        if dl.get("error"):
+            result["error"] = dl["error"]
+    return result
+
+
+def _default_gateway():
+    try:
+        p = subprocess.run(["ip", "route", "show", "default"],
+                           capture_output=True, text=True, timeout=4)
+        m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", p.stdout)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
 def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None,
-                       snr=None, noise=None, band=None, channel=None):
+                       snr=None, noise=None, band=None, channel=None,
+                       throughput=None):
     data = _heatmap_load()
     sample = {
         "x": float(x), "y": float(y), "rssi": float(rssi),
@@ -1219,28 +1501,88 @@ def heatmap_add_sample(x, y, rssi, bssid=None, ssid=None,
         sample["band"] = band
     if channel is not None:
         sample["channel"] = channel
+    if throughput:
+        # flatten the active-survey metrics onto the sample for the heatmap
+        for k in ("down_mbps", "up_mbps", "latency_ms", "jitter_ms", "loss_pct"):
+            if throughput.get(k) is not None:
+                sample[k] = throughput[k]
+        sample["tp_method"] = throughput.get("method")
     data["samples"].append(sample)
     _heatmap_save(data)
     return data
 
 
-def heatmap_sample_live(interface, x, y, bssid):
-    """Take a live passive reading of `bssid` and record it at (x, y)."""
+def heatmap_sample_live(interface, x, y, bssid, active=False,
+                        iperf_server=None, url=None, seconds=5):
+    """Take a live passive reading of `bssid` at (x, y). When `active`, also run
+    an Ekahau-style throughput/latency measurement and store it on the sample."""
     survey = do_scan(interface=interface, band="all")
     if "error" in survey:
         return survey
     match = next((b for b in survey["aps"] if b["bssid"] == (bssid or "").lower()), None)
     if not match:
         return {"error": "target bssid not heard in this reading", "bssid": bssid}
+    tp = None
+    if active:
+        tp = measure_throughput(iperf_server=iperf_server, url=url, seconds=seconds)
     return heatmap_add_sample(
         x, y, match["signal"], match["bssid"], match["ssid"],
         snr=match.get("snr"), noise=match.get("noise_floor") or survey.get("noise_floor"),
-        band=match.get("band"), channel=match.get("channel"))
+        band=match.get("band"), channel=match.get("channel"), throughput=tp)
+
+
+def _mesh_nodes_from_scan(aps, ssid):
+    """Every BSSID advertising `ssid` (an ESS / mesh), with the strongest as the
+    'serving' node — what a client at this spot would associate with. Pure."""
+    ssid = (ssid or "")
+    nodes = [{"bssid": a["bssid"], "rssi": a.get("signal"),
+              "snr": a.get("snr"), "band": a.get("band"), "channel": a.get("channel")}
+             for a in aps if (a.get("ssid") or "") == ssid and a.get("signal") is not None]
+    nodes.sort(key=lambda n: -(n["rssi"] if n["rssi"] is not None else -999))
+    serving = nodes[0] if nodes else None
+    return nodes, serving
+
+
+def heatmap_sample_mesh_live(interface, x, y, ssid, active=False,
+                             iperf_server=None, url=None, seconds=5):
+    """Mesh survey: record the RSSI of EVERY node (BSSID) of `ssid` at (x, y),
+    tag the serving (strongest) node, and register the nodes so the UI can map
+    serving-node coverage and hand-off zones. Optional active throughput too."""
+    survey = do_scan(interface=interface, band="all")
+    if "error" in survey:
+        return survey
+    nodes, serving = _mesh_nodes_from_scan(survey["aps"], ssid)
+    if not serving:
+        return {"error": "no node of that SSID heard here", "ssid": ssid}
+    tp = None
+    if active:
+        tp = measure_throughput(iperf_server=iperf_server, url=url, seconds=seconds)
+    data = _heatmap_load()
+    sample = {
+        "x": float(x), "y": float(y), "t": int(time.time()),
+        "ssid": ssid, "rssi": serving["rssi"],           # best-of-nodes = coverage
+        "serving": serving["bssid"], "snr": serving.get("snr"),
+        "band": serving.get("band"), "channel": serving.get("channel"),
+        "nodes": {n["bssid"]: n["rssi"] for n in nodes},
+    }
+    if tp:
+        for k in ("down_mbps", "up_mbps", "latency_ms", "jitter_ms", "loss_pct"):
+            if tp.get(k) is not None:
+                sample[k] = tp[k]
+        sample["tp_method"] = tp.get("method")
+    data["samples"].append(sample)
+    # Register/refresh node metadata (band/channel) for stable colours + labels.
+    reg = data.setdefault("mesh_nodes", {})
+    for n in nodes:
+        reg[n["bssid"]] = {"band": n["band"], "channel": n["channel"], "ssid": ssid}
+    _heatmap_save(data)
+    return data
 
 
 def heatmap_clear():
     data = _heatmap_load()
     data["samples"] = []
+    data["mesh_nodes"] = {}
     _heatmap_save(data)
     return data
 
@@ -1283,7 +1625,8 @@ def survey_list():
 
 
 def survey_save(name):
-    """Snapshot the current heatmap (floorplan + samples) under `name`."""
+    """Snapshot the current heatmap under `name` — including the whole design
+    layer (walls, columns, planned AP nodes, mesh nodes), not just samples."""
     name = (name or "").strip()
     if not name:
         return {"error": "survey name required"}
@@ -1296,6 +1639,11 @@ def survey_save(name):
         "target_bssid": cur.get("target_bssid"),
         "target_ssid": cur.get("target_ssid"),
         "samples": cur.get("samples", []),
+        "walls": cur.get("walls", []),
+        "columns": cur.get("columns", []),
+        "predict_aps": cur.get("predict_aps", []),
+        "predict_ap": cur.get("predict_ap"),
+        "mesh_nodes": cur.get("mesh_nodes", {}),
         "saved": int(time.time()),
     }
     _surveys_save(surveys)
@@ -1303,7 +1651,7 @@ def survey_save(name):
 
 
 def survey_load(name):
-    """Restore a saved survey into the active heatmap store."""
+    """Restore a saved survey into the active heatmap store, design layer and all."""
     surveys = _surveys_load()
     s = surveys.get(name)
     if s is None:
@@ -1313,6 +1661,11 @@ def survey_load(name):
         "target_bssid": s.get("target_bssid"),
         "target_ssid": s.get("target_ssid"),
         "samples": s.get("samples", []),
+        "walls": s.get("walls", []),
+        "columns": s.get("columns", []),
+        "predict_aps": s.get("predict_aps", []),
+        "predict_ap": s.get("predict_ap"),
+        "mesh_nodes": s.get("mesh_nodes", {}),
     })
     return _heatmap_load()
 
@@ -1619,11 +1972,26 @@ def selftest():
         check("saved survey listed with sample count",
               any(s["name"] == "siteA" and s["samples"] == 1 for s in lst["surveys"]),
               json.dumps(lst))
+        # A survey must also snapshot the whole design layer, not just samples.
+        heatmap_set_walls([{"x1": 0.1, "y1": 0.1, "x2": 0.9, "y2": 0.1,
+                            "loss_db": 15, "material": "concrete"}])
+        heatmap_set_columns([{"x": 0.5, "y": 0.5, "material": "metal"}])
+        heatmap_set_predict_aps([{"x": 0.2, "y": 0.2}, {"x": 0.8, "y": 0.8}])
+        survey_save("siteB")
         heatmap_clear()
         check("heatmap cleared before load", len(_heatmap_load()["samples"]) == 0)
         loaded = survey_load("siteA")
         check("survey load restores samples (with snr)",
               len(loaded["samples"]) == 1 and loaded["samples"][0].get("snr") == 25)
+        # Load the design-heavy survey and confirm every layer round-trips.
+        lb = survey_load("siteB")
+        check("survey restores walls", len(lb.get("walls", [])) == 1
+              and lb["walls"][0]["material"] == "concrete", json.dumps(lb.get("walls")))
+        check("survey restores columns", len(lb.get("columns", [])) == 1
+              and lb["columns"][0]["material"] == "metal", json.dumps(lb.get("columns")))
+        check("survey restores planned AP nodes",
+              len(lb.get("predict_aps", [])) == 2, json.dumps(lb.get("predict_aps")))
+        survey_delete("siteB")
         survey_delete("siteA")
         check("survey delete removes it",
               not any(s["name"] == "siteA" for s in survey_list()["surveys"]))
@@ -1634,6 +2002,137 @@ def selftest():
             except OSError:
                 pass
         _HEATMAP_FILE, _SURVEYS_FILE = _oh, _os_
+
+    # --- Active-survey parsers (Tier: active throughput) ---
+    ping_out = ("5 packets transmitted, 5 received, 0% packet loss, time 4005ms\n"
+                "rtt min/avg/max/mdev = 1.111/2.222/3.333/0.444 ms")
+    ps = _parse_ping(ping_out)
+    check("ping parse: latency/jitter/loss",
+          ps["latency_ms"] == 2.222 and ps["jitter_ms"] == 0.444 and ps["loss_pct"] == 0.0,
+          json.dumps(ps))
+    lossy = _parse_ping("10 packets transmitted, 7 received, 30% packet loss")
+    check("ping parse: loss with no rtt line", lossy["loss_pct"] == 30.0
+          and lossy["latency_ms"] is None, json.dumps(lossy))
+    iperf_json = {"end": {"sum_received": {"bits_per_second": 943000000.0}}}
+    check("iperf3 parse: Mbps from sum_received",
+          _parse_iperf3(iperf_json) == 943.0, str(_parse_iperf3(iperf_json)))
+    check("iperf3 parse: missing data => None", _parse_iperf3({}) is None)
+    # throughput fields flatten onto a heatmap sample (_HEATMAP_FILE already
+    # declared global above in this function)
+    _oh2, _HEATMAP_FILE = _HEATMAP_FILE, __import__("tempfile").mktemp(suffix=".json")
+    try:
+        d = heatmap_add_sample(0.5, 0.5, -55, "aa:bb:cc:00:00:01", "TP",
+                               throughput={"method": "iperf3", "down_mbps": 500.0,
+                                           "up_mbps": 120.0, "latency_ms": 8.0})
+        s = d["samples"][-1]
+        check("throughput flattened onto sample",
+              s.get("down_mbps") == 500.0 and s.get("up_mbps") == 120.0
+              and s.get("latency_ms") == 8.0 and s.get("tp_method") == "iperf3",
+              json.dumps(s))
+    finally:
+        try:
+            os.unlink(_HEATMAP_FILE)
+        except OSError:
+            pass
+        _HEATMAP_FILE = _oh2
+
+    # --- Predictive coverage geometry (Tier: design/planning) ---
+    check("segments cross detected",
+          _segments_cross((0, 0), (1, 1), (0, 1), (1, 0)) is True)
+    check("parallel segments do not cross",
+          _segments_cross((0, 0), (1, 0), (0, 1), (1, 1)) is False)
+    ap_pred = {"x": 0.5, "y": 0.5, "tx_dbm": 20, "freq": 5200, "ple": 3.0,
+               "width_m": 20.0, "height_m": 20.0}
+    r_near = predict_point_rssi(0.55, 0.5, ap_pred, [])
+    r_far = predict_point_rssi(0.95, 0.5, ap_pred, [])
+    check("predicted RSSI weakens with distance", r_far < r_near, f"{r_near} vs {r_far}")
+    wall = {"x1": 0.7, "y1": 0.0, "x2": 0.7, "y2": 1.0, "loss_db": 15}
+    r_nowall = predict_point_rssi(0.95, 0.5, ap_pred, [])
+    r_wall = predict_point_rssi(0.95, 0.5, ap_pred, [wall])
+    check("a crossed wall subtracts its loss (15 dB)",
+          abs((r_nowall - r_wall) - 15) < 0.01, f"{r_nowall} - {r_wall}")
+    r_sidewall = predict_point_rssi(0.6, 0.5, ap_pred, [wall])  # point before the wall
+    check("a wall not crossed has no effect",
+          abs(r_sidewall - predict_point_rssi(0.6, 0.5, ap_pred, [])) < 0.01)
+
+    # --- Structural columns (round pillars that shadow signal) ---
+    # AP at centre-left, column dead-centre, point on the far right => the
+    # AP→point line runs straight through the pillar and must lose its dB.
+    ap_l = dict(ap_pred, x=0.1, y=0.5)
+    col = {"x": 0.5, "y": 0.5, "radius_m": 0.5, "loss_db": 15}
+    r_clear = predict_point_rssi(0.9, 0.5, ap_l, [])
+    r_shadow = predict_point_rssi(0.9, 0.5, ap_l, [], [col])
+    check("a column in the line of sight subtracts its loss",
+          abs((r_clear - r_shadow) - 15) < 0.01, f"{r_clear} - {r_shadow}")
+    # A point off to the side (line misses the pillar) is unaffected.
+    r_side = predict_point_rssi(0.5, 0.05, ap_l, [], [col])
+    check("a column not in the path has no effect",
+          abs(r_side - predict_point_rssi(0.5, 0.05, ap_l, [])) < 0.01)
+    check("seg-circle hit true when line passes through centre",
+          _seg_circle_hit(0, 0, 10, 0, 5, 0, 0.5) is True)
+    check("seg-circle miss when line clears the radius",
+          _seg_circle_hit(0, 0, 10, 0, 5, 2, 0.5) is False)
+    # Columns compose with the mesh best-node combine.
+    two_col = predict_point_rssi_multi(0.9, 0.5, [ap_l], [], [col])
+    check("column loss flows through the mesh combine",
+          two_col == r_shadow, f"{two_col} vs {r_shadow}")
+
+    # --- Multi-node predictive coverage (planned mesh: best node wins) ---
+    ap_a = dict(ap_pred, x=0.1, y=0.5)
+    ap_b = dict(ap_pred, x=0.9, y=0.5)
+    check("no nodes => no prediction",
+          predict_point_rssi_multi(0.5, 0.5, [], []) is None)
+    # A point near node B must be served by B (single-node A would be far/weak).
+    near_b = predict_point_rssi_multi(0.85, 0.5, [ap_a, ap_b], [])
+    check("mesh coverage = best of all nodes (near B served by B)",
+          near_b == predict_point_rssi(0.85, 0.5, ap_b, [])
+          and near_b > predict_point_rssi(0.85, 0.5, ap_a, []),
+          f"{near_b}")
+    # A second node lifts coverage where one node was weak.
+    one = predict_point_rssi_multi(0.85, 0.5, [ap_a], [])
+    two = predict_point_rssi_multi(0.85, 0.5, [ap_a, ap_b], [])
+    check("adding a node never lowers predicted coverage", two >= one, f"{one}->{two}")
+    # Persistence round-trips a list and keeps legacy predict_ap in sync.
+    _oh3, _HEATMAP_FILE = _HEATMAP_FILE, _tf.mktemp(suffix=".json")
+    try:
+        heatmap_set_predict_aps([ap_a, ap_b])
+        hd = heatmap_get()
+        check("predict_aps persists the full node list",
+              len(hd.get("predict_aps", [])) == 2)
+        check("legacy predict_ap kept in sync with first node",
+              hd.get("predict_ap", {}).get("x") == 0.1)
+        heatmap_set_predict_aps([])
+        check("clearing nodes empties predict_aps and predict_ap",
+              heatmap_get().get("predict_aps") == []
+              and heatmap_get().get("predict_ap") is None)
+        heatmap_set_columns([{"x": 0.4, "y": 0.6, "material": "concrete"}])
+        hc = heatmap_get().get("columns", [])
+        check("columns persist with radius/loss defaults",
+              len(hc) == 1 and hc[0]["radius_m"] == 0.3
+              and hc[0]["loss_db"] == _WALL_MATERIALS["concrete"],
+              json.dumps(hc))
+        heatmap_set_columns([])
+        check("clearing columns empties them", heatmap_get().get("columns") == [])
+    finally:
+        try:
+            os.unlink(_HEATMAP_FILE)
+        except OSError:
+            pass
+        _HEATMAP_FILE = _oh3
+
+    # --- Mesh survey node selection (serving node = strongest of the ESS) ---
+    mesh_aps = [
+        {"bssid": "aa:00:00:00:00:01", "ssid": "MeshNet", "signal": -70, "band": "2.4", "channel": 6, "snr": 20},
+        {"bssid": "aa:00:00:00:00:02", "ssid": "MeshNet", "signal": -52, "band": "5", "channel": 36, "snr": 40},
+        {"bssid": "bb:00:00:00:00:03", "ssid": "OtherNet", "signal": -40, "band": "5", "channel": 44, "snr": 45},
+    ]
+    m_nodes, m_serving = _mesh_nodes_from_scan(mesh_aps, "MeshNet")
+    check("mesh: only same-SSID nodes included", len(m_nodes) == 2, str(len(m_nodes)))
+    check("mesh: serving node is the strongest",
+          m_serving["bssid"] == "aa:00:00:00:00:02" and m_serving["rssi"] == -52,
+          json.dumps(m_serving))
+    check("mesh: no node => no serving",
+          _mesh_nodes_from_scan(mesh_aps, "Nonexistent")[1] is None)
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,
