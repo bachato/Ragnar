@@ -1127,6 +1127,29 @@ def do_scan(interface="wlan0", band="all", passive=True):
     }
 
 
+def radius_from_fields(fields, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
+                       antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
+    """Compute the coverage rings from an AP's already-known scan fields — no
+    re-scan. The frontend hands back the row it's showing (signal/freq/…), so the
+    estimate stays consistent with the table and never races a fresh scan."""
+    freq = fields.get("center_freq") or fields.get("freq")
+    if fields.get("signal") is None or not freq:
+        return {"error": "missing signal/freq for radius estimate"}
+    tx_meas = fields.get("tx_power_dbm")
+    # Re-validate the advertised TX power (client could be stale/tampered).
+    if tx_meas is not None and not (_TX_PLAUSIBLE_MIN <= tx_meas <= _TX_PLAUSIBLE_MAX):
+        tx_meas = None
+    bss = {
+        "bssid": fields.get("bssid"), "ssid": fields.get("ssid"),
+        "band": fields.get("band"), "channel": fields.get("channel"),
+        "freq": fields.get("freq") or freq, "center_freq": freq,
+        "signal": fields.get("signal"), "tx_power_dbm": tx_meas,
+    }
+    return estimate_radius(bss, tx_dbm=tx_dbm, ple=ple, rssi_offset=rssi_offset,
+                           antenna_gain=antenna_gain, cable_loss=cable_loss,
+                           rssi0_override=rssi0_override)
+
+
 def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
               antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
     """Passive scan then compute the signal radius for one BSSID. tx_dbm=None
@@ -1142,7 +1165,8 @@ def do_radius(interface, bssid, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
             return estimate_radius(b, tx_dbm=tx_dbm, ple=ple,
                                    rssi_offset=rssi_offset, antenna_gain=antenna_gain,
                                    cable_loss=cable_loss, rssi0_override=rssi0_override)
-    return {"error": "bssid not found in latest scan", "bssid": bssid}
+    return {"error": "bssid not found in latest scan — rescan and try again",
+            "bssid": bssid}
 
 
 # --------------------------------------------------------------------------
@@ -1472,6 +1496,16 @@ def selftest():
           and rad_bogus["current_distance_m"] < 20,
           json.dumps({"src": rad_bogus["assumptions"]["tx_source"],
                       "d": rad_bogus["current_distance_m"]}))
+    # radius_from_fields: compute from a known row without re-scanning, and it
+    # must apply the same TX-power plausibility guard.
+    rf = radius_from_fields({"bssid": "a0:0:0:0:0:1", "band": "5", "channel": 36,
+                             "freq": 5180, "center_freq": 5180, "signal": -46,
+                             "tx_power_dbm": 63})
+    check("radius_from_fields ignores garbage advertised TX",
+          rf["assumptions"]["tx_source"] == "assumed" and rf["current_distance_m"] < 20,
+          json.dumps({"src": rf["assumptions"]["tx_source"], "d": rf["current_distance_m"]}))
+    check("radius_from_fields needs signal+freq",
+          "error" in radius_from_fields({"bssid": "x", "freq": 5180}))
 
     # --- Path-loss calibration (Tier 4) ---
     cal = calibrate_ple(1, -40, 10, -70)   # 30 dB over a decade => n=3.0

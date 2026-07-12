@@ -13239,12 +13239,33 @@ def register_network_diagnostics(app, logger=None):
             cable_loss = float(request.args.get('cable_loss', 0) or 0)
             _r0 = request.args.get('rssi0')
             rssi0 = float(_r0) if _r0 not in (None, '', 'auto') else None
+            _sig = request.args.get('signal')
+            sig = float(_sig) if _sig not in (None, '', 'auto') else None
         except (TypeError, ValueError):
             return _bad('Invalid calibration parameter')
         _log(f"net/wifi/radius {iface} {bssid}")
-        return jsonify(wifi_analyzer.do_radius(
-            iface, bssid, tx_dbm=tx, ple=ple, rssi_offset=rssi_offset,
-            antenna_gain=antenna_gain, cable_loss=cable_loss, rssi0_override=rssi0))
+        cal = dict(tx_dbm=tx, ple=ple, rssi_offset=rssi_offset,
+                   antenna_gain=antenna_gain, cable_loss=cable_loss,
+                   rssi0_override=rssi0)
+        # Prefer the already-known reading the client is displaying (no re-scan,
+        # no race with a fresh scan that might not hear the AP this instant).
+        if sig is not None:
+            def _f(name, cast=float):
+                v = request.args.get(name)
+                if v in (None, '', 'auto'):
+                    return None
+                try:
+                    return cast(v)
+                except (TypeError, ValueError):
+                    return None
+            fields = {
+                "bssid": bssid, "ssid": request.args.get('ssid'),
+                "band": request.args.get('band'), "channel": _f('channel', int),
+                "freq": _f('freq'), "center_freq": _f('center_freq'),
+                "signal": sig, "tx_power_dbm": _f('tx_measured'),
+            }
+            return jsonify(wifi_analyzer.radius_from_fields(fields, **cal))
+        return jsonify(wifi_analyzer.do_radius(iface, bssid, **cal))
 
     @app.route('/api/net/wifi/calibrate', methods=['GET'])
     def net_wifi_calibrate():

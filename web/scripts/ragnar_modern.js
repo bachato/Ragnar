@@ -1639,9 +1639,18 @@ function wifiSelectAp(bssid) {
     const antGain = document.getElementById('wifi-ant-gain').value || 0;
     const cableLoss = document.getElementById('wifi-cable-loss').value || 0;
     const rssi0 = _wifiState.calRssi0 != null ? `&rssi0=${_wifiState.calRssi0}` : '';
+    // Hand back the row we're already showing so the server needn't re-scan
+    // (a fresh scan can momentarily miss the AP → "bssid not found").
+    let known = '';
+    if (ap && ap.signal != null) {
+        known = `&signal=${ap.signal}&freq=${ap.freq || ''}&center_freq=${ap.center_freq || ''}`
+            + `&band=${encodeURIComponent(ap.band || '')}&channel=${ap.channel != null ? ap.channel : ''}`
+            + `&ssid=${encodeURIComponent(ap.ssid || '')}`
+            + `&tx_measured=${ap.tx_power_dbm != null ? ap.tx_power_dbm : ''}`;
+    }
     document.getElementById('wifi-radius-controls').style.display = 'flex';
     document.getElementById('wifi-cal-details').style.display = 'block';
-    fetch(`/api/net/wifi/radius?interface=${encodeURIComponent(iface)}&bssid=${encodeURIComponent(bssid)}&tx=${tx}&ple=${ple}&rssi_offset=${rssiOffset}&antenna_gain=${antGain}&cable_loss=${cableLoss}${rssi0}`)
+    fetch(`/api/net/wifi/radius?interface=${encodeURIComponent(iface)}&bssid=${encodeURIComponent(bssid)}&tx=${tx}&ple=${ple}&rssi_offset=${rssiOffset}&antenna_gain=${antGain}&cable_loss=${cableLoss}${rssi0}${known}`)
         .then(r => r.json()).then(d => {
             if (d.error) { document.getElementById('wifi-radius-info').innerHTML = '<span class="text-amber-400">' + d.error + '</span>'; return; }
             _wifiDrawRadius(d);
