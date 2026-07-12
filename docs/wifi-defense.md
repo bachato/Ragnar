@@ -53,8 +53,13 @@ it (best when you already know where the attack is).
 
 1. Plug in a monitor-capable adapter and pick it in **Monitor adapter**.
 2. **Enable monitor** (adds `ragmon0`, or switches the adapter).
-3. **Trust current APs** once, in a known-good environment — this records the
-   SSID→BSSID baseline that powers **evil-twin** detection.
+3. **Trust current APs** in a known-good environment — this **adds** the
+   currently-shown APs to the SSID→BSSID baseline that powers **evil-twin**
+   detection. It *accumulates* (union), so run it a few times / across a scan or
+   two: a single capture window can't hear every BSSID of every SSID (dual-band
+   radios, mesh nodes and band-steering publish one SSID from several BSSIDs),
+   and any legit BSSID not yet trusted would otherwise be flagged as an evil
+   twin. **Reset baseline** clears it to start over.
 4. **Scan** for a capture window (default 15 s), or tick **Continuous** to
    re-scan on a loop as a live monitor — each capture starts only after the
    previous one finishes (no overlap). Hit **■ Stop** to end the loop.

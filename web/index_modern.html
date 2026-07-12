@@ -2058,7 +2058,8 @@
                     <button onclick="wifidefScan()" id="wifidef-scan-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm font-semibold">Scan</button>
                     <button onclick="wifidefStopContinuous()" id="wifidef-stop-btn" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-semibold hidden">■ Stop</button>
                     <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifidef-auto" class="accent-Ragnar-600"> Continuous</label>
-                    <button onclick="wifidefTrust()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap" title="Record the currently-visible APs as the trusted baseline for evil-twin detection">Trust current APs</button>
+                    <button onclick="wifidefTrust()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap" title="Add the currently-visible APs to the trusted baseline (accumulates) for evil-twin detection. Run a few times / across bands to capture every BSSID of each SSID.">Trust current APs</button>
+                    <button onclick="wifidefResetBaseline()" class="bg-slate-800 hover:bg-slate-700 text-gray-400 px-3 py-2 rounded text-sm whitespace-nowrap" title="Clear the trusted-AP baseline and start over">Reset baseline</button>
                     <span id="wifidef-status" class="text-xs text-gray-500 ml-auto"></span>
                 </div>
                 <p class="text-[11px] text-amber-300/80 mt-2" id="wifidef-mon-note">Enabling monitor mode adds a separate capture interface where the driver allows it; otherwise it takes the adapter off your network. Only run on an adapter you can dedicate to sensing.</p>
@@ -6300,7 +6301,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-threatiface"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefbaseline"></script>
 
 </body>
 </html>

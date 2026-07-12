@@ -13373,6 +13373,17 @@ def register_network_diagnostics(app, logger=None):
         if request.method == 'GET':
             return jsonify({"baseline": wifi_defense.get_baseline()})
         data = request.get_json(silent=True) or {}
+        action = data.get('action')
+        if action == 'clear':
+            _log("wifidef/baseline clear")
+            return jsonify({"ok": True, "baseline": wifi_defense.clear_baseline(),
+                            "ssids": 0})
+        # Trust the AP inventory the client is already showing (no re-capture) —
+        # trusts exactly what's on screen and merges into the baseline.
+        aps = data.get('aps')
+        if isinstance(aps, list) and aps:
+            _log(f"wifidef/baseline trust {len(aps)} shown APs")
+            return jsonify(wifi_defense.trust_aps(aps))
         iface = (data.get('interface') or '').strip()
         if not _valid_iface(iface):
             return _bad('Invalid interface')

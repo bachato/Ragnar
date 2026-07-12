@@ -252,15 +252,57 @@ def get_baseline():
     return _load_state().get("baseline") or {}
 
 
-def set_baseline(ssid_bssids):
+def _write_baseline(baseline):
     state = _load_state()
-    state["baseline"] = ssid_bssids
+    state["baseline"] = baseline
     os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
     tmp = _STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f)
     os.replace(tmp, _STATE_FILE)
-    return state["baseline"]
+    return baseline
+
+
+def set_baseline(ssid_bssids, merge=True):
+    """Persist the trusted SSID->[BSSID] map.
+
+    A single capture window can never hear every BSSID of every SSID (dual-band
+    radios, mesh nodes and band-steering all publish the same SSID from several
+    BSSIDs, and channel-hopping only samples each channel briefly). Replacing the
+    baseline each time therefore leaves most legitimate BSSIDs "untrusted" and
+    they get flagged as evil twins on the next scan. So by default we **merge**
+    (union BSSIDs per SSID) rather than overwrite, letting the baseline build up
+    a complete picture across repeated Trust actions."""
+    if merge:
+        base = get_baseline()
+        for ssid, bssids in (ssid_bssids or {}).items():
+            have = base.setdefault(ssid, [])
+            for b in bssids:
+                b = (b or "").lower()
+                if b and b not in have:
+                    have.append(b)
+        ssid_bssids = base
+    else:
+        ssid_bssids = {s: sorted({(b or "").lower() for b in bs if b})
+                       for s, bs in (ssid_bssids or {}).items()}
+    return _write_baseline(ssid_bssids)
+
+
+def clear_baseline():
+    return _write_baseline({})
+
+
+def _aps_to_mapping(aps):
+    """SSID -> [BSSID] from an AP inventory list (skips hidden/empty SSIDs)."""
+    mapping = {}
+    for ap in aps or []:
+        ssid = ap.get("ssid")
+        bssid = (ap.get("bssid") or "").lower()
+        if ssid and bssid:
+            mapping.setdefault(ssid, [])
+            if bssid not in mapping[ssid]:
+                mapping[ssid].append(bssid)
+    return mapping
 
 
 # --------------------------------------------------------------------------
@@ -521,19 +563,29 @@ def do_scan(interface, seconds=15, channel=None, auto_enable=True):
     return result
 
 
-def learn_baseline(interface, seconds=20, channel=None):
-    """Capture, then record every SSID->BSSID mapping seen as trusted."""
+def learn_baseline(interface, seconds=20, channel=None, merge=True):
+    """Capture, then merge every SSID->BSSID mapping seen into the trusted
+    baseline. Merges by default so repeated captures accumulate all the BSSIDs a
+    single window can't hear at once (see set_baseline)."""
     res = do_scan(interface, seconds=seconds, channel=channel)
     if "error" in res:
         return res
-    mapping = {}
-    for ap in res.get("aps", []):
-        if ap.get("ssid"):
-            mapping.setdefault(ap["ssid"], [])
-            if ap["bssid"] not in mapping[ap["ssid"]]:
-                mapping[ap["ssid"]].append(ap["bssid"])
-    set_baseline(mapping)
-    return {"ok": True, "baseline": mapping, "ssids": len(mapping)}
+    mapping = _aps_to_mapping(res.get("aps", []))
+    baseline = set_baseline(mapping, merge=merge)
+    return {"ok": True, "baseline": baseline, "ssids": len(baseline),
+            "added": len(mapping)}
+
+
+def trust_aps(aps, merge=True):
+    """Trust an already-captured AP inventory (what the user is looking at) —
+    no re-capture, so 'Trust current APs' trusts exactly what's on screen and
+    accumulates into the baseline."""
+    mapping = _aps_to_mapping(aps)
+    if not mapping:
+        return {"error": "no APs with SSIDs to trust — run a scan first"}
+    baseline = set_baseline(mapping, merge=merge)
+    return {"ok": True, "baseline": baseline, "ssids": len(baseline),
+            "added": len(mapping)}
 
 
 # --------------------------------------------------------------------------
@@ -640,6 +692,41 @@ def selftest():
     clean_res = analyze(clean, baseline={"HomeNet": ["aa:aa:aa:00:00:01"]})
     check("clean traffic => no detections", clean_res["threat"] == "clear",
           json.dumps(clean_res["detections"]))
+
+    # --- Baseline merge/accumulate (the trust fix) — temp state file ---
+    global _STATE_FILE
+    _orig_state, _STATE_FILE = _STATE_FILE, __import__("tempfile").mktemp(suffix=".json")
+    try:
+        clear_baseline()
+        # First trust: HomeNet on its 2.4 GHz BSSID (one capture window).
+        set_baseline({"HomeNet": ["aa:aa:aa:00:00:01"]})
+        # Second trust later sees the SAME SSID from its 5 GHz BSSID.
+        set_baseline({"HomeNet": ["aa:aa:aa:00:00:02"]})
+        base = get_baseline()
+        check("baseline merges BSSIDs across trusts (multi-band SSID)",
+              set(base.get("HomeNet", [])) == {"aa:aa:aa:00:00:01", "aa:aa:aa:00:00:02"},
+              json.dumps(base))
+        # A later scan seeing both trusted BSSIDs must NOT flag an evil twin.
+        seen_events = [
+            {"kind": "beacon", "src": "aa:aa:aa:00:00:01", "ssid": "HomeNet"},
+            {"kind": "beacon", "src": "aa:aa:aa:00:00:02", "ssid": "HomeNet"},
+        ]
+        r_ok = analyze(seen_events, baseline=get_baseline())
+        check("no evil-twin false positive once both BSSIDs are trusted",
+              not any(d["type"] == "rogue_ap" for d in r_ok["detections"]),
+              json.dumps(r_ok["detections"]))
+        # trust_aps trusts a shown inventory (case-insensitive) without capture.
+        trust_aps([{"ssid": "Cafe", "bssid": "BB:BB:BB:00:00:01"}])
+        check("trust_aps stores shown APs lowercased",
+              get_baseline().get("Cafe") == ["bb:bb:bb:00:00:01"],
+              json.dumps(get_baseline().get("Cafe")))
+        check("clear_baseline empties it", clear_baseline() == {} and get_baseline() == {})
+    finally:
+        try:
+            os.unlink(_STATE_FILE)
+        except OSError:
+            pass
+        _STATE_FILE = _orig_state
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,

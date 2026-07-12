@@ -2111,15 +2111,36 @@ function wifidefScan() {
 }
 
 function wifidefTrust() {
-    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
-    if (!iface) return;
     const st = document.getElementById('wifidef-status');
-    st.textContent = 'Learning trusted APs (20s capture)…';
+    // Prefer trusting exactly what the last scan showed (accumulates into the
+    // baseline, no separate capture that would see a different set of BSSIDs).
+    const aps = (_wifidef.data && _wifidef.data.aps) || [];
+    let body;
+    if (aps.length) {
+        st.textContent = `Trusting ${aps.length} shown AP(s)…`;
+        body = { aps: aps.map(a => ({ ssid: a.ssid, bssid: a.bssid })) };
+    } else {
+        const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+        if (!iface) { st.textContent = 'Run a scan first, then Trust.'; return; }
+        st.textContent = 'Learning trusted APs (20s capture)…';
+        body = { interface: iface, seconds: 20 };
+    }
     fetch('/api/wifidef/baseline', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ interface: iface, seconds: 20 }) })
+        body: JSON.stringify(body) })
         .then(r => r.json()).then(d => {
-            st.textContent = d.error ? ('⚠ ' + d.error) : (`Trusted ${d.ssids} SSID(s) as baseline`);
+            st.textContent = d.error ? ('⚠ ' + d.error)
+                : (`Baseline now trusts ${d.ssids} SSID(s)` + (d.added ? ` (+${d.added} this time)` : '') + '. Re-scan to confirm.');
+            if (!d.error && _wifidef.data) wifidefScan();
         }).catch(() => { st.textContent = 'Baseline failed'; });
+}
+
+function wifidefResetBaseline() {
+    const st = document.getElementById('wifidef-status');
+    if (!confirm('Clear the trusted-AP baseline? Evil-twin detection will have nothing to compare against until you Trust again.')) return;
+    fetch('/api/wifidef/baseline', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'clear' }) })
+        .then(r => r.json()).then(() => { st.textContent = 'Baseline cleared'; })
+        .catch(() => { st.textContent = 'Clear failed'; });
 }
 
 function wifidefRender() {
