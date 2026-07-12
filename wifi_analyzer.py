@@ -723,14 +723,94 @@ def analyze_spectrum(bss_list, caps=None):
             rating = "moderate"
         else:
             rating = "congested"
+        # Width advice: dense bands should narrow their channels so more
+        # non-overlapping channels exist; empty bands can go wide.
+        if band == "2.4":
+            width_advice = (20, "2.4 GHz only has 3 non-overlapping channels — "
+                                "use 20 MHz and stick to 1/6/11")
+        else:
+            avg_w = sum(a["width"] for a in aps) / len(aps)
+            if prim_aps >= 12:
+                width_advice = (40, "dense band — 40 MHz keeps enough clear "
+                                    "channels")
+            elif prim_aps >= 6:
+                width_advice = (80, "80 MHz is a good balance here")
+            else:
+                width_advice = (160, "few APs — 160 MHz is viable for peak speed")
+            width_advice = (width_advice[0],
+                            width_advice[1] + f" (APs average {int(avg_w)} MHz now)")
         out[band] = {
             "ap_count": prim_aps,
             "channels": channels,
             "recommend": [c["channel"] for c in recommend],
             "rating": rating,
             "score": round(total_score, 2),
+            "width_advice": {"mhz": width_advice[0], "reason": width_advice[1]},
         }
     return out
+
+
+def _mac_prefix(bssid, octets=5):
+    return ":".join(bssid.split(":")[:octets])
+
+
+def group_aps(bss_list):
+    """Collapse the flat BSS list into two enterprise views:
+
+    * **networks** — one entry per SSID (an ESS): how many BSSIDs serve it,
+      which bands it spans, its security/best signal. The "how many APs is this
+      network on" view.
+    * **devices** — physical radios: BSSIDs that share their top-5 MAC octets
+      (an enterprise AP hands out consecutive BSSIDs per SSID/band) collapsed
+      into one logical AP.
+    """
+    networks = {}
+    for a in bss_list:
+        if a.get("hidden") or not a.get("ssid"):
+            continue
+        n = networks.setdefault(a["ssid"], {
+            "ssid": a["ssid"], "bssids": [], "bands": set(),
+            "security": a.get("security"), "best_signal": None,
+            "vendor": a.get("vendor"), "standard": a.get("standard")})
+        n["bssids"].append(a["bssid"])
+        n["bands"].add(a["band"])
+        if a.get("signal") is not None and (n["best_signal"] is None
+                                            or a["signal"] > n["best_signal"]):
+            n["best_signal"] = a["signal"]
+    net_list = []
+    for n in networks.values():
+        n["bands"] = sorted(n["bands"])
+        n["ap_count"] = len(n["bssids"])
+        net_list.append(n)
+    net_list.sort(key=lambda n: -(n["best_signal"] or -999))
+
+    devices = {}
+    for a in bss_list:
+        key = _mac_prefix(a["bssid"])
+        d = devices.setdefault(key, {
+            "mac_prefix": key, "bssids": [], "ssids": set(), "bands": set(),
+            "vendor": a.get("vendor"), "best_signal": None})
+        d["bssids"].append(a["bssid"])
+        if a.get("ssid"):
+            d["ssids"].add(a["ssid"])
+        d["bands"].add(a["band"])
+        if a.get("signal") is not None and (d["best_signal"] is None
+                                            or a["signal"] > d["best_signal"]):
+            d["best_signal"] = a["signal"]
+    dev_list = []
+    for d in devices.values():
+        d["ssids"] = sorted(d["ssids"])
+        d["bands"] = sorted(d["bands"])
+        d["radio_count"] = len(d["bssids"])
+        dev_list.append(d)
+    dev_list.sort(key=lambda d: -(d["best_signal"] or -999))
+
+    return {
+        "networks": net_list,
+        "network_count": len(net_list),
+        "devices": dev_list,
+        "device_count": len(dev_list),
+    }
 
 
 def find_interference(bss_list):
@@ -882,6 +962,7 @@ def do_scan(interface="wlan0", band="all", passive=True):
     bss_list.sort(key=lambda b: (b["band"], b["channel"], -(b["signal"] or -999)))
     spectrum = analyze_spectrum(bss_list, caps)
     interference = find_interference(bss_list)
+    groups = group_aps(bss_list)
     return {
         "interface": interface,
         "phy": caps["phy"],
@@ -895,6 +976,7 @@ def do_scan(interface="wlan0", band="all", passive=True):
         "aps": bss_list,
         "spectrum": spectrum,
         "interference": interference,
+        "groups": groups,
     }
 
 
@@ -1172,6 +1254,17 @@ def selftest():
           _oui_lookup("00:25:86:11:22:33") in ("TP-Link", "TP-Link Technologies",
                                                "Tp-Link Technologies Co.,Ltd."),
           str(_oui_lookup("00:25:86:11:22:33")))
+
+    # --- Grouping + width advice (Tier 2) ---
+    grp = group_aps(aps)
+    homenet = next((n for n in grp["networks"] if n["ssid"] == "HomeNet"), None)
+    check("networks grouped by SSID", grp["network_count"] >= 4, str(grp["network_count"]))
+    check("device grouping by MAC prefix", grp["device_count"] >= 1,
+          str(grp["device_count"]))
+    check("width advice present per band",
+          "width_advice" in spec.get("5", {})
+          and spec["2.4"]["width_advice"]["mhz"] == 20,
+          json.dumps(spec.get("5", {}).get("width_advice")))
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,
