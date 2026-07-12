@@ -201,15 +201,18 @@ def _mon_name(base):
 
 
 def _monitor_ready(mon):
-    """Bring a freshly-created monitor vif up on a known channel and confirm the
-    kernel really made it a monitor. Priming the channel matters: a just-added
-    (or just re-added) vif can sit on channel 0 and hear NOTHING — the classic
-    'ragmon0 is back but detects nothing after a re-enable' symptom."""
+    """Bring a freshly-created monitor vif up on a known channel and confirm both
+    that the kernel made it a monitor AND that we can actually TUNE it. The
+    channel set is the real test: on a shared-radio adapter (e.g. mt7921u) a
+    managed vif that is still up holds the channel, so `iw set channel` returns
+    EBUSY (-16) and the monitor hears nothing. If we can't set the channel the
+    vif is useless for capture."""
     if not _iface_exists(mon):
         return False
     _run(["ip", "link", "set", mon, "up"], timeout=5)
-    _set_channel(mon, 6)          # common 2.4 GHz channel; capture re-sets/hops later
-    return _iw_dev_list().get(mon, {}).get("type") == "monitor"
+    rc, _, _ = _run([_IW, "dev", mon, "set", "channel", "6"], timeout=5)
+    is_monitor = _iw_dev_list().get(mon, {}).get("type") == "monitor"
+    return is_monitor and rc == 0
 
 
 def enable_monitor(iface):
@@ -236,13 +239,19 @@ def enable_monitor(iface):
         _run([_IW, "dev", mon, "del"], timeout=8)
         time.sleep(0.3)
 
+    # Free the radio: a shared-PHY managed interface that stays UP holds the
+    # channel, so the monitor vif can't be tuned (`iw set channel` => EBUSY) and
+    # captures nothing. Take the managed base down while we monitor — this is what
+    # makes capture reliable on mt7921u and friends. disable_monitor restores it.
+    _run(["ip", "link", "set", iface, "down"], timeout=5)
+
     # Try a concurrent monitor vif first.
     rc, _, err = _run([_IW, "phy", phy, "interface", "add", mon,
                        "type", "monitor"], timeout=8)
     if rc == 0 and _monitor_ready(mon):
         _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
         return {"mon_iface": mon, "mode": "vif"}
-    # Half-created / not-a-monitor vif — clean it up before the fallback.
+    # Half-created / not-a-monitor / un-tunable vif — clean up before the fallback.
     if mon in _iw_dev_list():
         _run([_IW, "dev", mon, "del"], timeout=8)
 
@@ -270,6 +279,10 @@ def disable_monitor(mon_iface=None):
         _run(["ip", "link", "set", mon, "down"], timeout=5)
         _run([_IW, "dev", mon, "del"], timeout=8)
         time.sleep(0.3)  # let the delete settle so a quick re-enable doesn't race
+        # Bring the managed base interface back up (we took it down to free the
+        # radio for the monitor) so normal Wi-Fi resumes.
+        if base and base != mon:
+            _run(["ip", "link", "set", base, "up"], timeout=5)
     else:
         # We switched the base iface into monitor; switch it back to managed.
         _run(["ip", "link", "set", mon, "down"], timeout=5)
@@ -1157,6 +1170,28 @@ def selftest():
             check("re-enable re-adds the vif and primes a channel",
                   any(len(c) >= 5 and c[4] == "add" for c in cmds)
                   and _load_state().get("mon_iface") == "ragmon0")
+            check("enable frees the radio by bringing the managed base down",
+                  any(c[:3] == ["ip", "link", "set"] and c[3] == "wlan9"
+                      and c[-1] == "down" for c in cmds),
+                  json.dumps([c for c in cmds if "wlan9" in c]))
+            # _monitor_ready must reject an un-tunable vif (set channel EBUSY).
+            def _busy_run(args, **kw):
+                a = list(args)
+                if a[0] == _IW and len(a) >= 5 and a[3] == "set" and a[4] == "channel":
+                    return (240, "", "command failed: Device or resource busy (-16)")
+                return (0, "", "")
+            globals()["_run"] = _busy_run
+            check("_monitor_ready fails when the channel can't be set (EBUSY)",
+                  _monitor_ready("ragmon0") is False)
+            # disable brings the managed base back up.
+            globals()["_run"] = _fake_run
+            _save_state({"mon_iface": "ragmon0", "base_iface": "wlan9", "mode": "vif"})
+            cmds.clear()
+            disable_monitor()
+            check("disable restores the managed base (brought back up)",
+                  any(c[:3] == ["ip", "link", "set"] and c[3] == "wlan9"
+                      and c[-1] == "up" for c in cmds),
+                  json.dumps([c for c in cmds if "wlan9" in c]))
         finally:
             time.sleep = _real_sleep
             globals().update(_saved_fns)

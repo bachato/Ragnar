@@ -42,15 +42,22 @@ freq_to_chan() {
   else echo 6; fi
 }
 
-# ---- summarise a wifi_defense.py JSON result --------------------------------
-summarize() {
-  python3 - <<'PY'
+# ---- run a wifi_defense.py scan and summarise its JSON ----------------------
+# NB: the scan output goes to a temp FILE that python reads via argv — piping it
+# into a `python3 - <<HEREDOC` clashes (the heredoc IS python's stdin), which
+# silently ate the JSON in earlier runs.
+scan_summary() {
+  local desc="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  "$@" >"$tmp" 2>"$tmp.err"
+  echo "$desc"
+  python3 - "$tmp" <<'PY'
 import sys, json
-raw = sys.stdin.read()
 try:
-    d = json.loads(raw)
-except Exception:
-    print("  (could not parse JSON) ->", raw[:400]); sys.exit()
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    raw = open(sys.argv[1]).read()
+    print("  (no/invalid JSON: %s) raw=%r" % (e, raw[:300])); sys.exit()
 print("  frames=%s  monitor=%s  channel=%s  error=%s  detections=%d"
       % (d.get("frames"), d.get("monitor"), d.get("channel"),
          d.get("error"), len(d.get("detections", []))))
@@ -59,6 +66,8 @@ if aps:
     print("  APs heard: %d  e.g. %s"
           % (len(aps), ", ".join(sorted({a.get("ssid") or "?" for a in aps})[:6])))
 PY
+  [ -s "$tmp.err" ] && { echo "  stderr:"; sed 's/^/    /' "$tmp.err" | tail -n 5; }
+  rm -f "$tmp" "$tmp.err"
 }
 
 capture_test() {
@@ -71,10 +80,10 @@ capture_test() {
   else
     echo "  (tcpdump not installed — skipping OS oracle; 'apt install tcpdump')"
   fi
-  echo "\$ Ragnar scan --channel $ch (fixed):"
-  python3 "$REPO/wifi_defense.py" scan --interface "$IFACE" --seconds 8 --channel "$ch" | summarize
-  echo "\$ Ragnar scan hopping (all bands, 12s):"
-  python3 "$REPO/wifi_defense.py" scan --interface "$IFACE" --seconds 12 | summarize
+  scan_summary "\$ Ragnar scan --channel $ch (fixed):" \
+      python3 "$REPO/wifi_defense.py" scan --interface "$IFACE" --seconds 8 --channel "$ch"
+  scan_summary "\$ Ragnar scan hopping (all bands, 12s):" \
+      python3 "$REPO/wifi_defense.py" scan --interface "$IFACE" --seconds 12
 }
 
 # ===========================================================================
@@ -151,15 +160,19 @@ python3 "$REPO/wifi_defense.py" monitor --interface "$IFACE" --enable
 echo
 capture_test "$TESTCH"
 
-section "TEST 3 — MANUAL vif REBUILD (bypasses Ragnar, tests the driver alone)"
+section "TEST 3 — MANUAL vif REBUILD w/ base DOWN (proves the EBUSY fix)"
+# Bringing the managed base interface down frees the radio so the monitor vif
+# can be tuned. Without this, `set channel` returns EBUSY (-16) on shared-PHY
+# adapters (mt7921u) and the monitor hears nothing.
 run "$IW" dev "$MON" del
 sleep 1
+run ip link set "$IFACE" down
 run "$IW" phy "$PHY" interface add "$MON" type monitor
 run ip link set "$MON" up
-run "$IW" dev "$MON" set channel "$TESTCH"
+run "$IW" dev "$MON" set channel "$TESTCH"     # should now succeed (no EBUSY)
 run "$IW" dev "$MON" info
 if command -v tcpdump >/dev/null; then
-  echo "\$ tcpdump -i $MON (raw driver, 8s):"
+  echo "\$ tcpdump -i $MON on channel $TESTCH (raw driver, base down, 8s):"
   timeout 8 tcpdump -i "$MON" -c 30 -en 2>&1 | tail -n 12
 fi
 

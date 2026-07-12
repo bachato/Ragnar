@@ -32,11 +32,15 @@ BSSIDs/attackers, then frame counts and an inventory of every AP heard.
 WiFi Defense needs an adapter in **monitor mode**, configured with plain `iw`
 (no `aircrack-ng` required):
 
-- Where the driver allows it (e.g. the **Alfa AWUS036AXM** / `mt7921u`), a
-  **separate monitor vif** (`ragmon0`) is added so the box **keeps its normal
-  Wi-Fi link** while it sniffs.
-- Otherwise the adapter itself is switched into monitor mode — which takes it
-  **off your network** until you disable monitor mode (the UI warns you).
+- A **separate monitor vif** (`ragmon0`) is added on the adapter's radio (e.g.
+  the **Alfa AWUS036AXM** / `mt7921u`). While monitoring, that adapter's
+  **managed interface is brought down** — on a single-radio adapter a managed
+  interface that stays up *holds the channel*, so the monitor can't be tuned
+  (`iw set channel` → `EBUSY -16`) and hears nothing. Taking it down hands the
+  radio to the monitor; **Disable monitor** brings it back up. Use the Pi's
+  onboard Wi-Fi (or Ethernet) for connectivity while that adapter monitors.
+- If a concurrent vif can't be created/tuned, the adapter itself is switched
+  into monitor mode (also off your network until you disable it; the UI warns).
 
 The Pi's **onboard `brcmfmac` radio does not support monitor mode** at all, so
 you need a capable USB adapter. **Enable monitor** sets it up; **Disable
