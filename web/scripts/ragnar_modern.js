@@ -2345,6 +2345,55 @@ function wifidefResetBaseline() {
         .catch(() => { st.textContent = 'Clear failed'; });
 }
 
+function wifidefAirtime() {
+    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+    if (!iface) return;
+    const secs = document.getElementById('wifidef-at-secs').value || 10;
+    const chRaw = (document.getElementById('wifidef-at-channel').value || '').trim();
+    const ch = /^\d+$/.test(chRaw) ? chRaw : '';
+    const st = document.getElementById('wifidef-at-status');
+    const btn = document.getElementById('wifidef-at-btn');
+    st.textContent = 'Capturing ' + secs + 's' + (ch ? ' on ch ' + ch : ' (hopping)') + '…';
+    if (btn) btn.disabled = true;
+    fetch(`/api/wifidef/airtime?interface=${encodeURIComponent(iface)}&seconds=${secs}${ch ? '&channel=' + ch : ''}`)
+        .then(r => r.json()).then(d => {
+            if (btn) btn.disabled = false;
+            if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+            st.textContent = `${d.frames} frames${d.hopping ? ' · hopping (airtime % approx)' : ''}`;
+            wifidefRenderAirtime(d);
+        }).catch(() => { if (btn) btn.disabled = false; st.textContent = 'Airtime scan failed'; });
+}
+
+function wifidefRenderAirtime(d) {
+    const fnd = document.getElementById('wifidef-at-findings');
+    fnd.innerHTML = (d.findings || []).map(f => {
+        const cls = f.type === 'roaming_churn' ? 'bg-amber-600/20 text-amber-300 border-amber-700/50'
+            : f.type === 'airtime_hog' ? 'bg-orange-600/20 text-orange-300 border-orange-700/50'
+            : 'bg-red-600/20 text-red-300 border-red-700/50';
+        return `<span class="px-2 py-1 rounded border ${cls}">${f.detail}</span>`;
+    }).join('') || '<span class="text-green-400 text-xs">✓ No link-quality issues in this capture.</span>';
+    const tb = document.getElementById('wifidef-at-tbody');
+    const aps = d.aps || [];
+    if (!aps.length) { tb.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-gray-500">No frames captured (wrong channel? adapter idle?).</td></tr>'; }
+    else tb.innerHTML = aps.map(a => {
+        const retryCol = a.retry_pct >= 30 ? 'text-red-400' : a.retry_pct >= 15 ? 'text-amber-400' : 'text-gray-300';
+        const airCol = a.airtime_pct >= 50 ? 'text-orange-400' : 'text-gray-300';
+        const rate = a.rate_med != null ? `${a.rate_min}/${a.rate_med}/${a.rate_max}` : '—';
+        return `<tr class="border-b border-slate-800/50">
+            <td class="py-1 pr-2 font-mono text-[11px]">${a.bssid}</td>
+            <td class="py-1 pr-2">${a.frames} <span class="text-gray-600 text-[10px]">(${a.data_frames} data)</span></td>
+            <td class="py-1 pr-2 ${retryCol}">${a.retry_pct}%</td>
+            <td class="py-1 pr-2 ${airCol}">${a.airtime_pct}%</td>
+            <td class="py-1 pr-2 text-xs">${rate} <span class="text-gray-600">Mbps</span></td>
+            <td class="py-1 pr-2">${a.rssi == null ? '—' : a.rssi + ' dBm'}</td></tr>`;
+    }).join('');
+    const roam = document.getElementById('wifidef-at-roam');
+    roam.innerHTML = (d.roaming && d.roaming.length)
+        ? '<b class="text-gray-300">Roaming clients:</b> ' + d.roaming.map(r =>
+            `<span class="font-mono">${r.client}</span> (${r.reassoc + r.auth}×)`).join(', ')
+        : '';
+}
+
 function wifidefRender() {
     const d = _wifidef.data; if (!d) return;
     const [label, cls] = _WIFIDEF_THREAT[d.threat] || ['—', 'bg-slate-700 text-slate-300'];

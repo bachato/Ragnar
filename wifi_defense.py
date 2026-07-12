@@ -424,6 +424,130 @@ def parse_pcap(path):
 
 
 # --------------------------------------------------------------------------
+# Airtime / retry / roaming analysis (passive link-quality diagnostics)
+# --------------------------------------------------------------------------
+
+# Rough HT/VHT MCS 0-7 base rates at 20 MHz, 800 ns GI, 1 spatial stream (Mbps).
+_HT_MCS20 = [6.5, 13, 19.5, 26, 39, 52, 58.5, 65]
+
+
+def _frame_rate_mbps(rt):
+    """Best-effort PHY rate (Mbps) from a RadioTap layer: legacy Rate, else MCS."""
+    rate = getattr(rt, "Rate", None)
+    if rate:
+        return round(rate * 0.5, 1)          # radiotap Rate is in 500 kbps units
+    mcs = getattr(rt, "MCS_index", None)
+    if mcs is not None:
+        base = _HT_MCS20[mcs % 8]
+        streams = mcs // 8 + 1
+        bw = getattr(rt, "MCS_bandwidth", 0)
+        factor = 2.07 if bw == 1 else 1.0    # 40 MHz ~2.07x
+        return round(base * streams * factor, 1)
+    return None
+
+
+def _airtime_event(pkt):
+    """Normalize ANY 802.11 frame for airtime/retry/roaming stats (or None)."""
+    from scapy.all import Dot11
+    if not pkt.haslayer(Dot11):
+        return None
+    d = pkt.getlayer(Dot11)
+    fc = int(getattr(d, "FCfield", 0) or 0)
+    ev = {
+        "type": int(d.type), "subtype": int(d.subtype),
+        "retry": bool(fc & 0x08),
+        "src": (d.addr2 or "").lower() or None,
+        "dst": (d.addr1 or "").lower() or None,
+        "bssid": (d.addr3 or "").lower() or None,
+        "bytes": len(bytes(d)),
+        "rate_mbps": None, "rssi": None,
+    }
+    try:
+        from scapy.all import RadioTap
+        if pkt.haslayer(RadioTap):
+            rt = pkt.getlayer(RadioTap)
+            ev["rate_mbps"] = _frame_rate_mbps(rt)
+            ev["rssi"] = getattr(rt, "dBm_AntSignal", None)
+    except Exception:
+        pass
+    return ev
+
+
+def _frame_airtime_us(ev):
+    """Approximate on-air time of a frame in microseconds (data bits / rate +
+    fixed PHY/MAC overhead). Unknown rate → assume a slow 6 Mbps floor."""
+    rate = ev.get("rate_mbps") or 6.0
+    return (ev.get("bytes", 0) * 8) / rate + 50   # +~50us preamble+IFS
+
+
+# Management subtypes that indicate a client (re)joining / roaming.
+_ROAM_SUBTYPES = {0: "assoc", 2: "reassoc", 11: "auth"}
+
+
+def analyze_airtime(events, seconds=None):
+    """Per-AP airtime %, retry rate and PHY-rate spread, plus roaming churn."""
+    import statistics
+    seconds = seconds or 1
+    aps = {}
+    roam = {}
+    for e in events:
+        b = e.get("bssid")
+        # Airtime/retry keyed on the AP (BSSID) for data + mgmt frames.
+        if b:
+            ap = aps.setdefault(b, {"bssid": b, "frames": 0, "retries": 0,
+                                    "airtime_us": 0.0, "rates": [], "rssi": None,
+                                    "data_frames": 0})
+            ap["frames"] += 1
+            if e.get("retry"):
+                ap["retries"] += 1
+            if e["type"] == 2:               # data
+                ap["data_frames"] += 1
+            ap["airtime_us"] += _frame_airtime_us(e)
+            if e.get("rate_mbps"):
+                ap["rates"].append(e["rate_mbps"])
+            if e.get("rssi") is not None:
+                ap["rssi"] = e["rssi"]
+        # Roaming: a client (src) sending assoc/reassoc/auth frames.
+        if e["type"] == 0 and e["subtype"] in _ROAM_SUBTYPES and e.get("src"):
+            r = roam.setdefault(e["src"], {"client": e["src"], "assoc": 0,
+                                           "reassoc": 0, "auth": 0})
+            r[_ROAM_SUBTYPES[e["subtype"]]] += 1
+
+    ap_list = []
+    for ap in aps.values():
+        rates = ap.pop("rates")
+        ap["retry_pct"] = round(ap["retries"] / ap["frames"] * 100, 1) if ap["frames"] else 0
+        ap["airtime_pct"] = round(ap["airtime_us"] / (seconds * 1e6) * 100, 1)
+        ap["rate_min"] = min(rates) if rates else None
+        ap["rate_med"] = round(statistics.median(rates), 1) if rates else None
+        ap["rate_max"] = max(rates) if rates else None
+        ap["airtime_us"] = round(ap["airtime_us"])
+        ap_list.append(ap)
+    ap_list.sort(key=lambda a: -a["airtime_pct"])
+
+    # Roaming churn = a client re-associating/authing repeatedly.
+    roam_list = [r for r in roam.values() if (r["reassoc"] + r["auth"]) >= 3]
+    roam_list.sort(key=lambda r: -(r["reassoc"] + r["auth"]))
+
+    findings = []
+    for ap in ap_list:
+        if ap["retry_pct"] >= 30 and ap["frames"] >= 20:
+            findings.append({"type": "high_retry", "bssid": ap["bssid"],
+                             "detail": f"{ap['bssid']} retry rate {ap['retry_pct']}% "
+                                       f"({ap['retries']}/{ap['frames']}) — poor link"})
+        if ap["airtime_pct"] >= 50:
+            findings.append({"type": "airtime_hog", "bssid": ap["bssid"],
+                             "detail": f"{ap['bssid']} using ~{ap['airtime_pct']}% airtime"})
+    for r in roam_list:
+        findings.append({"type": "roaming_churn", "client": r["client"],
+                         "detail": f"{r['client']} re-joined {r['reassoc'] + r['auth']}× "
+                                   "(reassoc/auth) — roaming instability"})
+
+    return {"aps": ap_list, "roaming": roam_list, "findings": findings,
+            "frames": len(events), "seconds": seconds}
+
+
+# --------------------------------------------------------------------------
 # Live capture
 # --------------------------------------------------------------------------
 
@@ -463,6 +587,64 @@ def _capture(mon_iface, seconds, channel=None):
             return {"error": f"capture failed: {exc}"}
     stop.set()
     return events
+
+
+def _capture_all(mon_iface, seconds, channel=None):
+    """Sniff ALL 802.11 frames (data + mgmt) for airtime/retry analysis. Best on
+    a FIXED channel — airtime % is only meaningful when we dwell on one channel."""
+    from scapy.all import sniff
+    events = []
+
+    def _cb(pkt):
+        ev = _airtime_event(pkt)
+        if ev:
+            events.append(ev)
+
+    stop = threading.Event()
+    if channel:
+        _set_channel(mon_iface, channel)
+    else:
+        def _hopper():
+            i = 0
+            while not stop.is_set():
+                _set_channel(mon_iface, _HOP_CHANNELS[i % len(_HOP_CHANNELS)])
+                i += 1
+                stop.wait(0.35)
+        threading.Thread(target=_hopper, daemon=True).start()
+    try:
+        sniff(iface=mon_iface, prn=_cb, timeout=seconds, store=False, monitor=True)
+    except Exception:
+        try:
+            sniff(iface=mon_iface, prn=_cb, timeout=seconds, store=False)
+        except Exception as exc:
+            stop.set()
+            return {"error": f"capture failed: {exc}"}
+    stop.set()
+    return events
+
+
+def do_airtime(interface, seconds=10, channel=None, auto_enable=True):
+    """Ensure monitor mode, capture a window (ideally on a fixed channel), and
+    return per-AP airtime/retry/rate + roaming-churn diagnostics."""
+    if not _valid_iface(interface):
+        return {"error": "invalid interface"}
+    seconds = max(3, min(60, int(seconds)))
+    state = _load_state()
+    mon = state.get("mon_iface")
+    if not mon:
+        if not auto_enable:
+            return {"error": "monitor mode not enabled"}
+        res = enable_monitor(interface)
+        if "error" in res:
+            return res
+        mon = res["mon_iface"]
+    events = _capture_all(mon, seconds, channel=channel)
+    if isinstance(events, dict) and "error" in events:
+        return events
+    result = analyze_airtime(events, seconds=seconds)
+    result.update({"interface": interface, "monitor": mon, "channel": channel,
+                   "hopping": channel is None, "timestamp": int(time.time())})
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -823,6 +1005,39 @@ def selftest():
         except OSError:
             pass
         _STATE_FILE = _orig_state
+
+    # --- Airtime / retry / roaming analysis (passive diagnostics) ---
+    at_events = []
+    # AP1: 100 data frames, 40 retries (poor link), rate 6 Mbps
+    for i in range(100):
+        at_events.append({"type": 2, "subtype": 0, "retry": i < 40,
+                          "src": "cc:cc:cc:00:00:01", "dst": "11:11:11:11:11:11",
+                          "bssid": "cc:cc:cc:00:00:01", "bytes": 1500,
+                          "rate_mbps": 6.0, "rssi": -55})
+    # AP2: 20 clean data frames, fast
+    for i in range(20):
+        at_events.append({"type": 2, "subtype": 0, "retry": False,
+                          "src": "dd:dd:dd:00:00:02", "dst": "22:22:22:22:22:22",
+                          "bssid": "dd:dd:dd:00:00:02", "bytes": 1500,
+                          "rate_mbps": 300.0, "rssi": -45})
+    # A roaming client: 4 reassoc frames
+    for i in range(4):
+        at_events.append({"type": 0, "subtype": 2, "retry": False,
+                          "src": "ab:cd:ef:00:00:99", "dst": "cc:cc:cc:00:00:01",
+                          "bssid": "cc:cc:cc:00:00:01", "bytes": 60, "rate_mbps": 6.0})
+    at = analyze_airtime(at_events, seconds=10)
+    ap1 = next(a for a in at["aps"] if a["bssid"] == "cc:cc:cc:00:00:01")
+    check("airtime: retry_pct computed", ap1["retries"] == 40
+          and ap1["retry_pct"] == 38.5, json.dumps(ap1))
+    check("airtime: high-retry finding raised",
+          any(f["type"] == "high_retry" for f in at["findings"]),
+          json.dumps(at["findings"]))
+    check("airtime: rate spread captured",
+          ap1["rate_min"] == 6.0 and ap1["rate_max"] == 6.0)
+    check("airtime: roaming churn detected",
+          any(f["type"] == "roaming_churn" for f in at["findings"]))
+    check("airtime: rate parse legacy (radiotap Rate=12 => 6 Mbps)",
+          _frame_rate_mbps(type("R", (), {"Rate": 12, "MCS_index": None})()) == 6.0)
 
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,

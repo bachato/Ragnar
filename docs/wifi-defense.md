@@ -77,7 +77,18 @@ Detection-only; the only state written is the trusted-AP baseline.
 | `GET /api/wifidef/scan?interface=&seconds=&channel=` | capture window + WIDS analysis |
 | `GET/POST /api/wifidef/baseline` | get / add-to (`{aps}` or capture) / `{action:clear}` the trusted SSID→BSSID baseline |
 | `GET/POST /api/wifidef/thresholds` | get / set the beacon-flood thresholds (`{beacon_ssids, beacon_bssids}`) |
+| `GET /api/wifidef/airtime?interface=&seconds=&channel=` | passive airtime / retry / PHY-rate / roaming diagnostics |
 | `GET /api/wifidef/selftest` | parser + detector self-test |
+
+## Airtime & link quality
+
+A separate passive diagnostic (the "why is it slow" view). Capture all 802.11
+frames — ideally on a **fixed channel** (airtime % is only meaningful when not
+hopping) — and get, per AP: **airtime %** (estimated on-air time / capture time),
+**retry rate** (retransmit flag), the **PHY-rate spread** (min/median/max Mbps),
+plus **roaming churn** (clients re-associating/authing repeatedly). Findings flag
+high retry (≥30%), airtime hogs (≥50%) and unstable roaming. Route
+`GET /api/wifidef/airtime`; analysis is a pure function covered by selftest.
 
 ```bash
 python3 wifi_defense.py interfaces

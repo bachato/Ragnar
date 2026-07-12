@@ -13414,6 +13414,20 @@ def register_network_diagnostics(app, logger=None):
         _log(f"wifidef/baseline learn {iface}")
         return jsonify(wifi_defense.learn_baseline(iface, seconds=secs))
 
+    @app.route('/api/wifidef/airtime', methods=['GET'])
+    def wifidef_airtime():
+        iface = (request.args.get('interface') or '').strip()
+        if not _valid_iface(iface):
+            return _bad('Invalid interface')
+        try:
+            secs = max(3, min(60, int(request.args.get('seconds', 10))))
+        except (TypeError, ValueError):
+            secs = 10
+        ch = request.args.get('channel')
+        channel = int(ch) if (ch and ch.isdigit()) else None
+        _log(f"wifidef/airtime {iface} ch={channel}")
+        return jsonify(wifi_defense.do_airtime(iface, seconds=secs, channel=channel))
+
     @app.route('/api/wifidef/thresholds', methods=['GET', 'POST'])
     def wifidef_thresholds():
         if request.method == 'GET':
