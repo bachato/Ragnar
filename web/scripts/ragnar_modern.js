@@ -1972,7 +1972,7 @@ function wifiSurveyDelete() {
 // WiFi Defense — 802.11 frame monitor / WIDS (top-level tab)
 // Backend: /api/wifidef/* (wifi_defense.py)
 // ============================================================================
-const _wifidef = { iface: '', monitor: null, data: null, auto: null };
+const _wifidef = { iface: '', monitor: null, data: null, continuous: false, timer: null, abort: null };
 
 const _WIFIDEF_THREAT = {
     clear: ['CLEAR', 'bg-green-600/20 text-green-300 border border-green-600/50'],
@@ -1986,10 +1986,45 @@ function initWifiDefense() {
     if (auto && !auto._wired) {
         auto._wired = true;
         auto.addEventListener('change', (e) => {
-            if (_wifidef.auto) { clearInterval(_wifidef.auto); _wifidef.auto = null; }
-            if (e.target.checked) _wifidef.auto = setInterval(wifidefScan, 2000);
+            if (e.target.checked) _wifidefStartContinuous();
+            else wifidefStopContinuous();
         });
     }
+    _wifidefUpdateRunUI();
+}
+
+// Continuous mode chains scans: the next capture starts only after the previous
+// one finishes (each capture already runs for `seconds`), instead of a fixed
+// interval that would stack overlapping captures.
+function _wifidefStartContinuous() {
+    if (_wifidef.continuous) return;
+    _wifidef.continuous = true;
+    _wifidefUpdateRunUI();
+    _wifidefLoop();
+}
+
+function _wifidefLoop() {
+    if (!_wifidef.continuous) return;
+    wifidefScan().finally(() => {
+        if (_wifidef.continuous) _wifidef.timer = setTimeout(_wifidefLoop, 800);
+    });
+}
+
+function wifidefStopContinuous() {
+    _wifidef.continuous = false;
+    if (_wifidef.timer) { clearTimeout(_wifidef.timer); _wifidef.timer = null; }
+    if (_wifidef.abort) { try { _wifidef.abort.abort(); } catch (e) {} _wifidef.abort = null; }
+    const cb = document.getElementById('wifidef-auto'); if (cb) cb.checked = false;
+    _wifidefUpdateRunUI();
+    const st = document.getElementById('wifidef-status');
+    if (st) st.textContent = 'Continuous scan stopped';
+}
+
+function _wifidefUpdateRunUI() {
+    const scan = document.getElementById('wifidef-scan-btn');
+    const stop = document.getElementById('wifidef-stop-btn');
+    if (scan) scan.classList.toggle('hidden', _wifidef.continuous);
+    if (stop) stop.classList.toggle('hidden', !_wifidef.continuous);
 }
 
 function _wifidefFillIfaces() {
@@ -2046,23 +2081,33 @@ function wifidefToggleMonitor() {
 
 function wifidefScan() {
     const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
-    if (!iface) return;
+    if (!iface) return Promise.resolve();
     const secs = document.getElementById('wifidef-secs').value || 15;
     let ch = (document.getElementById('wifidef-channel').value || 'hop').trim();
     const chParam = /^\d+$/.test(ch) ? ch : 'auto';
     const st = document.getElementById('wifidef-status');
     const btn = document.getElementById('wifidef-scan-btn');
-    st.textContent = 'Capturing ' + secs + 's…'; if (btn) btn.disabled = true;
-    fetch(`/api/wifidef/scan?interface=${encodeURIComponent(iface)}&seconds=${secs}&channel=${chParam}`)
+    const ctrl = new AbortController();
+    _wifidef.abort = ctrl;
+    st.textContent = (_wifidef.continuous ? 'Continuous — capturing ' : 'Capturing ') + secs + 's…';
+    if (btn) btn.disabled = true;
+    return fetch(`/api/wifidef/scan?interface=${encodeURIComponent(iface)}&seconds=${secs}&channel=${chParam}`,
+        { signal: ctrl.signal })
         .then(r => r.json()).then(d => {
-            if (btn) btn.disabled = false;
             if (d.error) { st.textContent = '⚠ ' + d.error; return; }
             _wifidef.monitor = d.monitor || _wifidef.monitor;
             _wifidefUpdateMonBtn();
             _wifidef.data = d;
-            st.textContent = `${d.frames} frames · ${new Date(d.timestamp * 1000).toLocaleTimeString()}`;
+            st.textContent = `${d.frames} frames · ${new Date(d.timestamp * 1000).toLocaleTimeString()}`
+                + (_wifidef.continuous ? ' · live' : '');
             wifidefRender();
-        }).catch(() => { if (btn) btn.disabled = false; st.textContent = 'Scan failed'; });
+        }).catch((e) => {
+            if (e && e.name === 'AbortError') return;   // stopped by user; leave status
+            st.textContent = 'Scan failed';
+        }).finally(() => {
+            if (_wifidef.abort === ctrl) _wifidef.abort = null;
+            if (btn) btn.disabled = false;
+        });
 }
 
 function wifidefTrust() {

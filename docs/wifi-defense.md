@@ -56,7 +56,8 @@ it (best when you already know where the attack is).
 3. **Trust current APs** once, in a known-good environment — this records the
    SSID→BSSID baseline that powers **evil-twin** detection.
 4. **Scan** for a capture window (default 15 s), or tick **Continuous** to
-   re-scan on a loop as a live monitor.
+   re-scan on a loop as a live monitor — each capture starts only after the
+   previous one finishes (no overlap). Hit **■ Stop** to end the loop.
 
 ---
 

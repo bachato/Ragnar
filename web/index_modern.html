@@ -2049,6 +2049,7 @@
                     </div>
                     <button onclick="wifidefToggleMonitor()" id="wifidef-mon-btn" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Enable monitor</button>
                     <button onclick="wifidefScan()" id="wifidef-scan-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm font-semibold">Scan</button>
+                    <button onclick="wifidefStopContinuous()" id="wifidef-stop-btn" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-semibold hidden">■ Stop</button>
                     <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifidef-auto" class="accent-Ragnar-600"> Continuous</label>
                     <button onclick="wifidefTrust()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap" title="Record the currently-visible APs as the trusted baseline for evil-twin detection">Trust current APs</button>
                     <span id="wifidef-status" class="text-xs text-gray-500 ml-auto"></span>
@@ -6292,7 +6293,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifisel"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefstop"></script>
 
 </body>
 </html>
