@@ -129,3 +129,21 @@ the same call. Continuous mode keeps looping through a recovery, so live
 monitoring self-heals. If it still fails after that, **Disable monitor** then
 **Enable monitor** to force a fresh vif. Your trusted-AP baseline and tuned
 thresholds are preserved across all monitor bookkeeping.
+
+**Diagnosing a stubborn adapter — `scripts/wifidef_doctor.sh`.** When monitor
+comes up but captures nothing (or a specific dongle misbehaves), run the doctor:
+
+```bash
+sudo ./scripts/wifidef_doctor.sh            # auto-detects the adapter
+sudo ./scripts/wifidef_doctor.sh wlan1      # or name it explicitly
+```
+
+It records the environment (kernel, driver, `rfkill`, radio modes, code version
+and **when the service last restarted** — a common gotcha after `git pull`),
+then enables monitor through Ragnar's own code and compares an **OS-level
+capture (`tcpdump`)** against Ragnar's capture on a channel that has traffic. The
+contrast is the diagnosis: if `tcpdump` hears frames but Ragnar reports `frames=0`
+the bug is in the capture path; if neither hears anything while `iw dev ragmon0
+info` shows a real monitor channel, it's the driver/firmware. It also does a
+disable→re-enable cycle and a manual vif rebuild, and dumps `dmesg`. Everything
+is saved to `/tmp/wifidef_doctor_*.log` to paste into a bug report.
