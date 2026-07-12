@@ -958,6 +958,13 @@
                         <span id="monitor-mode-badge" class="hidden inline-flex items-center mt-1 text-xs font-medium px-2 py-0.5 rounded-full"></span>
                     </div>
                     <div class="flex flex-wrap items-center gap-3">
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400">
+                            <span class="whitespace-nowrap">Interface</span>
+                            <select id="threat-sweep-iface" title="WiFi interface to sweep with"
+                                    class="bg-slate-900/70 border border-slate-700 focus:border-red-500 rounded px-2 py-1.5 text-xs text-gray-200 min-w-[110px]">
+                                <option value="">Auto</option>
+                            </select>
+                        </label>
                         <button id="threat-sweep-btn"
                                 onclick="runThreatSweep()"
                                 class="bg-red-700 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap flex items-center space-x-2">
@@ -6293,7 +6300,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefstop"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-threatiface"></script>
 
 </body>
 </html>

@@ -8194,7 +8194,13 @@ async function runThreatSweep() {
     panel.innerHTML = `<div class="flex items-center space-x-2 text-gray-300 text-sm"><svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg><span>Scanning WiFi airspace for rogue APs, evil twins, and suspicious devices… (~10s)</span></div>`;
 
     try {
-        const resp = await fetch('/api/network/threat-sweep', { method: 'POST' });
+        const ifSel = document.getElementById('threat-sweep-iface');
+        const iface = ifSel ? ifSel.value : '';
+        const resp = await fetch('/api/network/threat-sweep', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(iface ? { interface: iface } : {}),
+        });
         const data = await resp.json();
 
         if (!data.success) {
@@ -8231,23 +8237,27 @@ async function toggleThreatMonitor() {
     interval = Math.max(10, Math.min(600, interval));
     if (intervalInput) intervalInput.value = interval;
 
+    const ifSel = document.getElementById('threat-sweep-iface');
+    const iface = ifSel ? ifSel.value : '';
     try {
         const resp = await fetch('/api/network/threat-monitor/toggle', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interval })
+            body: JSON.stringify(iface ? { interval, interface: iface } : { interval })
         });
         const data = await resp.json();
 
         if (data.enabled) {
             if (toggle) toggle.checked = true;
             if (intervalInput) intervalInput.disabled = true;
+            if (ifSel) ifSel.disabled = true;
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = 'Monitoring…'; statusEl.classList.remove('hidden'); }
             _startThreatMonitorPoll(panel);
         } else {
             if (toggle) toggle.checked = false;
             if (intervalInput) intervalInput.disabled = false;
+            if (ifSel) ifSel.disabled = false;
             if (warning) warning.classList.add('hidden');
             if (statusEl) { statusEl.textContent = ''; statusEl.classList.add('hidden'); }
             _stopThreatMonitorPoll();
@@ -8310,6 +8320,7 @@ async function clearThreatMonitorFindings() {
 
 // Restore toggle state on page load
 async function _restoreThreatMonitorState() {
+    await _threatFillIfaces();   // populate the selector before we set its value
     try {
         const resp = await fetch('/api/network/threat-monitor');
         const data = await resp.json();
@@ -8322,6 +8333,8 @@ async function _restoreThreatMonitorState() {
 
             if (toggle) toggle.checked = true;
             if (intervalInput) { intervalInput.value = data.interval || 60; intervalInput.disabled = true; }
+            const ifSel = document.getElementById('threat-sweep-iface');
+            if (ifSel) { if (data.interface) ifSel.value = data.interface; ifSel.disabled = true; }
             if (warning) warning.classList.remove('hidden');
             if (statusEl) { statusEl.textContent = `Sweep #${data.sweep_count || 0}`; statusEl.classList.remove('hidden'); }
             _updateMonitorModeBadge(data.monitor_mode);
@@ -8336,6 +8349,25 @@ async function _restoreThreatMonitorState() {
     } catch (e) { /* not critical */ }
 }
 document.addEventListener('DOMContentLoaded', _restoreThreatMonitorState);
+
+// Populate the External Threat Detection interface selector from the WiFi
+// interfaces the analyzer sees (same source as the WiFi Analyzer tab).
+async function _threatFillIfaces() {
+    const sel = document.getElementById('threat-sweep-iface');
+    if (!sel) return;
+    try {
+        const resp = await fetch('/api/net/wifi/interfaces');
+        const d = await resp.json();
+        const ifs = (d && d.interfaces) || [];
+        const cur = sel.value;
+        sel.innerHTML = '<option value="">Auto</option>' + ifs.map(i => {
+            const bands = (i.bands || []).length ? ' · ' + i.bands.join('/') + 'GHz' : '';
+            const mon = i.type === 'monitor' ? ' • MONITOR' : '';
+            return `<option value="${i.iface}">${i.iface}${bands}${mon}</option>`;
+        }).join('');
+        if (cur && ifs.some(i => i.iface === cur)) sel.value = cur;
+    } catch (e) { /* leave Auto */ }
+}
 
 function formatThreatBadge(threats) {
     if (!threats || threats.length === 0) return '';
