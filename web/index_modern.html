@@ -2047,12 +2047,21 @@
                                 <option value="metal">Metal (20 dB)</option>
                             </select>
                             <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to drop AP nodes — add as many as you like to plan a mesh">📶 Place AP nodes</button>
+                            <button id="wifi-hm-tool-column" onclick="wifiHmSetTool('column')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to drop structural columns/pillars — they shadow WiFi behind them">⬤ Column</button>
+                            <select id="wifi-hm-col-mat" class="bg-slate-800 border border-slate-700 rounded px-1 py-1 text-xs" title="Column material — sets its dB attenuation">
+                                <option value="concrete" selected>Concrete (15 dB)</option>
+                                <option value="metal">Steel/metal (20 dB)</option>
+                                <option value="brick">Brick (10 dB)</option>
+                            </select>
+                            <label class="text-[11px] text-gray-400" title="Column radius in metres (a typical pillar is ~0.3 m)">⌀ <input id="wifi-hm-col-rad" type="number" value="0.3" min="0.05" max="3" step="0.05" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
                             <label class="text-[11px] text-gray-400" title="Real width of the floorplan, so predicted distances are in metres">Floor width <input id="wifi-hm-scale" type="number" value="10" min="1" max="500" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
                             <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-600"> Predict coverage</label>
                             <button onclick="wifiHmUndoWall()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo wall</button>
                             <button onclick="wifiHmClearWalls()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear walls</button>
                             <button onclick="wifiHmUndoAp()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo AP</button>
                             <button onclick="wifiHmClearAps()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear APs</button>
+                            <button onclick="wifiHmUndoColumn()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo column</button>
+                            <button onclick="wifiHmClearColumns()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear columns</button>
                             <span id="wifi-hm-design-status" class="text-[11px] text-gray-500"></span>
                         </span>
                     </div>
@@ -6376,7 +6385,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-meshdrag"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-columns"></script>
 
 </body>
 </html>

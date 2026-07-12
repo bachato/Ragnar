@@ -194,24 +194,31 @@ measuring it — Ekahau's predictive-design feature in miniature:
 2. **Place AP nodes** — click where an AP would go. **Click again to drop more
    nodes and plan a whole mesh** (they're labelled AP1, AP2, …); **Undo AP** /
    **Clear APs** manage them. Set the **floor width (m)** so distances are metric.
-3. Tick **Predict coverage** — the map fills with **modelled RSSI** everywhere.
+3. **Place columns** — structural pillars are a *major* open-floor coverage
+   killer, so drop them with the **⬤ Column** tool: pick the **material**
+   (concrete 15 dB, steel/metal 20, brick 10) and the **radius (m)** (a typical
+   pillar is ~0.3 m). Each column is drawn to scale (amber, hatched) and **casts
+   a signal shadow** on the far side — any AP→point line that passes through the
+   pillar loses its dB. **Undo column** / **Clear columns** manage them.
+4. Tick **Predict coverage** — the map fills with **modelled RSSI** everywhere.
    With several nodes, each spot shows the **best signal any node delivers**
    (served by its strongest node — exactly how a real mesh behaves), using the
    log-distance path-loss model **minus the summed loss of every wall the
-   node→point line crosses**. Move nodes or edit walls and it updates live.
+   node→point line crosses and every column it passes through**. Move nodes,
+   walls or columns and it updates live.
 
 **Drag to rearrange:** in Design mode you can **grab and drag** any placed
-object — drag an **AP node** to move it, drag a **wall endpoint** (the small
-handles) to re-angle a wall, or drag a **wall's body** to slide the whole wall.
-The cursor shows a grab hand over anything draggable, and the predicted coverage
-re-renders live as you move. (Dragging never drops a new object; click empty
-space to add one.)
+object — drag an **AP node** or a **column** to move it, drag a **wall endpoint**
+(the small handles) to re-angle a wall, or drag a **wall's body** to slide the
+whole wall. The cursor shows a grab hand over anything draggable, and the
+predicted coverage re-renders live as you move. (Dragging never drops a new
+object; click empty space to add one.)
 
-Walls and the modelled AP nodes persist with the heatmap (and inside saved
-surveys). The prediction math (`predict_point_rssi` per node,
-`predict_point_rssi_multi` for the best-node mesh combine, segment-crossing
-attenuation) is identical in the Python backend and the JS renderer, and is
-covered by selftest.
+Walls, columns and the modelled AP nodes persist with the heatmap (and inside
+saved surveys). The prediction math (`predict_point_rssi` per node with wall
+segment-crossing + `_seg_circle_hit` column shadowing, `predict_point_rssi_multi`
+for the best-node mesh combine) is identical in the Python backend and the JS
+renderer, and is covered by selftest.
 
 Live samples persist in `data/wifi_heatmap.json`; **Clear** starts a fresh
 survey.

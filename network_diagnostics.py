@@ -13292,6 +13292,8 @@ def register_network_diagnostics(app, logger=None):
             return jsonify(wifi_analyzer.heatmap_clear())
         if action == 'walls':
             return jsonify(wifi_analyzer.heatmap_set_walls(data.get('walls') or []))
+        if action == 'columns':
+            return jsonify(wifi_analyzer.heatmap_set_columns(data.get('columns') or []))
         if action == 'predict_ap':
             return jsonify(wifi_analyzer.heatmap_set_predict_ap(data.get('ap')))
         if action == 'predict_aps':

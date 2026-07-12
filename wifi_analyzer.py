@@ -1184,6 +1184,8 @@ def _heatmap_load():
     # survey. `predict_aps` is a list so you can plan a whole mesh; a legacy
     # single `predict_ap` is migrated into it.
     data.setdefault("walls", [])
+    # Structural columns / pillars — round point-obstacles that shadow signal.
+    data.setdefault("columns", [])
     data.setdefault("predict_ap", None)
     if "predict_aps" not in data:
         data["predict_aps"] = [data["predict_ap"]] if data.get("predict_ap") else []
@@ -1241,6 +1243,27 @@ def heatmap_set_walls(walls):
     return data
 
 
+def heatmap_set_columns(columns):
+    """Persist structural columns/pillars (list of {x,y in 0..1 centre,
+    radius_m, loss_db, material}). A column shadows any AP→point line that
+    passes through it — the classic open-floor coverage killer."""
+    data = _heatmap_load()
+    clean = []
+    for c in columns or []:
+        try:
+            clean.append({
+                "x": float(c["x"]), "y": float(c["y"]),
+                "radius_m": max(0.05, float(c.get("radius_m", 0.3))),
+                "loss_db": float(c.get("loss_db", _WALL_MATERIALS["concrete"])),
+                "material": c.get("material") or "concrete",
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    data["columns"] = clean
+    _heatmap_save(data)
+    return data
+
+
 def _clean_predict_ap(ap):
     """Validate + normalize one modelled AP, or None if it's malformed.
     `width_m`/`height_m` give the floorplan's real size so normalized distances
@@ -1292,10 +1315,21 @@ def _segments_cross(a, b, c, d):
             and _ccw(*a, *b, *c) != _ccw(*a, *b, *d))
 
 
-def predict_point_rssi(px, py, ap, walls):
+def _seg_circle_hit(ax, ay, bx, by, cx, cy, r):
+    """True if segment (ax,ay)-(bx,by) passes within `r` of centre (cx,cy).
+    All coordinates in the same units (metres). Used to shadow a round column."""
+    dx, dy = bx - ax, by - ay
+    len2 = dx * dx + dy * dy
+    t = (((cx - ax) * dx + (cy - ay) * dy) / len2) if len2 else 0.0
+    t = max(0.0, min(1.0, t))
+    return math.hypot(cx - (ax + t * dx), cy - (ay + t * dy)) <= r
+
+
+def predict_point_rssi(px, py, ap, walls, columns=None):
     """Predicted RSSI (dBm) at normalized point (px,py) from a modelled AP,
     using log-distance path loss plus the summed loss of every wall the straight
-    AP→point line crosses. Pure + unit-tested; the JS renderer mirrors it."""
+    AP→point line crosses, plus every structural column it passes through.
+    Pure + unit-tested; the JS renderer mirrors it."""
     width_m = ap.get("width_m", 10.0)
     height_m = ap.get("height_m", 10.0)
     rssi0 = _rssi_at_1m(ap.get("freq", 5200), ap.get("tx_dbm", _DEFAULT_TX_DBM))
@@ -1308,16 +1342,23 @@ def predict_point_rssi(px, py, ap, walls):
     for w in walls or []:
         if _segments_cross(a, b, (w["x1"], w["y1"]), (w["x2"], w["y2"])):
             rssi -= w.get("loss_db", 5)
+    # Columns: test the AP→point line in metres against each pillar's radius.
+    for c in columns or []:
+        if _seg_circle_hit(ap["x"] * width_m, ap["y"] * height_m,
+                           px * width_m, py * height_m,
+                           c["x"] * width_m, c["y"] * height_m,
+                           c.get("radius_m", 0.3)):
+            rssi -= c.get("loss_db", _WALL_MATERIALS["concrete"])
     return round(rssi, 1)
 
 
-def predict_point_rssi_multi(px, py, aps, walls):
+def predict_point_rssi_multi(px, py, aps, walls, columns=None):
     """Predicted RSSI at (px,py) from a set of modelled AP nodes: the BEST
     signal any node delivers (each spot served by its strongest node), matching
     real mesh behaviour. None if no nodes. Mirrored in the JS renderer."""
     if not aps:
         return None
-    return round(max(predict_point_rssi(px, py, ap, walls) for ap in aps), 1)
+    return round(max(predict_point_rssi(px, py, ap, walls, columns) for ap in aps), 1)
 
 
 # --------------------------------------------------------------------------
@@ -1988,6 +2029,28 @@ def selftest():
     check("a wall not crossed has no effect",
           abs(r_sidewall - predict_point_rssi(0.6, 0.5, ap_pred, [])) < 0.01)
 
+    # --- Structural columns (round pillars that shadow signal) ---
+    # AP at centre-left, column dead-centre, point on the far right => the
+    # AP→point line runs straight through the pillar and must lose its dB.
+    ap_l = dict(ap_pred, x=0.1, y=0.5)
+    col = {"x": 0.5, "y": 0.5, "radius_m": 0.5, "loss_db": 15}
+    r_clear = predict_point_rssi(0.9, 0.5, ap_l, [])
+    r_shadow = predict_point_rssi(0.9, 0.5, ap_l, [], [col])
+    check("a column in the line of sight subtracts its loss",
+          abs((r_clear - r_shadow) - 15) < 0.01, f"{r_clear} - {r_shadow}")
+    # A point off to the side (line misses the pillar) is unaffected.
+    r_side = predict_point_rssi(0.5, 0.05, ap_l, [], [col])
+    check("a column not in the path has no effect",
+          abs(r_side - predict_point_rssi(0.5, 0.05, ap_l, [])) < 0.01)
+    check("seg-circle hit true when line passes through centre",
+          _seg_circle_hit(0, 0, 10, 0, 5, 0, 0.5) is True)
+    check("seg-circle miss when line clears the radius",
+          _seg_circle_hit(0, 0, 10, 0, 5, 2, 0.5) is False)
+    # Columns compose with the mesh best-node combine.
+    two_col = predict_point_rssi_multi(0.9, 0.5, [ap_l], [], [col])
+    check("column loss flows through the mesh combine",
+          two_col == r_shadow, f"{two_col} vs {r_shadow}")
+
     # --- Multi-node predictive coverage (planned mesh: best node wins) ---
     ap_a = dict(ap_pred, x=0.1, y=0.5)
     ap_b = dict(ap_pred, x=0.9, y=0.5)
@@ -2016,6 +2079,14 @@ def selftest():
         check("clearing nodes empties predict_aps and predict_ap",
               heatmap_get().get("predict_aps") == []
               and heatmap_get().get("predict_ap") is None)
+        heatmap_set_columns([{"x": 0.4, "y": 0.6, "material": "concrete"}])
+        hc = heatmap_get().get("columns", [])
+        check("columns persist with radius/loss defaults",
+              len(hc) == 1 and hc[0]["radius_m"] == 0.3
+              and hc[0]["loss_db"] == _WALL_MATERIALS["concrete"],
+              json.dumps(hc))
+        heatmap_set_columns([])
+        check("clearing columns empties them", heatmap_get().get("columns") == [])
     finally:
         try:
             os.unlink(_HEATMAP_FILE)
