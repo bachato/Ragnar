@@ -1683,9 +1683,11 @@ function wifiSetEnvPreset(v) {
 
 function _wifiSyncEnvPreset() {
     // Reflect a manually-typed n back into the preset dropdown (custom if no match).
+    // Compare numerically so 5, 5.0 and "5.0" all match the same option.
     const sel = document.getElementById('wifi-env-preset'); if (!sel) return;
-    const n = String(parseFloat(document.getElementById('wifi-ple').value));
-    sel.value = [...sel.options].some(o => o.value === n) ? n : 'custom';
+    const n = parseFloat(document.getElementById('wifi-ple').value);
+    const match = [...sel.options].find(o => o.value !== 'custom' && parseFloat(o.value) === n);
+    sel.value = match ? match.value : 'custom';
 }
 
 function wifiCalibrate() {

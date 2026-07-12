@@ -116,7 +116,7 @@ advertised TPC power when present) and the environment path-loss exponent (`n`,
 default 3.0 for indoor) are adjustable, and the model and its assumptions are
 shown so the numbers stay honest. An **Env preset** dropdown sets `n` for common
 environments — Open/LOS (2.0), Open indoor (2.5), Light indoor (3.0), Office/few
-walls (3.5), Heavy walls (4.5) — or **Custom** to type your own; the preset and
+walls (3.5), Heavy walls (5.0) — or **Custom** to type your own; the preset and
 the manual `n` field stay in sync. Through walls, a single free-space model reads
 *long* (it attributes wall loss to distance), so bump `n` up (or use two-point
 calibration) for wall-heavy paths.
