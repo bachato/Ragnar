@@ -164,7 +164,9 @@ metric render grey and are excluded from interpolation.
 
 **Named surveys** — save the current floorplan + samples under a name, then
 list/load/delete them (`data/wifi_surveys.json`) to keep several sites or
-before/after comparisons.
+before/after comparisons. **📄 Report** opens a printable one-page survey report
+(heatmap image, coverage stats, band/channel plan, interference, security issues
+and the full AP inventory) — print or "Save as PDF" from the browser dialog.
 
 ### Design / predictive coverage
 
