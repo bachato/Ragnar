@@ -46,14 +46,15 @@ _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Detection thresholds (per capture window)
 _DEAUTH_FLOOD_MIN = 15      # deauth+disassoc frames => flood
-# Beacon flood. Raw SSID/BSSID counts alone false-positive badly in dense/urban
-# airspace (a normal apartment block easily has 30+ SSIDs / 50+ BSSIDs), so the
-# primary signal is randomized/locally-administered BSSIDs — real vendor APs use
-# globally-unique OUIs, whereas mdk3/mdk4/ESP32 beacon spammers spray SSIDs from
-# random MACs. Raw counts are kept only as a very-high safety net.
-_BEACON_FLOOD_RANDOM_BSSIDS = 6   # AP-beaconing randomized MACs => flood (real ~0)
-_BEACON_FLOOD_SSIDS = 80          # extreme distinct-SSID safety net
-_BEACON_FLOOD_BSSIDS = 120        # extreme distinct-BSSID safety net
+# Beacon flood. There is no reliable "shape" signal that separates a flood from a
+# dense neighbourhood passively: raw SSID/BSSID counts scale with how crowded the
+# airspace is, and randomized/locally-administered BSSIDs are ALSO used by ordinary
+# multi-SSID routers (guest/IoT VAPs derive their BSSID by setting the 0x02 bit),
+# so a block full of them trips any LA-based rule. The only robust lever is the raw
+# distinct-SSID/BSSID count with a threshold the user calibrates to their own RF
+# environment — a real mdk3/mdk4/ESP32 flood produces hundreds, far above any home.
+_BEACON_FLOOD_SSIDS = 100         # distinct beaconed SSIDs => flood (tunable)
+_BEACON_FLOOD_BSSIDS = 150        # distinct beaconing BSSIDs => flood (tunable)
 _KARMA_SSID_MIN = 5               # distinct SSIDs answered by ONE bssid => KARMA
 
 # Channels the hopper cycles when no fixed channel is requested (2.4 GHz + the
@@ -298,6 +299,31 @@ def clear_baseline():
     return _write_baseline({})
 
 
+def get_thresholds():
+    """User-tunable beacon-flood thresholds (persisted), with sane defaults."""
+    st = _load_state().get("thresholds") or {}
+    return {
+        "beacon_ssids": int(st.get("beacon_ssids", _BEACON_FLOOD_SSIDS)),
+        "beacon_bssids": int(st.get("beacon_bssids", _BEACON_FLOOD_BSSIDS)),
+    }
+
+
+def set_thresholds(beacon_ssids=None, beacon_bssids=None):
+    cur = get_thresholds()
+    if beacon_ssids is not None:
+        cur["beacon_ssids"] = max(10, min(2000, int(beacon_ssids)))
+    if beacon_bssids is not None:
+        cur["beacon_bssids"] = max(10, min(2000, int(beacon_bssids)))
+    state = _load_state()
+    state["thresholds"] = cur
+    os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
+    tmp = _STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, _STATE_FILE)
+    return cur
+
+
 def _aps_to_mapping(aps):
     """SSID -> [BSSID] from an AP inventory list (skips hidden/empty SSIDs)."""
     mapping = {}
@@ -443,9 +469,12 @@ def _capture(mon_iface, seconds, channel=None):
 # Analysis
 # --------------------------------------------------------------------------
 
-def analyze(events, baseline=None, window_secs=None):
+def analyze(events, baseline=None, window_secs=None, thresholds=None):
     """Classify a list of frame events into WIDS detections. Pure function."""
     baseline = baseline or {}
+    th = thresholds or {}
+    beacon_ssid_max = int(th.get("beacon_ssids", _BEACON_FLOOD_SSIDS))
+    beacon_bssid_max = int(th.get("beacon_bssids", _BEACON_FLOOD_BSSIDS))
     deauths = [e for e in events if e["kind"] in ("deauth", "disassoc")]
     beacons = [e for e in events if e["kind"] == "beacon"]
     presp = [e for e in events if e["kind"] == "probe_resp"]
@@ -468,19 +497,19 @@ def analyze(events, baseline=None, window_secs=None):
         })
 
     # --- Beacon flood ---
-    # Distinguish a real flood from a merely-crowded neighbourhood: the telltale
-    # sign is a swarm of SSIDs from *randomized* (locally-administered) BSSIDs.
+    # A real flood produces hundreds of distinct SSIDs/BSSIDs — far above any home
+    # or apartment block. The threshold is user-tunable so it can be calibrated to
+    # the local RF density (see get/set_thresholds). The live counts are always
+    # reported (below, in `airspace`) so the user can see where they sit.
     if beacons:
         ssids = {e["ssid"] for e in beacons if e.get("ssid")}
         bssids = {e["src"] for e in beacons if e.get("src")}
         rnd_bssids = {b for b in bssids if _is_locally_administered(b)}
         reasons = []
-        if len(rnd_bssids) >= _BEACON_FLOOD_RANDOM_BSSIDS:
-            reasons.append(f"{len(rnd_bssids)} randomized-MAC APs")
-        if len(ssids) >= _BEACON_FLOOD_SSIDS:
-            reasons.append(f"{len(ssids)} distinct SSIDs")
-        if len(bssids) >= _BEACON_FLOOD_BSSIDS:
-            reasons.append(f"{len(bssids)} distinct BSSIDs")
+        if len(ssids) >= beacon_ssid_max:
+            reasons.append(f"{len(ssids)} distinct SSIDs (≥{beacon_ssid_max})")
+        if len(bssids) >= beacon_bssid_max:
+            reasons.append(f"{len(bssids)} distinct BSSIDs (≥{beacon_bssid_max})")
         if reasons:
             detections.append({
                 "type": "beacon_flood", "severity": "flood",
@@ -551,12 +580,24 @@ def analyze(events, baseline=None, window_secs=None):
         worst = max(sev_rank.get(d["severity"], 1) for d in detections)
         threat = "critical" if worst >= 3 else "warning"
 
+    # Live airspace stats so the UI can show where the capture sits relative to
+    # the beacon-flood threshold (for calibration).
+    b_ssids = {e["ssid"] for e in beacons if e.get("ssid")}
+    b_bssids = {e["src"] for e in beacons if e.get("src")}
+    airspace = {
+        "ssids": len(b_ssids), "bssids": len(b_bssids),
+        "random_bssids": len({b for b in b_bssids if _is_locally_administered(b)}),
+        "beacon_ssid_threshold": beacon_ssid_max,
+        "beacon_bssid_threshold": beacon_bssid_max,
+    }
+
     return {
         "threat": threat,
         "frames": len(events),
         "counts": {"deauth": len(deauths), "beacon": len(beacons),
                    "probe_resp": len(presp),
                    "probe_req": sum(1 for e in events if e["kind"] == "probe_req")},
+        "airspace": airspace,
         "detections": detections,
         "aps": sorted(aps.values(), key=lambda a: -(a.get("rssi") or -999)),
     }
@@ -584,7 +625,8 @@ def do_scan(interface, seconds=15, channel=None, auto_enable=True):
     events = _capture(mon, seconds, channel=channel)
     if isinstance(events, dict) and "error" in events:
         return events
-    result = analyze(events, baseline=get_baseline(), window_secs=seconds)
+    result = analyze(events, baseline=get_baseline(), window_secs=seconds,
+                     thresholds=get_thresholds())
     result.update({"interface": interface, "monitor": mon,
                    "seconds": seconds, "channel": channel,
                    "timestamp": int(time.time())})
@@ -697,17 +739,25 @@ def selftest():
     check("deauth attacker identified",
           any(a["src"] == "aa:aa:aa:00:00:01" for a in
               types.get("deauth", {}).get("attackers", [])))
-    check("beacon flood detected", "beacon_flood" in types,
-          str(types.get("beacon_flood")))
-    check("beacon flood attributed to randomized MACs",
-          types.get("beacon_flood", {}).get("random_bssids", 0) >= _BEACON_FLOOD_RANDOM_BSSIDS,
-          str(types.get("beacon_flood")))
+    # 35 fake SSIDs is a flood in a home but below the default (100) threshold;
+    # the point of the fix is that beacon flood must be TUNABLE, not fire on
+    # raw density. Default => quiet; a lowered threshold => fires.
+    check("beacon flood NOT flagged at default threshold (35 < 100)",
+          "beacon_flood" not in types, str(types.get("beacon_flood")))
+    res_low = analyze(events, thresholds={"beacon_ssids": 25})
+    check("beacon flood fires when threshold is lowered",
+          any(d["type"] == "beacon_flood" for d in res_low["detections"]),
+          json.dumps([d.get("detail") for d in res_low["detections"]]))
+    check("airspace counts reported for calibration",
+          res["airspace"]["ssids"] >= 35
+          and res["airspace"]["beacon_ssid_threshold"] == _BEACON_FLOOD_SSIDS,
+          json.dumps(res["airspace"]))
     # A dense-but-legit airspace (many SSIDs from GLOBAL/vendor MACs) must NOT
-    # trip beacon flood — this is the false positive the user hit.
+    # trip beacon flood at the default threshold — this is the user's false pos.
     dense = [{"kind": "beacon", "src": "00:1a:2b:%02x:%02x:00" % (i // 256, i % 256),
-              "ssid": "Neighbour_%d" % i} for i in range(45)]
+              "ssid": "Neighbour_%d" % i} for i in range(60)]
     dense_res = analyze(dense, baseline={})
-    check("dense legit airspace is NOT a beacon flood",
+    check("dense legit airspace is NOT a beacon flood (default)",
           not any(d["type"] == "beacon_flood" for d in dense_res["detections"]),
           json.dumps([d["detail"] for d in dense_res["detections"]]))
     check("KARMA detected", "karma" in types and types["karma"]["ssid_count"] >= 5,
@@ -760,6 +810,13 @@ def selftest():
               get_baseline().get("Cafe") == ["bb:bb:bb:00:00:01"],
               json.dumps(get_baseline().get("Cafe")))
         check("clear_baseline empties it", clear_baseline() == {} and get_baseline() == {})
+        # Tunable thresholds persist and survive a baseline clear.
+        set_thresholds(beacon_ssids=250)
+        check("threshold persists and is clamped/read back",
+              get_thresholds()["beacon_ssids"] == 250)
+        set_baseline({"X": ["aa:bb:cc:dd:ee:ff"]})
+        check("threshold survives a later baseline write",
+              get_thresholds()["beacon_ssids"] == 250)
     finally:
         try:
             os.unlink(_STATE_FILE)

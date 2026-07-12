@@ -17,7 +17,7 @@ Wi-Fi attacks a defender cares about.
 | Attack | What it is | How it's flagged |
 |--------|-----------|------------------|
 | **Deauth / disassoc flood** | The 802.11 deauthentication DoS (`aireplay-ng`, `mdk4`): spoofed deauth/disassoc frames kick clients off an AP. | A burst of deauth/disassoc management frames; ≥ 15 in a window is called a **flood**. The attacker (transmitter) and target are listed. |
-| **Beacon flood** | A storm of fake APs (`mdk3`/`mdk4` beacon mode, ESP32 spammers) — bogus SSIDs to drown the air or bait clients. | A swarm of beacons from **randomized / locally-administered BSSIDs** (≥ 6) — the flood signature real vendor APs don't produce — or an extreme raw count (≥ 80 SSIDs / ≥ 120 BSSIDs) as a safety net. Raw counts alone are deliberately **not** enough, so a merely-crowded neighbourhood no longer false-positives. |
+| **Beacon flood** | A storm of fake APs (`mdk3`/`mdk4` beacon mode, ESP32 spammers) — bogus SSIDs to drown the air or bait clients. | Distinct beaconed **SSIDs** ≥ a **user-tunable threshold** (default 100) in one capture, or BSSIDs ≥ 150. A real flood produces hundreds; the threshold is calibrated to your local RF density (there is no passive "shape" signal that separates a flood from a crowded block — randomized MACs are also used by ordinary multi-SSID/guest routers). The capture's live SSID/BSSID counts are shown next to the threshold so you can set it just above your normal density. |
 | **Rogue AP / evil twin** | A look-alike AP advertising a **known** SSID from a BSSID that isn't yours, set up to harvest clients. | An SSID in the **trusted baseline** appearing from an untrusted BSSID → *evil twin*; or one SSID from ≥ 2 BSSIDs → *duplicate SSID* (set a baseline to confirm). |
 | **KARMA / MANA** | An AP that answers probe requests for **many different SSIDs** — it pretends to be every network a client has ever joined. | A single BSSID that beacons/probe-responds for ≥ 5 distinct SSIDs. |
 
@@ -75,7 +75,8 @@ Detection-only; the only state written is the trusted-AP baseline.
 | `GET /api/wifidef/interfaces` | wireless adapters + monitor capability + current monitor state |
 | `POST /api/wifidef/monitor` | `{action: enable|disable, interface}` — set up / tear down monitor mode |
 | `GET /api/wifidef/scan?interface=&seconds=&channel=` | capture window + WIDS analysis |
-| `GET/POST /api/wifidef/baseline` | get / learn the trusted SSID→BSSID baseline |
+| `GET/POST /api/wifidef/baseline` | get / add-to (`{aps}` or capture) / `{action:clear}` the trusted SSID→BSSID baseline |
+| `GET/POST /api/wifidef/thresholds` | get / set the beacon-flood thresholds (`{beacon_ssids, beacon_bssids}`) |
 | `GET /api/wifidef/selftest` | parser + detector self-test |
 
 ```bash

@@ -1982,6 +1982,11 @@ const _WIFIDEF_THREAT = {
 
 function initWifiDefense() {
     _wifidefFillIfaces();
+    // Load the persisted beacon-flood threshold into the control.
+    fetch('/api/wifidef/thresholds').then(r => r.json()).then(t => {
+        const el = document.getElementById('wifidef-flood-ssids');
+        if (el && t && t.beacon_ssids) el.value = t.beacon_ssids;
+    }).catch(() => {});
     const auto = document.getElementById('wifidef-auto');
     if (auto && !auto._wired) {
         auto._wired = true;
@@ -2129,9 +2134,21 @@ function wifidefTrust() {
         body: JSON.stringify(body) })
         .then(r => r.json()).then(d => {
             st.textContent = d.error ? ('⚠ ' + d.error)
-                : (`Baseline now trusts ${d.ssids} SSID(s)` + (d.added ? ` (+${d.added} this time)` : '') + '. Re-scan to confirm.');
-            if (!d.error && _wifidef.data) wifidefScan();
+                : (`✓ Trusted — baseline now covers ${d.ssids} SSID(s)` + (d.added ? ` (+${d.added} added)` : '') + '. Hit Scan to re-check.');
         }).catch(() => { st.textContent = 'Baseline failed'; });
+}
+
+function wifidefSetThreshold() {
+    const el = document.getElementById('wifidef-flood-ssids');
+    const st = document.getElementById('wifidef-status');
+    const v = parseInt(el.value);
+    if (!v || v < 10) return;
+    fetch('/api/wifidef/thresholds', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ beacon_ssids: v }) })
+        .then(r => r.json()).then(t => {
+            if (t && t.beacon_ssids) el.value = t.beacon_ssids;
+            if (st) st.textContent = `Beacon-flood threshold = ${t.beacon_ssids} SSIDs (applies on next scan)`;
+        }).catch(() => {});
 }
 
 function wifidefResetBaseline() {
@@ -2176,9 +2193,16 @@ function wifidefRender() {
     }
     // Counts
     const c = d.counts || {};
-    document.getElementById('wifidef-counts').innerHTML =
-        [['frames', d.frames], ['deauth', c.deauth], ['beacons', c.beacon], ['probe-req', c.probe_req], ['probe-resp', c.probe_resp]]
-            .map(([k, v]) => `<span class="px-3 py-1 rounded bg-slate-800 border border-slate-700"><b>${v || 0}</b> <span class="text-gray-400">${k}</span></span>`).join('');
+    let chips = [['frames', d.frames], ['deauth', c.deauth], ['beacons', c.beacon], ['probe-req', c.probe_req], ['probe-resp', c.probe_resp]]
+        .map(([k, v]) => `<span class="px-3 py-1 rounded bg-slate-800 border border-slate-700"><b>${v || 0}</b> <span class="text-gray-400">${k}</span></span>`).join('');
+    // Airspace density vs the flood threshold — lets the user calibrate.
+    const a = d.airspace;
+    if (a) {
+        const near = a.ssids >= a.beacon_ssid_threshold;
+        chips += `<span class="px-3 py-1 rounded bg-slate-800 border ${near ? 'border-red-600/60 text-red-300' : 'border-slate-700'}" title="Distinct SSIDs / BSSIDs heard this capture, vs the beacon-flood threshold. Raise the threshold above your normal density.">`
+            + `<b>${a.ssids}</b> SSIDs · <b>${a.bssids}</b> BSSIDs <span class="text-gray-500">(flood ≥ ${a.beacon_ssid_threshold})</span></span>`;
+    }
+    document.getElementById('wifidef-counts').innerHTML = chips;
     // AP table
     document.getElementById('wifidef-ap-count').textContent = `(${(d.aps || []).length})`;
     const body = document.getElementById('wifidef-ap-tbody');

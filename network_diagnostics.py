@@ -13394,6 +13394,18 @@ def register_network_diagnostics(app, logger=None):
         _log(f"wifidef/baseline learn {iface}")
         return jsonify(wifi_defense.learn_baseline(iface, seconds=secs))
 
+    @app.route('/api/wifidef/thresholds', methods=['GET', 'POST'])
+    def wifidef_thresholds():
+        if request.method == 'GET':
+            return jsonify(wifi_defense.get_thresholds())
+        data = request.get_json(silent=True) or {}
+        try:
+            return jsonify(wifi_defense.set_thresholds(
+                beacon_ssids=data.get('beacon_ssids'),
+                beacon_bssids=data.get('beacon_bssids')))
+        except (TypeError, ValueError):
+            return _bad('Invalid threshold')
+
     @app.route('/api/wifidef/selftest', methods=['GET'])
     def wifidef_selftest():
         _log("wifidef/selftest")

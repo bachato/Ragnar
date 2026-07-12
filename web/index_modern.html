@@ -2054,6 +2054,10 @@
                         <label class="block text-xs text-gray-400 mb-1">Capture (s)</label>
                         <input id="wifidef-secs" type="number" value="15" min="3" max="120" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm w-20">
                     </div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1" title="Distinct SSIDs in one capture that count as a beacon flood. Raise it above your local density so a crowded neighbourhood doesn't false-positive; a real flood is in the hundreds.">Flood ≥ SSIDs</label>
+                        <input id="wifidef-flood-ssids" type="number" value="100" min="10" max="2000" onchange="wifidefSetThreshold()" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm w-20" title="Beacon-flood SSID threshold">
+                    </div>
                     <button onclick="wifidefToggleMonitor()" id="wifidef-mon-btn" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm">Enable monitor</button>
                     <button onclick="wifidefScan()" id="wifidef-scan-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm font-semibold">Scan</button>
                     <button onclick="wifidefStopContinuous()" id="wifidef-stop-btn" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded text-sm font-semibold hidden">■ Stop</button>
@@ -6301,7 +6305,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefbaseline"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260712-wifidefflood"></script>
 
 </body>
 </html>
