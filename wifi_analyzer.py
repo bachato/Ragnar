@@ -1625,7 +1625,8 @@ def survey_list():
 
 
 def survey_save(name):
-    """Snapshot the current heatmap (floorplan + samples) under `name`."""
+    """Snapshot the current heatmap under `name` — including the whole design
+    layer (walls, columns, planned AP nodes, mesh nodes), not just samples."""
     name = (name or "").strip()
     if not name:
         return {"error": "survey name required"}
@@ -1638,6 +1639,11 @@ def survey_save(name):
         "target_bssid": cur.get("target_bssid"),
         "target_ssid": cur.get("target_ssid"),
         "samples": cur.get("samples", []),
+        "walls": cur.get("walls", []),
+        "columns": cur.get("columns", []),
+        "predict_aps": cur.get("predict_aps", []),
+        "predict_ap": cur.get("predict_ap"),
+        "mesh_nodes": cur.get("mesh_nodes", {}),
         "saved": int(time.time()),
     }
     _surveys_save(surveys)
@@ -1645,7 +1651,7 @@ def survey_save(name):
 
 
 def survey_load(name):
-    """Restore a saved survey into the active heatmap store."""
+    """Restore a saved survey into the active heatmap store, design layer and all."""
     surveys = _surveys_load()
     s = surveys.get(name)
     if s is None:
@@ -1655,6 +1661,11 @@ def survey_load(name):
         "target_bssid": s.get("target_bssid"),
         "target_ssid": s.get("target_ssid"),
         "samples": s.get("samples", []),
+        "walls": s.get("walls", []),
+        "columns": s.get("columns", []),
+        "predict_aps": s.get("predict_aps", []),
+        "predict_ap": s.get("predict_ap"),
+        "mesh_nodes": s.get("mesh_nodes", {}),
     })
     return _heatmap_load()
 
@@ -1961,11 +1972,26 @@ def selftest():
         check("saved survey listed with sample count",
               any(s["name"] == "siteA" and s["samples"] == 1 for s in lst["surveys"]),
               json.dumps(lst))
+        # A survey must also snapshot the whole design layer, not just samples.
+        heatmap_set_walls([{"x1": 0.1, "y1": 0.1, "x2": 0.9, "y2": 0.1,
+                            "loss_db": 15, "material": "concrete"}])
+        heatmap_set_columns([{"x": 0.5, "y": 0.5, "material": "metal"}])
+        heatmap_set_predict_aps([{"x": 0.2, "y": 0.2}, {"x": 0.8, "y": 0.8}])
+        survey_save("siteB")
         heatmap_clear()
         check("heatmap cleared before load", len(_heatmap_load()["samples"]) == 0)
         loaded = survey_load("siteA")
         check("survey load restores samples (with snr)",
               len(loaded["samples"]) == 1 and loaded["samples"][0].get("snr") == 25)
+        # Load the design-heavy survey and confirm every layer round-trips.
+        lb = survey_load("siteB")
+        check("survey restores walls", len(lb.get("walls", [])) == 1
+              and lb["walls"][0]["material"] == "concrete", json.dumps(lb.get("walls")))
+        check("survey restores columns", len(lb.get("columns", [])) == 1
+              and lb["columns"][0]["material"] == "metal", json.dumps(lb.get("columns")))
+        check("survey restores planned AP nodes",
+              len(lb.get("predict_aps", [])) == 2, json.dumps(lb.get("predict_aps")))
+        survey_delete("siteB")
         survey_delete("siteA")
         check("survey delete removes it",
               not any(s["name"] == "siteA" for s in survey_list()["surveys"]))

@@ -1509,6 +1509,20 @@ function wifiExportReport() {
         const mn = Math.min(...vals), mx = Math.max(...vals), av = vals.reduce((a, b) => a + b, 0) / vals.length;
         cov = `<p><b>${samples.length}</b> survey points · ${_wifiHm.metric.toUpperCase()} min <b>${mn.toFixed(1)}</b> / avg <b>${av.toFixed(1)}</b> / max <b>${mx.toFixed(1)}</b> ${mName}</p>`;
     }
+    // Design / build plan summary (walls, columns, planned mesh nodes).
+    let plan = '';
+    const pWalls = _wifiHm.walls || [], pCols = _wifiHm.columns || [], pAps = _wifiHm.predictAps || [];
+    if (pWalls.length || pCols.length || pAps.length) {
+        const tally = (arr) => {
+            const m = {}; arr.forEach(o => { const k = o.material || 'wall'; m[k] = (m[k] || 0) + 1; });
+            return Object.keys(m).map(k => `${m[k]}× ${_esc(k)}`).join(', ');
+        };
+        plan = '<ul>';
+        if (pAps.length) plan += `<li><b>${pAps.length}</b> planned AP node${pAps.length > 1 ? 's' : ''} (predictive mesh)</li>`;
+        if (pWalls.length) plan += `<li><b>${pWalls.length}</b> wall${pWalls.length > 1 ? 's' : ''}: ${tally(pWalls)}</li>`;
+        if (pCols.length) plan += `<li><b>${pCols.length}</b> column${pCols.length > 1 ? 's' : ''}: ${tally(pCols)}</li>`;
+        plan += '</ul>';
+    }
     // Heatmap image, if drawn.
     let img = '';
     try {
@@ -1548,6 +1562,7 @@ function wifiExportReport() {
   <h1>WiFi Survey Report</h1>
   <div class="sub">${now.toLocaleString()} · interface ${_esc(_wifiState.iface || '—')} · ${aps.length} APs heard${_wifiHm.data && _wifiHm.data.target_ssid ? ' · target ' + _esc(_wifiHm.data.target_ssid) : ''}</div>
   ${cov ? '<h2>Coverage</h2>' + cov : ''}
+  ${plan ? '<h2>Build plan</h2>' + plan : ''}
   ${img ? '<h2>Heatmap</h2>' + img : ''}
   ${bands ? '<h2>Bands &amp; channel plan</h2>' + bands : ''}
   ${intf ? '<h2>Interference</h2>' + intf : ''}
