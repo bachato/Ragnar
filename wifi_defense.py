@@ -745,6 +745,204 @@ def analyze_airtime(events, seconds=None):
 
 
 # --------------------------------------------------------------------------
+# Client-isolation observer  (passive AP/mesh peer-traffic audit)
+# --------------------------------------------------------------------------
+# Infers whether an AP (or a whole mesh/ESS) enforces client isolation purely
+# from the cleartext 802.11 data-frame headers — encryption hides the payload,
+# but the DS bits + addr1/2/3 always reveal WHO the AP is relaying frames FOR:
+#   ToDS   (STA->AP):  addr1=BSSID, addr2=SA (the wireless client), addr3=DA
+#   FromDS (AP->STA):  addr1=DA (the wireless client), addr2=BSSID, addr3=SA
+# If the AP transmits a FromDS frame whose SA is one of its own wireless
+# clients, it just relayed intra-BSS traffic — client isolation is OFF.
+
+def _is_group_mac(mac):
+    """True for broadcast/multicast (group) addresses — the 0x01 bit."""
+    try:
+        return bool(int(mac.split(":")[0], 16) & 0x01)
+    except (AttributeError, ValueError, IndexError):
+        return False
+
+
+def _iso_event(pkt):
+    """Normalize a frame for the isolation observer (or None). Keeps beacons
+    (they name the BSS so the report can group a mesh by SSID) and data frames
+    with their DS bits + addresses."""
+    from scapy.all import Dot11, Dot11Elt
+    if not pkt.haslayer(Dot11):
+        return None
+    d = pkt.getlayer(Dot11)
+    if d.type == 0 and d.subtype == 8:           # beacon -> BSSID/SSID naming
+        ev = {"kind": "beacon", "bssid": (d.addr3 or "").lower() or None,
+              "ssid": None}
+        el = pkt.getlayer(Dot11Elt)
+        while el is not None and isinstance(el, Dot11Elt):
+            if el.ID == 0:
+                try:
+                    ev["ssid"] = el.info.decode(errors="replace")
+                except Exception:
+                    ev["ssid"] = None
+                break
+            el = el.payload.getlayer(Dot11Elt)
+        return ev
+    if d.type != 2:                              # 2 = data
+        return None
+    fc = int(getattr(d, "FCfield", 0) or 0)
+    tods, fromds = bool(fc & 0x01), bool(fc & 0x02)
+    a1 = (d.addr1 or "").lower() or None
+    a2 = (d.addr2 or "").lower() or None
+    a3 = (d.addr3 or "").lower() or None
+    if tods and fromds:                          # 4-address = WDS/mesh backhaul
+        return {"kind": "wds", "ta": a2, "ra": a1}
+    if tods:
+        return {"kind": "tods", "bssid": a1, "sa": a2, "da": a3}
+    if fromds:
+        return {"kind": "fromds", "bssid": a2, "sa": a3, "da": a1}
+    return None                                  # IBSS frames aren't AP-relayed
+
+
+def parse_pcap_iso(path):
+    """Read a pcap into isolation-observer events (for tests / offline runs)."""
+    from scapy.all import rdpcap
+    return [e for e in (_iso_event(p) for p in rdpcap(path)) if e]
+
+
+def analyze_isolation(events, seconds=None):
+    """Per-BSS client-isolation verdict from passively observed frames. Pure.
+
+    Evidence, weakest to strongest:
+    - bcast_sent:   a client sent a broadcast up (ARP etc.) — a working,
+                    non-isolated AP re-broadcasts these into the cell;
+    - attempts:     a client addressed a ToDS frame at ANOTHER wireless client
+                    of the same BSS (someone is trying to reach a WLAN peer);
+    - bcast_relays: the AP re-broadcast a client-originated broadcast;
+    - relays:       the AP forwarded unicast client->client traffic.
+    Verdicts: 'open' (unicast relays seen — isolation OFF), 'broadcast_open'
+    (client broadcasts forwarded, no unicast peer traffic observed),
+    'isolating' (peer attempts and/or repeated client broadcasts, yet the AP
+    relayed nothing back — it is filtering), 'no_evidence' otherwise."""
+    seconds = seconds or 0
+    names = {}                                   # bssid -> ssid (from beacons)
+    bss = {}
+    wds_frames = 0
+
+    def _rec(b):
+        return bss.setdefault(b, {"clients": set(), "attempts": 0, "relays": 0,
+                                  "bcast_sent": 0, "bcast_relays": 0,
+                                  "frames": 0, "pairs": {}})
+
+    # Pass 1: name BSSes and learn each one's wireless clients. A STA proves it
+    # is a wireless client by transmitting ToDS, or by being the unicast RA of
+    # a FromDS frame (the AP only airs FromDS to associated wireless STAs).
+    for e in events:
+        k = e.get("kind")
+        if k == "beacon":
+            if e.get("bssid") and e.get("ssid"):
+                names[e["bssid"]] = e["ssid"]
+            continue
+        if k == "wds":
+            wds_frames += 1
+            continue
+        b = e.get("bssid")
+        if not b or _is_group_mac(b):
+            continue
+        r = _rec(b)
+        r["frames"] += 1
+        if k == "tods" and e.get("sa"):
+            r["clients"].add(e["sa"])
+        elif k == "fromds":
+            da = e.get("da")
+            if da and da != b and not _is_group_mac(da):
+                r["clients"].add(da)
+
+    # Pass 2: with the client sets complete, classify every data frame.
+    for e in events:
+        k = e.get("kind")
+        b = e.get("bssid")
+        if k not in ("tods", "fromds") or b not in bss:
+            continue
+        r = bss[b]
+        sa, da = e.get("sa"), e.get("da")
+        if k == "tods":
+            if da and _is_group_mac(da):
+                r["bcast_sent"] += 1
+            elif sa and da and da != sa and da != b and da in r["clients"]:
+                r["attempts"] += 1
+        else:                                    # fromds — what the AP relayed
+            if not sa or sa == b or sa not in r["clients"]:
+                continue                         # upstream/wired source: normal
+            if da and _is_group_mac(da):
+                r["bcast_relays"] += 1
+            elif da and da != sa and da in r["clients"]:
+                r["relays"] += 1
+                key = tuple(sorted((sa, da)))
+                r["pairs"][key] = r["pairs"].get(key, 0) + 1
+
+    bss_list = []
+    for b, r in bss.items():
+        if r["relays"]:
+            verdict = "open"
+        elif r["bcast_relays"]:
+            verdict = "broadcast_open"
+        elif r["attempts"] or (r["bcast_sent"] >= 3 and len(r["clients"]) >= 1):
+            verdict = "isolating"
+        else:
+            verdict = "no_evidence"
+        pairs = sorted(r["pairs"].items(), key=lambda kv: -kv[1])[:8]
+        bss_list.append({
+            "bssid": b, "ssid": names.get(b),
+            "clients": len(r["clients"]),
+            "client_list": sorted(r["clients"])[:24],
+            "attempts": r["attempts"], "relays": r["relays"],
+            "bcast_sent": r["bcast_sent"], "bcast_relays": r["bcast_relays"],
+            "frames": r["frames"], "verdict": verdict,
+            "pairs": [[a, c, n] for (a, c), n in pairs],
+        })
+    bss_list.sort(key=lambda x: -x["frames"])
+
+    # ESS/mesh view: group nodes by SSID. Cross-node relays = a node forwarding
+    # traffic sourced from a client that only ever appeared on a SIBLING node.
+    ess_list = []
+    by_ssid = {}
+    for x in bss_list:
+        if x["ssid"]:
+            by_ssid.setdefault(x["ssid"], []).append(x)
+    for ssid, nodes in by_ssid.items():
+        if len(nodes) < 2:
+            continue
+        node_set = {n["bssid"] for n in nodes}
+        clients_elsewhere = {}
+        for n in nodes:
+            for c in n["client_list"]:
+                clients_elsewhere.setdefault(c, set()).add(n["bssid"])
+        cross = 0
+        for e in events:
+            if e.get("kind") != "fromds" or e.get("bssid") not in node_set:
+                continue
+            sa = e.get("sa")
+            homes = clients_elsewhere.get(sa)
+            if homes and e["bssid"] not in homes:
+                cross += 1
+        verdicts = {n["verdict"] for n in nodes}
+        if "open" in verdicts or cross:
+            verdict = "open"
+        elif "broadcast_open" in verdicts:
+            verdict = "broadcast_open"
+        elif "isolating" in verdicts:
+            verdict = "isolating"
+        else:
+            verdict = "no_evidence"
+        ess_list.append({"ssid": ssid, "nodes": sorted(node_set),
+                         "node_count": len(nodes),
+                         "clients": len(clients_elsewhere),
+                         "cross_relays": cross, "verdict": verdict})
+    ess_list.sort(key=lambda x: -x["node_count"])
+
+    data_frames = sum(x["frames"] for x in bss_list)
+    return {"bss": bss_list, "ess": ess_list, "wds_frames": wds_frames,
+            "frames": data_frames, "seconds": seconds}
+
+
+# --------------------------------------------------------------------------
 # Live capture
 # --------------------------------------------------------------------------
 
@@ -873,6 +1071,58 @@ def _capture_all(mon_iface, seconds, channel=None):
             return _capture_error(mon_iface, exc)
     stop.set()
     return events
+
+
+def _capture_iso(mon_iface, seconds, channel=None):
+    """Sniff data frames + beacons for the client-isolation observer. Best on
+    a FIXED channel — catching both a peer attempt and the AP's relay of it
+    needs to dwell where the BSS lives."""
+    from scapy.all import sniff
+    events = []
+
+    def _cb(pkt):
+        ev = _iso_event(pkt)
+        if ev:
+            events.append(ev)
+
+    stop = threading.Event()
+    if channel:
+        _set_channel(mon_iface, channel)
+    else:
+        targets = _hop_targets(_load_state().get("six_ghz", False))
+        def _hopper():
+            i = 0
+            while not stop.is_set():
+                _tune(mon_iface, targets[i % len(targets)])
+                i += 1
+                stop.wait(0.35)
+        threading.Thread(target=_hopper, daemon=True).start()
+    try:
+        sniff(iface=mon_iface, prn=_cb, timeout=seconds, store=False, monitor=True)
+    except Exception:
+        try:
+            sniff(iface=mon_iface, prn=_cb, timeout=seconds, store=False)
+        except Exception as exc:
+            stop.set()
+            return _capture_error(mon_iface, exc)
+    stop.set()
+    return events
+
+
+def do_isolation(interface, seconds=20, channel=None, auto_enable=True):
+    """Ensure monitor mode, observe a window of data frames, and report each
+    BSS's client-isolation behaviour (plus a mesh/ESS rollup). Receive-only."""
+    if not _valid_iface(interface):
+        return {"error": "invalid interface"}
+    seconds = max(5, min(120, int(seconds)))
+    events = _capture_recover(_capture_iso, interface, seconds, channel, auto_enable)
+    if isinstance(events, dict) and "error" in events:
+        return events
+    mon = _load_state().get("mon_iface")
+    result = analyze_isolation(events, seconds=seconds)
+    result.update({"interface": interface, "monitor": mon, "channel": channel,
+                   "hopping": channel is None, "timestamp": int(time.time())})
+    return result
 
 
 def do_airtime(interface, seconds=10, channel=None, auto_enable=True):
@@ -1444,6 +1694,81 @@ def selftest():
     check("airtime: rate parse legacy (radiotap Rate=12 => 6 Mbps)",
           _frame_rate_mbps(type("R", (), {"Rate": 12, "MCS_index": None})()) == 6.0)
 
+    # --- Client-isolation observer (passive AP/mesh peer-traffic audit) ---
+    from scapy.all import wrpcap
+    C1, C2 = "12:34:56:00:00:01", "12:34:56:00:00:02"
+    C3, C4 = "12:34:56:00:00:03", "12:34:56:00:00:04"
+    C5, C6 = "12:34:56:00:00:05", "12:34:56:00:00:06"
+    AP_OPEN, AP_ISO = "aa:aa:aa:00:00:01", "ac:ac:ac:00:00:02"
+    MESH_A, MESH_B = "ee:ee:ee:00:00:0a", "ee:ee:ee:00:00:0b"
+    GW = "0a:0a:0a:00:00:fe"                     # wired-side gateway MAC
+    BCAST = "ff:ff:ff:ff:ff:ff"
+
+    def data(fc, a1, a2, a3):
+        return RadioTap() / Dot11(type=2, subtype=0, FCfield=fc,
+                                  addr1=a1, addr2=a2, addr3=a3)
+
+    def nbeacon(bssid, ssid):
+        return (RadioTap() / Dot11(type=0, subtype=8, addr1=BCAST,
+                                   addr2=bssid, addr3=bssid) /
+                Dot11Beacon() / Dot11Elt(ID=0, info=ssid.encode()))
+
+    iso_pkts = [nbeacon(AP_OPEN, "OpenNet"), nbeacon(AP_ISO, "IsoNet"),
+                nbeacon(MESH_A, "MeshNet"), nbeacon(MESH_B, "MeshNet")]
+    # OpenNet: C1 addresses C2 and the AP relays it back out => isolation OFF.
+    # (fc=1 -> ToDS: addr1=BSSID,addr2=SA,addr3=DA; fc=2 -> FromDS:
+    #  addr1=DA,addr2=BSSID,addr3=SA)
+    iso_pkts += [data(1, AP_OPEN, C2, GW)]                       # C2 is a client
+    iso_pkts += [data(1, AP_OPEN, C1, C2)] * 3                   # peer attempts
+    iso_pkts += [data(2, C2, AP_OPEN, C1)] * 3                   # AP relays C1->C2
+    # IsoNet: peer attempts + client broadcasts, but the AP relays NOTHING back
+    # (only normal upstream traffic from the wired gateway) => isolating.
+    iso_pkts += [data(1, AP_ISO, C4, GW)]                        # C4 is a client
+    iso_pkts += [data(1, AP_ISO, C3, C4)] * 5                    # blocked attempts
+    iso_pkts += [data(1, AP_ISO, C3, BCAST)] * 4                 # ARP-ish bcasts
+    iso_pkts += [data(2, C3, AP_ISO, GW)] * 6                    # upstream, normal
+    # MeshNet: C5 lives on node A; node B relays C5's traffic to its client C6
+    # => cross-node forwarding, mesh-wide isolation OFF (per-node evidence alone
+    # would miss it).
+    iso_pkts += [data(1, MESH_A, C5, GW)]                        # C5 on node A
+    iso_pkts += [data(1, MESH_B, C6, GW)]                        # C6 on node B
+    iso_pkts += [data(2, C6, MESH_B, C5)] * 2                    # B airs SA=C5
+    iso_pkts += [data(3, MESH_B, MESH_A, MESH_A)]                # 4-addr backhaul
+    tmp_iso = tempfile.mktemp(suffix=".pcap")
+    try:
+        wrpcap(tmp_iso, iso_pkts)
+        iso_events = parse_pcap_iso(tmp_iso)
+    finally:
+        try:
+            os.unlink(tmp_iso)
+        except OSError:
+            pass
+    check("isolation: DS bits + addresses parsed from pcap",
+          {"beacon", "tods", "fromds", "wds"} <=
+          {e["kind"] for e in iso_events}, f"{len(iso_events)} events")
+    iso = analyze_isolation(iso_events, seconds=20)
+    by_bssid = {x["bssid"]: x for x in iso["bss"]}
+    op, isod = by_bssid.get(AP_OPEN, {}), by_bssid.get(AP_ISO, {})
+    check("isolation: relayed peer traffic => verdict open",
+          op.get("verdict") == "open" and op.get("relays") == 3,
+          json.dumps(op))
+    check("isolation: talking pair identified",
+          op.get("pairs") and sorted(op["pairs"][0][:2]) == sorted([C1, C2]),
+          json.dumps(op.get("pairs")))
+    check("isolation: blocked attempts => verdict isolating",
+          isod.get("verdict") == "isolating" and isod.get("attempts") == 5
+          and isod.get("relays") == 0 and isod.get("bcast_sent") == 4,
+          json.dumps(isod))
+    check("isolation: upstream (wired-source) frames never count as relays",
+          isod.get("relays") == 0 and isod.get("clients") == 2,
+          json.dumps(isod))
+    mesh = next((x for x in iso["ess"] if x["ssid"] == "MeshNet"), {})
+    check("isolation: mesh grouped by SSID with cross-node forwarding => open",
+          mesh.get("node_count") == 2 and mesh.get("cross_relays", 0) >= 2
+          and mesh.get("verdict") == "open", json.dumps(mesh))
+    check("isolation: WDS/mesh backhaul frames counted",
+          iso["wds_frames"] == 1, str(iso["wds_frames"]))
+
     passed = sum(1 for r in results if r["pass"])
     return {"pass": passed == len(results), "passed": passed,
             "total": len(results), "results": results}
@@ -1469,6 +1794,10 @@ def _main(argv):
     pb = sub.add_parser("baseline")
     pb.add_argument("--interface", required=True)
     pb.add_argument("--seconds", type=int, default=20)
+    pi = sub.add_parser("isolation")
+    pi.add_argument("--interface", required=True)
+    pi.add_argument("--seconds", type=int, default=20)
+    pi.add_argument("--channel", type=int, default=None)
     # Boot-time dedicated monitor: claim the whole interface (switch-mode) once,
     # e.g. from a systemd ExecStartPre. See scripts/wifidef_dedicate.sh.
     pd = sub.add_parser("dedicate")
@@ -1496,6 +1825,9 @@ def _main(argv):
         print(json.dumps(do_scan(args.interface, args.seconds, args.channel), indent=2))
     elif args.cmd == "baseline":
         print(json.dumps(learn_baseline(args.interface, args.seconds), indent=2))
+    elif args.cmd == "isolation":
+        print(json.dumps(do_isolation(args.interface, args.seconds, args.channel),
+                         indent=2))
     elif args.cmd == "selftest":
         r = selftest()
         for item in r["results"]:

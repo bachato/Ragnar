@@ -2257,7 +2257,7 @@
                 <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
                     <div>
                         <h2 class="text-xl font-semibold flex items-center gap-2">🛡️ WiFi Defense <span class="text-xs font-normal px-2 py-0.5 rounded bg-slate-700 text-slate-300">802.11 WIDS</span></h2>
-                        <p class="text-sm text-gray-400 mt-1 max-w-3xl">A passive <strong>wireless intrusion-detection</strong> monitor. Listens on a <strong>monitor-mode</strong> adapter for 802.11 management frames and flags <strong>deauth/disassoc floods</strong>, <strong>beacon floods</strong> (fake-AP storms), <strong>rogue APs / evil twins</strong>, and <strong>KARMA/MANA</strong> rogue APs. <strong>Receive-only</strong> — it never transmits a frame or deauths anyone back. Needs an adapter that supports monitor mode (e.g. the Alfa AWUS036AXM); the Pi's onboard radio does not.</p>
+                        <p class="text-sm text-gray-400 mt-1 max-w-3xl">A passive <strong>wireless intrusion-detection</strong> monitor. Listens on a <strong>monitor-mode</strong> adapter for 802.11 management frames and flags <strong>deauth/disassoc floods</strong>, <strong>beacon floods</strong> (fake-AP storms), <strong>rogue APs / evil twins</strong>, and <strong>KARMA/MANA</strong> rogue APs — plus a <strong>client-isolation observer</strong> that audits whether an AP/mesh really isolates its clients. <strong>Receive-only</strong> — it never transmits a frame or deauths anyone back. Needs an adapter that supports monitor mode (e.g. the Alfa AWUS036AXM); the Pi's onboard radio does not.</p>
                     </div>
                     <span id="wifidef-threat" class="shrink-0 px-4 py-2 rounded-lg text-sm font-bold bg-slate-700 text-slate-300">— idle —</span>
                 </div>
@@ -2333,6 +2333,32 @@
                     </table>
                 </div>
                 <div id="wifidef-at-roam" class="mt-2 text-xs text-gray-400"></div>
+            </div>
+
+            <!-- Client-isolation observer (passive AP/mesh peer-traffic audit) -->
+            <div class="glass rounded-xl p-4 mt-5">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+                    <div>
+                        <h3 class="font-semibold text-sm">Client isolation observer</h3>
+                        <p class="text-[11px] text-gray-500 mt-0.5 max-w-2xl">Audits whether an AP or mesh enforces <strong>client isolation</strong> — purely passively, from cleartext 802.11 headers (works on encrypted networks; payloads are never read). If the AP is seen <strong>relaying unicast frames between two of its own wireless clients</strong>, isolation is <strong>OFF</strong>; if clients address each other (or broadcast) but the AP relays nothing back, it's <strong>blocking</strong>. A multi-node SSID gets a mesh rollup incl. <strong>cross-node forwarding</strong>. Best on a <strong>fixed channel</strong> — catching a request <em>and</em> its relay needs to dwell on the BSS's channel.</p>
+                    </div>
+                    <div class="flex flex-wrap items-end gap-2">
+                        <label class="text-[11px] text-gray-400">Channel <input id="wifidef-iso-channel" type="text" value="" placeholder="e.g. 6" class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs" title="Fix the channel of the AP/mesh you're auditing; blank = hop (much weaker evidence)"></label>
+                        <label class="text-[11px] text-gray-400">for <input id="wifidef-iso-secs" type="number" value="30" min="5" max="120" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> s</label>
+                        <button onclick="wifidefIsolation()" id="wifidef-iso-btn" class="bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-3 py-1.5 rounded text-xs font-semibold">Observe isolation</button>
+                        <span id="wifidef-iso-status" class="text-[11px] text-gray-500"></span>
+                    </div>
+                </div>
+                <div id="wifidef-iso-ess" class="flex flex-wrap gap-2 mb-3 text-xs"></div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead><tr class="text-left text-gray-400 border-b border-slate-800">
+                            <th class="py-1 pr-2">SSID</th><th class="py-1 pr-2">BSSID</th><th class="py-1 pr-2">Clients</th><th class="py-1 pr-2">Peer attempts</th><th class="py-1 pr-2">Peer relays</th><th class="py-1 pr-2">Bcast sent/relayed</th><th class="py-1 pr-2">Verdict</th>
+                        </tr></thead>
+                        <tbody id="wifidef-iso-tbody"><tr><td colspan="7" class="py-4 text-center text-gray-500">Press <span class="text-gray-300">Observe isolation</span> (needs monitor mode).</td></tr></tbody>
+                    </table>
+                </div>
+                <div id="wifidef-iso-pairs" class="mt-2 text-xs text-gray-400"></div>
             </div>
         </div><!-- /#wifidef-tab -->
 
@@ -6552,7 +6578,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260713-heatmap-scale"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260713-iso-observer"></script>
 
 </body>
 </html>

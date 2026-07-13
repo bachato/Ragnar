@@ -132,6 +132,7 @@ Detection-only; the only state written is the trusted-AP baseline.
 | `GET/POST /api/wifidef/baseline` | get / add-to (`{aps}` or capture) / `{action:clear}` the trusted SSID→BSSID baseline |
 | `GET/POST /api/wifidef/thresholds` | get / set the beacon-flood thresholds (`{beacon_ssids, beacon_bssids}`) |
 | `GET /api/wifidef/airtime?interface=&seconds=&channel=` | passive airtime / retry / PHY-rate / roaming diagnostics |
+| `GET /api/wifidef/isolation?interface=&seconds=&channel=` | passive per-BSS client-isolation audit (+ mesh/ESS rollup) |
 | `GET /api/wifidef/selftest` | parser + detector self-test |
 
 ## Airtime & link quality
@@ -144,19 +145,58 @@ plus **roaming churn** (clients re-associating/authing repeatedly). Findings fla
 high retry (≥30%), airtime hogs (≥50%) and unstable roaming. Route
 `GET /api/wifidef/airtime`; analysis is a pure function covered by selftest.
 
+## Client isolation observer
+
+A passive audit of whether an AP — or a whole mesh/ESS — actually enforces
+**client isolation** (guest networks, hotel/office WLANs, IoT segments).
+Encryption hides payloads, but the cleartext 802.11 header always reveals who
+the AP is relaying frames *for*: a **ToDS** frame carries the wireless client
+as SA, and a **FromDS** frame carries the original source as `addr3`. The
+observer never transmits and never reads a payload.
+
+Evidence collected per BSS over the capture window:
+
+- **Peer relays** — the AP transmitted a unicast FromDS frame whose source is
+  one of its *own wireless clients* and destination is another. That is the AP
+  forwarding intra-BSS traffic: **isolation OFF** (verdict `open`), with the
+  talking client pairs listed.
+- **Broadcast relays** — the AP re-broadcast a client-originated broadcast
+  (ARP and friends) into the cell: clients can at least discover each other
+  (verdict `broadcast_open`).
+- **Peer attempts / client broadcasts with no relay** — clients addressed each
+  other (or broadcast repeatedly) yet the AP relayed nothing back: it is
+  filtering (verdict `isolating`).
+- Anything else — too little peer-directed traffic to judge (`no_evidence`).
+
+Multi-node SSIDs get a **mesh/ESS rollup**: nodes grouped by SSID, plus
+**cross-node forwarding** detection (a node airing traffic sourced from a
+client that only ever appeared on a sibling node — mesh-wide isolation off
+even when each node looks clean alone). 4-address **WDS/backhaul** frames are
+counted as mesh-link evidence. Normal upstream traffic (wired-side sources
+like the gateway) never counts against an AP.
+
+Run it on a **fixed channel** (the channel of the AP/mesh under audit) —
+catching a peer request *and* the AP's relay of it requires dwelling on the
+BSS's channel; hopping yields only weak evidence. Route
+`GET /api/wifidef/isolation`; `analyze_isolation()` is a pure function covered
+by selftest (open / isolating / broadcast / mesh-cross-node cases, all
+offline).
+
 ```bash
 python3 wifi_defense.py interfaces
 python3 wifi_defense.py monitor --interface wlan1 --enable
 python3 wifi_defense.py scan --interface wlan1 --seconds 15         # or --channel 6
 python3 wifi_defense.py baseline --interface wlan1 --seconds 20     # learn trusted APs
+python3 wifi_defense.py isolation --interface wlan1 --seconds 30 --channel 6
 python3 wifi_defense.py monitor --interface wlan1 --disable
 python3 wifi_defense.py selftest
 ```
 
 The self-test crafts real 802.11 frames with **Scapy** (deauth flood, 35-SSID
-beacon flood, a 6-SSID KARMA AP, an evil twin), writes them to a pcap, then runs
+beacon flood, a 6-SSID KARMA AP, an evil twin, plus open / isolating /
+mesh-cross-node client-isolation traffic), writes them to a pcap, then runs
 the full parse → analyse pipeline and asserts each detection fires (and that
-clean traffic stays **CLEAR**) — 11 checks, all offline.
+clean traffic stays **CLEAR**) — all offline.
 
 Requires `iw` and **Scapy** (both installed by `install_ragnar.sh` /
 `requirements.txt`).

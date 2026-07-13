@@ -3059,6 +3059,65 @@ function wifidefRenderAirtime(d) {
         : '';
 }
 
+// ---- Client-isolation observer (passive AP/mesh peer-traffic audit) --------
+const _WIFIDEF_ISO_VERDICT = {
+    open: ['OPEN — clients reach each other', 'bg-red-600/20 text-red-300 border-red-700/50'],
+    broadcast_open: ['PARTIAL — broadcasts forwarded', 'bg-amber-600/20 text-amber-300 border-amber-700/50'],
+    isolating: ['ISOLATING — peer traffic blocked', 'bg-green-600/20 text-green-300 border-green-700/50'],
+    no_evidence: ['no evidence', 'bg-slate-700/40 text-gray-400 border-slate-600/50'],
+};
+
+function wifidefIsolation() {
+    const iface = _wifidef.iface || document.getElementById('wifidef-iface').value;
+    if (!iface) return;
+    const secs = document.getElementById('wifidef-iso-secs').value || 30;
+    const chRaw = (document.getElementById('wifidef-iso-channel').value || '').trim();
+    const ch = /^\d+$/.test(chRaw) ? chRaw : '';
+    const st = document.getElementById('wifidef-iso-status');
+    const btn = document.getElementById('wifidef-iso-btn');
+    st.textContent = 'Observing ' + secs + 's' + (ch ? ' on ch ' + ch : ' (hopping — weak evidence)') + '…';
+    if (btn) btn.disabled = true;
+    fetch(`/api/wifidef/isolation?interface=${encodeURIComponent(iface)}&seconds=${secs}${ch ? '&channel=' + ch : ''}`)
+        .then(r => r.json()).then(d => {
+            if (btn) btn.disabled = false;
+            if (d.error) { st.textContent = '⚠ ' + d.error; return; }
+            st.textContent = `${d.frames} data frames · ${(d.bss || []).length} BSS`
+                + (d.hopping ? ' · hopping (dwell on one channel for solid verdicts)' : '');
+            wifidefRenderIsolation(d);
+        }).catch(() => { if (btn) btn.disabled = false; st.textContent = 'Observation failed'; });
+}
+
+function wifidefRenderIsolation(d) {
+    const badge = (v) => {
+        const [label, cls] = _WIFIDEF_ISO_VERDICT[v] || _WIFIDEF_ISO_VERDICT.no_evidence;
+        return `<span class="px-2 py-0.5 rounded border text-[11px] whitespace-nowrap ${cls}">${label}</span>`;
+    };
+    // Mesh/ESS rollup chips (multi-node SSIDs only)
+    const ess = document.getElementById('wifidef-iso-ess');
+    ess.innerHTML = (d.ess || []).map(m =>
+        `<span class="px-2 py-1 rounded border bg-slate-800/60 border-slate-700 flex items-center gap-2">🕸 <b>${_esc(m.ssid)}</b> <span class="text-gray-500">${m.node_count} nodes · ${m.clients} clients${m.cross_relays ? ` · ${m.cross_relays} cross-node relays` : ''}</span> ${badge(m.verdict)}</span>`
+    ).join('') + ((d.wds_frames) ? `<span class="px-2 py-1 rounded border bg-slate-800/60 border-slate-700 text-gray-400">${d.wds_frames} WDS/backhaul frames heard</span>` : '');
+    const tb = document.getElementById('wifidef-iso-tbody');
+    const bss = d.bss || [];
+    if (!bss.length) {
+        tb.innerHTML = '<tr><td colspan="7" class="py-4 text-center text-gray-500">No data frames captured — wrong channel, or the air is idle.</td></tr>';
+    } else tb.innerHTML = bss.map(b => `<tr class="border-b border-slate-800/50">
+            <td class="py-1 pr-2">${b.ssid ? _esc(b.ssid) : '<span class="text-gray-600">—</span>'}</td>
+            <td class="py-1 pr-2 font-mono text-[11px]">${b.bssid}</td>
+            <td class="py-1 pr-2">${b.clients}</td>
+            <td class="py-1 pr-2 ${b.attempts ? 'text-gray-200' : 'text-gray-600'}">${b.attempts}</td>
+            <td class="py-1 pr-2 ${b.relays ? 'text-red-400 font-semibold' : 'text-gray-600'}">${b.relays}</td>
+            <td class="py-1 pr-2 text-gray-400">${b.bcast_sent}/${b.bcast_relays}</td>
+            <td class="py-1 pr-2">${badge(b.verdict)}</td></tr>`).join('');
+    // Talking pairs = the concrete isolation-off evidence.
+    const pr = document.getElementById('wifidef-iso-pairs');
+    const pairs = bss.flatMap(b => (b.pairs || []).map(p =>
+        `<span class="font-mono">${p[0]} ⇄ ${p[1]}</span> ×${p[2]}`));
+    pr.innerHTML = pairs.length
+        ? '<b class="text-gray-300">Clients seen talking through the AP:</b> ' + pairs.join(' · ')
+        : '';
+}
+
 function wifidefRender() {
     const d = _wifidef.data; if (!d) return;
     const [label, cls] = _WIFIDEF_THREAT[d.threat] || ['—', 'bg-slate-700 text-slate-300'];
