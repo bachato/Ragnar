@@ -2168,9 +2168,9 @@ function wifiHmSetMode(m) {
     _wifiHm.mode = m;
     const survey = m === 'survey';
     document.getElementById('wifi-hm-mode-survey').className =
-        'px-2.5 py-1 rounded text-xs ' + (survey ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300');
+        'wifi-hm-seg-btn ' + (survey ? 'wifi-hm-seg-on' : 'wifi-hm-seg-off');
     document.getElementById('wifi-hm-mode-design').className =
-        'px-2.5 py-1 rounded text-xs ' + (!survey ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300');
+        'wifi-hm-seg-btn ' + (!survey ? 'wifi-hm-seg-on' : 'wifi-hm-seg-off');
     document.getElementById('wifi-hm-design-tools').classList.toggle('hidden', survey);
     _wifiHm.wallStart = null;
     wifiHeatmapRender();
@@ -2180,7 +2180,7 @@ function wifiHmSetTool(t) {
     _wifiHm.tool = t;
     _wifiHm.wallStart = null;
     const sel = (id, on) => { const el = document.getElementById(id); if (el)
-        el.className = 'px-2.5 py-1 rounded text-xs ' + (on ? 'bg-Ragnar-600 text-white' : 'bg-slate-800 text-gray-300'); };
+        el.className = 'wifi-hm-seg-btn ' + (on ? 'wifi-hm-seg-on' : 'wifi-hm-seg-off'); };
     sel('wifi-hm-tool-wall', t === 'wall');
     sel('wifi-hm-tool-ap', t === 'ap');
     sel('wifi-hm-tool-column', t === 'column');
@@ -2547,8 +2547,8 @@ function wifiHeatmapRender() {
     // --- Mesh serving-node / hand-off map (survey mode, mesh metrics) ---
     const meshMode = !design && (_wifiHm.metric === 'serving' || _wifiHm.metric === 'handoff');
     if (meshMode) _wifiRenderMeshGrid(ctx, vp, floorM, _wifiHm.metric);
-    // --- Survey samples (survey mode only; skip IDW when showing a mesh map) ---
-    const allSamples = (!design && _wifiHm.data && _wifiHm.data.samples) || [];
+    // --- Survey samples (shown in both modes as the base layer; skip IDW when showing a mesh map) ---
+    const allSamples = (_wifiHm.data && _wifiHm.data.samples) || [];
     const samples = (meshMode ? [] : allSamples).filter(sp => _wifiHmValue(sp) != null);
     if (samples.length >= 1) {
         const cell = 12;

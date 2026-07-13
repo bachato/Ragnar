@@ -311,6 +311,136 @@
             border-radius: 0 !important;
             z-index: 99999 !important;
         }
+
+        /* Coverage Heatmap toolbar — shared control styling */
+        .wifi-hm-select, .wifi-hm-input {
+            background: rgba(30, 41, 59, 0.8);
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 11px;
+            line-height: 1.3;
+            color: #e2e8f0;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        .wifi-hm-select:focus, .wifi-hm-input:focus {
+            outline: none;
+            border-color: #0ea5e9;
+            box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.5);
+        }
+        .wifi-hm-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: rgba(30, 41, 59, 0.8);
+            border: 1px solid #334155;
+            color: #e2e8f0;
+            font-size: 11px;
+            font-weight: 500;
+            border-radius: 6px;
+            padding: 6px 12px;
+            transition: background-color 0.15s ease, border-color 0.15s ease;
+        }
+        .wifi-hm-btn:hover { background: #334155; border-color: #475569; }
+        .wifi-hm-btn-primary {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: #0284c7;
+            border: 1px solid rgba(14, 165, 233, 0.5);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 500;
+            border-radius: 6px;
+            padding: 6px 12px;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+            transition: background-color 0.15s ease;
+        }
+        .wifi-hm-btn-primary:hover { background: #0ea5e9; }
+        .wifi-hm-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(30, 41, 59, 0.4);
+            border: 1px solid rgba(51, 65, 85, 0.6);
+            color: #cbd5e1;
+            font-size: 11px;
+            border-radius: 6px;
+            padding: 6px 10px;
+            cursor: pointer;
+            user-select: none;
+            transition: background-color 0.15s ease;
+        }
+        .wifi-hm-chip:hover { background: rgba(30, 41, 59, 0.75); }
+        .wifi-hm-segment {
+            display: inline-flex;
+            gap: 2px;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 2px;
+        }
+        .wifi-hm-seg-btn {
+            border: none;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 500;
+            padding: 5px 12px;
+            transition: background-color 0.15s ease, color 0.15s ease;
+            cursor: pointer;
+        }
+        .wifi-hm-seg-on { background: #0284c7; color: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
+        .wifi-hm-seg-off { background: transparent; color: #94a3b8; }
+        .wifi-hm-seg-off:hover { background: rgba(51, 65, 85, 0.6); color: #e2e8f0; }
+        .wifi-hm-divider { width: 1px; height: 20px; background: #334155; margin: 0 2px; }
+        .wifi-hm-history-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+            background: rgba(15, 23, 42, 0.4);
+            border: 1px solid rgba(51, 65, 85, 0.6);
+            border-radius: 6px;
+            padding: 3px 4px 3px 8px;
+        }
+        .wifi-hm-history-label { font-size: 10px; color: #64748b; margin-right: 2px; }
+        .wifi-hm-icon-btn {
+            border: none;
+            background: transparent;
+            color: #94a3b8;
+            font-size: 12px;
+            border-radius: 4px;
+            padding: 2px 6px;
+            line-height: 1.4;
+            cursor: pointer;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        .wifi-hm-icon-btn:hover { background: rgba(51, 65, 85, 0.7); color: #e2e8f0; }
+        .wifi-hm-icon-btn-danger:hover { color: #f87171; }
+        .wifi-hm-swatch {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+        }
+        .wifi-hm-zoom-group {
+            display: inline-flex;
+            align-items: center;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid #334155;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .wifi-hm-zoom-btn {
+            border: none;
+            background: transparent;
+            color: #cbd5e1;
+            font-size: 12px;
+            padding: 6px 10px;
+            cursor: pointer;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        .wifi-hm-zoom-btn:hover { background: #334155; color: #fff; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
@@ -1996,14 +2126,14 @@
                         <div class="flex flex-wrap items-end gap-2">
                             <div>
                                 <label class="block text-[11px] text-gray-400 mb-1" id="wifi-hm-target-label">Target AP</label>
-                                <select id="wifi-hm-ap" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[160px]"><option value="">Scan first…</option></select>
+                                <select id="wifi-hm-ap" class="wifi-hm-select min-w-[160px]"><option value="">Scan first…</option></select>
                             </div>
-                            <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer self-end pb-1" title="Survey the whole mesh/ESS — record every node (BSSID) of the SSID at each point, and map serving-node coverage + hand-off zones.">
-                                <input type="checkbox" id="wifi-hm-mesh" onchange="wifiHmToggleMesh()" class="accent-Ragnar-600"> Mesh
+                            <label class="wifi-hm-chip self-end" title="Survey the whole mesh/ESS — record every node (BSSID) of the SSID at each point, and map serving-node coverage + hand-off zones.">
+                                <input type="checkbox" id="wifi-hm-mesh" onchange="wifiHmToggleMesh()" class="accent-Ragnar-500 w-3.5 h-3.5"> Mesh
                             </label>
                             <div>
                                 <label class="block text-[11px] text-gray-400 mb-1">Metric</label>
-                                <select id="wifi-hm-metric" onchange="wifiHeatmapSetMetric(this.value)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
+                                <select id="wifi-hm-metric" onchange="wifiHeatmapSetMetric(this.value)" class="wifi-hm-select">
                                     <option value="rssi">RSSI (dBm)</option>
                                     <option value="snr">SNR (dB)</option>
                                     <option value="throughput_down">Throughput ↓ (Mbps)</option>
@@ -2013,32 +2143,38 @@
                                     <option value="handoff" class="wifi-hm-mesh-metric" hidden>Hand-off zones</option>
                                 </select>
                             </div>
-                            <label class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs cursor-pointer">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
-                            <button onclick="wifiHeatmapRender()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Redraw</button>
-                            <button onclick="wifiHeatmapClear()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs">Clear</button>
-                            <button onclick="wifiExportReport()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs" title="Generate a printable survey report (save as PDF)">📄 Report</button>
-                            <span id="wifi-hm-status" class="text-[11px] text-gray-500"></span>
+                            <label class="wifi-hm-btn cursor-pointer self-end">Floorplan…<input type="file" id="wifi-hm-file" accept="image/*" class="hidden"></label>
+                            <button onclick="wifiHeatmapRender()" class="wifi-hm-btn self-end">Redraw</button>
+                            <button onclick="wifiHeatmapClear()" class="wifi-hm-btn self-end">Clear</button>
+                            <button onclick="wifiExportReport()" class="wifi-hm-btn self-end" title="Generate a printable survey report (save as PDF)">📄 Report</button>
+                            <span id="wifi-hm-status" class="text-[11px] text-gray-500 self-end pb-1.5"></span>
                         </div>
                     </div>
                     <!-- Active survey (throughput/latency at each point) -->
                     <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
-                        <label class="flex items-center gap-1.5 text-[11px] text-gray-300 cursor-pointer select-none" title="Also measure throughput + latency at each click (a few seconds per point), Ekahau-style active survey. Off = fast RSSI-only.">
-                            <input type="checkbox" id="wifi-hm-active" class="accent-Ragnar-600"> Active test on click
+                        <label class="wifi-hm-chip" title="Also measure throughput + latency at each click (a few seconds per point), Ekahau-style active survey. Off = fast RSSI-only.">
+                            <input type="checkbox" id="wifi-hm-active" class="accent-Ragnar-500 w-3.5 h-3.5"> Active test on click
                         </label>
-                        <input id="wifi-hm-iperf" placeholder="iperf3 server IP (LAN, optional)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs w-64 min-w-[16rem]" title="A LAN iperf3 server IP/host measures true up+down. Leave blank to use a WAN download speed test instead.">
-                        <label class="text-[11px] text-gray-400">for <input id="wifi-hm-tp-secs" type="number" value="5" min="2" max="30" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> s</label>
-                        <button onclick="wifiThroughputTest()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs" title="Run one throughput/latency test here without dropping a sample">Test now</button>
+                        <input id="wifi-hm-iperf" placeholder="iperf3 server IP (LAN, optional)" class="wifi-hm-input w-64 min-w-[16rem]" title="A LAN iperf3 server IP/host measures true up+down. Leave blank to use a WAN download speed test instead.">
+                        <label class="text-[11px] text-gray-400 flex items-center gap-1.5">for <input id="wifi-hm-tp-secs" type="number" value="5" min="2" max="30" class="wifi-hm-input w-14 text-center"> s</label>
+                        <button onclick="wifiThroughputTest()" class="wifi-hm-btn" title="Run one throughput/latency test here without dropping a sample">Test now</button>
                         <span id="wifi-hm-tp-status" class="text-[11px] text-gray-500"></span>
                     </div>
                     <!-- Design / predictive coverage -->
                     <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
-                        <span class="text-[11px] text-gray-400">Mode:</span>
-                        <button id="wifi-hm-mode-survey" onclick="wifiHmSetMode('survey')" class="bg-Ragnar-600 text-white px-2.5 py-1 rounded text-xs">Survey</button>
-                        <button id="wifi-hm-mode-design" onclick="wifiHmSetMode('design')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs">Design / Predict</button>
+                        <span class="text-[11px] text-gray-400 font-medium">Mode</span>
+                        <div class="wifi-hm-segment">
+                            <button id="wifi-hm-mode-survey" onclick="wifiHmSetMode('survey')" class="wifi-hm-seg-btn wifi-hm-seg-on">Survey</button>
+                            <button id="wifi-hm-mode-design" onclick="wifiHmSetMode('design')" class="wifi-hm-seg-btn wifi-hm-seg-off">Design / Predict</button>
+                        </div>
                         <span id="wifi-hm-design-tools" class="hidden flex flex-wrap items-center gap-2">
-                            <span class="text-gray-700">|</span>
-                            <button id="wifi-hm-tool-wall" onclick="wifiHmSetTool('wall')" class="bg-Ragnar-600 text-white px-2.5 py-1 rounded text-xs">✏ Draw wall</button>
-                            <select id="wifi-hm-wall-mat" class="bg-slate-800 border border-slate-700 rounded px-1 py-1 text-xs" title="Wall material — sets its dB attenuation">
+                            <span class="wifi-hm-divider"></span>
+                            <div class="wifi-hm-segment">
+                                <button id="wifi-hm-tool-wall" onclick="wifiHmSetTool('wall')" class="wifi-hm-seg-btn wifi-hm-seg-on" title="Click two points on the plan to draw a wall">✏ Draw wall</button>
+                                <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="wifi-hm-seg-btn wifi-hm-seg-off" title="Click the plan to drop AP nodes — add as many as you like to plan a mesh">📶 Place AP nodes</button>
+                                <button id="wifi-hm-tool-column" onclick="wifiHmSetTool('column')" class="wifi-hm-seg-btn wifi-hm-seg-off" title="Click the plan to drop structural columns/pillars — they shadow WiFi behind them">⬤ Column</button>
+                            </div>
+                            <select id="wifi-hm-wall-mat" class="wifi-hm-select" title="Wall material — sets its dB attenuation">
                                 <option value="drywall">Drywall (3 dB)</option>
                                 <option value="wood">Wood (4 dB)</option>
                                 <option value="glass">Glass (6 dB)</option>
@@ -2046,55 +2182,65 @@
                                 <option value="concrete">Concrete (15 dB)</option>
                                 <option value="metal">Metal (20 dB)</option>
                             </select>
-                            <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to drop AP nodes — add as many as you like to plan a mesh">📶 Place AP nodes</button>
-                            <button id="wifi-hm-tool-column" onclick="wifiHmSetTool('column')" class="bg-slate-800 text-gray-300 px-2.5 py-1 rounded text-xs" title="Click the plan to drop structural columns/pillars — they shadow WiFi behind them">⬤ Column</button>
-                            <select id="wifi-hm-col-mat" class="bg-slate-800 border border-slate-700 rounded px-1 py-1 text-xs" title="Column material — sets its dB attenuation">
+                            <select id="wifi-hm-col-mat" class="wifi-hm-select" title="Column material — sets its dB attenuation">
                                 <option value="concrete" selected>Concrete (15 dB)</option>
                                 <option value="metal">Steel/metal (20 dB)</option>
                                 <option value="brick">Brick (10 dB)</option>
                             </select>
-                            <label class="text-[11px] text-gray-400" title="Column radius in metres (a typical pillar is ~0.3 m)">⌀ <input id="wifi-hm-col-rad" type="number" value="0.3" min="0.05" max="3" step="0.05" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
-                            <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-600"> Predict coverage</label>
-                            <button onclick="wifiHmUndoWall()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo wall</button>
-                            <button onclick="wifiHmClearWalls()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear walls</button>
-                            <button onclick="wifiHmUndoAp()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo AP</button>
-                            <button onclick="wifiHmClearAps()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear APs</button>
-                            <button onclick="wifiHmUndoColumn()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo column</button>
-                            <button onclick="wifiHmClearColumns()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear columns</button>
+                            <label class="text-[11px] text-gray-400 flex items-center gap-1.5" title="Column radius in metres (a typical pillar is ~0.3 m)">⌀ <input id="wifi-hm-col-rad" type="number" value="0.3" min="0.05" max="3" step="0.05" class="wifi-hm-input w-14 text-center"> m</label>
+                            <label class="wifi-hm-chip"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-500 w-3.5 h-3.5"> Predict coverage</label>
+                            <span class="wifi-hm-divider"></span>
+                            <div class="wifi-hm-history-group">
+                                <span class="wifi-hm-history-label">Wall</span>
+                                <button onclick="wifiHmUndoWall()" class="wifi-hm-icon-btn" title="Undo last wall">↺</button>
+                                <button onclick="wifiHmClearWalls()" class="wifi-hm-icon-btn wifi-hm-icon-btn-danger" title="Clear all walls">🗑</button>
+                            </div>
+                            <div class="wifi-hm-history-group">
+                                <span class="wifi-hm-history-label">AP</span>
+                                <button onclick="wifiHmUndoAp()" class="wifi-hm-icon-btn" title="Undo last AP node">↺</button>
+                                <button onclick="wifiHmClearAps()" class="wifi-hm-icon-btn wifi-hm-icon-btn-danger" title="Clear all AP nodes">🗑</button>
+                            </div>
+                            <div class="wifi-hm-history-group">
+                                <span class="wifi-hm-history-label">Column</span>
+                                <button onclick="wifiHmUndoColumn()" class="wifi-hm-icon-btn" title="Undo last column">↺</button>
+                                <button onclick="wifiHmClearColumns()" class="wifi-hm-icon-btn wifi-hm-icon-btn-danger" title="Clear all columns">🗑</button>
+                            </div>
                             <span id="wifi-hm-design-status" class="text-[11px] text-gray-500"></span>
-                            <span class="basis-full flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-400 pt-1">
-                                <span class="text-gray-500">Materials:</span>
-                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#dc2626;border:1px solid #0b1220"></span>Brick</span>
-                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#f8fafc;border:1px solid #0b1220"></span>Glass</span>
-                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#9ca3af;border:1px solid #0b1220"></span>Concrete</span>
-                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#3b82f6;border:1px solid #0b1220"></span>Steel</span>
-                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#d8c39a;border:1px solid #0b1220"></span>Drywall</span>
-                                <span class="inline-flex items-center gap-1"><span style="width:10px;height:10px;border-radius:2px;display:inline-block;background:#8b5a2b;border:1px solid #0b1220"></span>Wood</span>
+                            <span class="basis-full flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-400 pt-2 mt-1 border-t border-slate-800/60">
+                                <span class="text-gray-500 font-medium">Materials</span>
+                                <span class="inline-flex items-center gap-1.5"><span class="wifi-hm-swatch" style="background:#dc2626"></span>Brick</span>
+                                <span class="inline-flex items-center gap-1.5"><span class="wifi-hm-swatch" style="background:#f8fafc"></span>Glass</span>
+                                <span class="inline-flex items-center gap-1.5"><span class="wifi-hm-swatch" style="background:#9ca3af"></span>Concrete</span>
+                                <span class="inline-flex items-center gap-1.5"><span class="wifi-hm-swatch" style="background:#3b82f6"></span>Steel</span>
+                                <span class="inline-flex items-center gap-1.5"><span class="wifi-hm-swatch" style="background:#d8c39a"></span>Drywall</span>
+                                <span class="inline-flex items-center gap-1.5"><span class="wifi-hm-swatch" style="background:#8b5a2b"></span>Wood</span>
                             </span>
                         </span>
                     </div>
                     <!-- Saved surveys -->
                     <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
-                        <span class="text-[11px] text-gray-400">Surveys:</span>
-                        <select id="wifi-hm-survey" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[150px]"><option value="">—</option></select>
-                        <button onclick="wifiSurveyLoad()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Load</button>
-                        <button onclick="wifiSurveyDelete()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Delete</button>
-                        <span class="text-gray-700">|</span>
-                        <input id="wifi-hm-survey-name" placeholder="name this survey…" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs min-w-[150px]">
-                        <button onclick="wifiSurveySave()" class="bg-Ragnar-600 hover:bg-Ragnar-500 text-white px-2.5 py-1 rounded text-xs">Save</button>
+                        <span class="text-[11px] text-gray-400 font-medium">Surveys</span>
+                        <select id="wifi-hm-survey" class="wifi-hm-select min-w-[150px]"><option value="">—</option></select>
+                        <button onclick="wifiSurveyLoad()" class="wifi-hm-btn">Load</button>
+                        <button onclick="wifiSurveyDelete()" class="wifi-hm-btn">Delete</button>
+                        <span class="wifi-hm-divider"></span>
+                        <input id="wifi-hm-survey-name" placeholder="name this survey…" class="wifi-hm-input min-w-[150px]">
+                        <button onclick="wifiSurveySave()" class="wifi-hm-btn-primary">Save</button>
                         <span id="wifi-hm-survey-status" class="text-[11px] text-gray-500"></span>
                     </div>
                     <!-- Floor scale + zoom (the canvas is a square floor with metre rulers) -->
                     <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
-                        <label class="text-[11px] text-gray-400" title="Real size of the floor — the rulers, predicted distances and column sizes all use it. 3.2 m ≈ a 10 m² room, 17.3 m ≈ a 300 m² office.">Floor size
-                            <input id="wifi-hm-scale" type="number" value="10" min="1" max="200" step="0.5" onchange="wifiHmScaleChanged()" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m / side</label>
+                        <label class="text-[11px] text-gray-400 flex items-center gap-1.5" title="Real size of the floor — the rulers, predicted distances and column sizes all use it. 3.2 m ≈ a 10 m² room, 17.3 m ≈ a 300 m² office.">Floor size
+                            <input id="wifi-hm-scale" type="number" value="10" min="1" max="200" step="0.5" onchange="wifiHmScaleChanged()" class="wifi-hm-input w-16 text-center"> m / side</label>
                         <span class="text-[11px] text-gray-500">= <span id="wifi-hm-area">100 m²</span></span>
-                        <span class="text-gray-700">|</span>
-                        <span class="text-[11px] text-gray-400">Zoom:</span>
-                        <button onclick="wifiHmZoom(0.8)" class="bg-slate-800 hover:bg-slate-700 text-gray-300 px-2.5 py-1 rounded text-xs" title="Zoom out">−</button>
-                        <span id="wifi-hm-zoom-pct" class="text-[11px] text-gray-300 font-mono w-10 text-center">100%</span>
-                        <button onclick="wifiHmZoom(1.25)" class="bg-slate-800 hover:bg-slate-700 text-gray-300 px-2.5 py-1 rounded text-xs" title="Zoom in">+</button>
-                        <button onclick="wifiHmZoomReset()" class="bg-slate-800 hover:bg-slate-700 text-gray-300 px-2.5 py-1 rounded text-xs" title="Reset to the whole floor">⤢ Fit</button>
+                        <span class="wifi-hm-divider"></span>
+                        <span class="text-[11px] text-gray-400 font-medium">Zoom</span>
+                        <div class="wifi-hm-zoom-group">
+                            <button onclick="wifiHmZoom(0.8)" class="wifi-hm-zoom-btn" title="Zoom out">−</button>
+                            <span id="wifi-hm-zoom-pct" class="text-[11px] text-gray-300 font-mono w-12 text-center border-x border-slate-700">100%</span>
+                            <button onclick="wifiHmZoom(1.25)" class="wifi-hm-zoom-btn" title="Zoom in">+</button>
+                        </div>
+                        <button onclick="wifiHmZoomReset()" class="wifi-hm-btn" title="Reset to the whole floor">⤢ Fit</button>
                         <span class="text-[11px] text-gray-500">scroll on the plan to zoom · drag to pan when zoomed</span>
                     </div>
                     <div class="mt-3">
