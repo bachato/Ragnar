@@ -148,9 +148,21 @@ The Ekahau workflow, in miniature:
 3. **Walk the space and click where you're standing** — each click takes a live
    passive reading of that AP (RSSI, SNR, noise, band/channel) and drops a
    sample at that spot.
-4. Samples are interpolated (**inverse-distance weighting**) into a coverage
-   heatmap with a **calibrated colour scale** and labelled legend
-   (excellent/good/fair/weak/dead break points).
+4. Samples are interpolated (**inverse-distance weighting**, computed in real
+   metres) into a coverage heatmap with a **calibrated colour scale** and
+   labelled legend (excellent/good/fair/weak/dead break points).
+
+**Real-world scale, rulers and zoom** — the plan is a large **square canvas**
+with **metre rulers along the left and bottom edges** and a matching grid, so
+you always know how far apart things are. Set the **Floor size (m / side)** to
+the real size of the space — anything from a 10 m² room (~3.2 m/side) to a
+300+ m² office (~17.3 m/side); the live area (m²) is shown next to the input,
+and the rulers, IDW blending, predicted distances and column sizes all follow
+it. **Scroll on the plan (or use the − / + / ⤢ Fit buttons) to zoom** up to
+16×, and **drag to pan** while zoomed — the rulers re-scale adaptively (down to
+centimetre ticks) and a header line shows the visible window (e.g. "viewing
+4.3 × 4.3 m"). Zooming never moves your data: samples, walls and APs stay
+anchored to their true floor positions.
 
 **Active survey (throughput + latency)** — tick **Active test on click** to also
 run an Ekahau-style performance measurement at each point: it pings the gateway
@@ -196,7 +208,8 @@ measuring it — Ekahau's predictive-design feature in miniature:
    under the Design tools).
 2. **Place AP nodes** — click where an AP would go. **Click again to drop more
    nodes and plan a whole mesh** (they're labelled AP1, AP2, …); **Undo AP** /
-   **Clear APs** manage them. Set the **floor width (m)** so distances are metric.
+   **Clear APs** manage them. The **Floor size (m / side)** control above the
+   plan sets the real metric scale (changing it re-scales existing nodes too).
 3. **Place columns** — structural pillars are a *major* open-floor coverage
    killer, so drop them with the **⬤ Column** tool: pick the **material**
    (concrete 15 dB, steel/metal 20, brick 10) and the **radius (m)** (a typical
