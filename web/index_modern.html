@@ -2172,7 +2172,7 @@
                             <div class="wifi-hm-segment">
                                 <button id="wifi-hm-tool-wall" onclick="wifiHmSetTool('wall')" class="wifi-hm-seg-btn wifi-hm-seg-on" title="Click two points on the plan to draw a wall">✏ Draw wall</button>
                                 <button id="wifi-hm-tool-ap" onclick="wifiHmSetTool('ap')" class="wifi-hm-seg-btn wifi-hm-seg-off" title="Click the plan to drop AP nodes — add as many as you like to plan a mesh">📶 Place AP nodes</button>
-                                <button id="wifi-hm-tool-column" onclick="wifiHmSetTool('column')" class="wifi-hm-seg-btn wifi-hm-seg-off" title="Click the plan to drop structural columns/pillars — they shadow WiFi behind them">⬤ Column</button>
+                                <button id="wifi-hm-tool-column" onclick="wifiHmSetTool('column')" class="wifi-hm-seg-btn wifi-hm-seg-off" title="Click the plan to drop structural columns/pillars — they shadow WiFi behind them. Drag a column's white edge handle to resize it.">⬤ Column</button>
                             </div>
                             <select id="wifi-hm-wall-mat" class="wifi-hm-select" title="Wall material — sets its dB attenuation">
                                 <option value="drywall">Drywall (3 dB)</option>
@@ -2187,8 +2187,8 @@
                                 <option value="metal">Steel/metal (20 dB)</option>
                                 <option value="brick">Brick (10 dB)</option>
                             </select>
-                            <label class="text-[11px] text-gray-400 flex items-center gap-1.5" title="Column radius in metres (a typical pillar is ~0.3 m)">⌀ <input id="wifi-hm-col-rad" type="number" value="0.3" min="0.05" max="3" step="0.05" class="wifi-hm-input w-14 text-center"> m</label>
-                            <label class="wifi-hm-chip"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-500 w-3.5 h-3.5"> Predict coverage</label>
+                            <label class="text-[11px] text-gray-400 flex items-center gap-1.5" title="Radius for newly-placed columns, in metres (a typical pillar is ~0.3 m). Existing columns can be resized by dragging their white edge handle.">⌀ <input id="wifi-hm-col-rad" type="number" value="0.3" min="0.05" max="3" step="0.05" class="wifi-hm-input w-14 text-center"> m</label>
+                            <label class="wifi-hm-chip"><input type="checkbox" id="wifi-hm-predict" checked onchange="wifiHmTogglePredict()" class="accent-Ragnar-500 w-3.5 h-3.5"> Predict coverage</label>
                             <span class="wifi-hm-divider"></span>
                             <div class="wifi-hm-history-group">
                                 <span class="wifi-hm-history-label">Wall</span>

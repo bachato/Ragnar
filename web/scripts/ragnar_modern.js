@@ -1831,7 +1831,7 @@ function _wifiDrawRadius(d) {
 
 // ---- WiFi coverage heatmap (walk-around survey) ----------------------------
 const _wifiHm = { floorplan: null, data: null, inited: false, metric: 'rssi',
-    mode: 'survey', tool: 'wall', walls: [], columns: [], predictAps: [], predicting: false,
+    mode: 'survey', tool: 'wall', walls: [], columns: [], predictAps: [], predicting: true,
     wallStart: null, mesh: false, drag: null, dragMoved: false, suppressClick: false,
     view: { zoom: 1, cx: 0.5, cy: 0.5 }, pan: null };
 
@@ -2086,7 +2086,7 @@ function wifiHeatmapInit() {
                 if (hit) {
                     _wifiHm.drag = hit; _wifiHm.dragMoved = false;
                     try { cv.setPointerCapture(e.pointerId); } catch (_) {}
-                    cv.style.cursor = 'grabbing';
+                    cv.style.cursor = hit.kind === 'column-resize' ? 'nwse-resize' : 'grabbing';
                     e.preventDefault();
                     return;
                 }
@@ -2115,8 +2115,10 @@ function wifiHeatmapInit() {
             }
             const p = norm(e);
             if (!_wifiHm.drag) {
-                if (_wifiHm.mode === 'design' && !_wifiHm.wallStart)
-                    cv.style.cursor = _wifiHmHitTest(p) ? 'grab' : '';
+                if (_wifiHm.mode === 'design' && !_wifiHm.wallStart) {
+                    const hit = _wifiHmHitTest(p);
+                    cv.style.cursor = hit ? (hit.kind === 'column-resize' ? 'nwse-resize' : 'grab') : '';
+                }
                 return;
             }
             _wifiHmApplyDrag(p.wx, p.wy);
@@ -2133,7 +2135,7 @@ function wifiHeatmapInit() {
             if (!_wifiHm.drag) return;
             if (_wifiHm.dragMoved) {
                 if (_wifiHm.drag.kind === 'ap') _wifiHmPersistAp();
-                else if (_wifiHm.drag.kind === 'column') _wifiHmPersistColumns();
+                else if (_wifiHm.drag.kind === 'column' || _wifiHm.drag.kind === 'column-resize') _wifiHmPersistColumns();
                 else _wifiHmPersistWalls();
             }
             _wifiHm.suppressClick = true;   // swallow the click that follows this press
@@ -2187,7 +2189,7 @@ function wifiHmSetTool(t) {
     const st = document.getElementById('wifi-hm-design-status');
     const msg = { wall: 'Click two points to draw a wall — or drag an existing wall to move it.',
         ap: 'Click the plan to drop an AP node (add several for a mesh) — or drag a node to move it.',
-        column: 'Click to drop a structural column (pillar) — or drag one to move it. Columns shadow WiFi behind them.' };
+        column: 'Click to drop a structural column (pillar) — drag it to move, or drag its white edge handle to resize. Columns shadow WiFi behind them.' };
     if (st) st.textContent = msg[t] || '';
 }
 
@@ -2200,9 +2202,17 @@ function _wifiPtSegDistPx(px, py, x1, y1, x2, y2) {
     return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
 }
 
+// Screen-space radius (px) a column is drawn at — kept in sync with _wifiHmDrawDesign.
+function _wifiHmColumnPxRadius(c, vp) {
+    const floorM = _wifiHmFloorM();
+    const pxPerM = vp.pw / (vp.span * floorM);
+    return Math.max(5, (c.radius_m || 0.3) * pxPerM);
+}
+
 // Hit-test a pointer position (p = {px,py,wx,wy,vp} from norm()) against AP
-// nodes (top), columns, then wall endpoints, then wall bodies. Returns a drag
-// descriptor (offsets in world/normalized coords) or null. Distances in CSS px.
+// nodes (top), column resize handles, column bodies, then wall endpoints, then
+// wall bodies. Returns a drag descriptor (offsets in world/normalized coords)
+// or null. Distances in CSS px.
 function _wifiHmHitTest(p) {
     const { px, py, wx, wy, vp } = p, R = 12;
     for (let i = _wifiHm.predictAps.length - 1; i >= 0; i--) {
@@ -2210,9 +2220,19 @@ function _wifiHmHitTest(p) {
         if (Math.hypot(vp.toX(ap.x) - px, vp.toY(ap.y) - py) <= R)
             return { kind: 'ap', idx: i, ox: ap.x - wx, oy: ap.y - wy };
     }
+    // Resize handle sits on the column's edge (45°) — checked before the body
+    // hit-test below so it wins even though it's inside the column's own radius.
     for (let i = _wifiHm.columns.length - 1; i >= 0; i--) {
         const c = _wifiHm.columns[i];
-        if (Math.hypot(vp.toX(c.x) - px, vp.toY(c.y) - py) <= R)
+        const rpx = _wifiHmColumnPxRadius(c, vp);
+        const hx = vp.toX(c.x) + rpx * Math.SQRT1_2, hy = vp.toY(c.y) + rpx * Math.SQRT1_2;
+        if (Math.hypot(hx - px, hy - py) <= 8)
+            return { kind: 'column-resize', idx: i };
+    }
+    for (let i = _wifiHm.columns.length - 1; i >= 0; i--) {
+        const c = _wifiHm.columns[i];
+        const rpx = _wifiHmColumnPxRadius(c, vp);
+        if (Math.hypot(vp.toX(c.x) - px, vp.toY(c.y) - py) <= Math.max(R, rpx))
             return { kind: 'column', idx: i, ox: c.x - wx, oy: c.y - wy };
     }
     for (let i = _wifiHm.walls.length - 1; i >= 0; i--) {
@@ -2240,6 +2260,11 @@ function _wifiHmApplyDrag(nx, ny) {
     } else if (d.kind === 'column') {
         const c = _wifiHm.columns[d.idx]; if (!c) return;
         c.x = _clamp01(nx + d.ox); c.y = _clamp01(ny + d.oy);
+    } else if (d.kind === 'column-resize') {
+        const c = _wifiHm.columns[d.idx]; if (!c) return;
+        const floorM = _wifiHmFloorM();
+        const distM = Math.hypot((nx - c.x) * floorM, (ny - c.y) * floorM);
+        c.radius_m = Math.max(0.05, Math.min(3, Math.round(distM * 20) / 20));
     } else if (d.kind === 'wall-end') {
         const w = _wifiHm.walls[d.idx]; if (!w) return;
         if (d.end === 1) { w.x1 = _clamp01(nx + d.ox); w.y1 = _clamp01(ny + d.oy); }
@@ -2593,7 +2618,7 @@ function wifiHeatmapRender() {
         ctx.fillText(val == null ? '—' : Math.round(val), x, y - 8);
     });
     // --- Design overlays: walls + modelled AP ---
-    if (design) _wifiHmDrawDesign(ctx, vp, floorM);
+    if (design) _wifiHmDrawDesign(ctx, vp);
     if (!allSamples.length && !_wifiHm.floorplan && !design) {
         ctx.fillStyle = '#475569'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText(_wifiHm.mesh ? 'Pick a mesh SSID, then click where you are standing to map every node.'
@@ -2644,7 +2669,7 @@ function _wifiHmDrawRulers(ctx, vp, floorM) {
         vp.ML, vp.MT - 5);
 }
 
-function _wifiHmDrawDesign(ctx, vp, floorM) {
+function _wifiHmDrawDesign(ctx, vp) {
     // Walls
     ctx.lineCap = 'round';
     _wifiHm.walls.forEach(w => {
@@ -2670,10 +2695,9 @@ function _wifiHmDrawDesign(ctx, vp, floorM) {
         ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 1.5; ctx.stroke();
     }
     // Structural columns — round pillars drawn to scale, coloured by material
-    const pxPerM = vp.pw / (vp.span * floorM);
     _wifiHm.columns.forEach(c => {
         const x = vp.toX(c.x), y = vp.toY(c.y);
-        const rpx = Math.max(5, (c.radius_m || 0.3) * pxPerM);
+        const rpx = _wifiHmColumnPxRadius(c, vp);
         ctx.beginPath(); ctx.arc(x, y, rpx, 0, 2 * Math.PI);
         ctx.fillStyle = _wifiMatColor(c.material); ctx.globalAlpha = 0.9; ctx.fill(); ctx.globalAlpha = 1;
         ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 2; ctx.stroke();
@@ -2683,6 +2707,11 @@ function _wifiHmDrawDesign(ctx, vp, floorM) {
         ctx.moveTo(x - rpx * 0.7, y - rpx * 0.7); ctx.lineTo(x + rpx * 0.7, y + rpx * 0.7);
         ctx.moveTo(x - rpx * 0.7, y + rpx * 0.7); ctx.lineTo(x + rpx * 0.7, y - rpx * 0.7);
         ctx.stroke();
+        // Resize handle on the edge (45°) — drag to change radius.
+        const hx = x + rpx * Math.SQRT1_2, hy = y + rpx * Math.SQRT1_2;
+        ctx.beginPath(); ctx.arc(hx, hy, 4, 0, 2 * Math.PI);
+        ctx.fillStyle = '#fff'; ctx.fill();
+        ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 1.5; ctx.stroke();
     });
     // Modelled AP nodes (a planned mesh) — labelled AP1, AP2, …
     _wifiHm.predictAps.forEach((ap, i) => {
