@@ -1991,7 +1991,7 @@
                     <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
                         <div>
                             <h4 class="font-semibold text-sm">Coverage Heatmap</h4>
-                            <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Enable <strong>Active test</strong> to also measure <strong>throughput + latency</strong> at each point (iperf3 to a LAN server, or a WAN speed test). Samples are interpolated (IDW) into a coverage map; switch the <strong>Metric</strong> to view RSSI, SNR, throughput or latency. Green = good, red = bad.</p>
+                            <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Enable <strong>Active test</strong> to also measure <strong>throughput + latency</strong> at each point (iperf3 to a LAN server, or a WAN speed test). Samples are interpolated (IDW) into a coverage map; switch the <strong>Metric</strong> to view RSSI, SNR, throughput or latency. Green = good, red = bad. The plan is a <strong>square floor with metre rulers</strong> — set the real <strong>Floor size</strong> (a 10 m² room to a 300+ m² office) so distances and predictions are in true metres, and <strong>scroll to zoom</strong> / drag to pan for detail work.</p>
                         </div>
                         <div class="flex flex-wrap items-end gap-2">
                             <div>
@@ -2054,7 +2054,6 @@
                                 <option value="brick">Brick (10 dB)</option>
                             </select>
                             <label class="text-[11px] text-gray-400" title="Column radius in metres (a typical pillar is ~0.3 m)">⌀ <input id="wifi-hm-col-rad" type="number" value="0.3" min="0.05" max="3" step="0.05" class="w-14 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
-                            <label class="text-[11px] text-gray-400" title="Real width of the floorplan, so predicted distances are in metres">Floor width <input id="wifi-hm-scale" type="number" value="10" min="1" max="500" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m</label>
                             <label class="flex items-center gap-1 text-[11px] text-gray-300 cursor-pointer"><input type="checkbox" id="wifi-hm-predict" onchange="wifiHmTogglePredict()" class="accent-Ragnar-600"> Predict coverage</label>
                             <button onclick="wifiHmUndoWall()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Undo wall</button>
                             <button onclick="wifiHmClearWalls()" class="bg-slate-800 text-gray-400 px-2 py-1 rounded text-xs">Clear walls</button>
@@ -2085,8 +2084,21 @@
                         <button onclick="wifiSurveySave()" class="bg-Ragnar-600 hover:bg-Ragnar-500 text-white px-2.5 py-1 rounded text-xs">Save</button>
                         <span id="wifi-hm-survey-status" class="text-[11px] text-gray-500"></span>
                     </div>
-                    <div class="w-full overflow-x-auto mt-3">
-                        <canvas id="wifi-heatmap" class="w-full rounded border border-slate-800 cursor-crosshair" style="height:380px; min-width:520px; background:#0b1220;"></canvas>
+                    <!-- Floor scale + zoom (the canvas is a square floor with metre rulers) -->
+                    <div class="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-slate-800">
+                        <label class="text-[11px] text-gray-400" title="Real size of the floor — the rulers, predicted distances and column sizes all use it. 3.2 m ≈ a 10 m² room, 17.3 m ≈ a 300 m² office.">Floor size
+                            <input id="wifi-hm-scale" type="number" value="10" min="1" max="200" step="0.5" onchange="wifiHmScaleChanged()" class="w-16 bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-xs"> m / side</label>
+                        <span class="text-[11px] text-gray-500">= <span id="wifi-hm-area">100 m²</span></span>
+                        <span class="text-gray-700">|</span>
+                        <span class="text-[11px] text-gray-400">Zoom:</span>
+                        <button onclick="wifiHmZoom(0.8)" class="bg-slate-800 hover:bg-slate-700 text-gray-300 px-2.5 py-1 rounded text-xs" title="Zoom out">−</button>
+                        <span id="wifi-hm-zoom-pct" class="text-[11px] text-gray-300 font-mono w-10 text-center">100%</span>
+                        <button onclick="wifiHmZoom(1.25)" class="bg-slate-800 hover:bg-slate-700 text-gray-300 px-2.5 py-1 rounded text-xs" title="Zoom in">+</button>
+                        <button onclick="wifiHmZoomReset()" class="bg-slate-800 hover:bg-slate-700 text-gray-300 px-2.5 py-1 rounded text-xs" title="Reset to the whole floor">⤢ Fit</button>
+                        <span class="text-[11px] text-gray-500">scroll on the plan to zoom · drag to pan when zoomed</span>
+                    </div>
+                    <div class="mt-3 flex justify-center">
+                        <canvas id="wifi-heatmap" class="rounded border border-slate-800 cursor-crosshair" style="width:100%; max-width:860px; aspect-ratio:1/1; touch-action:none; background:#0b1220;"></canvas>
                     </div>
                     <div id="wifi-hm-legend" class="flex items-center flex-wrap gap-2 mt-2 text-[11px] text-gray-400"></div>
                 </div>
@@ -6394,7 +6406,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260713-dedicated"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260713-heatmap-scale"></script>
 
 </body>
 </html>
