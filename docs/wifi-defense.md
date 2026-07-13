@@ -179,6 +179,14 @@ monitoring self-heals. If it still fails after that, **Disable monitor** then
 **Enable monitor** to force a fresh vif. Your trusted-AP baseline and tuned
 thresholds are preserved across all monitor bookkeeping.
 
+*Why a **service restart** used to be the only thing that fixed it:* recreating
+`ragmon0` (a disable→re-enable) gives it a **new kernel ifindex**, but the packet
+library (scapy) caches the interface's old ifindex for the life of the process
+and keeps binding the capture socket to the dead index → ENODEV on every scan —
+until the process restarts and rebuilds that cache. Ragnar now **refreshes that
+cache before every capture**, so a runtime re-enable heals just like a restart
+(no `sudo systemctl restart ragnar` needed).
+
 **Diagnosing a stubborn adapter — `scripts/wifidef_doctor.sh`.** When monitor
 comes up but captures nothing (or a specific dongle misbehaves), run the doctor:
 

@@ -763,6 +763,24 @@ def _capture_error(mon_iface, exc):
     return {"error": f"capture failed: {exc}"}
 
 
+def _refresh_scapy_ifaces():
+    """Drop scapy's cached interface table so it re-reads the live ifindex.
+
+    scapy caches a NetworkInterface object (with a fixed .index) per name at
+    import time and binds its AF_PACKET/monitor socket using that. When we
+    delete+recreate the monitor vif — a disable→re-enable, or an ENODEV rebuild —
+    ragmon0 comes back with a NEW ifindex, but scapy keeps the stale cached one
+    and every sniff() then fails with ENODEV. A fresh process rebuilds this cache,
+    which is exactly why 'systemctl restart ragnar' heals it while a runtime
+    re-enable does not. Reload it ourselves so the running service self-heals too
+    (scapy's own resolve_iface() does the same reload as its miss fallback)."""
+    try:
+        from scapy.all import conf
+        conf.ifaces.reload()
+    except Exception:
+        pass
+
+
 def _capture_recover(capture_fn, interface, seconds, channel, auto_enable):
     """Resolve a live monitor, capture, and — if the vif dies around capture time
     (ENODEV) — rebuild it once and retry. Returns an events list, or an
@@ -771,12 +789,14 @@ def _capture_recover(capture_fn, interface, seconds, channel, auto_enable):
     mon = _resolve_monitor(interface, auto_enable=auto_enable)
     if isinstance(mon, dict):
         return mon
+    _refresh_scapy_ifaces()                   # pick up the current ifindex of `mon`
     events = capture_fn(mon, seconds, channel=channel)
     if isinstance(events, dict) and events.get("enodev") and auto_enable:
         _save_state({})                       # drop the dead vif bookkeeping
         mon = _resolve_monitor(interface, auto_enable=True)   # force a rebuild
         if isinstance(mon, dict):
             return mon
+        _refresh_scapy_ifaces()               # the rebuild gave `mon` a new ifindex
         events = capture_fn(mon, seconds, channel=channel)
     return events
 
@@ -1250,12 +1270,19 @@ def selftest():
                 return {"error": "capture failed: … (Errno 19)", "enodev": True}
             return [{"kind": "beacon", "src": "aa:aa:aa:00:00:01", "ssid": "OK"}]
         _orig_resolve = _resolve_monitor
+        _orig_refresh = _refresh_scapy_ifaces
+        refreshes = {"n": 0}
         try:
             globals()["_resolve_monitor"] = lambda interface, auto_enable=True: "ragmon0"
+            globals()["_refresh_scapy_ifaces"] = lambda: refreshes.__setitem__("n", refreshes["n"] + 1)
             rec = _capture_recover(_flaky, "wlan0", 5, None, True)
             check("_capture_recover rebuilds + retries after one ENODEV",
                   isinstance(rec, list) and len(rec) == 1 and calls["n"] == 2,
                   json.dumps({"calls": calls["n"], "rec": rec}))
+            # scapy's stale iface cache is refreshed before the initial capture AND
+            # after the rebuild — the fix for ENODEV-until-service-restart.
+            check("_capture_recover refreshes scapy ifaces on capture + rebuild",
+                  refreshes["n"] == 2, json.dumps({"refreshes": refreshes["n"]}))
             # With auto_enable off it must NOT retry — surfaces the error once.
             calls["n"] = 0
             rec2 = _capture_recover(_flaky, "wlan0", 5, None, False)
@@ -1264,6 +1291,7 @@ def selftest():
                   json.dumps({"calls": calls["n"]}))
         finally:
             globals()["_resolve_monitor"] = _orig_resolve
+            globals()["_refresh_scapy_ifaces"] = _orig_refresh
 
         # --- Robust re-enable: a lingering vif is torn down, rebuilt, primed
         #     on a channel, and verified — the disable→re-enable "comes back but
