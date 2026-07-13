@@ -215,6 +215,20 @@ def _monitor_ready(mon):
     return is_monitor and rc == 0
 
 
+def _release_iface(iface):
+    """Stop NetworkManager / wpa_supplicant from managing `iface` so they don't
+    re-up it under us (which re-grabs the channel → EBUSY). All best-effort and
+    silent where the tool/service isn't present."""
+    _run(["nmcli", "device", "set", iface, "managed", "no"], timeout=5)
+    # wpa_supplicant bound to this iface also holds the radio; ask it to drop it.
+    _run(["wpa_cli", "-i", iface, "terminate"], timeout=5)
+
+
+def _restore_iface(iface):
+    """Hand `iface` back to NetworkManager so normal Wi-Fi resumes after monitor."""
+    _run(["nmcli", "device", "set", iface, "managed", "yes"], timeout=5)
+
+
 def enable_monitor(iface):
     """Put a monitor interface up for `iface`'s radio.
 
@@ -229,6 +243,11 @@ def enable_monitor(iface):
         return {"error": f"{iface}'s radio ({phy}) does not support monitor mode"}
     _run(["/usr/bin/rfkill", "unblock", "all"], timeout=5)
     mon = _mon_name(iface)
+
+    # Stop NetworkManager (and wpa_supplicant) from fighting us: an interface they
+    # manage gets brought back UP moments after we down it, which re-grabs the
+    # channel and brings the EBUSY straight back. No-ops where they aren't present.
+    _release_iface(iface)
 
     # Always rebuild a FRESH vif. A ragmon0 left over from a previous
     # enable/disable cycle can exist yet be in a half-dead state that captures
@@ -249,9 +268,15 @@ def enable_monitor(iface):
     rc, _, err = _run([_IW, "phy", phy, "interface", "add", mon,
                        "type", "monitor"], timeout=8)
     if rc == 0 and _monitor_ready(mon):
-        _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
-        return {"mon_iface": mon, "mode": "vif"}
-    # Half-created / not-a-monitor / un-tunable vif — clean up before the fallback.
+        # Confirm the vif SURVIVES a beat. On a USB adapter (mt7921u) the churn
+        # of down/up + vif add can trigger a device reset that silently removes
+        # ragmon0 right after we make it — reporting "on" then would give the
+        # ENODEV-on-first-scan the tester saw after a re-enable.
+        time.sleep(0.4)
+        if _iface_exists(mon) and _iw_dev_list().get(mon, {}).get("type") == "monitor":
+            _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
+            return {"mon_iface": mon, "mode": "vif"}
+    # Half-created / not-a-monitor / un-tunable / vanished vif — clean up first.
     if mon in _iw_dev_list():
         _run([_IW, "dev", mon, "del"], timeout=8)
 
@@ -279,9 +304,10 @@ def disable_monitor(mon_iface=None):
         _run(["ip", "link", "set", mon, "down"], timeout=5)
         _run([_IW, "dev", mon, "del"], timeout=8)
         time.sleep(0.3)  # let the delete settle so a quick re-enable doesn't race
-        # Bring the managed base interface back up (we took it down to free the
-        # radio for the monitor) so normal Wi-Fi resumes.
+        # Hand the managed base interface back to NetworkManager and bring it up
+        # (we took it down + unmanaged it to free the radio) so Wi-Fi resumes.
         if base and base != mon:
+            _restore_iface(base)
             _run(["ip", "link", "set", base, "up"], timeout=5)
     else:
         # We switched the base iface into monitor; switch it back to managed.

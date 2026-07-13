@@ -93,10 +93,28 @@ run uname -a
 run "$IW" --version
 echo "repo: $REPO"
 run git -C "$REPO" log --oneline -3
+SVC_START="$(systemctl show ragnar.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null)"
 echo -n "ragnar.service last (re)start: "
 systemctl show ragnar.service -p ActiveEnterTimestamp --value 2>/dev/null
+# Warn LOUDLY if the service is older than the newest code — a very common
+# reason "the fix doesn't work": the running process still has the old module.
+COMMIT_EPOCH="$(git -C "$REPO" log -1 --format=%ct 2>/dev/null)"
+SVC_EPOCH="$(date -d "$(systemctl show ragnar.service -p ActiveEnterTimestamp --value 2>/dev/null)" +%s 2>/dev/null)"
+if [ -n "$COMMIT_EPOCH" ] && [ -n "$SVC_EPOCH" ] && [ "$SVC_EPOCH" -lt "$COMMIT_EPOCH" ]; then
+  echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "  !! STALE SERVICE: the running ragnar.service started BEFORE the latest"
+  echo "  !! commit, so the web UI is still running OLD code. Run:"
+  echo "  !!     sudo systemctl restart ragnar"
+  echo "  !! then RE-RUN this doctor. (CLI tests below use the fresh code regardless.)"
+  echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+fi
 command -v tcpdump >/dev/null && echo "tcpdump: present" || echo "tcpdump: MISSING (apt install tcpdump)"
 python3 -c 'import scapy; print("scapy:", scapy.__version__)' 2>/dev/null || echo "scapy: MISSING"
+
+echo "interfering managers (they can re-up / reset the adapter under monitor):"
+systemctl is-active NetworkManager 2>/dev/null | sed 's/^/  NetworkManager: /'
+command -v nmcli >/dev/null && echo "  nmcli: present (Ragnar will set the adapter unmanaged while monitoring)" || echo "  nmcli: absent"
+pgrep -a wpa_supplicant 2>/dev/null | sed 's/^/  wpa_supplicant: /' || echo "  wpa_supplicant: not running"
 
 section "RADIOS / INTERFACES"
 run "$IW" dev
@@ -154,9 +172,17 @@ echo
 capture_test "$TESTCH"
 
 section "TEST 2 — DISABLE -> RE-ENABLE (the reported failure)"
+DMESG_BEFORE="$(dmesg 2>/dev/null | wc -l)"
 python3 "$REPO/wifi_defense.py" monitor --interface "$IFACE" --disable
 sleep 1
 python3 "$REPO/wifi_defense.py" monitor --interface "$IFACE" --enable
+echo
+echo "-- new kernel messages during the disable/re-enable (watch for USB reset / re-enumeration) --"
+dmesg 2>/dev/null | tail -n +"$((DMESG_BEFORE + 1))" | grep -iE "mt7921|usb|reset|firmware|disconnect|new .* device|phy[0-9]" | tail -n 20
+if dmesg 2>/dev/null | tail -n +"$((DMESG_BEFORE + 1))" | grep -qiE "reset|disconnect|new high-speed|new full-speed"; then
+  echo ">> NOTE: the adapter appears to RESET/re-enumerate on the enable/disable cycle."
+  echo ">>       That is the root cause of ragmon0 'disappearing' (ENODEV) after re-enable."
+fi
 echo
 capture_test "$TESTCH"
 
@@ -178,6 +204,29 @@ fi
 
 section "KERNEL / DRIVER MESSAGES"
 dmesg --ctime 2>/dev/null | tail -n 40 || dmesg | tail -n 40
+
+section "FINAL VERDICT (post disable/re-enable)"
+# Leave the adapter in a working state and report whether capture works NOW.
+python3 "$REPO/wifi_defense.py" monitor --interface "$IFACE" --enable >/dev/null 2>&1
+VTMP="$(mktemp)"
+python3 "$REPO/wifi_defense.py" scan --interface "$IFACE" --seconds 10 >"$VTMP" 2>/dev/null
+python3 - "$VTMP" <<'PY'
+import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("VERDICT: UNKNOWN (scan produced no JSON: %s)" % e); sys.exit()
+f = d.get("frames") or 0
+if d.get("error"):
+    print("VERDICT: FAIL — %s" % d["error"])
+elif f > 0:
+    print("VERDICT: PASS — captured %d frames on %s (monitor works)."
+          % (f, d.get("monitor")))
+else:
+    print("VERDICT: FAIL — monitor is up but captured 0 frames "
+          "(driver/channel issue — see dmesg + Test 3 above).")
+PY
+rm -f "$VTMP"
 
 section "DONE"
 echo "Full log saved to: $LOG"

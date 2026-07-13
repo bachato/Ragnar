@@ -39,6 +39,10 @@ WiFi Defense needs an adapter in **monitor mode**, configured with plain `iw`
   (`iw set channel` → `EBUSY -16`) and hears nothing. Taking it down hands the
   radio to the monitor; **Disable monitor** brings it back up. Use the Pi's
   onboard Wi-Fi (or Ethernet) for connectivity while that adapter monitors.
+  While monitoring, the adapter is also set **unmanaged in NetworkManager** (and
+  `wpa_supplicant` released) so it isn't re-upped/reset under the monitor — the
+  cause of `ragmon0` "disappearing" (ENODEV) right after a disable→re-enable.
+  Disable re-manages it.
 - If a concurrent vif can't be created/tuned, the adapter itself is switched
   into monitor mode (also off your network until you disable it; the UI warns).
 
