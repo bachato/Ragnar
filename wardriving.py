@@ -18,6 +18,13 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("Wardriving")
 
+# WiFi Defense (wifi_defense.py) records its active monitor vif here. Wardriving
+# reclaims every non-management adapter (deleting monitor children), so it must
+# leave this radio alone while a capture is live — otherwise it deletes ragmon0
+# and the monitor dies mid-scan with "ragmon0 disappeared (Errno 19)".
+_WIFIDEF_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "wifi_defense.json")
+
 # WiGLE CSV header
 WIGLE_HEADER = [
     'MAC', 'SSID', 'AuthMode', 'FirstSeen', 'Channel', 'RSSI',
@@ -2533,6 +2540,28 @@ class WardrivingEngine:
             pass
         return ''
 
+    def _wifidef_owned(self):
+        """Interfaces + phys that WiFi Defense is actively monitoring right now.
+        Wardriving must not reclaim/delete these (deleting ragmon0 kills the
+        capture with ENODEV mid-scan). Empty when no monitor is active."""
+        ifaces, phys = set(), set()
+        try:
+            with open(_WIFIDEF_STATE_FILE) as f:
+                st = json.load(f)
+        except Exception:
+            return ifaces, phys
+        if not st.get("mon_iface"):
+            return ifaces, phys           # monitor not active → nothing to protect
+        for key in ("mon_iface", "base_iface"):
+            name = st.get(key)
+            if not name:
+                continue
+            ifaces.add(name)
+            ph = self._iface_phy(name)
+            if ph:
+                phys.add(ph)
+        return ifaces, phys
+
     def _iface_phy(self, interface):
         """Return the phy name (e.g. 'phy0') for an interface, or '' on failure."""
         try:
@@ -2685,6 +2714,10 @@ class WardrivingEngine:
         phy = self._iface_phy(interface)
         if not phy:
             return
+        wd_ifaces, wd_phys = self._wifidef_owned()
+        if phy in wd_phys:
+            logger.debug(f"Wardriving: leaving phy {phy} to WiFi Defense (monitor active)")
+            return
         try:
             r = subprocess.run(['iw', 'dev'], capture_output=True, text=True, timeout=3)
             if r.returncode != 0:
@@ -2710,6 +2743,8 @@ class WardrivingEngine:
                             f"Wardriving: removing leftover {current_type} "
                             f"child {current_iface} on {phy} (parent {interface})"
                         )
+                        if current_iface in wd_ifaces:
+                            continue  # WiFi Defense's monitor vif — never delete it
                         try:
                             subprocess.run(['sudo', 'ip', 'link', 'set', current_iface, 'down'],
                                            capture_output=True, timeout=3)
@@ -2738,6 +2773,16 @@ class WardrivingEngine:
         enable wardriving_on_boot). Do not add an "if type=='ap' then skip"
         guard here without re-discussing this trade-off.
         """
+        # Hands off any adapter WiFi Defense is actively monitoring — reclaiming
+        # it (unmanage/managed/up + delete monitor children) would kill ragmon0.
+        wd_ifaces, wd_phys = self._wifidef_owned()
+        if interface in wd_ifaces or self._iface_phy(interface) in wd_phys:
+            logger.info(
+                f"Wardriving: skipping {interface} — WiFi Defense owns its radio "
+                f"(monitor active)"
+            )
+            return
+
         # rfkill unblock — cheap, idempotent
         try:
             subprocess.run(['sudo', 'rfkill', 'unblock', 'wifi'],

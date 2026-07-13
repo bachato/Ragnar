@@ -2632,17 +2632,34 @@ function _wifidefUpdateRunUI() {
     if (stop) stop.classList.toggle('hidden', !_wifidef.continuous);
 }
 
+// Must match wifi_defense.py `_BUILD`. If the running service reports something
+// else, the webapp is executing an OLD wifi_defense module (service not restarted
+// after a git pull) — the #1 cause of "the fix didn't work in the web UI".
+const WIFIDEF_BUILD = '20260713-dedicated';
+
 function _wifidefFillIfaces() {
     fetch('/api/wifidef/interfaces').then(r => r.json()).then(d => {
         const sel = document.getElementById('wifidef-iface');
         const ifs = (d && d.interfaces) || [];
         _wifidef.monitor = d.active_monitor || null;
+        _wifidef.mode = d.mode || null;
+        _wifidef.dedicated = !!d.dedicated;
+        const st = document.getElementById('wifidef-status');
+        if (d.build && d.build !== WIFIDEF_BUILD && st) {
+            st.innerHTML = '<span class="text-amber-400">⚠ WiFi Defense service is running old code (build '
+                + _esc(d.build) + ', page expects ' + WIFIDEF_BUILD
+                + '). Restart it: <code>sudo systemctl restart ragnar</code></span>';
+        }
         if (!ifs.length) { sel.innerHTML = '<option value="">No wireless adapter</option>'; }
         else {
             sel.innerHTML = ifs.map(i =>
                 `<option value="${i.iface}"${i.monitor_capable ? '' : ' disabled'}>${i.iface}${i.monitor_capable ? '' : ' (no monitor)'}${i.is_monitor ? ' • MONITOR' : ''}</option>`).join('');
             const cap = ifs.find(i => i.monitor_capable) || ifs[0];
-            if (!_wifidef.iface || !ifs.some(i => i.iface === _wifidef.iface && i.monitor_capable)) _wifidef.iface = (d.base_iface) || cap.iface;
+            // Never let the base selection be our own monitor vif; base_iface is
+            // only trusted if it's actually in the (vif-excluded) adapter list.
+            const baseOk = d.base_iface && ifs.some(i => i.iface === d.base_iface);
+            if (!_wifidef.iface || !ifs.some(i => i.iface === _wifidef.iface && i.monitor_capable))
+                _wifidef.iface = (baseOk ? d.base_iface : cap.iface);
             sel.value = _wifidef.iface;
             sel.onchange = () => { _wifidef.iface = sel.value; };
         }
@@ -2653,6 +2670,18 @@ function _wifidefFillIfaces() {
 function _wifidefUpdateMonBtn() {
     const btn = document.getElementById('wifidef-mon-btn');
     if (!btn) return;
+    // A boot-dedicated adapter is owned by the systemd unit, not the UI: it's
+    // always in monitor mode by design, so don't offer a toggle that would hand
+    // it back to NetworkManager and defeat the whole point.
+    if (_wifidef.dedicated) {
+        btn.textContent = 'Dedicated monitor (' + (_wifidef.monitor || '') + ') — boot-managed';
+        btn.classList.remove('text-red-300');
+        btn.disabled = true;
+        btn.classList.add('opacity-60', 'cursor-not-allowed');
+        return;
+    }
+    btn.disabled = false;
+    btn.classList.remove('opacity-60', 'cursor-not-allowed');
     if (_wifidef.monitor) {
         btn.textContent = 'Disable monitor (' + _wifidef.monitor + ')';
         btn.classList.add('text-red-300');
@@ -2664,7 +2693,15 @@ function _wifidefUpdateMonBtn() {
 
 function wifidefToggleMonitor() {
     const st = document.getElementById('wifidef-status');
+    // Boot-dedicated monitor is managed by systemd; the UI must not toggle it.
+    if (_wifidef.dedicated) {
+        if (st) st.textContent = 'Adapter is a boot-dedicated monitor (managed by ragnar-wifidef-monitor.service)';
+        return;
+    }
     if (_wifidef.monitor) {
+        // Stop any continuous scan first — otherwise its next loop would
+        // immediately auto-re-enable the monitor and "disable" would look broken.
+        if (_wifidef.continuous) wifidefStopContinuous();
         st.textContent = 'Disabling monitor…';
         fetch('/api/wifidef/monitor', { method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'disable' }) })

@@ -32,11 +32,19 @@ BSSIDs/attackers, then frame counts and an inventory of every AP heard.
 WiFi Defense needs an adapter in **monitor mode**, configured with plain `iw`
 (no `aircrack-ng` required):
 
-- Where the driver allows it (e.g. the **Alfa AWUS036AXM** / `mt7921u`), a
-  **separate monitor vif** (`ragmon0`) is added so the box **keeps its normal
-  Wi-Fi link** while it sniffs.
-- Otherwise the adapter itself is switched into monitor mode — which takes it
-  **off your network** until you disable monitor mode (the UI warns you).
+- A **separate monitor vif** (`ragmon0`) is added on the adapter's radio (e.g.
+  the **Alfa AWUS036AXM** / `mt7921u`). While monitoring, that adapter's
+  **managed interface is brought down** — on a single-radio adapter a managed
+  interface that stays up *holds the channel*, so the monitor can't be tuned
+  (`iw set channel` → `EBUSY -16`) and hears nothing. Taking it down hands the
+  radio to the monitor; **Disable monitor** brings it back up. Use the Pi's
+  onboard Wi-Fi (or Ethernet) for connectivity while that adapter monitors.
+  While monitoring, the adapter is also set **unmanaged in NetworkManager** (and
+  `wpa_supplicant` released) so it isn't re-upped/reset under the monitor — the
+  cause of `ragmon0` "disappearing" (ENODEV) right after a disable→re-enable.
+  Disable re-manages it.
+- If a concurrent vif can't be created/tuned, the adapter itself is switched
+  into monitor mode (also off your network until you disable it; the UI warns).
 
 The Pi's **onboard `brcmfmac` radio does not support monitor mode** at all, so
 you need a capable USB adapter. **Enable monitor** sets it up; **Disable
@@ -47,12 +55,58 @@ box on **`hop`** to cycle the common 2.4/5 GHz channels during the capture
 (catches attacks on any channel), or pin a specific channel number to dwell on
 it (best when you already know where the attack is).
 
+### Dedicated monitor (boot-time) — most robust
+
+If you have an adapter you can **dedicate 100% to sniffing** (a spare USB dongle,
+with the Pi's onboard Wi-Fi / Ethernet carrying connectivity), claim it as a
+**dedicated monitor at boot** instead of toggling it from the web UI. The whole
+interface is switched into `type monitor` (switch-mode) once, before the app
+starts, so there is **no shared-radio vif, no runtime enable/disable dance, and
+none of the EBUSY / "`ragmon0` disappeared" (ENODEV) failure modes**. WiFi
+Defense then just captures on the already-monitor interface. The web UI detects
+this and shows **"Dedicated monitor (wlan1) — boot-managed"** with the toggle
+disabled (systemd owns the adapter).
+
+Set it up (opt-in):
+
+```bash
+# 1. Try it once by hand (root):
+sudo scripts/wifidef_dedicate.sh wlan1 US 2437 0
+#      <iface> <regdomain> <init-freq-MHz> <six_ghz:0|1>
+
+# 2. Make it persistent across reboots:
+sudo cp scripts/ragnar-wifidef-monitor.service /etc/systemd/system/
+sudo mkdir -p /etc/ragnar
+sudo cp scripts/wifidef-monitor.env.example /etc/ragnar/wifidef-monitor.env
+sudoedit /etc/ragnar/wifidef-monitor.env        # set WIFIDEF_IFACE=wlan1 etc.
+sudo systemctl daemon-reload
+sudo systemctl enable --now ragnar-wifidef-monitor
+```
+
+The unit runs **before** `ragnar.service` and, on stop/disable, hands the adapter
+back to NetworkManager. Config lives in `/etc/ragnar/wifidef-monitor.env`:
+
+| Var | Meaning |
+|-----|---------|
+| `WIFIDEF_IFACE` | the dedicated capture adapter (e.g. `wlan1`) — **not** the Pi's onboard `wlan0` |
+| `WIFIDEF_REGDOMAIN` | 2-letter ISO regdomain (`iw reg set`) — needed to unlock 5 GHz DFS / 6 GHz |
+| `WIFIDEF_INIT_FREQ` | MHz to park on at boot; the scan hopper retunes immediately |
+| `WIFIDEF_SIX_GHZ` | `1` also hops 6 GHz — requires a Wi-Fi 6E radio (e.g. `mt7921u` / AXM) and a correct regdomain |
+
+You can also run it directly: `python3 wifi_defense.py dedicate --interface wlan1
+--regdomain US --init-freq 2437 [--six-ghz]`.
+
 ---
 
 ## Using it
 
 1. Plug in a monitor-capable adapter and pick it in **Monitor adapter**.
-2. **Enable monitor** (adds `ragmon0`, or switches the adapter).
+2. **Enable monitor** (adds `ragmon0`, or switches the adapter). The **same
+   button toggles it off** — it reads *Disable monitor (ragmon0)* while active.
+   Enabling always rebuilds a **fresh, channel-primed** vif (tearing down any
+   lingering one first), so disable→re-enable reliably comes back working rather
+   than a vif that exists but hears nothing. Disabling also stops a running
+   **Continuous** scan (otherwise its next loop would just re-enable monitor).
 3. **Trust current APs** in a known-good environment — this **adds** the
    currently-shown APs to the SSID→BSSID baseline that powers **evil-twin**
    detection. It *accumulates* (union), so run it a few times / across a scan or
@@ -124,3 +178,29 @@ the same call. Continuous mode keeps looping through a recovery, so live
 monitoring self-heals. If it still fails after that, **Disable monitor** then
 **Enable monitor** to force a fresh vif. Your trusted-AP baseline and tuned
 thresholds are preserved across all monitor bookkeeping.
+
+*Why a **service restart** used to be the only thing that fixed it:* recreating
+`ragmon0` (a disable→re-enable) gives it a **new kernel ifindex**, but the packet
+library (scapy) caches the interface's old ifindex for the life of the process
+and keeps binding the capture socket to the dead index → ENODEV on every scan —
+until the process restarts and rebuilds that cache. Ragnar now **refreshes that
+cache before every capture**, so a runtime re-enable heals just like a restart
+(no `sudo systemctl restart ragnar` needed).
+
+**Diagnosing a stubborn adapter — `scripts/wifidef_doctor.sh`.** When monitor
+comes up but captures nothing (or a specific dongle misbehaves), run the doctor:
+
+```bash
+sudo ./scripts/wifidef_doctor.sh            # auto-detects the adapter
+sudo ./scripts/wifidef_doctor.sh wlan1      # or name it explicitly
+```
+
+It records the environment (kernel, driver, `rfkill`, radio modes, code version
+and **when the service last restarted** — a common gotcha after `git pull`),
+then enables monitor through Ragnar's own code and compares an **OS-level
+capture (`tcpdump`)** against Ragnar's capture on a channel that has traffic. The
+contrast is the diagnosis: if `tcpdump` hears frames but Ragnar reports `frames=0`
+the bug is in the capture path; if neither hears anything while `iw dev ragmon0
+info` shows a real monitor channel, it's the driver/firmware. It also does a
+disable→re-enable cycle and a manual vif rebuild, and dumps `dmesg`. Everything
+is saved to `/tmp/wifidef_doctor_*.log` to paste into a bug report.

@@ -45,6 +45,12 @@ _IW = "/usr/sbin/iw" if os.path.exists("/usr/sbin/iw") else "iw"
 _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "data", "wifi_defense.json")
 
+# Build marker — bump on every monitor-lifecycle change and mirror the value in
+# the web UI (WIFIDEF_BUILD in ragnar_modern.js). The UI compares them and warns
+# if the running (long-lived) webapp still has an OLD wifi_defense module loaded,
+# i.e. the service wasn't restarted after a git pull. Kills stale-service guesswork.
+_BUILD = "20260713-dedicated"
+
 # Detection thresholds (per capture window)
 _DEAUTH_FLOOD_MIN = 15      # deauth+disassoc frames => flood
 # Beacon flood. There is no reliable "shape" signal that separates a flood from a
@@ -61,6 +67,13 @@ _KARMA_SSID_MIN = 5               # distinct SSIDs answered by ONE bssid => KARM
 # Channels the hopper cycles when no fixed channel is requested (2.4 GHz + the
 # common U-NII-1/3 5 GHz set). Kept short so each channel gets real dwell time.
 _HOP_CHANNELS = [1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161]
+
+# 6 GHz (Wi-Fi 6E) preferred-scanning channels, as *frequencies* in MHz — 6 GHz
+# must be tuned by freq (channel numbers collide with 2.4/5 GHz) and only works
+# with a correct regulatory domain + a 6E-capable radio. Opt-in (see six_ghz).
+# freq = 5950 + 5*chan; these are the PSC (preferred scanning) channels.
+_HOP_6GHZ_FREQS = [5975, 6055, 6135, 6215, 6295, 6375, 6455, 6535,
+                   6615, 6695, 6775, 6855, 6935, 7015, 7095]
 
 # 802.11 management subtype -> event kind
 _MGMT_SUBTYPES = {
@@ -159,6 +172,12 @@ def _resolve_monitor(interface, auto_enable=True):
     mon = state.get("mon_iface")
     if mon and _iface_exists(mon):
         return mon
+    # A dedicated (boot-managed) monitor should still be present; if it vanished
+    # (adapter re-plugged), re-claim the same interface in dedicated switch-mode
+    # rather than adding a vif.
+    if state.get("mode") == "dedicated" and mon:
+        res = dedicate_monitor(mon, six_ghz=state.get("six_ghz", False))
+        return res["mon_iface"] if "error" not in res else res
     # Stale or absent — clear the dead bookkeeping (keeps baseline/thresholds).
     if mon:
         _save_state({})
@@ -176,7 +195,12 @@ def list_monitor_capable():
     state = _load_state()
     out = []
     seen_phys = {}
+    mon_name = _mon_name(None)
     for iface, info in devs.items():
+        # Our own monitor vif (ragmon0) is not a selectable *base* adapter — hide
+        # it so the UI/tools never try to enable/disable monitor "on ragmon0".
+        if iface == mon_name and info["type"] == "monitor":
+            continue
         phy = info["phy"]
         if phy not in seen_phys:
             seen_phys[phy] = _phy_supports_monitor(phy)
@@ -192,12 +216,57 @@ def list_monitor_capable():
     if active and not _iface_exists(active):
         active = None
     return {"interfaces": out, "active_monitor": active,
-            "base_iface": state.get("base_iface")}
+            "base_iface": state.get("base_iface"),
+            "mode": state.get("mode") if active else None,
+            "dedicated": state.get("mode") == "dedicated" and active is not None,
+            "build": _BUILD}
 
 
 def _mon_name(base):
     # Deterministic, short, and unlikely to collide with a user's naming.
     return "ragmon0"
+
+
+def _monitor_ready(mon):
+    """Bring a freshly-created monitor vif up on a known channel and confirm both
+    that the kernel made it a monitor AND that we can actually TUNE it. The
+    channel set is the real test: on a shared-radio adapter (e.g. mt7921u) a
+    managed vif that is still up holds the channel, so `iw set channel` returns
+    EBUSY (-16) and the monitor hears nothing. If we can't set the channel the
+    vif is useless for capture."""
+    if not _iface_exists(mon):
+        return False
+    _run(["ip", "link", "set", mon, "up"], timeout=5)
+    rc, _, _ = _run([_IW, "dev", mon, "set", "channel", "6"], timeout=5)
+    is_monitor = _iw_dev_list().get(mon, {}).get("type") == "monitor"
+    return is_monitor and rc == 0
+
+
+def _release_iface(iface):
+    """Stop NetworkManager / wpa_supplicant / dhclient from managing `iface` so
+    they don't re-up it under us (which re-grabs the channel → EBUSY). Targets
+    only processes bound to THIS interface. All best-effort and silent where the
+    tool/service isn't present."""
+    _run(["nmcli", "device", "set", iface, "managed", "no"], timeout=5)
+    # wpa_supplicant/dhclient bound to this iface hold the radio; drop only the
+    # instances tied to it (leave the management link's supplicant alone).
+    _run(["pkill", "-f", f"wpa_supplicant.*{iface}"], timeout=5)
+    _run(["pkill", "-f", f"dhclient.*{iface}"], timeout=5)
+
+
+def _restore_iface(iface):
+    """Hand `iface` back to NetworkManager so normal Wi-Fi resumes after monitor."""
+    _run(["nmcli", "device", "set", iface, "managed", "yes"], timeout=5)
+
+
+def set_regdomain(domain):
+    """Set the wireless regulatory domain (e.g. 'US', 'SE'). Required for 5 GHz
+    DFS and 6 GHz channels to become available. No-op for a falsy/blank domain."""
+    domain = (domain or "").strip().upper()
+    if not re.match(r"^[A-Z]{2}$", domain):
+        return {"error": "regdomain must be a 2-letter ISO code (e.g. US)"}
+    rc, _, err = _run([_IW, "reg", "set", domain], timeout=5)
+    return {"ok": rc == 0, "regdomain": domain, "error": (err or "").strip() or None}
 
 
 def enable_monitor(iface):
@@ -209,25 +278,58 @@ def enable_monitor(iface):
     """
     if not _valid_iface(iface):
         return {"error": "invalid interface"}
+    # Never run monitor *on* our own monitor vif. A caller (a stale UI selection,
+    # a diagnostic) can hand us 'ragmon0'; map it back to the real managed base,
+    # otherwise disabling (which deletes ragmon0) makes the next enable fail with
+    # "radio (None) does not support monitor mode".
+    if iface == _mon_name(iface):
+        base = _load_state().get("base_iface")
+        if base and base != iface:
+            iface = base
+        else:
+            return {"error": f"'{iface}' is the monitor interface, not an adapter — "
+                             "select the adapter's managed interface (e.g. wlan1)"}
     phy = _phy_for_iface(iface)
     if not _phy_supports_monitor(phy):
         return {"error": f"{iface}'s radio ({phy}) does not support monitor mode"}
     _run(["/usr/bin/rfkill", "unblock", "all"], timeout=5)
     mon = _mon_name(iface)
 
-    # Already have it?
+    # Stop NetworkManager (and wpa_supplicant) from fighting us: an interface they
+    # manage gets brought back UP moments after we down it, which re-grabs the
+    # channel and brings the EBUSY straight back. No-ops where they aren't present.
+    _release_iface(iface)
+
+    # Always rebuild a FRESH vif. A ragmon0 left over from a previous
+    # enable/disable cycle can exist yet be in a half-dead state that captures
+    # nothing — so tear any lingering one down and recreate, letting the driver
+    # settle in between (the del→add race is what breaks mt7921u re-enables).
     if mon in _iw_dev_list():
-        _run(["ip", "link", "set", mon, "up"], timeout=5)
-        _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
-        return {"mon_iface": mon, "mode": "vif"}
+        _run(["ip", "link", "set", mon, "down"], timeout=5)
+        _run([_IW, "dev", mon, "del"], timeout=8)
+        time.sleep(0.3)
+
+    # Free the radio: a shared-PHY managed interface that stays UP holds the
+    # channel, so the monitor vif can't be tuned (`iw set channel` => EBUSY) and
+    # captures nothing. Take the managed base down while we monitor — this is what
+    # makes capture reliable on mt7921u and friends. disable_monitor restores it.
+    _run(["ip", "link", "set", iface, "down"], timeout=5)
 
     # Try a concurrent monitor vif first.
     rc, _, err = _run([_IW, "phy", phy, "interface", "add", mon,
                        "type", "monitor"], timeout=8)
-    if rc == 0:
-        _run(["ip", "link", "set", mon, "up"], timeout=5)
-        _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
-        return {"mon_iface": mon, "mode": "vif"}
+    if rc == 0 and _monitor_ready(mon):
+        # Confirm the vif SURVIVES a beat. On a USB adapter (mt7921u) the churn
+        # of down/up + vif add can trigger a device reset that silently removes
+        # ragmon0 right after we make it — reporting "on" then would give the
+        # ENODEV-on-first-scan the tester saw after a re-enable.
+        time.sleep(0.4)
+        if _iface_exists(mon) and _iw_dev_list().get(mon, {}).get("type") == "monitor":
+            _save_state({"mon_iface": mon, "base_iface": iface, "mode": "vif"})
+            return {"mon_iface": mon, "mode": "vif"}
+    # Half-created / not-a-monitor / un-tunable / vanished vif — clean up first.
+    if mon in _iw_dev_list():
+        _run([_IW, "dev", mon, "del"], timeout=8)
 
     # Fallback: switch the interface itself to monitor (disrupts its link).
     _run(["ip", "link", "set", iface, "down"], timeout=5)
@@ -252,17 +354,75 @@ def disable_monitor(mon_iface=None):
     if mode == "vif" or (mon in _iw_dev_list() and _iw_dev_list().get(mon, {}).get("type") == "monitor" and mon == _mon_name(base)):
         _run(["ip", "link", "set", mon, "down"], timeout=5)
         _run([_IW, "dev", mon, "del"], timeout=8)
+        time.sleep(0.3)  # let the delete settle so a quick re-enable doesn't race
+        # Hand the managed base interface back to NetworkManager and bring it up
+        # (we took it down + unmanaged it to free the radio) so Wi-Fi resumes.
+        if base and base != mon:
+            _restore_iface(base)
+            _run(["ip", "link", "set", base, "up"], timeout=5)
     else:
-        # We switched the base iface into monitor; switch it back to managed.
+        # We switched the base iface itself into monitor (switch / dedicated
+        # mode); switch it back to managed and re-manage it.
         _run(["ip", "link", "set", mon, "down"], timeout=5)
         _run([_IW, "dev", mon, "set", "type", "managed"], timeout=8)
+        _restore_iface(mon)
         _run(["ip", "link", "set", mon, "up"], timeout=5)
     _save_state({})
     return {"ok": True, "restored": base or mon}
 
 
+def dedicate_monitor(iface, regdomain=None, init_freq=None, six_ghz=False):
+    """Claim `iface` as a *dedicated* passive monitor (switch-mode: the whole
+    interface becomes type=monitor). Meant to run once at boot for a sensor that
+    owns the adapter — no runtime enable/disable dance, no shared-radio vif, so
+    none of the EBUSY / 'ragmon0 disappeared' failure modes apply. Sets the
+    regulatory domain (needed for DFS/6 GHz), releases NM/wpa_supplicant/dhclient
+    on the iface, then switches it to monitor and parks a frequency."""
+    if not _valid_iface(iface):
+        return {"error": "invalid interface"}
+    phy = _phy_for_iface(iface)
+    if not _phy_supports_monitor(phy):
+        return {"error": f"{iface}'s radio ({phy}) does not support monitor mode"}
+    _run(["/usr/bin/rfkill", "unblock", "all"], timeout=5)
+    if regdomain:
+        set_regdomain(regdomain)
+    _release_iface(iface)
+    _run(["ip", "link", "set", iface, "down"], timeout=5)
+    rc, _, err = _run([_IW, "dev", iface, "set", "type", "monitor"], timeout=8)
+    _run(["ip", "link", "set", iface, "up"], timeout=5)
+    if rc != 0 or _iw_dev_list().get(iface, {}).get("type") != "monitor":
+        return {"error": f"driver rejected monitor mode on {iface}: {(err or '').strip()}"}
+    if init_freq:
+        _set_freq(iface, init_freq)
+    _save_state({"mon_iface": iface, "base_iface": iface, "mode": "dedicated",
+                 "six_ghz": bool(six_ghz)})
+    return {"mon_iface": iface, "mode": "dedicated", "regdomain": regdomain,
+            "six_ghz": bool(six_ghz)}
+
+
 def _set_channel(mon_iface, channel):
     _run([_IW, "dev", mon_iface, "set", "channel", str(int(channel))], timeout=5)
+
+
+def _set_freq(mon_iface, freq_mhz):
+    _run([_IW, "dev", mon_iface, "set", "freq", str(int(freq_mhz))], timeout=5)
+
+
+def _hop_targets(six_ghz=False):
+    """Ordered tune targets for the channel hopper: ('chan', N) for 2.4/5 GHz and
+    ('freq', MHz) for 6 GHz (which must be tuned by frequency)."""
+    targets = [("chan", c) for c in _HOP_CHANNELS]
+    if six_ghz:
+        targets += [("freq", f) for f in _HOP_6GHZ_FREQS]
+    return targets
+
+
+def _tune(mon_iface, target):
+    kind, val = target
+    if kind == "freq":
+        _set_freq(mon_iface, val)
+    else:
+        _set_channel(mon_iface, val)
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +763,24 @@ def _capture_error(mon_iface, exc):
     return {"error": f"capture failed: {exc}"}
 
 
+def _refresh_scapy_ifaces():
+    """Drop scapy's cached interface table so it re-reads the live ifindex.
+
+    scapy caches a NetworkInterface object (with a fixed .index) per name at
+    import time and binds its AF_PACKET/monitor socket using that. When we
+    delete+recreate the monitor vif — a disable→re-enable, or an ENODEV rebuild —
+    ragmon0 comes back with a NEW ifindex, but scapy keeps the stale cached one
+    and every sniff() then fails with ENODEV. A fresh process rebuilds this cache,
+    which is exactly why 'systemctl restart ragnar' heals it while a runtime
+    re-enable does not. Reload it ourselves so the running service self-heals too
+    (scapy's own resolve_iface() does the same reload as its miss fallback)."""
+    try:
+        from scapy.all import conf
+        conf.ifaces.reload()
+    except Exception:
+        pass
+
+
 def _capture_recover(capture_fn, interface, seconds, channel, auto_enable):
     """Resolve a live monitor, capture, and — if the vif dies around capture time
     (ENODEV) — rebuild it once and retry. Returns an events list, or an
@@ -611,12 +789,14 @@ def _capture_recover(capture_fn, interface, seconds, channel, auto_enable):
     mon = _resolve_monitor(interface, auto_enable=auto_enable)
     if isinstance(mon, dict):
         return mon
+    _refresh_scapy_ifaces()                   # pick up the current ifindex of `mon`
     events = capture_fn(mon, seconds, channel=channel)
     if isinstance(events, dict) and events.get("enodev") and auto_enable:
         _save_state({})                       # drop the dead vif bookkeeping
         mon = _resolve_monitor(interface, auto_enable=True)   # force a rebuild
         if isinstance(mon, dict):
             return mon
+        _refresh_scapy_ifaces()               # the rebuild gave `mon` a new ifindex
         events = capture_fn(mon, seconds, channel=channel)
     return events
 
@@ -636,10 +816,11 @@ def _capture(mon_iface, seconds, channel=None):
     if channel:
         _set_channel(mon_iface, channel)
     else:
+        targets = _hop_targets(_load_state().get("six_ghz", False))
         def _hopper():
             i = 0
             while not stop.is_set():
-                _set_channel(mon_iface, _HOP_CHANNELS[i % len(_HOP_CHANNELS)])
+                _tune(mon_iface, targets[i % len(targets)])
                 i += 1
                 stop.wait(0.35)
         threading.Thread(target=_hopper, daemon=True).start()
@@ -674,10 +855,11 @@ def _capture_all(mon_iface, seconds, channel=None):
     if channel:
         _set_channel(mon_iface, channel)
     else:
+        targets = _hop_targets(_load_state().get("six_ghz", False))
         def _hopper():
             i = 0
             while not stop.is_set():
-                _set_channel(mon_iface, _HOP_CHANNELS[i % len(_HOP_CHANNELS)])
+                _tune(mon_iface, targets[i % len(targets)])
                 i += 1
                 stop.wait(0.35)
         threading.Thread(target=_hopper, daemon=True).start()
@@ -1088,12 +1270,19 @@ def selftest():
                 return {"error": "capture failed: … (Errno 19)", "enodev": True}
             return [{"kind": "beacon", "src": "aa:aa:aa:00:00:01", "ssid": "OK"}]
         _orig_resolve = _resolve_monitor
+        _orig_refresh = _refresh_scapy_ifaces
+        refreshes = {"n": 0}
         try:
             globals()["_resolve_monitor"] = lambda interface, auto_enable=True: "ragmon0"
+            globals()["_refresh_scapy_ifaces"] = lambda: refreshes.__setitem__("n", refreshes["n"] + 1)
             rec = _capture_recover(_flaky, "wlan0", 5, None, True)
             check("_capture_recover rebuilds + retries after one ENODEV",
                   isinstance(rec, list) and len(rec) == 1 and calls["n"] == 2,
                   json.dumps({"calls": calls["n"], "rec": rec}))
+            # scapy's stale iface cache is refreshed before the initial capture AND
+            # after the rebuild — the fix for ENODEV-until-service-restart.
+            check("_capture_recover refreshes scapy ifaces on capture + rebuild",
+                  refreshes["n"] == 2, json.dumps({"refreshes": refreshes["n"]}))
             # With auto_enable off it must NOT retry — surfaces the error once.
             calls["n"] = 0
             rec2 = _capture_recover(_flaky, "wlan0", 5, None, False)
@@ -1102,6 +1291,119 @@ def selftest():
                   json.dumps({"calls": calls["n"]}))
         finally:
             globals()["_resolve_monitor"] = _orig_resolve
+            globals()["_refresh_scapy_ifaces"] = _orig_refresh
+
+        # --- Robust re-enable: a lingering vif is torn down, rebuilt, primed
+        #     on a channel, and verified — the disable→re-enable "comes back but
+        #     detects nothing" fix. Stub the shell primitives. ---
+        _names = ("_run", "_iw_dev_list", "_iface_exists", "_phy_for_iface",
+                  "_phy_supports_monitor", "_set_channel", "_valid_iface")
+        _saved_fns = {n: globals()[n] for n in _names}
+        _real_sleep = time.sleep
+        try:
+            devs = {"wlan9": {"phy": "phy9", "type": "managed"},
+                    "ragmon0": {"phy": "phy9", "type": "monitor"}}  # stale leftover
+            cmds = []
+
+            def _fake_run(args, **kw):
+                cmds.append(list(args))
+                a = list(args)
+                if len(a) >= 6 and a[1] == "phy" and a[3] == "interface" and a[4] == "add":
+                    devs[a[5]] = {"phy": "phy9", "type": "monitor"}
+                if len(a) >= 4 and a[0] == _IW and a[1] == "dev" and a[3] == "del":
+                    devs.pop(a[2], None)
+                # iw dev <if> set type <t>  → reflect the new type
+                if (len(a) >= 6 and a[0] == _IW and a[1] == "dev"
+                        and a[3] == "set" and a[4] == "type" and a[2] in devs):
+                    devs[a[2]]["type"] = a[5]
+                return (0, "", "")
+
+            globals().update(
+                _run=_fake_run, _iw_dev_list=lambda: {k: dict(v) for k, v in devs.items()},
+                _iface_exists=lambda n: n in devs, _phy_for_iface=lambda i: "phy9",
+                _phy_supports_monitor=lambda p: True, _set_channel=lambda m, c: None,
+                _valid_iface=lambda i: True)
+            time.sleep = lambda *_a, **_k: None
+            res = enable_monitor("wlan9")
+            check("re-enable yields a working vif monitor",
+                  res.get("mon_iface") == "ragmon0" and res.get("mode") == "vif",
+                  json.dumps(res))
+            check("re-enable tears the stale vif down before recreating (fresh)",
+                  any(c[0] == _IW and c[1:2] == ["dev"] and c[-1] == "del" for c in cmds))
+            check("re-enable re-adds the vif and primes a channel",
+                  any(len(c) >= 5 and c[4] == "add" for c in cmds)
+                  and _load_state().get("mon_iface") == "ragmon0")
+            check("enable frees the radio by bringing the managed base down",
+                  any(c[:3] == ["ip", "link", "set"] and c[3] == "wlan9"
+                      and c[-1] == "down" for c in cmds),
+                  json.dumps([c for c in cmds if "wlan9" in c]))
+            # The monitor vif (ragmon0) must never be offered as a selectable base.
+            check("list_monitor_capable hides our own monitor vif",
+                  not any(i["iface"] == "ragmon0"
+                          for i in list_monitor_capable()["interfaces"]),
+                  json.dumps([i["iface"] for i in list_monitor_capable()["interfaces"]]))
+            # enable_monitor must refuse to run monitor *on* ragmon0 (no base to map to).
+            _base_keep = _load_state().get("base_iface")
+            _save_state({"mode": "vif"})  # no base_iface
+            _guard = enable_monitor("ragmon0")
+            check("enable_monitor refuses the monitor vif (ragmon0) as a base",
+                  isinstance(_guard, dict) and "error" in _guard, json.dumps(_guard))
+            _save_state({"mon_iface": "ragmon0", "base_iface": _base_keep or "wlan9", "mode": "vif"})
+            # _monitor_ready must reject an un-tunable vif (set channel EBUSY).
+            def _busy_run(args, **kw):
+                a = list(args)
+                if a[0] == _IW and len(a) >= 5 and a[3] == "set" and a[4] == "channel":
+                    return (240, "", "command failed: Device or resource busy (-16)")
+                return (0, "", "")
+            globals()["_run"] = _busy_run
+            check("_monitor_ready fails when the channel can't be set (EBUSY)",
+                  _monitor_ready("ragmon0") is False)
+            # disable brings the managed base back up.
+            globals()["_run"] = _fake_run
+            _save_state({"mon_iface": "ragmon0", "base_iface": "wlan9", "mode": "vif"})
+            cmds.clear()
+            disable_monitor()
+            check("disable restores the managed base (brought back up)",
+                  any(c[:3] == ["ip", "link", "set"] and c[3] == "wlan9"
+                      and c[-1] == "up" for c in cmds),
+                  json.dumps([c for c in cmds if "wlan9" in c]))
+
+            # --- Regdomain, targeted release, 6 GHz, dedicated boot-time mode ---
+            check("set_regdomain rejects a non-ISO code",
+                  "error" in set_regdomain("USA"))
+            cmds.clear()
+            check("set_regdomain issues `iw reg set` for a valid code",
+                  set_regdomain("us").get("regdomain") == "US"
+                  and any(c[:3] == [_IW, "reg", "set"] and c[3] == "US" for c in cmds))
+            cmds.clear()
+            _release_iface("wlan9")
+            check("_release_iface kills wpa_supplicant/dhclient bound to the iface",
+                  any(c[0] == "pkill" and "wpa_supplicant" in c[-1] for c in cmds)
+                  and any(c[0] == "pkill" and "dhclient" in c[-1] for c in cmds),
+                  json.dumps(cmds))
+            check("6 GHz hop targets are freq-tuned and opt-in",
+                  ("freq", 5975) in _hop_targets(True)
+                  and all(t[0] == "chan" for t in _hop_targets(False)))
+            # Dedicated (switch-mode) boot claim.
+            devs["wlan9"]["type"] = "managed"
+            cmds.clear()
+            ded = dedicate_monitor("wlan9", regdomain="US", init_freq=2437, six_ghz=True)
+            check("dedicate_monitor claims the whole iface as monitor",
+                  ded.get("mode") == "dedicated" and ded.get("mon_iface") == "wlan9"
+                  and devs["wlan9"]["type"] == "monitor", json.dumps(ded))
+            check("dedicate_monitor set regdomain + type monitor + init freq",
+                  any(c[:3] == [_IW, "reg", "set"] for c in cmds)
+                  and any(c[3:6] == ["set", "type", "monitor"] for c in cmds if len(c) >= 6)
+                  and any(c[3:5] == ["set", "freq"] for c in cmds if len(c) >= 5))
+            check("dedicated state persists mode + six_ghz",
+                  _load_state().get("mode") == "dedicated"
+                  and _load_state().get("six_ghz") is True)
+            # _resolve_monitor re-claims a dedicated monitor if the iface reappears.
+            check("_resolve_monitor returns the live dedicated monitor",
+                  _resolve_monitor("wlan9") == "wlan9")
+        finally:
+            time.sleep = _real_sleep
+            globals().update(_saved_fns)
     finally:
         try:
             os.unlink(_STATE_FILE)
@@ -1167,6 +1469,14 @@ def _main(argv):
     pb = sub.add_parser("baseline")
     pb.add_argument("--interface", required=True)
     pb.add_argument("--seconds", type=int, default=20)
+    # Boot-time dedicated monitor: claim the whole interface (switch-mode) once,
+    # e.g. from a systemd ExecStartPre. See scripts/wifidef_dedicate.sh.
+    pd = sub.add_parser("dedicate")
+    pd.add_argument("--interface", required=True)
+    pd.add_argument("--regdomain", default=None, help="e.g. US, SE — unlocks DFS/6 GHz")
+    pd.add_argument("--init-freq", type=int, default=None, dest="init_freq")
+    pd.add_argument("--six-ghz", action="store_true", dest="six_ghz",
+                    help="also hop 6 GHz (needs a 6E radio + correct regdomain)")
     sub.add_parser("selftest")
 
     args = ap.parse_args(argv)
@@ -1177,6 +1487,11 @@ def _main(argv):
             print(json.dumps(disable_monitor(), indent=2))
         else:
             print(json.dumps(enable_monitor(args.interface), indent=2))
+    elif args.cmd == "dedicate":
+        r = dedicate_monitor(args.interface, regdomain=args.regdomain,
+                             init_freq=args.init_freq, six_ghz=args.six_ghz)
+        print(json.dumps(r, indent=2))
+        return 0 if "error" not in r else 1
     elif args.cmd == "scan":
         print(json.dumps(do_scan(args.interface, args.seconds, args.channel), indent=2))
     elif args.cmd == "baseline":
