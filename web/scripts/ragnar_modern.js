@@ -4049,12 +4049,30 @@ async function locatePort(force) {
     }
 }
 
+// Fill the Network Identity interface selector once (auto + each real NIC),
+// preserving the current selection on later calls.
+function _niPopulateIfaces() {
+    const sel = document.getElementById('net-identity-iface');
+    if (!sel || sel.options.length > 1) return;
+    fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            o.textContent = i.name + (i.type && i.type !== 'ethernet' ? ' (' + i.type + ')' : '');
+            sel.appendChild(o);
+        });
+    }).catch(() => {});
+}
+
 async function loadNetworkIdentity() {
     const out = document.getElementById('net-identity-results');
     if (!out) return;
+    _niPopulateIfaces();
+    const isel = document.getElementById('net-identity-iface');
+    const scoped = (isel && isel.value) || '';
     out.innerHTML = '<p class="text-gray-400">Loading…</p>';
     try {
-        const d = await fetchAPI('/api/net/identity');
+        const d = await fetchAPI('/api/net/identity' + (scoped ? '?interface=' + encodeURIComponent(scoped) : ''));
         if (!d.success) {
             out.innerHTML = '<p class="text-red-400">' + escapeHtml(d.error || 'failed') + '</p>';
             return;
@@ -4095,12 +4113,14 @@ async function loadNetworkIdentity() {
         row('Nameservers', nsHtml);
 
         // Gateway
-        let gwHtml = '<span class="text-gray-500">—</span>';
+        let gwHtml = d.interface
+            ? '<span class="text-gray-500">none — no route via ' + escapeHtml(d.interface) + ' (segment without a gateway, or DHCP still pending)</span>'
+            : '<span class="text-gray-500">—</span>';
         if (d.gateway && d.gateway.ip) {
             gwHtml = escapeHtml(d.gateway.ip);
             if (d.gateway.ptr) gwHtml += ' <span class="text-gray-500">(' + escapeHtml(d.gateway.ptr) + ')</span>';
         }
-        row('Default gateway', gwHtml);
+        row(d.interface ? 'Gateway via ' + d.interface : 'Default gateway', gwHtml);
 
         // Traffic via VPN — a local tunnel on the default route is shown
         // instantly; anything else needs the *egress* checked (VPN/Tor on the
@@ -4123,10 +4143,12 @@ async function loadNetworkIdentity() {
             row('Traffic via VPN', veHtml);
         }
 
+        const scopeNote = d.interface
+            ? `<p class="text-[11px] text-cyan-400/80 mt-2">Scoped to <span class="font-mono">${escapeHtml(d.interface)}</span> — gateway + nameservers are what this interface's own network provides.</p>` : '';
         const src = (d.sources && d.sources.length)
             ? `<p class="text-[11px] text-gray-500 mt-2">Sources: ${d.sources.map(escapeHtml).join(', ')}</p>` : '';
         out.innerHTML = `<table class="min-w-full text-sm">
-            <tbody>${rows.join('')}</tbody></table>${src}`;
+            <tbody>${rows.join('')}</tbody></table>${scopeNote}${src}`;
         // Fill the egress-check interface selector (auto + each real NIC) so
         // the LAN path can be tested even when WiFi carries the default route.
         const sel = document.getElementById('vpn-egress-iface');
@@ -4138,6 +4160,8 @@ async function loadNetworkIdentity() {
                     o.textContent = i.name + (i.type && i.type !== 'ethernet' ? ' (' + i.type + ')' : '');
                     sel.appendChild(o);
                 });
+                // A scoped identity view should test the same interface's egress.
+                if (d.interface) sel.value = d.interface;
             }).catch(() => {});
         }
     } catch (e) {

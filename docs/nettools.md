@@ -1668,7 +1668,18 @@ authoritative):
   even when the physical uplink is a normal `eth0`/`wlan0`. This catches
   full-tunnel VPNs / exit nodes that silently reroute everything.
 
-- Endpoint: `GET /api/net/identity`
+**Per-interface scope.** By default the card shows the **default-route** view.
+Pick an **interface** from the selector to see the network *that NIC* is
+attached to instead — its own **gateway** (that segment's DHCP gateway, even
+when it's a higher-metric / non-active default) and its own **nameservers +
+search domains** (from `resolvectl`/`nmcli` per-link data; falls back to the
+global view, clearly flagged, when the system exposes no per-link DNS). This is
+the "the one I'm testing" case: a second dongle on a test LAN whose gateway and
+DNS are invisible in the default-route summary because another NIC carries the
+default route. The VPN egress check auto-targets the same interface.
+
+- Endpoint: `GET /api/net/identity` — optional `?interface=<name>` to scope to
+  one NIC
 
 ### ISP / WAN Detection
 Detects the **public IP and ISP/ASN reached *through each interface***. On a
