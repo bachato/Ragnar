@@ -176,7 +176,12 @@ def list_monitor_capable():
     state = _load_state()
     out = []
     seen_phys = {}
+    mon_name = _mon_name(None)
     for iface, info in devs.items():
+        # Our own monitor vif (ragmon0) is not a selectable *base* adapter — hide
+        # it so the UI/tools never try to enable/disable monitor "on ragmon0".
+        if iface == mon_name and info["type"] == "monitor":
+            continue
         phy = info["phy"]
         if phy not in seen_phys:
             seen_phys[phy] = _phy_supports_monitor(phy)
@@ -238,6 +243,17 @@ def enable_monitor(iface):
     """
     if not _valid_iface(iface):
         return {"error": "invalid interface"}
+    # Never run monitor *on* our own monitor vif. A caller (a stale UI selection,
+    # a diagnostic) can hand us 'ragmon0'; map it back to the real managed base,
+    # otherwise disabling (which deletes ragmon0) makes the next enable fail with
+    # "radio (None) does not support monitor mode".
+    if iface == _mon_name(iface):
+        base = _load_state().get("base_iface")
+        if base and base != iface:
+            iface = base
+        else:
+            return {"error": f"'{iface}' is the monitor interface, not an adapter — "
+                             "select the adapter's managed interface (e.g. wlan1)"}
     phy = _phy_for_iface(iface)
     if not _phy_supports_monitor(phy):
         return {"error": f"{iface}'s radio ({phy}) does not support monitor mode"}
@@ -1200,6 +1216,18 @@ def selftest():
                   any(c[:3] == ["ip", "link", "set"] and c[3] == "wlan9"
                       and c[-1] == "down" for c in cmds),
                   json.dumps([c for c in cmds if "wlan9" in c]))
+            # The monitor vif (ragmon0) must never be offered as a selectable base.
+            check("list_monitor_capable hides our own monitor vif",
+                  not any(i["iface"] == "ragmon0"
+                          for i in list_monitor_capable()["interfaces"]),
+                  json.dumps([i["iface"] for i in list_monitor_capable()["interfaces"]]))
+            # enable_monitor must refuse to run monitor *on* ragmon0 (no base to map to).
+            _base_keep = _load_state().get("base_iface")
+            _save_state({"mode": "vif"})  # no base_iface
+            _guard = enable_monitor("ragmon0")
+            check("enable_monitor refuses the monitor vif (ragmon0) as a base",
+                  isinstance(_guard, dict) and "error" in _guard, json.dumps(_guard))
+            _save_state({"mon_iface": "ragmon0", "base_iface": _base_keep or "wlan9", "mode": "vif"})
             # _monitor_ready must reject an un-tunable vif (set channel EBUSY).
             def _busy_run(args, **kw):
                 a = list(args)

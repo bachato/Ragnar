@@ -126,10 +126,22 @@ done
 echo; lsusb | grep -iE 'ralink|mediatek|realtek|atheros|0e8d|0bda' || echo "(no known USB wifi vendor lines)"
 
 # ---- choose interface -------------------------------------------------------
+# Only a MANAGED interface is a valid base — never our monitor vif (ragmon0) or a
+# P2P-device. Prefer the base_iface Ragnar already recorded, then a non-onboard
+# managed adapter whose radio supports monitor.
 IFACE="${1:-}"
+if [ -z "$IFACE" ]; then
+  STATE_BASE="$(python3 -c 'import json;print(json.load(open("'"$REPO"'/data/wifi_defense.json")).get("base_iface") or "")' 2>/dev/null)"
+  if [ -n "$STATE_BASE" ] && [ "$("$IW" dev "$STATE_BASE" info 2>/dev/null | awk '/type/{print $2;exit}')" = "managed" ]; then
+    IFACE="$STATE_BASE"
+  fi
+fi
 if [ -z "$IFACE" ]; then
   CAND=""
   for n in $("$IW" dev 2>/dev/null | awk '/Interface/{print $2}'); do
+    [ "$n" = "$MON" ] && continue                     # skip our monitor vif
+    typ="$("$IW" dev "$n" info 2>/dev/null | awk '/type/{print $2; exit}')"
+    [ "$typ" = "managed" ] || continue                # base must be managed
     wp="$("$IW" dev "$n" info 2>/dev/null | awk '/wiphy/{print $2}')"
     [ -n "$wp" ] || continue
     if phy_supports_monitor "phy$wp"; then

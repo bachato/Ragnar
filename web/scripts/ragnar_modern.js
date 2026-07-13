@@ -2642,7 +2642,11 @@ function _wifidefFillIfaces() {
             sel.innerHTML = ifs.map(i =>
                 `<option value="${i.iface}"${i.monitor_capable ? '' : ' disabled'}>${i.iface}${i.monitor_capable ? '' : ' (no monitor)'}${i.is_monitor ? ' • MONITOR' : ''}</option>`).join('');
             const cap = ifs.find(i => i.monitor_capable) || ifs[0];
-            if (!_wifidef.iface || !ifs.some(i => i.iface === _wifidef.iface && i.monitor_capable)) _wifidef.iface = (d.base_iface) || cap.iface;
+            // Never let the base selection be our own monitor vif; base_iface is
+            // only trusted if it's actually in the (vif-excluded) adapter list.
+            const baseOk = d.base_iface && ifs.some(i => i.iface === d.base_iface);
+            if (!_wifidef.iface || !ifs.some(i => i.iface === _wifidef.iface && i.monitor_capable))
+                _wifidef.iface = (baseOk ? d.base_iface : cap.iface);
             sel.value = _wifidef.iface;
             sel.onchange = () => { _wifidef.iface = sel.value; };
         }
