@@ -55,6 +55,47 @@ box on **`hop`** to cycle the common 2.4/5 GHz channels during the capture
 (catches attacks on any channel), or pin a specific channel number to dwell on
 it (best when you already know where the attack is).
 
+### Dedicated monitor (boot-time) — most robust
+
+If you have an adapter you can **dedicate 100% to sniffing** (a spare USB dongle,
+with the Pi's onboard Wi-Fi / Ethernet carrying connectivity), claim it as a
+**dedicated monitor at boot** instead of toggling it from the web UI. The whole
+interface is switched into `type monitor` (switch-mode) once, before the app
+starts, so there is **no shared-radio vif, no runtime enable/disable dance, and
+none of the EBUSY / "`ragmon0` disappeared" (ENODEV) failure modes**. WiFi
+Defense then just captures on the already-monitor interface. The web UI detects
+this and shows **"Dedicated monitor (wlan1) — boot-managed"** with the toggle
+disabled (systemd owns the adapter).
+
+Set it up (opt-in):
+
+```bash
+# 1. Try it once by hand (root):
+sudo scripts/wifidef_dedicate.sh wlan1 US 2437 0
+#      <iface> <regdomain> <init-freq-MHz> <six_ghz:0|1>
+
+# 2. Make it persistent across reboots:
+sudo cp scripts/ragnar-wifidef-monitor.service /etc/systemd/system/
+sudo mkdir -p /etc/ragnar
+sudo cp scripts/wifidef-monitor.env.example /etc/ragnar/wifidef-monitor.env
+sudoedit /etc/ragnar/wifidef-monitor.env        # set WIFIDEF_IFACE=wlan1 etc.
+sudo systemctl daemon-reload
+sudo systemctl enable --now ragnar-wifidef-monitor
+```
+
+The unit runs **before** `ragnar.service` and, on stop/disable, hands the adapter
+back to NetworkManager. Config lives in `/etc/ragnar/wifidef-monitor.env`:
+
+| Var | Meaning |
+|-----|---------|
+| `WIFIDEF_IFACE` | the dedicated capture adapter (e.g. `wlan1`) — **not** the Pi's onboard `wlan0` |
+| `WIFIDEF_REGDOMAIN` | 2-letter ISO regdomain (`iw reg set`) — needed to unlock 5 GHz DFS / 6 GHz |
+| `WIFIDEF_INIT_FREQ` | MHz to park on at boot; the scan hopper retunes immediately |
+| `WIFIDEF_SIX_GHZ` | `1` also hops 6 GHz — requires a Wi-Fi 6E radio (e.g. `mt7921u` / AXM) and a correct regdomain |
+
+You can also run it directly: `python3 wifi_defense.py dedicate --interface wlan1
+--regdomain US --init-freq 2437 [--six-ghz]`.
+
 ---
 
 ## Using it

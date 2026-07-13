@@ -49,7 +49,7 @@ _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # the web UI (WIFIDEF_BUILD in ragnar_modern.js). The UI compares them and warns
 # if the running (long-lived) webapp still has an OLD wifi_defense module loaded,
 # i.e. the service wasn't restarted after a git pull. Kills stale-service guesswork.
-_BUILD = "20260713-wardriveguard"
+_BUILD = "20260713-dedicated"
 
 # Detection thresholds (per capture window)
 _DEAUTH_FLOOD_MIN = 15      # deauth+disassoc frames => flood
@@ -67,6 +67,13 @@ _KARMA_SSID_MIN = 5               # distinct SSIDs answered by ONE bssid => KARM
 # Channels the hopper cycles when no fixed channel is requested (2.4 GHz + the
 # common U-NII-1/3 5 GHz set). Kept short so each channel gets real dwell time.
 _HOP_CHANNELS = [1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161]
+
+# 6 GHz (Wi-Fi 6E) preferred-scanning channels, as *frequencies* in MHz — 6 GHz
+# must be tuned by freq (channel numbers collide with 2.4/5 GHz) and only works
+# with a correct regulatory domain + a 6E-capable radio. Opt-in (see six_ghz).
+# freq = 5950 + 5*chan; these are the PSC (preferred scanning) channels.
+_HOP_6GHZ_FREQS = [5975, 6055, 6135, 6215, 6295, 6375, 6455, 6535,
+                   6615, 6695, 6775, 6855, 6935, 7015, 7095]
 
 # 802.11 management subtype -> event kind
 _MGMT_SUBTYPES = {
@@ -165,6 +172,12 @@ def _resolve_monitor(interface, auto_enable=True):
     mon = state.get("mon_iface")
     if mon and _iface_exists(mon):
         return mon
+    # A dedicated (boot-managed) monitor should still be present; if it vanished
+    # (adapter re-plugged), re-claim the same interface in dedicated switch-mode
+    # rather than adding a vif.
+    if state.get("mode") == "dedicated" and mon:
+        res = dedicate_monitor(mon, six_ghz=state.get("six_ghz", False))
+        return res["mon_iface"] if "error" not in res else res
     # Stale or absent — clear the dead bookkeeping (keeps baseline/thresholds).
     if mon:
         _save_state({})
@@ -203,7 +216,10 @@ def list_monitor_capable():
     if active and not _iface_exists(active):
         active = None
     return {"interfaces": out, "active_monitor": active,
-            "base_iface": state.get("base_iface"), "build": _BUILD}
+            "base_iface": state.get("base_iface"),
+            "mode": state.get("mode") if active else None,
+            "dedicated": state.get("mode") == "dedicated" and active is not None,
+            "build": _BUILD}
 
 
 def _mon_name(base):
@@ -227,17 +243,30 @@ def _monitor_ready(mon):
 
 
 def _release_iface(iface):
-    """Stop NetworkManager / wpa_supplicant from managing `iface` so they don't
-    re-up it under us (which re-grabs the channel → EBUSY). All best-effort and
-    silent where the tool/service isn't present."""
+    """Stop NetworkManager / wpa_supplicant / dhclient from managing `iface` so
+    they don't re-up it under us (which re-grabs the channel → EBUSY). Targets
+    only processes bound to THIS interface. All best-effort and silent where the
+    tool/service isn't present."""
     _run(["nmcli", "device", "set", iface, "managed", "no"], timeout=5)
-    # wpa_supplicant bound to this iface also holds the radio; ask it to drop it.
-    _run(["wpa_cli", "-i", iface, "terminate"], timeout=5)
+    # wpa_supplicant/dhclient bound to this iface hold the radio; drop only the
+    # instances tied to it (leave the management link's supplicant alone).
+    _run(["pkill", "-f", f"wpa_supplicant.*{iface}"], timeout=5)
+    _run(["pkill", "-f", f"dhclient.*{iface}"], timeout=5)
 
 
 def _restore_iface(iface):
     """Hand `iface` back to NetworkManager so normal Wi-Fi resumes after monitor."""
     _run(["nmcli", "device", "set", iface, "managed", "yes"], timeout=5)
+
+
+def set_regdomain(domain):
+    """Set the wireless regulatory domain (e.g. 'US', 'SE'). Required for 5 GHz
+    DFS and 6 GHz channels to become available. No-op for a falsy/blank domain."""
+    domain = (domain or "").strip().upper()
+    if not re.match(r"^[A-Z]{2}$", domain):
+        return {"error": "regdomain must be a 2-letter ISO code (e.g. US)"}
+    rc, _, err = _run([_IW, "reg", "set", domain], timeout=5)
+    return {"ok": rc == 0, "regdomain": domain, "error": (err or "").strip() or None}
 
 
 def enable_monitor(iface):
@@ -332,16 +361,68 @@ def disable_monitor(mon_iface=None):
             _restore_iface(base)
             _run(["ip", "link", "set", base, "up"], timeout=5)
     else:
-        # We switched the base iface into monitor; switch it back to managed.
+        # We switched the base iface itself into monitor (switch / dedicated
+        # mode); switch it back to managed and re-manage it.
         _run(["ip", "link", "set", mon, "down"], timeout=5)
         _run([_IW, "dev", mon, "set", "type", "managed"], timeout=8)
+        _restore_iface(mon)
         _run(["ip", "link", "set", mon, "up"], timeout=5)
     _save_state({})
     return {"ok": True, "restored": base or mon}
 
 
+def dedicate_monitor(iface, regdomain=None, init_freq=None, six_ghz=False):
+    """Claim `iface` as a *dedicated* passive monitor (switch-mode: the whole
+    interface becomes type=monitor). Meant to run once at boot for a sensor that
+    owns the adapter — no runtime enable/disable dance, no shared-radio vif, so
+    none of the EBUSY / 'ragmon0 disappeared' failure modes apply. Sets the
+    regulatory domain (needed for DFS/6 GHz), releases NM/wpa_supplicant/dhclient
+    on the iface, then switches it to monitor and parks a frequency."""
+    if not _valid_iface(iface):
+        return {"error": "invalid interface"}
+    phy = _phy_for_iface(iface)
+    if not _phy_supports_monitor(phy):
+        return {"error": f"{iface}'s radio ({phy}) does not support monitor mode"}
+    _run(["/usr/bin/rfkill", "unblock", "all"], timeout=5)
+    if regdomain:
+        set_regdomain(regdomain)
+    _release_iface(iface)
+    _run(["ip", "link", "set", iface, "down"], timeout=5)
+    rc, _, err = _run([_IW, "dev", iface, "set", "type", "monitor"], timeout=8)
+    _run(["ip", "link", "set", iface, "up"], timeout=5)
+    if rc != 0 or _iw_dev_list().get(iface, {}).get("type") != "monitor":
+        return {"error": f"driver rejected monitor mode on {iface}: {(err or '').strip()}"}
+    if init_freq:
+        _set_freq(iface, init_freq)
+    _save_state({"mon_iface": iface, "base_iface": iface, "mode": "dedicated",
+                 "six_ghz": bool(six_ghz)})
+    return {"mon_iface": iface, "mode": "dedicated", "regdomain": regdomain,
+            "six_ghz": bool(six_ghz)}
+
+
 def _set_channel(mon_iface, channel):
     _run([_IW, "dev", mon_iface, "set", "channel", str(int(channel))], timeout=5)
+
+
+def _set_freq(mon_iface, freq_mhz):
+    _run([_IW, "dev", mon_iface, "set", "freq", str(int(freq_mhz))], timeout=5)
+
+
+def _hop_targets(six_ghz=False):
+    """Ordered tune targets for the channel hopper: ('chan', N) for 2.4/5 GHz and
+    ('freq', MHz) for 6 GHz (which must be tuned by frequency)."""
+    targets = [("chan", c) for c in _HOP_CHANNELS]
+    if six_ghz:
+        targets += [("freq", f) for f in _HOP_6GHZ_FREQS]
+    return targets
+
+
+def _tune(mon_iface, target):
+    kind, val = target
+    if kind == "freq":
+        _set_freq(mon_iface, val)
+    else:
+        _set_channel(mon_iface, val)
 
 
 # --------------------------------------------------------------------------
@@ -715,10 +796,11 @@ def _capture(mon_iface, seconds, channel=None):
     if channel:
         _set_channel(mon_iface, channel)
     else:
+        targets = _hop_targets(_load_state().get("six_ghz", False))
         def _hopper():
             i = 0
             while not stop.is_set():
-                _set_channel(mon_iface, _HOP_CHANNELS[i % len(_HOP_CHANNELS)])
+                _tune(mon_iface, targets[i % len(targets)])
                 i += 1
                 stop.wait(0.35)
         threading.Thread(target=_hopper, daemon=True).start()
@@ -753,10 +835,11 @@ def _capture_all(mon_iface, seconds, channel=None):
     if channel:
         _set_channel(mon_iface, channel)
     else:
+        targets = _hop_targets(_load_state().get("six_ghz", False))
         def _hopper():
             i = 0
             while not stop.is_set():
-                _set_channel(mon_iface, _HOP_CHANNELS[i % len(_HOP_CHANNELS)])
+                _tune(mon_iface, targets[i % len(targets)])
                 i += 1
                 stop.wait(0.35)
         threading.Thread(target=_hopper, daemon=True).start()
@@ -1201,6 +1284,10 @@ def selftest():
                     devs[a[5]] = {"phy": "phy9", "type": "monitor"}
                 if len(a) >= 4 and a[0] == _IW and a[1] == "dev" and a[3] == "del":
                     devs.pop(a[2], None)
+                # iw dev <if> set type <t>  → reflect the new type
+                if (len(a) >= 6 and a[0] == _IW and a[1] == "dev"
+                        and a[3] == "set" and a[4] == "type" and a[2] in devs):
+                    devs[a[2]]["type"] = a[5]
                 return (0, "", "")
 
             globals().update(
@@ -1252,6 +1339,40 @@ def selftest():
                   any(c[:3] == ["ip", "link", "set"] and c[3] == "wlan9"
                       and c[-1] == "up" for c in cmds),
                   json.dumps([c for c in cmds if "wlan9" in c]))
+
+            # --- Regdomain, targeted release, 6 GHz, dedicated boot-time mode ---
+            check("set_regdomain rejects a non-ISO code",
+                  "error" in set_regdomain("USA"))
+            cmds.clear()
+            check("set_regdomain issues `iw reg set` for a valid code",
+                  set_regdomain("us").get("regdomain") == "US"
+                  and any(c[:3] == [_IW, "reg", "set"] and c[3] == "US" for c in cmds))
+            cmds.clear()
+            _release_iface("wlan9")
+            check("_release_iface kills wpa_supplicant/dhclient bound to the iface",
+                  any(c[0] == "pkill" and "wpa_supplicant" in c[-1] for c in cmds)
+                  and any(c[0] == "pkill" and "dhclient" in c[-1] for c in cmds),
+                  json.dumps(cmds))
+            check("6 GHz hop targets are freq-tuned and opt-in",
+                  ("freq", 5975) in _hop_targets(True)
+                  and all(t[0] == "chan" for t in _hop_targets(False)))
+            # Dedicated (switch-mode) boot claim.
+            devs["wlan9"]["type"] = "managed"
+            cmds.clear()
+            ded = dedicate_monitor("wlan9", regdomain="US", init_freq=2437, six_ghz=True)
+            check("dedicate_monitor claims the whole iface as monitor",
+                  ded.get("mode") == "dedicated" and ded.get("mon_iface") == "wlan9"
+                  and devs["wlan9"]["type"] == "monitor", json.dumps(ded))
+            check("dedicate_monitor set regdomain + type monitor + init freq",
+                  any(c[:3] == [_IW, "reg", "set"] for c in cmds)
+                  and any(c[3:6] == ["set", "type", "monitor"] for c in cmds if len(c) >= 6)
+                  and any(c[3:5] == ["set", "freq"] for c in cmds if len(c) >= 5))
+            check("dedicated state persists mode + six_ghz",
+                  _load_state().get("mode") == "dedicated"
+                  and _load_state().get("six_ghz") is True)
+            # _resolve_monitor re-claims a dedicated monitor if the iface reappears.
+            check("_resolve_monitor returns the live dedicated monitor",
+                  _resolve_monitor("wlan9") == "wlan9")
         finally:
             time.sleep = _real_sleep
             globals().update(_saved_fns)
@@ -1320,6 +1441,14 @@ def _main(argv):
     pb = sub.add_parser("baseline")
     pb.add_argument("--interface", required=True)
     pb.add_argument("--seconds", type=int, default=20)
+    # Boot-time dedicated monitor: claim the whole interface (switch-mode) once,
+    # e.g. from a systemd ExecStartPre. See scripts/wifidef_dedicate.sh.
+    pd = sub.add_parser("dedicate")
+    pd.add_argument("--interface", required=True)
+    pd.add_argument("--regdomain", default=None, help="e.g. US, SE — unlocks DFS/6 GHz")
+    pd.add_argument("--init-freq", type=int, default=None, dest="init_freq")
+    pd.add_argument("--six-ghz", action="store_true", dest="six_ghz",
+                    help="also hop 6 GHz (needs a 6E radio + correct regdomain)")
     sub.add_parser("selftest")
 
     args = ap.parse_args(argv)
@@ -1330,6 +1459,11 @@ def _main(argv):
             print(json.dumps(disable_monitor(), indent=2))
         else:
             print(json.dumps(enable_monitor(args.interface), indent=2))
+    elif args.cmd == "dedicate":
+        r = dedicate_monitor(args.interface, regdomain=args.regdomain,
+                             init_freq=args.init_freq, six_ghz=args.six_ghz)
+        print(json.dumps(r, indent=2))
+        return 0 if "error" not in r else 1
     elif args.cmd == "scan":
         print(json.dumps(do_scan(args.interface, args.seconds, args.channel), indent=2))
     elif args.cmd == "baseline":

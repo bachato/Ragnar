@@ -2635,13 +2635,15 @@ function _wifidefUpdateRunUI() {
 // Must match wifi_defense.py `_BUILD`. If the running service reports something
 // else, the webapp is executing an OLD wifi_defense module (service not restarted
 // after a git pull) — the #1 cause of "the fix didn't work in the web UI".
-const WIFIDEF_BUILD = '20260713-wardriveguard';
+const WIFIDEF_BUILD = '20260713-dedicated';
 
 function _wifidefFillIfaces() {
     fetch('/api/wifidef/interfaces').then(r => r.json()).then(d => {
         const sel = document.getElementById('wifidef-iface');
         const ifs = (d && d.interfaces) || [];
         _wifidef.monitor = d.active_monitor || null;
+        _wifidef.mode = d.mode || null;
+        _wifidef.dedicated = !!d.dedicated;
         const st = document.getElementById('wifidef-status');
         if (d.build && d.build !== WIFIDEF_BUILD && st) {
             st.innerHTML = '<span class="text-amber-400">⚠ WiFi Defense service is running old code (build '
@@ -2668,6 +2670,18 @@ function _wifidefFillIfaces() {
 function _wifidefUpdateMonBtn() {
     const btn = document.getElementById('wifidef-mon-btn');
     if (!btn) return;
+    // A boot-dedicated adapter is owned by the systemd unit, not the UI: it's
+    // always in monitor mode by design, so don't offer a toggle that would hand
+    // it back to NetworkManager and defeat the whole point.
+    if (_wifidef.dedicated) {
+        btn.textContent = 'Dedicated monitor (' + (_wifidef.monitor || '') + ') — boot-managed';
+        btn.classList.remove('text-red-300');
+        btn.disabled = true;
+        btn.classList.add('opacity-60', 'cursor-not-allowed');
+        return;
+    }
+    btn.disabled = false;
+    btn.classList.remove('opacity-60', 'cursor-not-allowed');
     if (_wifidef.monitor) {
         btn.textContent = 'Disable monitor (' + _wifidef.monitor + ')';
         btn.classList.add('text-red-300');
@@ -2679,6 +2693,11 @@ function _wifidefUpdateMonBtn() {
 
 function wifidefToggleMonitor() {
     const st = document.getElementById('wifidef-status');
+    // Boot-dedicated monitor is managed by systemd; the UI must not toggle it.
+    if (_wifidef.dedicated) {
+        if (st) st.textContent = 'Adapter is a boot-dedicated monitor (managed by ragnar-wifidef-monitor.service)';
+        return;
+    }
     if (_wifidef.monitor) {
         // Stop any continuous scan first — otherwise its next loop would
         // immediately auto-re-enable the monitor and "disable" would look broken.
