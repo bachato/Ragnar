@@ -2097,8 +2097,8 @@
                         <button onclick="wifiHmZoomReset()" class="bg-slate-800 hover:bg-slate-700 text-gray-300 px-2.5 py-1 rounded text-xs" title="Reset to the whole floor">⤢ Fit</button>
                         <span class="text-[11px] text-gray-500">scroll on the plan to zoom · drag to pan when zoomed</span>
                     </div>
-                    <div class="mt-3 flex justify-center">
-                        <canvas id="wifi-heatmap" class="rounded border border-slate-800 cursor-crosshair" style="width:100%; max-width:860px; aspect-ratio:1/1; touch-action:none; background:#0b1220;"></canvas>
+                    <div class="mt-3">
+                        <canvas id="wifi-heatmap" class="rounded border border-slate-800 cursor-crosshair" style="width:100%; max-width:min(100%, 90vh); aspect-ratio:1/1; touch-action:none; background:#0b1220;"></canvas>
                     </div>
                     <div id="wifi-hm-legend" class="flex items-center flex-wrap gap-2 mt-2 text-[11px] text-gray-400"></div>
                 </div>
