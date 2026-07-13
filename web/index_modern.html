@@ -2118,12 +2118,12 @@
 
                 <!-- Coverage heatmap (Ekahau-style walk-around survey) -->
                 <div class="glass rounded-xl p-4 mt-5">
-                    <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-                        <div>
+                    <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
+                        <div class="min-w-0 lg:flex-1">
                             <h4 class="font-semibold text-sm">Coverage Heatmap</h4>
                             <p class="text-[11px] text-gray-500 mt-1 max-w-2xl">Walk-around survey like the Sidekick: pick the AP to map, optionally load a floorplan image, then <strong>click where you're standing</strong> — each click takes a live passive RSSI reading of that AP and drops a sample. Enable <strong>Active test</strong> to also measure <strong>throughput + latency</strong> at each point (iperf3 to a LAN server, or a WAN speed test). Samples are interpolated (IDW) into a coverage map; switch the <strong>Metric</strong> to view RSSI, SNR, throughput or latency. Green = good, red = bad. The plan is a <strong>square floor with metre rulers</strong> — set the real <strong>Floor size</strong> (a 10 m² room to a 300+ m² office) so distances and predictions are in true metres, and <strong>scroll to zoom</strong> / drag to pan for detail work.</p>
                         </div>
-                        <div class="flex flex-wrap items-end gap-2">
+                        <div class="flex flex-wrap items-end gap-2 lg:flex-none lg:justify-end">
                             <div>
                                 <label class="block text-[11px] text-gray-400 mb-1" id="wifi-hm-target-label">Target AP</label>
                                 <select id="wifi-hm-ap" class="wifi-hm-select min-w-[160px]"><option value="">Scan first…</option></select>
