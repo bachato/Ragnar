@@ -45,6 +45,12 @@ _IW = "/usr/sbin/iw" if os.path.exists("/usr/sbin/iw") else "iw"
 _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "data", "wifi_defense.json")
 
+# Build marker — bump on every monitor-lifecycle change and mirror the value in
+# the web UI (WIFIDEF_BUILD in ragnar_modern.js). The UI compares them and warns
+# if the running (long-lived) webapp still has an OLD wifi_defense module loaded,
+# i.e. the service wasn't restarted after a git pull. Kills stale-service guesswork.
+_BUILD = "20260713-wardriveguard"
+
 # Detection thresholds (per capture window)
 _DEAUTH_FLOOD_MIN = 15      # deauth+disassoc frames => flood
 # Beacon flood. There is no reliable "shape" signal that separates a flood from a
@@ -197,7 +203,7 @@ def list_monitor_capable():
     if active and not _iface_exists(active):
         active = None
     return {"interfaces": out, "active_monitor": active,
-            "base_iface": state.get("base_iface")}
+            "base_iface": state.get("base_iface"), "build": _BUILD}
 
 
 def _mon_name(base):

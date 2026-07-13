@@ -2632,11 +2632,22 @@ function _wifidefUpdateRunUI() {
     if (stop) stop.classList.toggle('hidden', !_wifidef.continuous);
 }
 
+// Must match wifi_defense.py `_BUILD`. If the running service reports something
+// else, the webapp is executing an OLD wifi_defense module (service not restarted
+// after a git pull) — the #1 cause of "the fix didn't work in the web UI".
+const WIFIDEF_BUILD = '20260713-wardriveguard';
+
 function _wifidefFillIfaces() {
     fetch('/api/wifidef/interfaces').then(r => r.json()).then(d => {
         const sel = document.getElementById('wifidef-iface');
         const ifs = (d && d.interfaces) || [];
         _wifidef.monitor = d.active_monitor || null;
+        const st = document.getElementById('wifidef-status');
+        if (d.build && d.build !== WIFIDEF_BUILD && st) {
+            st.innerHTML = '<span class="text-amber-400">⚠ WiFi Defense service is running old code (build '
+                + _esc(d.build) + ', page expects ' + WIFIDEF_BUILD
+                + '). Restart it: <code>sudo systemctl restart ragnar</code></span>';
+        }
         if (!ifs.length) { sel.innerHTML = '<option value="">No wireless adapter</option>'; }
         else {
             sel.innerHTML = ifs.map(i =>

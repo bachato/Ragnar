@@ -11689,7 +11689,9 @@ def network_threat_sweep():
                     ln = ln.strip()
                     if ln.startswith('Interface '):
                         cur = ln.split()[1]
-                        if cur != iface and cur != _mon:
+                        # 'ragmon0' is WiFi Defense's monitor vif — don't grab or
+                        # reset it, that kills its capture with ENODEV.
+                        if cur != iface and cur != _mon and cur != 'ragmon0':
                             secondary = cur
 
                 if secondary:
