@@ -1995,6 +1995,62 @@ def _default_gateway():
     return m.group(1) if m else None
 
 
+def _iface_gateway(iface):
+    """The IPv4 default gateway reachable via ONE interface (that segment's
+    own DHCP gateway on a multi-homed box), or None when the segment offers no
+    default route. A higher-metric default (the non-active uplink) still
+    counts — that's exactly the 'the one I'm testing' case."""
+    res = _run(['ip', '-4', 'route', 'show', 'default', 'dev', iface], timeout=5)
+    m = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)', res['out'])
+    if m:
+        return m.group(1)
+    # Last resort: any 'via' route on the device (classless static routes).
+    res = _run(['ip', '-4', 'route', 'show', 'dev', iface], timeout=5)
+    m = re.search(r'\bvia\s+(\d+\.\d+\.\d+\.\d+)', res['out'])
+    return m.group(1) if m else None
+
+
+def _iface_dns(iface):
+    """Per-link nameservers + search domains for one interface, from
+    systemd-resolved (resolvectl) or NetworkManager — i.e. what THAT
+    interface's DHCP lease advertised, not the merged global view.
+    Returns (domains, nameservers, source_or_None)."""
+    domains, ns = [], []
+    if _have('resolvectl'):
+        r = _run(['resolvectl', 'dns', iface], timeout=5)
+        if r['rc'] == 0:
+            # "Link 3 (wlan1): 192.168.8.1 fd00::1"
+            _, _, after = r['out'].partition(':')
+            for tok in after.split():
+                if tok not in ns:
+                    ns.append(tok)
+        r = _run(['resolvectl', 'domain', iface], timeout=5)
+        if r['rc'] == 0:
+            _, _, after = r['out'].partition(':')
+            for tok in after.split():
+                tok = tok.lstrip('~')
+                if tok and tok != '.' and tok not in domains:
+                    domains.append(tok)
+        if ns or domains:
+            return domains, ns, 'resolvectl (per-link)'
+    if _have('nmcli'):
+        r = _run(['nmcli', '-t', '-f', 'IP4.DNS,IP4.DOMAINS', 'device', 'show',
+                  iface], timeout=6)
+        if r['rc'] == 0:
+            for line in r['out'].splitlines():
+                key, _, v = line.partition(':')
+                v = v.strip()
+                if not v or v == '--':
+                    continue
+                if key.startswith('IP4.DNS') and v not in ns:
+                    ns.append(v)
+                elif key.startswith('IP4.DOMAINS') and v not in domains:
+                    domains.append(v)
+        if ns or domains:
+            return domains, ns, 'nmcli (per-device)'
+    return domains, ns, None
+
+
 def _default_route_iface():
     """Return the interface carrying the IPv4 default route, or None. Used to
     tell whether this host's internet traffic egresses through a VPN tunnel."""
@@ -2155,36 +2211,52 @@ def _reverse_dns(ip):
     return None
 
 
-def do_network_identity():
+def do_network_identity(interface=None):
     """Best-effort identity of the network Ragnar is attached to: DNS search
     domain(s), nameservers, this host's name/FQDN, and the default gateway
     (with reverse-DNS). No single source is authoritative, so several are
-    merged and the provenance is reported."""
+    merged and the provenance is reported.
+
+    With `interface` set, the gateway, nameservers and search domains are
+    scoped to THAT interface (its own routes + DHCP lease), so a second test
+    uplink can be inspected while another NIC carries the default route.
+    Hostname/FQDN stay host-global."""
     sources = []
+    stub = False
 
-    rc_domains, rc_ns, stub = _read_resolv_conf()
-
-    # Search domains: union of resolv.conf and NetworkManager (DHCP option 15 /
-    # 119). NM is preferred when resolv.conf is the systemd stub.
-    domains = list(rc_domains)
-    for d in _nmcli_global_values('IP4.DOMAINS'):
-        if d not in domains:
-            domains.append(d)
-    if rc_domains:
-        sources.append('resolv.conf')
-    if _have('nmcli'):
-        sources.append('nmcli')
-
-    # Nameservers: resolv.conf, unless it only holds the local stub -- then use
-    # the upstream servers NetworkManager learned from DHCP.
-    nameservers = list(rc_ns)
-    nm_ns = _nmcli_global_values('IP4.DNS')
-    if stub or not nameservers:
-        nameservers = nm_ns or nameservers
+    if interface:
+        domains, nameservers, src = _iface_dns(interface)
+        if src:
+            sources.append(src)
+        if not (nameservers or domains):
+            # No per-link DNS source on this system (no resolved/NM manages
+            # the iface) — fall back to the global view, flagged as such.
+            domains, nameservers, stub = _read_resolv_conf()
+            sources.append('resolv.conf (global fallback — no per-link DNS source)')
     else:
-        for n in nm_ns:
-            if n not in nameservers:
-                nameservers.append(n)
+        rc_domains, rc_ns, stub = _read_resolv_conf()
+
+        # Search domains: union of resolv.conf and NetworkManager (DHCP option
+        # 15 / 119). NM is preferred when resolv.conf is the systemd stub.
+        domains = list(rc_domains)
+        for d in _nmcli_global_values('IP4.DOMAINS'):
+            if d not in domains:
+                domains.append(d)
+        if rc_domains:
+            sources.append('resolv.conf')
+        if _have('nmcli'):
+            sources.append('nmcli')
+
+        # Nameservers: resolv.conf, unless it only holds the local stub --
+        # then use the upstream servers NetworkManager learned from DHCP.
+        nameservers = list(rc_ns)
+        nm_ns = _nmcli_global_values('IP4.DNS')
+        if stub or not nameservers:
+            nameservers = nm_ns or nameservers
+        else:
+            for n in nm_ns:
+                if n not in nameservers:
+                    nameservers.append(n)
 
     # Hostname / FQDN. `hostname -f` can resolve the FQDN via DNS; bounded by
     # _run's timeout so a misconfigured resolver can't hang the request.
@@ -2199,13 +2271,14 @@ def do_network_identity():
         if cand and cand != hostname and '.' in cand:
             fqdn = cand
 
-    gw_ip = _default_gateway()
+    gw_ip = _iface_gateway(interface) if interface else _default_gateway()
     gateway = {'ip': gw_ip, 'ptr': _reverse_dns(gw_ip)} if gw_ip else None
 
     # Is this host's traffic egressing through a VPN? True when the default
     # route leaves via a tunnel interface (full-tunnel VPN / exit node), even
-    # if the physical uplink is a normal eth0/wlan0.
-    route_if = _default_route_iface()
+    # if the physical uplink is a normal eth0/wlan0. When scoped, judge the
+    # selected interface itself.
+    route_if = interface or _default_route_iface()
     route_vpn = _iface_vpn_info(route_if) if route_if else {'is_vpn': False, 'kind': None, 'endpoint': None}
     vpn_egress = {'interface': route_if,
                   'via_vpn': route_vpn['is_vpn'],
@@ -2222,6 +2295,7 @@ def do_network_identity():
 
     return {
         'success': True,
+        'interface': interface,
         'hostname': hostname,
         'fqdn': fqdn,
         'domains': domains,
@@ -13188,8 +13262,11 @@ def register_network_diagnostics(app, logger=None):
 
     @app.route('/api/net/identity', methods=['GET'])
     def net_identity():
-        _log("net/identity")
-        return jsonify(do_network_identity())
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"net/identity {iface or 'auto'}")
+        return jsonify(do_network_identity(interface=iface))
 
     @app.route('/api/net/install-tool', methods=['POST'])
     def net_install_tool():
