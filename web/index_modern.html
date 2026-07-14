@@ -1926,10 +1926,18 @@
                 <div class="glass rounded-xl p-4 sm:p-6 mt-6">
                     <div class="mb-3">
                         <h3 class="text-lg font-semibold">Locate Port</h3>
-                        <p class="text-sm text-gray-400">Find which switch port this device is plugged into by blinking the link in a pattern — like a cable tester. Watch the switch: the port whose <strong>link LED</strong> flashes in cadence is the one. On a managed switch, Switch Discovery already names the port; this is the fallback for unmanaged switches. <span class="text-amber-400">Briefly drops the link on the chosen port.</span></p>
+                        <p class="text-sm text-gray-400">Find which switch port this device is plugged into by blinking a per-port LED in a pattern — like a cable tester. Watch the switch: the port that flashes in cadence is the one. On a managed switch, Switch Discovery already names the port; this is the fallback for unmanaged switches. Switches differ in which LED they drive, so pick the method that makes <em>your</em> switch blink:</p>
+                        <ul class="text-xs text-gray-500 mt-2 space-y-0.5">
+                            <li><strong class="text-gray-400">Link flap</strong> — links the port down/up so the <strong>LINK</strong> LED blinks. <span class="text-amber-400">Briefly drops the link each cycle</span> (fine on the port you're testing; needs confirmation on the uplink).</li>
+                            <li><strong class="text-gray-400">Traffic burst</strong> — floods traffic so the <strong>ACTIVITY</strong> LED blinks while the link <strong>stays up</strong>. Never drops connectivity — safe on any port.</li>
+                        </ul>
                     </div>
                     <div class="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
                         <input id="locate-iface" type="text" autocomplete="off" placeholder="interface (e.g. eth0)" class="w-full sm:w-auto sm:flex-1 sm:min-w-[12rem] bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')locatePort()">
+                        <select id="locate-method" title="Which LED to blink" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
+                            <option value="flap">Link flap (LINK LED)</option>
+                            <option value="burst">Traffic burst (ACTIVITY LED)</option>
+                        </select>
                         <input id="locate-count" type="number" min="1" max="30" value="6" title="blink count" class="w-full sm:w-24 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="locatePort()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Flash Port</button>
                     </div>
@@ -6581,7 +6589,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260713-identity-iface"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260714-locate-burst"></script>
 
 </body>
 </html>

@@ -2974,17 +2974,76 @@ def _flap_sequence(interface, count, on_ms, off_ms):
             _locate_active.pop(interface, None)
 
 
-def do_locate_port(interface, count=6, on_ms=800, off_ms=800, force=False):
-    """Physically locate which switch port this device is plugged into by
-    flapping the link in a timed pattern (link LED blinks). Managed switches
-    already report the port via LLDP/CDP (Switch Discovery) -- this is the
-    fallback for unmanaged switches. Runs in the background and returns at once.
+def _burst_sequence(interface, count, on_ms, off_ms):
+    """Blink the switch's ACTIVITY/TRAFFIC LED by sending dense bursts of raw
+    Ethernet frames out `interface`, idling between them, so the LED pulses in
+    the same recognisable on/off cadence as a flap — but the LINK stays up the
+    whole time. Some switches only blink their per-port LED on traffic, not on
+    link state, which is exactly what this covers. Raw AF_PACKET egress needs
+    no IP/route on the interface (it goes straight out the wire)."""
+    import socket
+    sock = None
+    try:
+        # The switch only sees traffic if the link is up first.
+        _run(['ip', 'link', 'set', interface, 'up'], timeout=10)
+        try:
+            with open('/sys/class/net/%s/address' % interface) as f:
+                mac = f.read().strip()
+            src = bytes(int(b, 16) for b in mac.split(':'))
+        except (OSError, ValueError):
+            src = b'\x02\x00\x00\x00\x00\x01'          # locally-administered fallback
+        # Broadcast dst + a local-experimental EtherType (0x88b5); a tagged
+        # payload so the frames are identifiable on a capture, padded to the
+        # 60-byte minimum Ethernet frame.
+        frame = (b'\xff\xff\xff\xff\xff\xff' + src + b'\x88\xb5'
+                 + b'RAGNAR-LOCATE-PORT')
+        frame += b'\x00' * (60 - len(frame))
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+            sock.bind((interface, 0))
+        except OSError:
+            return                                     # no raw-socket perms / iface gone
+        for _ in range(count):
+            end = time.time() + on_ms / 1000.0
+            while time.time() < end:
+                for _ in range(64):                    # dense burst -> LED clearly lit
+                    try:
+                        sock.send(frame)
+                    except OSError:
+                        end = 0                        # link/iface dropped mid-burst
+                        break
+                time.sleep(0.002)                      # ~32k pps ceiling, CPU-friendly
+            time.sleep(off_ms / 1000.0)                # idle window -> LED dark
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        with _locate_lock:
+            _locate_active.pop(interface, None)
 
-    Refuses the interface carrying this host's default route unless force=True,
-    since flapping it briefly drops Ragnar's own connectivity."""
+
+def do_locate_port(interface, count=6, on_ms=800, off_ms=800, force=False, method='flap'):
+    """Physically locate which switch port this device is plugged into by
+    blinking a per-port LED in a timed cadence. Managed switches already report
+    the port via LLDP/CDP (Switch Discovery) -- this is the fallback for
+    unmanaged switches. Runs in the background and returns at once.
+
+    Two methods, because switches differ in which LED they drive:
+    - 'flap'  — links the port down/up so the **LINK** LED blinks (the link
+                drops for a moment each cycle). Refuses the default-route
+                interface unless force=True, since it briefly cuts Ragnar's own
+                connectivity.
+    - 'burst' — floods traffic bursts so the **ACTIVITY** LED blinks while the
+                link stays up. Never drops connectivity, so no force is needed
+                — safe even on the default route."""
     interface = (interface or '').strip()
     if not interface:
         return {'success': False, 'error': 'interface required'}
+    method = (method or 'flap').strip().lower()
+    if method not in ('flap', 'burst'):
+        method = 'flap'
 
     match = next((i for i in do_interfaces(include_virtual=True).get('interfaces', [])
                   if i['name'] == interface), None)
@@ -2992,33 +3051,37 @@ def do_locate_port(interface, count=6, on_ms=800, off_ms=800, force=False):
         return {'success': False, 'error': f'unknown interface: {interface}'}
     if match.get('type') != 'ethernet' or not interface.startswith(('eth', 'en')):
         return {'success': False,
-                'error': f'{interface} is not a physical Ethernet port; a link-flap '
-                         'only identifies a switch port on a wired link.'}
+                'error': f'{interface} is not a physical Ethernet port; locating '
+                         'a switch port only works on a wired link.'}
 
     count = _clamp_int(count, 6, 1, 30)
     on_ms = _clamp_int(on_ms, 800, 100, 3000)
     off_ms = _clamp_int(off_ms, 800, 100, 3000)
 
-    # Guard: flapping the default-route interface drops our own uplink.
-    if not force and _default_route_iface() == interface:
+    # Guard: only the flap method cuts our uplink; burst keeps the link up.
+    if method == 'flap' and not force and _default_route_iface() == interface:
         return {'success': False, 'needs_force': True, 'interface': interface,
                 'error': f'{interface} carries this device\'s default route — flapping '
                          'it will briefly drop Ragnar\'s connectivity (the UI freezes '
-                         'until the sequence finishes, then it auto-restores). '
-                         'Confirm to proceed anyway.'}
+                         'until the sequence finishes, then it auto-restores). Confirm '
+                         'to proceed anyway — or use the Traffic-burst method, which '
+                         'keeps the link up.'}
 
     with _locate_lock:
         if _locate_active.get(interface):
             return {'success': False, 'error': f'a locate sequence is already running on {interface}.'}
         _locate_active[interface] = True
 
-    threading.Thread(target=_flap_sequence, args=(interface, count, on_ms, off_ms),
+    seq = _burst_sequence if method == 'burst' else _flap_sequence
+    threading.Thread(target=seq, args=(interface, count, on_ms, off_ms),
                      daemon=True).start()
     total = round(count * (on_ms + off_ms) / 1000.0, 1)
-    return {'success': True, 'interface': interface, 'count': count,
+    verb = 'Bursting traffic on' if method == 'burst' else 'Flapping'
+    led = 'ACTIVITY' if method == 'burst' else 'LINK'
+    return {'success': True, 'interface': interface, 'count': count, 'method': method,
             'on_ms': on_ms, 'off_ms': off_ms, 'duration_s': total,
-            'message': f'Flapping {interface} {count}× (~{round(total)}s). Watch the '
-                       'switch — the port whose LINK LED blinks in this cadence is the one.'}
+            'message': f'{verb} {interface} {count}× (~{round(total)}s). Watch the switch — '
+                       f'the port whose {led} LED blinks in this cadence is the one.'}
 
 
 # --------------------------------------------------------------------------
@@ -13628,10 +13691,11 @@ def register_network_diagnostics(app, logger=None):
     def net_locate_port():
         data = request.get_json(silent=True) or {}
         iface = (data.get('interface') or '').strip()
-        _log(f"net/locate-port {iface}")
+        method = (data.get('method') or 'flap')
+        _log(f"net/locate-port {iface} ({method})")
         return jsonify(do_locate_port(iface, data.get('count', 6),
                                       data.get('on_ms', 800), data.get('off_ms', 800),
-                                      bool(data.get('force'))))
+                                      bool(data.get('force')), method))
 
     if logger is not None:
         try:
