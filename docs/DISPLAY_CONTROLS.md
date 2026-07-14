@@ -92,7 +92,11 @@ WAN · DNS Doctor · Speedtest; **DHCP/WIFI/SIGNAL** are read-only. On the
 it draws that band's live **channel-occupancy spectrum** (a bar per channel,
 height ∝ the strongest AP's signal, DFS/radar channels hollow, busiest channel
 tick-marked) — the WiFi Spectrum Analyzer's Bar view on the panel. Press KEY3 to
-freeze the auto-cycle, then ↑/↓ to sweep bands. See the full
+freeze the auto-cycle, then ↑/↓ to sweep bands. It scans the **widest-band
+adapter present** (so a tri-band dongle like the **Alfa AWUS036AXM** is used for
+5/6 GHz instead of a 2.4-only onboard radio) and shows the scanned interface
+name in the header — a band reads *"not supported"* when the chosen radio can't
+reach it. See the full
 [field‑test pad](nettools.md#field-test-pad-144-lcd-hat--joystick) table.
 
 ---

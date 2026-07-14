@@ -149,10 +149,17 @@ The display auto-cycles six pages every **5 seconds**:
    the panel**: a live **channel-occupancy graph** for one band (a bar per
    channel, height ∝ the strongest AP's signal there, **DFS/radar channels drawn
    hollow**, the busiest channel tick-marked), with the band, AP count and
-   strongest channel in the header. The ↑/↓ joystick picks the **band**
-   (2.4 / 5 / 6 GHz); an unsupported band says so. Shares the same background
-   passive scan as SIGNAL, so it never blocks the cycle. *(LCD HAT only — the
-   2.7" e-Paper HAT's card set stops at SWITCH.)*
+   strongest channel + the **scanned adapter name** in the header. The ↑/↓
+   joystick picks the **band** (2.4 / 5 / 6 GHz); an unsupported band says so.
+   Shares the same background passive scan as SIGNAL, so it never blocks the
+   cycle. *(LCD HAT only — the 2.7" e-Paper HAT's card set stops at SWITCH.)*
+
+   **Which radio it scans:** the SIGNAL and SPECTRUM cards auto-select the
+   **widest-band adapter present** — so a tri-band dongle (e.g. the **Alfa
+   AWUS036AXM**, 2.4/5/6 GHz) is used for 5/6 GHz instead of the connected
+   2.4-only onboard radio. The header shows that interface name; if you only
+   see 2.4 GHz, plug in the Alfa (or another 5/6 GHz-capable adapter) and the
+   card switches to it automatically.
 
 The wired pages focus on the **physical** wired NIC (`eth*` / `en*`), ignoring
 VPN, tunnel, bridge and container interfaces; the WIFI/SIGNAL/SPECTRUM pages use
@@ -210,7 +217,7 @@ The functions selectable inside each card (Up/Down, then press):
 | **LINK** / **SWITCH** | **Locate port** (blink the switch link LED) · **L2 health** capture (~12 s) |
 | **IP** | **Ping gateway** (LAN) · **Ping internet** (`8.8.8.8`, WAN) · **DNS Doctor** (poison/hijack verdict) · **Speed test** |
 | **DHCP** / **WIFI** / **SIGNAL** | read-only (no functions) |
-| **SPECTRUM** | Up/Down selects the **band** (2.4 / 5 / 6 GHz) whose live channel-occupancy spectrum is drawn; press does nothing (nothing to run) |
+| **SPECTRUM** | Up/Down selects the **band** (2.4 / 5 / 6 GHz) whose live channel-occupancy spectrum is drawn (scanned on the widest-band adapter — plug in the Alfa for 5/6 GHz); press does nothing (nothing to run) |
 
 In the **card-selection menu** any joystick direction moves the highlight and
 press opens that card. The joystick arrows above are **as you read them on the
