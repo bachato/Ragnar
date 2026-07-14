@@ -87,7 +87,10 @@ shaded. Toggle between:
 the **SPECTRUM** card in on-screen Network Diagnostic mode — a per-channel
 occupancy graph for one band (height ∝ the strongest AP's signal, DFS/radar
 channels hollow, busiest channel tick-marked); the joystick ↑/↓ picks the band.
-See [Display Controls](DISPLAY_CONTROLS.md#network-diagnostic-mode).
+It auto-scans the **widest-band adapter present** (plug in the Alfa AWUS036AXM
+for 5/6 GHz — a 2.4-only onboard radio only ever shows 2.4) and names the
+scanned interface in the header. See
+[Display Controls](DISPLAY_CONTROLS.md#network-diagnostic-mode).
 
 ---
 

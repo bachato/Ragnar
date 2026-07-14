@@ -1087,15 +1087,45 @@ class Display:
             info['rate'] = float(m.group(1))
         return info
 
+    def _netdiag_scan_iface(self):
+        """Pick the WiFi interface to scan for the SIGNAL/SPECTRUM cards: the
+        adapter that supports the MOST bands, so a tri-band dongle (e.g. the
+        Alfa AWUS036AXM) is used for 5/6 GHz instead of a 2.4-only onboard
+        radio. The connected onboard radio is what `detect_wifi_interface`
+        returns, but it can't see 5/6 GHz — this looks at each radio's real
+        band capability. Cached ~2 min; falls back to the onboard interface."""
+        cached = getattr(self, '_netdiag_scan_if', None)
+        if cached and (time.time() - getattr(self, '_netdiag_scan_if_ts', 0)) < 120:
+            return cached
+        iface = getattr(self, '_wifi_iface', None) or 'wlan0'
+        try:
+            import wifi_analyzer as wa
+            cands = [i for i in wa.list_wifi_interfaces()
+                     if i.get('type') != 'monitor' and i.get('bands')]
+            if cands:
+                # Most bands wins; prefer 6 GHz- then 5 GHz-capable on ties.
+                best = max(cands, key=lambda i: (len(set(i['bands'])),
+                                                 '6' in i['bands'], '5' in i['bands']))
+                if best['iface'] != iface:
+                    logger.info(f"netdiag spectrum: scanning {best['iface']} "
+                                f"(bands {'/'.join(best['bands'])}) instead of {iface}")
+                iface = best['iface']
+        except Exception as e:
+            logger.debug(f"netdiag scan-iface pick error: {e}")
+        self._netdiag_scan_if = iface
+        self._netdiag_scan_if_ts = time.time()
+        return iface
+
     def _netdiag_wifi_scan(self):
-        """Background-cached passive scan for the net-diag SIGNAL page. A full
-        passive scan takes several seconds, so it runs in a worker thread and the
-        page shows the last result — the render never blocks. Refreshes at most
-        ~every 45s, and only while this page is on screen."""
+        """Background-cached passive scan for the net-diag SIGNAL/SPECTRUM pages.
+        A full passive scan takes several seconds, so it runs in a worker thread
+        and the page shows the last result — the render never blocks. Refreshes
+        at most ~every 45s, and only while a wifi page is on screen. Scans the
+        widest-band adapter (see _netdiag_scan_iface) so 5/6 GHz show up."""
         st = getattr(self, '_netdiag_wifi_state', None)
         if st is None:
             st = self._netdiag_wifi_state = {'ts': 0, 'aps': None, 'scanning': False,
-                                             'spectrum': None, 'bands': None}
+                                             'spectrum': None, 'bands': None, 'iface': None}
         now = time.time()
         if not st['scanning'] and (now - st['ts']) > 45:
             st['scanning'] = True
@@ -1103,9 +1133,9 @@ class Display:
             def _worker():
                 aps = None
                 spectrum = bands = None
+                iface = self._netdiag_scan_iface()
                 try:
                     import wifi_analyzer as wa
-                    iface = getattr(self, '_wifi_iface', None) or 'wlan0'
                     d = wa.do_scan(interface=iface, band='all')
                     if 'error' not in d:
                         aps = sorted(d.get('aps', []),
@@ -1115,6 +1145,7 @@ class Display:
                         bands = d.get('supported_bands') or {}
                 except Exception as e:
                     logger.debug(f"netdiag wifi scan error: {e}")
+                st['iface'] = iface
                 if aps is not None:
                     st['aps'] = aps
                     st['spectrum'] = spectrum
@@ -1373,13 +1404,16 @@ class Display:
                 ])
                 return
             band = ['2.4', '5', '6'][(func_idx if func_idx >= 0 else 0) % 3]
-            self._draw_spectrum(draw, y, band, spectrum, st.get('bands') or {})
+            self._draw_spectrum(draw, y, band, spectrum, st.get('bands') or {},
+                                st.get('iface'))
 
-    def _draw_spectrum(self, draw, y, band, spectrum, supported):
+    def _draw_spectrum(self, draw, y, band, spectrum, supported, iface=None):
         """Channel-occupancy spectrum for one band on the LCD HAT: a bar per
         channel, height ∝ strongest AP's signal there, with DFS/radar channels
         drawn hollow and the busiest channel tick-marked. This is the analyzer's
-        signature 'Bar' view shrunk to 128 px. `band` is '2.4'|'5'|'6'."""
+        signature 'Bar' view shrunk to 128 px. `band` is '2.4'|'5'|'6'; `iface`
+        (the scanned adapter) is shown so it's obvious which radio 5/6 GHz
+        come from."""
         w = getattr(self, 'render_w', self.shared_data.width)
         h = getattr(self, 'render_h', self.shared_data.height)
         sx = getattr(self, 'render_sx', self.scale_factor_x)
@@ -1388,21 +1422,33 @@ class Display:
         pad_x = int(6 * sx)
         band_lbl = {'2.4': '2.4G', '5': '5G', '6': '6G'}.get(band, band)
 
+        # Adapter name, right-aligned on the header row (answers "which radio?").
+        if iface:
+            iw = font.getlength(iface)
+            draw.text((w - pad_x - iw, y), iface, font=font, fill=0)
+            hdr_avail = w - 2 * pad_x - iw - int(4 * sx)
+        else:
+            hdr_avail = w - 2 * pad_x
+
         info = spectrum.get(band) or {}
         chans = info.get('channels') or []
         if not chans:
             reason = 'not supported' if not supported.get(band, True) else 'no APs seen'
-            self._draw_stat_rows(draw, y, [(band_lbl, reason),
-                                           ("Tip", "Up/Down = band")])
+            draw.text((pad_x, y), band_lbl, font=font, fill=0)
+            self._draw_stat_rows(draw, y + int(13 * sy),
+                                 [(reason, ""), ("Up/Down", "= band")])
             return
 
-        # Header: band · AP count · strongest signal + its channel.
+        # Header (left): band · AP count · strongest signal + its channel,
+        # trimmed so it never runs into the right-aligned adapter name.
         best = max(chans, key=lambda c: (c.get('max_signal') is not None,
                                          c.get('max_signal') or -999))
         best_sig = best.get('max_signal')
         hdr = f"{band_lbl}  {info.get('ap_count', 0)}AP"
         if best_sig is not None:
             hdr += f"  ch{best.get('channel')} {int(best_sig)}"
+        while hdr and font.getlength(hdr) > hdr_avail:
+            hdr = hdr[:-1]
         draw.text((pad_x, y), hdr, font=font, fill=0)
 
         # Plot area under the header, leaving a row for channel-axis labels
