@@ -56,10 +56,10 @@ logger = logging.getLogger(__name__)
 # (joystick-center toggles it). Matches the net-diag auto-cycle cadence.
 AUTOSCROLL_INTERVAL = 5.0
 
-# Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP / WIFI / SIGNAL).
-# Mirrors display.NETDIAG_PAGE_COUNT; kept local so this module needn't import
-# display.py.
-NETDIAG_PAGE_COUNT = 6
+# Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP / WIFI / SIGNAL /
+# SPECTRUM). Mirrors display.NETDIAG_PAGE_COUNT; kept local so this module
+# needn't import display.py.
+NETDIAG_PAGE_COUNT = 7
 
 # Button pins
 KEY1_PIN = 21
