@@ -109,6 +109,19 @@ web will be down during wardrive without ap or wifi connection.
 
 **Recommendation:** Edit `~/.config/labwc/autostart` and comment out `/usr/bin/lwrespawn /usr/bin/wf-panel-pi &` to free up resources, or run `sudo pkill wf-panel-pi` temporarily.
 
+#### Ragnar Gen 2 — reference build
+
+The compact, self-contained reference node: a headless Pi Zero 2 W with an
+on-board status display, wired networking, and a Wi-Fi 6E monitor-mode radio.
+In collaboration with [Solarflere](https://www.instagram.com/solarflere?igsh=MXR6bjMyMmRzZzE4dg==).
+
+- **Raspberry Pi Zero 2 W** — main compute
+- **Waveshare 1.44" LCD Display HAT** (ST7735S, 3 keys + joystick) — on-device display + controls
+- **Waveshare Ethernet/USB HAT** — wired uplink + USB-A for the dongle
+- **Alfa AWUS036AXM** (Wi-Fi 6E, `mt7921u`) — tri-band scan/monitor radio
+
+See [Gen 2 Hardware Requirements](docs/hardware-gen2.md) for the full BOM, assembly, and setup notes.
+
 ### Debian-Based Server / Headless
 
 - Debian 11+ or Ubuntu 20.04+ (AMD64, ARM64, or ARMv7)
