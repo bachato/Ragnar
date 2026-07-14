@@ -113,6 +113,7 @@ web will be down during wardrive without ap or wifi connection.
 
 The compact, self-contained reference node: a headless Pi Zero 2 W with an
 on-board status display, wired networking, and a Wi-Fi 6E monitor-mode radio.
+In collaboration with [Solarflere](https://www.instagram.com/solarflere?igsh=MXR6bjMyMmRzZzE4dg==).
 
 - **Raspberry Pi Zero 2 W** — main compute
 - **Waveshare 1.44" LCD Display HAT** (ST7735S, 3 keys + joystick) — on-device display + controls

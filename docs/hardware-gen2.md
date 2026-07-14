@@ -1,5 +1,7 @@
 # Ragnar Gen 2 — Minimal Hardware Requirements
 
+> In collaboration with [Solarflere](https://www.instagram.com/solarflere?igsh=MXR6bjMyMmRzZzE4dg==).
+
 The **Gen 2** reference build is a compact, self-contained Ragnar node: a headless
 Pi Zero 2 W with an on-board status display, wired networking, and a Wi-Fi 6E
 monitor-mode radio. It is the smallest hardware set that runs the full Ragnar
