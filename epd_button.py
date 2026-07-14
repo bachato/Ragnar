@@ -58,7 +58,7 @@ NETDIAG_PAGE_COUNT = 3
 # one with the centre press (the "card" navigation model); the 2.7" e-Paper HAT
 # still fires them from its hardware keys. Kept module-level so both display.py
 # (for rendering) and the LCD listener (for dispatch) share one definition.
-NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL"]
+NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL", "SPECTRUM"]
 NETDIAG_CARD_FUNCS = {
     0: [("Locate Port", "port"), ("L2 Health", "l2")],            # LINK
     1: [("Ping GW", "ping_gw"), ("Ping WAN", "ping_wan"),
@@ -67,6 +67,11 @@ NETDIAG_CARD_FUNCS = {
     3: [],                                                         # DHCP (auto)
     4: [],                                                         # WIFI (live)
     5: [],                                                         # SIGNAL (auto)
+    # SPECTRUM: the "functions" are band selectors — Up/Down picks which band's
+    # channel spectrum is drawn (band_* keys are no-ops on press, see
+    # _run_netdiag_test). Only the LCD HAT reaches this card (its
+    # NETDIAG_PAGE_COUNT is 7; the e-Paper HAT's is 3).
+    6: [("2.4 GHz", "band_24"), ("5 GHz", "band_5"), ("6 GHz", "band_6")],
 }
 
 # Hold time (seconds) that separates a short press from a long press in the
@@ -340,6 +345,10 @@ class EPDButtonListener:
     def _run_netdiag_test(self, kind):
         """Show a 'running' placeholder and run the test on a daemon thread so
         the button callback returns at once (some tests take many seconds)."""
+        # SPECTRUM band selectors aren't tests — Up/Down already picked the band
+        # the card renders; a press should do nothing rather than pop a result.
+        if str(kind).startswith('band_'):
+            return
         if self._netdiag_busy:
             logger.debug(f"Netdiag test '{kind}' ignored — another is running")
             return

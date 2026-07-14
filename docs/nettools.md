@@ -16,7 +16,8 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
 > Authority Verification suite was designed and built in collaboration with Solarflere.
 
-<img width="1080" height="1824" alt="image" src="https://github.com/user-attachments/assets/1556051a-2114-4144-8e4b-0020cf0b2c1d" />
+<img width="3375" height="5700" alt="image" src="https://github.com/user-attachments/assets/e8ab8188-56ed-4f43-9671-4b4cbf4efd3d" />
+
 
 
 
@@ -144,10 +145,18 @@ The display auto-cycles six pages every **5 seconds**:
 6. **SIGNAL** — a bar chart of the **strongest nearby networks' signal
    strengths** (SSID + RSSI), from a background [passive Wi-Fi
    scan](wifi-analyzer.md) so the page never blocks.
+7. **SPECTRUM** — the [WiFi Spectrum Analyzer](wifi-analyzer.md)'s **Bar view on
+   the panel**: a live **channel-occupancy graph** for one band (a bar per
+   channel, height ∝ the strongest AP's signal there, **DFS/radar channels drawn
+   hollow**, the busiest channel tick-marked), with the band, AP count and
+   strongest channel in the header. The ↑/↓ joystick picks the **band**
+   (2.4 / 5 / 6 GHz); an unsupported band says so. Shares the same background
+   passive scan as SIGNAL, so it never blocks the cycle. *(LCD HAT only — the
+   2.7" e-Paper HAT's card set stops at SWITCH.)*
 
 The wired pages focus on the **physical** wired NIC (`eth*` / `en*`), ignoring
-VPN, tunnel, bridge and container interfaces; the WIFI/SIGNAL pages use the
-wireless interface. Toggle it off to restore the normal Ragnar display. The
+VPN, tunnel, bridge and container interfaces; the WIFI/SIGNAL/SPECTRUM pages use
+the wireless interface. Toggle it off to restore the normal Ragnar display. The
 setting is persisted (`network_diagnostic_mode` in the config) and shared across
 sessions.
 
@@ -181,9 +190,9 @@ Network Diagnostic Mode on/off directly (no web UI needed). Select the HAT in
 **Display settings** as *"1.44" ST7735S LCD HAT + joystick"*.
 
 The mode is navigated as a stack of **cards** — `LINK · IP · SWITCH · DHCP ·
-WIFI · SIGNAL`. **Left/Right move between cards; Up/Down cycle the test functions
-*inside* a card; the centre press runs the highlighted one** (the footer shows
-`>` + its name). While the mode is on:
+WIFI · SIGNAL · SPECTRUM`. **Left/Right move between cards; Up/Down cycle the test
+functions *inside* a card; the centre press runs the highlighted one** (the
+footer shows `>` + its name). While the mode is on:
 
 | Input | Action |
 |-------|--------|
@@ -191,7 +200,7 @@ WIFI · SIGNAL`. **Left/Right move between cards; Up/Down cycle the test functio
 | **Joystick ← / →** | Previous / next **card** |
 | **Joystick ↑ / ↓** | Cycle the highlighted **function** inside the card |
 | **Joystick press** | **OK / select** — run the highlighted function (or dismiss a shown result) |
-| **KEY2** | **Card-selection menu** — an overview list of the six cards; press again to leave it |
+| **KEY2** | **Card-selection menu** — an overview list of the cards; press again to leave it |
 | **KEY3** | **Pause / start auto-switch** — auto-cycle the cards every 5 s (off by default) |
 
 The functions selectable inside each card (Up/Down, then press):
@@ -201,6 +210,7 @@ The functions selectable inside each card (Up/Down, then press):
 | **LINK** / **SWITCH** | **Locate port** (blink the switch link LED) · **L2 health** capture (~12 s) |
 | **IP** | **Ping gateway** (LAN) · **Ping internet** (`8.8.8.8`, WAN) · **DNS Doctor** (poison/hijack verdict) · **Speed test** |
 | **DHCP** / **WIFI** / **SIGNAL** | read-only (no functions) |
+| **SPECTRUM** | Up/Down selects the **band** (2.4 / 5 / 6 GHz) whose live channel-occupancy spectrum is drawn; press does nothing (nothing to run) |
 
 In the **card-selection menu** any joystick direction moves the highlight and
 press opens that card. The joystick arrows above are **as you read them on the

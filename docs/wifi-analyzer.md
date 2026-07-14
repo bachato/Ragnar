@@ -83,6 +83,12 @@ shaded. Toggle between:
   centred on its operating channel and spanning its channel width, peak = RSSI.
   This is the view that makes channel overlap and crowding obvious at a glance.
 
+**On the device (1.44" LCD HAT):** the Bar view is also available head-less as
+the **SPECTRUM** card in on-screen Network Diagnostic mode — a per-channel
+occupancy graph for one band (height ∝ the strongest AP's signal, DFS/radar
+channels hollow, busiest channel tick-marked); the joystick ↑/↓ picks the band.
+See [Display Controls](DISPLAY_CONTROLS.md#network-diagnostic-mode).
+
 ---
 
 ## Interference & channel planning

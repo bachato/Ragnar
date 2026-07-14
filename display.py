@@ -87,13 +87,13 @@ try:
 except ImportError:
     EPDButtonListener = None
     PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC = 0, 1, 2, 3, 4, 5
-    NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL"]
+    NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL", "SPECTRUM"]
     NETDIAG_CARD_FUNCS = {}
 
-# Network Diagnostic mode: number of auto-cycling e-Paper sub-pages
-# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL). See
+# Network Diagnostic mode: number of auto-cycling sub-pages
+# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL, 6=SPECTRUM). See
 # Display._render_netdiag_page.
-NETDIAG_PAGE_COUNT = 6
+NETDIAG_PAGE_COUNT = 7
 NETDIAG_CYCLE_SECONDS = 5
 
 class Display:
@@ -1094,13 +1094,15 @@ class Display:
         ~every 45s, and only while this page is on screen."""
         st = getattr(self, '_netdiag_wifi_state', None)
         if st is None:
-            st = self._netdiag_wifi_state = {'ts': 0, 'aps': None, 'scanning': False}
+            st = self._netdiag_wifi_state = {'ts': 0, 'aps': None, 'scanning': False,
+                                             'spectrum': None, 'bands': None}
         now = time.time()
         if not st['scanning'] and (now - st['ts']) > 45:
             st['scanning'] = True
 
             def _worker():
                 aps = None
+                spectrum = bands = None
                 try:
                     import wifi_analyzer as wa
                     iface = getattr(self, '_wifi_iface', None) or 'wlan0'
@@ -1108,10 +1110,15 @@ class Display:
                     if 'error' not in d:
                         aps = sorted(d.get('aps', []),
                                      key=lambda a: -(a.get('signal') or -999))[:5]
+                        # Full per-channel spectrum feeds the SPECTRUM card too.
+                        spectrum = d.get('spectrum') or {}
+                        bands = d.get('supported_bands') or {}
                 except Exception as e:
                     logger.debug(f"netdiag wifi scan error: {e}")
                 if aps is not None:
                     st['aps'] = aps
+                    st['spectrum'] = spectrum
+                    st['bands'] = bands
                 st['ts'] = time.time()
                 st['scanning'] = False
 
@@ -1160,25 +1167,38 @@ class Display:
     def _render_netdiag_menu(self, image, draw, highlight):
         """The card-selection menu (reached with KEY2 on the LCD HAT): list the
         net-diag cards and highlight the current one. The joystick moves the
-        highlight; the centre press opens that card."""
+        highlight; the centre press opens that card. No title header — the list
+        starts at the top so all cards fit on the short panel."""
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         sx = getattr(self, 'render_sx', self.scale_factor_x)
         w = getattr(self, 'render_w', self.shared_data.width)
+        h = getattr(self, 'render_h', self.shared_data.height)
         font = self.shared_data.font_arial9
-        self._draw_page_frame(draw, "NET CARDS", hint="K2 back · press=open")
-        y = int(26 * sy)
+        # Thin border + footer hint only (no "NET CARDS" title / top divider),
+        # reclaiming that space for the list.
+        draw.rectangle((1, 1, w - 1, h - 1), outline=0)
+        foot_y = h - int(18 * sy)
+        draw.line((1, foot_y, w - 1, foot_y), fill=0)
+        hint = "K2 back · press=open"
+        avail_hint = w - int(8 * sx)
+        while hint and font.getlength(hint) > avail_hint:
+            hint = hint[:-1]
+        draw.text((int(4 * sx), h - int(16 * sy)), hint, font=font, fill=0)
         pad_x = int(8 * sx)
-        row_h = int(13 * sy)
         n = len(NETDIAG_CARD_NAMES)
+        # Fit every card between the top and the footer divider.
+        top = int(4 * sy)
+        row_h = max(int(11 * sy), min(int(15 * sy), (foot_y - top) // max(1, n)))
+        y = top
         for i, nm in enumerate(NETDIAG_CARD_NAMES):
             sel = (i == highlight % n)
             label = f"{i + 1}. {nm}"
             if sel:
-                draw.rectangle([int(3 * sx), y - int(1 * sy),
-                                w - int(3 * sx), y + row_h - int(2 * sy)], fill=0)
-                draw.text((pad_x, y), label, font=font, fill=1)
+                draw.rectangle([int(3 * sx), y,
+                                w - int(3 * sx), y + row_h - int(1 * sy)], fill=0)
+                draw.text((pad_x, y + int(1 * sy)), label, font=font, fill=1)
             else:
-                draw.text((pad_x, y), label, font=font, fill=0)
+                draw.text((pad_x, y + int(1 * sy)), label, font=font, fill=0)
             y += row_h
 
     def _render_netdiag_page(self, image, draw, page, frozen=False, func_idx=-1):
@@ -1332,7 +1352,7 @@ class Display:
                 self._draw_signal_bar(draw, yy + int(3 * sy), wl['signal'],
                                       pad_x, w - pad_x)
 
-        else:  # page 5: SIGNAL — nearby networks' signal strengths (scan)
+        elif page == 5:  # SIGNAL — nearby networks' signal strengths (scan)
             st = self._netdiag_wifi_scan()
             aps = st.get('aps')
             if not aps:
@@ -1342,6 +1362,83 @@ class Display:
                 ])
                 return
             self._draw_signal_bars(draw, y, aps)
+
+        else:  # page 6: SPECTRUM — per-channel occupancy graph (band via func_idx)
+            st = self._netdiag_wifi_scan()
+            spectrum = st.get('spectrum')
+            if spectrum is None:
+                self._draw_stat_rows(draw, y, [
+                    ("Spectrum", "scanning..." if st.get('scanning') else "no data"),
+                    ("Wait", "~5s"),
+                ])
+                return
+            band = ['2.4', '5', '6'][(func_idx if func_idx >= 0 else 0) % 3]
+            self._draw_spectrum(draw, y, band, spectrum, st.get('bands') or {})
+
+    def _draw_spectrum(self, draw, y, band, spectrum, supported):
+        """Channel-occupancy spectrum for one band on the LCD HAT: a bar per
+        channel, height ∝ strongest AP's signal there, with DFS/radar channels
+        drawn hollow and the busiest channel tick-marked. This is the analyzer's
+        signature 'Bar' view shrunk to 128 px. `band` is '2.4'|'5'|'6'."""
+        w = getattr(self, 'render_w', self.shared_data.width)
+        h = getattr(self, 'render_h', self.shared_data.height)
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        font = self.shared_data.font_arial9
+        pad_x = int(6 * sx)
+        band_lbl = {'2.4': '2.4G', '5': '5G', '6': '6G'}.get(band, band)
+
+        info = spectrum.get(band) or {}
+        chans = info.get('channels') or []
+        if not chans:
+            reason = 'not supported' if not supported.get(band, True) else 'no APs seen'
+            self._draw_stat_rows(draw, y, [(band_lbl, reason),
+                                           ("Tip", "Up/Down = band")])
+            return
+
+        # Header: band · AP count · strongest signal + its channel.
+        best = max(chans, key=lambda c: (c.get('max_signal') is not None,
+                                         c.get('max_signal') or -999))
+        best_sig = best.get('max_signal')
+        hdr = f"{band_lbl}  {info.get('ap_count', 0)}AP"
+        if best_sig is not None:
+            hdr += f"  ch{best.get('channel')} {int(best_sig)}"
+        draw.text((pad_x, y), hdr, font=font, fill=0)
+
+        # Plot area under the header, leaving a row for channel-axis labels
+        # above the footer divider (h - 18·sy) so they don't collide with it.
+        top = y + int(13 * sy)
+        bottom = h - int(28 * sy)
+        axis_y = bottom
+        x0, x1 = pad_x, w - pad_x
+        if bottom - top < int(10 * sy) or x1 - x0 < 8:
+            return
+        draw.line((x0, axis_y, x1, axis_y), fill=0)         # baseline
+        n = len(chans)
+        slot = (x1 - x0) / float(n)
+        bar_w = max(1, int(slot) - 1)
+        plot_h = axis_y - top
+        for i, c in enumerate(chans):
+            bx = int(x0 + i * slot)
+            sig = c.get('max_signal')
+            q = self._dbm_to_quality(sig) if sig is not None else 0
+            bh = int(plot_h * (q or 0) / 100.0)
+            if bh <= 0:
+                continue
+            by = axis_y - bh
+            if c.get('radar'):                              # DFS/radar → hollow
+                draw.rectangle([bx, by, bx + bar_w, axis_y], outline=0)
+            else:
+                draw.rectangle([bx, by, bx + bar_w, axis_y], fill=0)
+            if c is best and bh > 0:                        # mark the busiest
+                draw.line((bx, by - int(3 * sy), bx + bar_w, by - int(3 * sy)), fill=0)
+
+        # Channel-axis ticks: label first, middle and last channel numbers.
+        for i in (0, n // 2, n - 1):
+            lab = str(chans[i].get('channel'))
+            lx = int(x0 + i * slot)
+            lx = min(lx, x1 - int(font.getlength(lab)))
+            draw.text((max(x0, lx), axis_y + int(1 * sy)), lab, font=font, fill=0)
 
     def _draw_wrapped_note(self, draw, y, text, max_lines=3):
         """Word-wrap a short note across up to max_lines using the small font."""

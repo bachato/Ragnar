@@ -75,7 +75,7 @@ GPIO pins (BCM), fixed by the HAT: `KEY1=21`, `KEY2=20`, `KEY3=16`; joystick
 
 ### Network Diagnostic mode
 
-Navigated as **cards**: `LINK · IP · SWITCH · DHCP · WIFI · SIGNAL`.
+Navigated as **cards**: `LINK · IP · SWITCH · DHCP · WIFI · SIGNAL · SPECTRUM`.
 
 | Input | Action |
 |-------|--------|
@@ -87,7 +87,12 @@ Navigated as **cards**: `LINK · IP · SWITCH · DHCP · WIFI · SIGNAL`.
 | **KEY3** | **Pause / start auto-switch** — auto-cycle the cards every 5 s |
 
 Functions: **LINK/SWITCH** → Locate Port · L2 Health; **IP** → Ping GW · Ping
-WAN · DNS Doctor · Speedtest; **DHCP/WIFI/SIGNAL** are read-only. See the full
+WAN · DNS Doctor · Speedtest; **DHCP/WIFI/SIGNAL** are read-only. On the
+**SPECTRUM** card the ↑/↓ "functions" select the **band** (2.4 / 5 / 6 GHz) —
+it draws that band's live **channel-occupancy spectrum** (a bar per channel,
+height ∝ the strongest AP's signal, DFS/radar channels hollow, busiest channel
+tick-marked) — the WiFi Spectrum Analyzer's Bar view on the panel. Press KEY3 to
+freeze the auto-cycle, then ↑/↓ to sweep bands. See the full
 [field‑test pad](nettools.md#field-test-pad-144-lcd-hat--joystick) table.
 
 ---
