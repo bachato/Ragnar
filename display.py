@@ -1167,25 +1167,38 @@ class Display:
     def _render_netdiag_menu(self, image, draw, highlight):
         """The card-selection menu (reached with KEY2 on the LCD HAT): list the
         net-diag cards and highlight the current one. The joystick moves the
-        highlight; the centre press opens that card."""
+        highlight; the centre press opens that card. No title header — the list
+        starts at the top so all cards fit on the short panel."""
         sy = getattr(self, 'render_sy', self.scale_factor_y)
         sx = getattr(self, 'render_sx', self.scale_factor_x)
         w = getattr(self, 'render_w', self.shared_data.width)
+        h = getattr(self, 'render_h', self.shared_data.height)
         font = self.shared_data.font_arial9
-        self._draw_page_frame(draw, "NET CARDS", hint="K2 back · press=open")
-        y = int(26 * sy)
+        # Thin border + footer hint only (no "NET CARDS" title / top divider),
+        # reclaiming that space for the list.
+        draw.rectangle((1, 1, w - 1, h - 1), outline=0)
+        foot_y = h - int(18 * sy)
+        draw.line((1, foot_y, w - 1, foot_y), fill=0)
+        hint = "K2 back · press=open"
+        avail_hint = w - int(8 * sx)
+        while hint and font.getlength(hint) > avail_hint:
+            hint = hint[:-1]
+        draw.text((int(4 * sx), h - int(16 * sy)), hint, font=font, fill=0)
         pad_x = int(8 * sx)
-        row_h = int(13 * sy)
         n = len(NETDIAG_CARD_NAMES)
+        # Fit every card between the top and the footer divider.
+        top = int(4 * sy)
+        row_h = max(int(11 * sy), min(int(15 * sy), (foot_y - top) // max(1, n)))
+        y = top
         for i, nm in enumerate(NETDIAG_CARD_NAMES):
             sel = (i == highlight % n)
             label = f"{i + 1}. {nm}"
             if sel:
-                draw.rectangle([int(3 * sx), y - int(1 * sy),
-                                w - int(3 * sx), y + row_h - int(2 * sy)], fill=0)
-                draw.text((pad_x, y), label, font=font, fill=1)
+                draw.rectangle([int(3 * sx), y,
+                                w - int(3 * sx), y + row_h - int(1 * sy)], fill=0)
+                draw.text((pad_x, y + int(1 * sy)), label, font=font, fill=1)
             else:
-                draw.text((pad_x, y), label, font=font, fill=0)
+                draw.text((pad_x, y + int(1 * sy)), label, font=font, fill=0)
             y += row_h
 
     def _render_netdiag_page(self, image, draw, page, frozen=False, func_idx=-1):
