@@ -4024,16 +4024,18 @@ async function locatePort(force) {
     if (!iface) { ifaceEl.focus(); return; }
     let count = parseInt(document.getElementById('locate-count').value, 10);
     if (!Number.isFinite(count)) count = 6;
+    const methEl = document.getElementById('locate-method');
+    const method = (methEl && methEl.value) || 'flap';
     const btn = event && event.target ? event.target : null;
-    _ndBusy(btn, true, 'Flashing…');
+    _ndBusy(btn, true, method === 'burst' ? 'Bursting…' : 'Flashing…');
     out.classList.remove('hidden');
     try {
-        const data = await postAPI('/api/net/locate-port', { interface: iface, count: count, force: !!force });
+        const data = await postAPI('/api/net/locate-port', { interface: iface, count: count, method: method, force: !!force });
         if (!data.success) {
             if (data.needs_force) {
                 _ndBusy(btn, false);
                 if (confirm(data.error + '\n\nFlash it anyway?')) return locatePort(true);
-                out.innerHTML = '<p class="text-gray-400">Cancelled.</p>';
+                out.innerHTML = '<p class="text-gray-400">Cancelled — tip: the Traffic-burst method locates it without dropping the link.</p>';
                 return;
             }
             out.innerHTML = '<p class="text-red-400">Error: ' + escapeHtml(data.error || 'failed') + '</p>';
@@ -4041,7 +4043,8 @@ async function locatePort(force) {
         }
         out.innerHTML = '<p class="text-green-400">⚡ ' + escapeHtml(data.message) + '</p>';
     } catch (e) {
-        // A flap on the interface serving this page can abort the request — that's expected.
+        // A flap on the interface serving this page can abort the request — that's
+        // expected. (Burst never drops the link, so this path is flap-only.)
         out.innerHTML = '<p class="text-amber-300">Flash started on ' + escapeHtml(iface)
             + '. If the UI dropped, that\'s the link flapping — watch the switch LED; it auto-restores.</p>';
     } finally {
