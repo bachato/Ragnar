@@ -7350,6 +7350,22 @@ def _relay_selftest():
 #     hosts answering one name differently), WPAD targeting, and mere exposure
 #     (LLMNR/NBT-NS in use at all). Capture is done by tcpdump into a pcap; Scapy
 #     dissects it (tcpdump no longer decodes SMB, and never decoded LLMNR/NBT-NS).
+#   Part 3 — Kerberos downgrade / roasting (tcp+udp 88): the same capture also reads
+#     Kerberos KDC traffic. Kerberos is ASN.1/DER, and the fields that matter for a
+#     *passive* downgrade watch sit near the start of each message, so a small tolerant
+#     DER walker (_krb_*) reads them straight off the wire without a full dissector —
+#     and it keeps working on packets truncated by the capture snaplen. It flags:
+#       * kerberoast    — a TGS-REQ for a service SPN (sname != krbtgt) that forces RC4
+#         (etype 23) so the returned service ticket is offline-crackable (Rubeus /
+#         GetUserSPNs signature); or a KDC that issues an RC4 service ticket.
+#       * asrep-roast   — an AS-REQ with no PA-ENC-TIMESTAMP pre-auth (account has "do
+#         not require preauth"), especially one answered by an AS-REP — the AS-REP is an
+#         offline-crackable hash.
+#       * krb-downgrade — the KDC actually issues a DES/RC4 ticket (weak encryption in
+#         real use), or a client offers only weak etypes (AES stripped/disabled).
+#       * krb-exposure  — RC4/DES still enabled alongside AES (legacy encryption).
+#     Kerberos attack verdicts are never baselined away; the baseline only remembers
+#     known KDC IPs + realms to annotate the output. See [[SMB Watch]] / [[relay watch]].
 _SMB_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'data', 'smb_watch.json')
 _smb_watch_lock = threading.Lock()
@@ -7359,6 +7375,21 @@ _SMB_SERVER_PORTS = {445, 139}
 _SMB_HIGHVALUE = {'wpad', 'isatap'}
 # Multicast/broadcast destinations that mark a name-resolution *query*.
 _SMB_MCAST = {'224.0.0.252', 'ff02::1:3', '224.0.0.251', 'ff02::fb'}
+# Kerberos KDC ports (AS/TGS exchange). Same passive capture, tcp + udp.
+_KRB_PORTS = {88}
+# Kerberos encryption types (RFC 3961/4120). AES is strong; RC4/DES are the
+# downgrade/roasting-enabling weak ones; 3DES is deprecated legacy.
+_KRB_ETYPE_NAMES = {1: 'des-cbc-crc', 2: 'des-cbc-md4', 3: 'des-cbc-md5',
+                    5: 'des3-cbc-md5', 16: 'des3-cbc-sha1', 17: 'aes128',
+                    18: 'aes256', 19: 'aes128-sha256', 20: 'aes256-sha384',
+                    23: 'rc4-hmac', 24: 'rc4-hmac-exp', 25: 'camellia128',
+                    26: 'camellia256'}
+_KRB_RC4 = {23, 24}
+_KRB_DES = {1, 2, 3, 5, 16}          # single-DES + 3DES, all deprecated/breakable
+_KRB_AES = {17, 18, 19, 20}
+_KRB_WEAK = _KRB_RC4 | _KRB_DES
+# PA-ENC-TIMESTAMP pre-auth padata type; its absence == "do not require preauth".
+_KRB_PA_ENC_TIMESTAMP = 2
 
 
 def _smb_find_magic(raw):
@@ -7512,8 +7543,9 @@ def _smb_watch_save(d):
 
 def do_smb_baseline(action='get'):
     """Manage the learned SMB Watch baseline (accepted mDNS responders + known SMBv1
-    hosts). LLMNR/NBT-NS responders are never baselined away — nothing should answer
-    them."""
+    hosts + known Kerberos KDCs/realms). LLMNR/NBT-NS responders and Kerberos attack
+    verdicts are never baselined away — nothing should answer LLMNR/NBT-NS, and the
+    KDC/realm baseline only annotates output, never suppresses a downgrade/roast."""
     with _smb_watch_lock:
         if action == 'reset':
             _smb_watch_save({})
@@ -7521,7 +7553,9 @@ def do_smb_baseline(action='get'):
         b = _smb_watch_load()
         return {'success': True, 'baseline': {
             'mdns_responders': b.get('mdns_responders') or [],
-            'smbv1_hosts': b.get('smbv1_hosts') or []}}
+            'smbv1_hosts': b.get('smbv1_hosts') or [],
+            'kdcs': b.get('kdcs') or [],
+            'krb_realms': b.get('krb_realms') or []}}
 
 
 def _smb_analyze(smb_events, nameres, seconds, baseline, learn=True):
@@ -7692,6 +7726,357 @@ def _smb_analyze(smb_events, nameres, seconds, baseline, learn=True):
     }
 
 
+# ---- Kerberos (Part 3): tolerant DER walker + passive downgrade/roasting parse ----
+# Kerberos messages are ASN.1/DER. We don't need a full dissector — only a handful of
+# early fields — so this walks the tag/length/value tree just far enough, and never
+# raises on malformed or snaplen-truncated input (it returns what it managed to read).
+
+def _der_len(buf, i):
+    """DER length starting at byte i (tag already consumed). Returns (length, next_i);
+    length is None on a malformed/indefinite/oversized encoding."""
+    if i >= len(buf):
+        return None, i
+    b = buf[i]
+    i += 1
+    if b < 0x80:
+        return b, i
+    n = b & 0x7f
+    if n == 0 or n > 4 or i + n > len(buf):
+        return None, i
+    return int.from_bytes(buf[i:i + n], 'big'), i + n
+
+
+def _der_children(buf):
+    """Split a constructed value's content into a list of (tag_byte, content_bytes).
+    Stops cleanly at a truncated tail rather than raising."""
+    out, i = [], 0
+    while i < len(buf):
+        tag = buf[i]
+        i += 1
+        length, i = _der_len(buf, i)
+        if length is None:
+            break
+        content = buf[i:i + length]
+        out.append((tag, content))
+        if len(content) < length:      # truncated by snaplen — keep the partial tail
+            break
+        i += length
+    return out
+
+
+def _der_int(b):
+    """Decode a DER INTEGER's content bytes (two's-complement signed)."""
+    if not b:
+        return 0
+    v = int.from_bytes(b, 'big')
+    return v - (1 << (8 * len(b))) if (b[0] & 0x80) else v
+
+
+def _der_first_int(content):
+    """First INTEGER value inside a context tag's content, or None."""
+    kids = _der_children(content)
+    return _der_int(kids[0][1]) if kids else None
+
+
+def _der_child(children, tag):
+    for t, c in children:
+        if t == tag:
+            return c
+    return None
+
+
+def _der_unwrap(content):
+    """Children of the SEQUENCE (or APPLICATION-tagged SEQUENCE) inside a context tag."""
+    kids = _der_children(content)
+    if kids and kids[0][0] in (0x30, 0x61, 0x6e):
+        return _der_children(kids[0][1])
+    return kids
+
+
+def _krb_princ(content):
+    """PrincipalName -> list of its name-string components (['MSSQLSvc','db01'] ...)."""
+    ns = _der_child(_der_unwrap(content), 0xa1)          # [1] name-string
+    if ns is None:
+        return []
+    seq = _der_children(ns)
+    if not seq:
+        return []
+    return [c.decode('latin1', 'replace')
+            for t, c in _der_children(seq[0][1]) if t == 0x1b]
+
+
+def _krb_gstr(content):
+    for t, c in _der_children(content):
+        if t == 0x1b:                                    # GeneralString
+            return c.decode('latin1', 'replace')
+    return None
+
+
+# Application tags of the Kerberos messages we read (class APPLICATION, constructed).
+_KRB_APP_TAGS = {0x6a: 'as-req', 0x6b: 'as-rep', 0x6c: 'tgs-req', 0x6d: 'tgs-rep',
+                 0x7e: 'krb-error'}
+
+
+def _krb_parse_message(raw):
+    """Parse one Kerberos message payload into a dict, or None if it isn't one. Over TCP
+    the payload is preceded by a 4-byte length; over UDP it starts at the app tag."""
+    if not raw:
+        return None
+    if raw[0] not in _KRB_APP_TAGS and len(raw) > 4 and raw[4] in _KRB_APP_TAGS:
+        raw = raw[4:]                                    # skip TCP length prefix
+    if not raw or raw[0] not in _KRB_APP_TAGS:
+        return None
+    kind = _KRB_APP_TAGS[raw[0]]
+    length, hdr = _der_len(raw, 1)
+    seq = _der_children(raw[hdr:hdr + (length if length else len(raw))])
+    kids = _der_children(seq[0][1]) if (seq and seq[0][0] == 0x30) else seq
+    ev = {'kind': kind, 'etypes': [], 'cname': [], 'sname': [], 'realm': None,
+          'padata': [], 'rep_etype': None, 'error_code': None}
+
+    def padata_types(tag_content):
+        types = []
+        for t, c in _der_unwrap(tag_content):            # each PA-DATA SEQUENCE
+            if t == 0x30:
+                pt = _der_child(_der_children(c), 0xa1)  # [1] padata-type
+                if pt is not None:
+                    types.append(_der_first_int(pt))
+        return types
+
+    if kind in ('as-req', 'tgs-req'):
+        pc = _der_child(kids, 0xa3)                      # [3] padata
+        if pc:
+            ev['padata'] = padata_types(pc)
+        rb = _der_child(kids, 0xa4)                      # [4] req-body
+        if rb:
+            body = _der_unwrap(rb)
+            et = _der_child(body, 0xa8)                  # [8] etype (SEQUENCE OF Int32)
+            if et:
+                s = _der_children(et)
+                if s:
+                    ev['etypes'] = [_der_int(c) for t, c in _der_children(s[0][1])
+                                    if t == 0x02]
+            cn = _der_child(body, 0xa1)                  # [1] cname
+            ev['cname'] = _krb_princ(cn) if cn else []
+            rl = _der_child(body, 0xa2)                  # [2] realm
+            ev['realm'] = _krb_gstr(rl) if rl else None
+            sn = _der_child(body, 0xa3)                  # [3] sname
+            ev['sname'] = _krb_princ(sn) if sn else []
+    elif kind in ('as-rep', 'tgs-rep'):
+        cn = _der_child(kids, 0xa4)                      # [4] cname
+        ev['cname'] = _krb_princ(cn) if cn else []
+        rl = _der_child(kids, 0xa3)                      # [3] crealm
+        ev['realm'] = _krb_gstr(rl) if rl else None
+        ep = _der_child(kids, 0xa6)                      # [6] enc-part (EncryptedData)
+        if ep:
+            e0 = _der_child(_der_unwrap(ep), 0xa0)       # [0] etype
+            if e0 is not None:
+                ev['rep_etype'] = _der_first_int(e0)
+    elif kind == 'krb-error':
+        ec = _der_child(kids, 0xa6)                      # [6] error-code
+        if ec is not None:
+            ev['error_code'] = _der_first_int(ec)
+        cn = _der_child(kids, 0xa8)                      # [8] cname
+        ev['cname'] = _krb_princ(cn) if cn else []
+    return ev
+
+
+def _krb_parse_packets(packets):
+    """Extract Kerberos KDC events from scapy packets (tcp/udp port 88). Each event also
+    records src/dst and which side is the KDC, for known-KDC baselining."""
+    from scapy.all import IP, IPv6, UDP, TCP, Raw
+    events = []
+    for pk in packets:
+        ipl = pk.getlayer(IP) or pk.getlayer(IPv6)
+        if ipl is None or not pk.haslayer(Raw):
+            continue
+        l4 = pk.getlayer(TCP) or pk.getlayer(UDP)
+        if l4 is None:
+            continue
+        if l4.sport not in _KRB_PORTS and l4.dport not in _KRB_PORTS:
+            continue
+        try:
+            ev = _krb_parse_message(bytes(pk.getlayer(Raw).load))
+        except Exception:
+            ev = None
+        if not ev:
+            continue
+        from_kdc = l4.sport in _KRB_PORTS
+        ev['src'], ev['dst'] = ipl.src, ipl.dst
+        ev['kdc'] = ipl.src if from_kdc else ipl.dst
+        events.append(ev)
+    return events
+
+
+def _krb_etype_names(etypes):
+    return [_KRB_ETYPE_NAMES.get(e, str(e)) for e in etypes]
+
+
+def _krb_analyze(krb_events, baseline, learn=True):
+    """Pure classifier over parsed Kerberos events (separated from capture for the
+    self-test). Flags downgrade / kerberoast / AS-REP roast. May learn known KDC IPs +
+    realms into `baseline`, but never suppresses an attack verdict with them."""
+    PRIORITY = ['kerberoast', 'asrep-roast', 'krb-downgrade', 'krb-exposure', 'clean']
+    verdict = 'clean'
+    reasons, findings = [], []
+
+    def bump(v):
+        nonlocal verdict
+        if PRIORITY.index(v) < PRIORITY.index(verdict):
+            verdict = v
+
+    kdcs, realms = set(), set()
+    counts = {'as-req': 0, 'as-rep': 0, 'tgs-req': 0, 'tgs-rep': 0, 'krb-error': 0}
+    nopreauth_clients = set()          # cnames that sent an AS-REQ without pre-auth
+    etype_nosupp = 0
+
+    for e in krb_events:
+        counts[e['kind']] = counts.get(e['kind'], 0) + 1
+        if e.get('kdc'):
+            kdcs.add(e['kdc'])
+        if e.get('realm'):
+            realms.add(e['realm'])
+        cname = '/'.join(e['cname']) if e['cname'] else ''
+        sname = '/'.join(e['sname']) if e['sname'] else ''
+        et = e['etypes']
+        has_aes = any(x in _KRB_AES for x in et)
+        weak = [x for x in et if x in _KRB_WEAK]
+
+        # A request offering only weak etypes (no AES at all) is an AES-stripped
+        # downgrade — client-side AES disabled or an on-path etype strip.
+        only_weak = bool(et) and not has_aes and all(x in _KRB_WEAK for x in et)
+
+        if e['kind'] == 'as-req':
+            preauth = _KRB_PA_ENC_TIMESTAMP in e['padata']
+            if not preauth and cname:
+                nopreauth_clients.add(cname)
+            # No pre-auth + RC4 requested is the AS-REP-roasting request signature.
+            if not preauth and any(x in _KRB_RC4 for x in et):
+                bump('asrep-roast')
+                findings.append({'type': 'asrep-roast', 'principal': cname,
+                                 'etypes': _krb_etype_names(et)})
+                reasons.append(
+                    f"AS-REP roast: AS-REQ for '{cname or '?'}' with no pre-auth "
+                    f"requesting RC4 — the account likely has 'do not require "
+                    f"Kerberos preauthentication'; its AS-REP is an offline-crackable "
+                    f"hash (Rubeus/GetNPUsers). Require pre-auth on every account")
+            elif only_weak:
+                bump('krb-downgrade')
+                findings.append({'type': 'downgrade', 'principal': cname,
+                                 'etypes': _krb_etype_names(et)})
+                reasons.append(
+                    f"Downgrade: AS-REQ for '{cname or '?'}' offers only weak "
+                    f"encryption ({', '.join(_krb_etype_names(et))}) with no AES — AES "
+                    f"appears stripped/disabled on the client")
+        elif e['kind'] == 'tgs-req':
+            is_service = sname and not sname.lower().startswith('krbtgt')
+            if is_service and et and any(x in _KRB_RC4 for x in et) and not has_aes:
+                bump('kerberoast')
+                findings.append({'type': 'kerberoast', 'principal': cname,
+                                 'sname': sname, 'etypes': _krb_etype_names(et)})
+                reasons.append(
+                    f"Kerberoast: TGS-REQ for service '{sname}' forcing RC4 (etype 23, "
+                    f"no AES offered) — the returned service ticket is encrypted with "
+                    f"the service account's RC4 key and crackable offline "
+                    f"(Rubeus/GetUserSPNs). Set AES-only + a long managed password on "
+                    f"the account")
+            elif is_service and weak:
+                bump('krb-exposure')
+                findings.append({'type': 'weak-etype', 'sname': sname,
+                                 'etypes': _krb_etype_names(et)})
+                reasons.append(
+                    f"TGS-REQ for '{sname}' still offers weak encryption "
+                    f"({', '.join(_krb_etype_names(weak))}) alongside AES — legacy "
+                    f"etypes remain enabled and can be forced by a roaster")
+            elif only_weak:                              # TGT (krbtgt) request, AES-less
+                bump('krb-downgrade')
+                findings.append({'type': 'downgrade', 'principal': cname,
+                                 'sname': sname, 'etypes': _krb_etype_names(et)})
+                reasons.append(
+                    f"Downgrade: TGS-REQ for '{sname or '?'}' offers only weak "
+                    f"encryption ({', '.join(_krb_etype_names(et))}) with no AES — AES "
+                    f"appears stripped/disabled on the client")
+        elif e['kind'] in ('as-rep', 'tgs-rep'):
+            re_ = e['rep_etype']
+            if e['kind'] == 'as-rep' and cname and cname in nopreauth_clients:
+                bump('asrep-roast')
+                findings.append({'type': 'asrep-roast', 'principal': cname,
+                                 'etypes': _krb_etype_names([re_] if re_ else [])})
+                reasons.append(
+                    f"AS-REP roast: the KDC returned an AS-REP for '{cname}' whose "
+                    f"AS-REQ carried no pre-auth — the encrypted part is an "
+                    f"offline-crackable hash")
+            if re_ in _KRB_RC4:
+                bump('krb-downgrade')
+                findings.append({'type': 'downgrade', 'principal': cname,
+                                 'etypes': _krb_etype_names([re_])})
+                reasons.append(
+                    f"Downgrade: the KDC issued an RC4 ({_KRB_ETYPE_NAMES.get(re_)}) "
+                    f"ticket to '{cname or '?'}' — weak encryption in real use; "
+                    f"enable/enforce AES on the account and KDC")
+            elif re_ in _KRB_DES:
+                bump('krb-downgrade')
+                findings.append({'type': 'downgrade', 'principal': cname,
+                                 'etypes': _krb_etype_names([re_])})
+                reasons.append(
+                    f"Downgrade: the KDC issued a DES/3DES ({_KRB_ETYPE_NAMES.get(re_)})"
+                    f" ticket to '{cname or '?'}' — broken encryption; disable DES and "
+                    f"enforce AES")
+        elif e['kind'] == 'krb-error':
+            if e['error_code'] == 14:                    # KDC_ERR_ETYPE_NOSUPP
+                etype_nosupp += 1
+
+    if etype_nosupp:
+        reasons.append(
+            f"{etype_nosupp} KDC_ERR_ETYPE_NOSUPP error(s) — a client requested an "
+            f"encryption type the KDC would not grant (possible etype probing)")
+
+    known_kdcs = set(baseline.get('kdcs') or [])
+    known_realms = set(baseline.get('krb_realms') or [])
+    learned = False
+    if learn and 'kdcs' not in baseline and (kdcs or realms):
+        baseline['kdcs'] = sorted(kdcs)
+        baseline['krb_realms'] = sorted(realms)
+        known_kdcs, known_realms = set(kdcs), set(realms)
+        learned = True
+
+    advisories = []
+    if krb_events:
+        advisories.append(
+            "Kerberos hardening: set msDS-SupportedEncryptionTypes to AES-only "
+            "(remove RC4/DES) on accounts and DCs, require Kerberos pre-authentication "
+            "on every account, and give service accounts (gMSA) long random passwords "
+            "so a captured RC4 ticket can't be cracked.")
+
+    return {
+        'verdict': verdict,
+        'reasons': reasons,
+        'learned': learned,
+        'advisories': advisories,
+        'kerberos': {
+            'verdict': verdict,
+            'kdcs': [{'ip': ip, 'known': ip in known_kdcs} for ip in sorted(kdcs)],
+            'realms': sorted(realms),
+            'new_kdc': sorted(kdcs - known_kdcs) if known_kdcs else [],
+            'counts': counts,
+            'findings': findings[:24],
+            'errors': counts.get('krb-error', 0),
+        },
+    }
+
+
+# Unified severity across the SMB/name-res and Kerberos verdict vocabularies, so one
+# combined banner can show the worst finding from either leg.
+_SMB_SEVERITY = {
+    'clean': 0, 'name-exposure': 2, 'smbv1-offered': 3, 'krb-exposure': 3,
+    'krb-downgrade': 4, 'spoof-conflict': 5, 'smbv1-active': 6, 'poisoning': 7,
+    'asrep-roast': 7, 'kerberoast': 8,
+}
+
+
+def _smb_worse_verdict(a, b):
+    return a if _SMB_SEVERITY.get(a, 0) >= _SMB_SEVERITY.get(b, 0) else b
+
+
 def _smb_capture(interface, seconds):
     """Capture SMB + name-resolution traffic to a temp pcap via tcpdump -w, and return
     (pcap_path, error). Scapy then dissects it (tcpdump can't decode these)."""
@@ -7701,12 +8086,15 @@ def _smb_capture(interface, seconds):
         return None, ('python3-scapy is required to parse SMB / name-resolution '
                       'traffic — install Scapy (Detector Self-Test → Install Scapy).')
     bpf = ('(tcp port 445 or tcp port 139) or (udp port 5355 or udp port 5353 or '
-           'udp port 137)')
+           'udp port 137) or (tcp port 88 or udp port 88)')
     import tempfile
     fd, path = tempfile.mkstemp(suffix='.pcap')
     os.close(fd)
+    # 2048-byte snaplen: SMB magic + name-res fit easily, and it captures the Kerberos
+    # KDC-REQ-BODY (etype list / SPN) even in a TGS-REQ, whose embedded TGT would push
+    # those fields past a 512 snaplen. The tolerant DER walker still copes if truncated.
     res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-nn', '-p',
-                '-s', '512', '-c', '20000', '-w', path, bpf], timeout=seconds + 8)
+                '-s', '2048', '-c', '20000', '-w', path, bpf], timeout=seconds + 8)
     if (os.path.getsize(path) <= 24 and res['err']
             and ('permission' in res['err'].lower() or "couldn't" in res['err'].lower()
                  or 'no such device' in res['err'].lower()
@@ -7720,9 +8108,10 @@ def _smb_capture(interface, seconds):
 
 
 def do_smb_watch(interface=None, seconds=20, learn=True):
-    """Passive SMBv1 + LLMNR/NBT-NS/mDNS-poisoning scanner (detection-only). One
-    capture; classifies SMBv1 use and Responder-style name-resolution poisoning.
-    Learns accepted mDNS responders + known SMBv1 hosts on first run."""
+    """Passive SMBv1 + LLMNR/NBT-NS/mDNS-poisoning + Kerberos-downgrade scanner
+    (detection-only). One capture; classifies SMBv1 use, Responder-style name-resolution
+    poisoning, and Kerberos downgrade / kerberoasting / AS-REP roasting. Learns accepted
+    mDNS responders, known SMBv1 hosts, and known KDCs/realms on first run."""
     iface = interface if _valid_iface(interface or '') else _default_route_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
@@ -7747,12 +8136,30 @@ def do_smb_watch(interface=None, seconds=20, learn=True):
             pass
 
     smb_events, nameres = _smb_parse_packets(packets)
+    krb_events = _krb_parse_packets(packets)
 
     with _smb_watch_lock:
         baseline = _smb_watch_load()
         result = _smb_analyze(smb_events, nameres, seconds, baseline, learn=learn)
-        if result.get('learned'):
+        krb = _krb_analyze(krb_events, baseline, learn=learn)
+        if result.get('learned') or krb.get('learned'):
             _smb_watch_save(baseline)
+            result['learned'] = bool(result.get('learned') or krb.get('learned'))
+
+        # Fold the Kerberos leg into the combined result. Overall verdict is the more
+        # severe of the SMB/name-res verdict and the Kerberos verdict.
+        result['smb_verdict'] = result['verdict']
+        result['kerberos'] = krb['kerberos']
+        result['verdict'] = _smb_worse_verdict(result['verdict'], krb['verdict'])
+        if krb['reasons']:
+            base = result['reasons']
+            if base == ['No SMB or LLMNR/NBT-NS/mDNS traffic seen on this segment'] or \
+               base == ['No SMBv1 and no name-resolution poisoning detected '
+                        '(SMB2/3 + legit mDNS only)']:
+                base = []
+            result['reasons'] = base + krb['reasons']
+        result['advisories'] = (result.get('advisories') or []) + krb['advisories']
+
         if result['verdict'] != 'clean':
             b = _smb_watch_load()
             evs = b.get('events') or []
@@ -7763,7 +8170,8 @@ def do_smb_watch(interface=None, seconds=20, learn=True):
 
     result['interface'] = iface
     result['seconds'] = seconds
-    result['packet_count'] = len(smb_events) + len(nameres)
+    result['packet_count'] = len(smb_events) + len(nameres) + len(krb_events)
+    result['krb_count'] = len(krb_events)
     return result
 
 
@@ -7871,6 +8279,96 @@ def _smb_selftest():
     scenarios.append({'name': 'smb-parse', 'expect': 'llmnr-wpad/smbv1-resp',
                       'got': f"name={llmnr_ev.get('name')} v={smb_ev.get('version')}",
                       'pass': p_ok})
+
+    # ---- Kerberos (Part 3): hand-crafted DER through the byte walker + analyzer ----
+    # Minimal DER encoders — no scapy Kerberos layer needed, which also lets us build a
+    # deliberately truncated TGS-REQ to prove the walker tolerates snaplen cut-offs.
+    def _el(n):
+        if n < 0x80:
+            return bytes([n])
+        b = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+        return bytes([0x80 | len(b)]) + b
+
+    def _tlv(tag, c):
+        return bytes([tag]) + _el(len(c)) + c
+
+    def _int(v):
+        b = v.to_bytes(max(1, (v.bit_length() + 8) // 8), 'big', signed=v < 0)
+        return _tlv(0x02, b)
+
+    def _gs(s):
+        return _tlv(0x1b, s.encode())
+
+    def _ctx(n, c):
+        return _tlv(0xa0 | n, c)
+
+    def _princ(parts):
+        ns = _tlv(0x30, b''.join(_gs(p) for p in parts))
+        return _tlv(0x30, _ctx(0, _int(1)) + _ctx(1, ns))
+
+    def _etypes(lst):
+        return _tlv(0x30, b''.join(_int(e) for e in lst))
+
+    def as_req(cname, sname, realm, etypes, pa):
+        pad = b''.join(_tlv(0x30, _ctx(1, _int(t)) + _ctx(2, _tlv(0x04, b'\x00')))
+                       for t in pa)
+        body = _tlv(0x30, _ctx(0, _tlv(0x03, b'\x00' * 5)) + _ctx(1, _princ(cname))
+                    + _ctx(2, _gs(realm)) + _ctx(3, _princ(sname)) + _ctx(7, _int(9))
+                    + _ctx(8, _etypes(etypes)))
+        inner = _ctx(1, _int(5)) + _ctx(2, _int(10)) \
+            + (_ctx(3, _tlv(0x30, pad)) if pad else b'') + _ctx(4, body)
+        return _tlv(0x6a, _tlv(0x30, inner))
+
+    def tgs_req(sname, realm, etypes, tgt=800):
+        body = _tlv(0x30, _ctx(0, _tlv(0x03, b'\x00' * 5)) + _ctx(2, _gs(realm))
+                    + _ctx(3, _princ(sname)) + _ctx(7, _int(9))
+                    + _ctx(8, _etypes(etypes)))
+        pad = _tlv(0x30, _tlv(0x30, _ctx(1, _int(1))          # big PA-TGS-REQ (a TGT)
+                    + _ctx(2, _tlv(0x04, b'\x00' * tgt))))
+        inner = _ctx(1, _int(5)) + _ctx(2, _int(12)) + _ctx(3, pad) + _ctx(4, body)
+        return _tlv(0x6c, _tlv(0x30, inner))
+
+    def as_rep(cname, realm, etype):
+        ep = _ctx(6, _tlv(0x30, _ctx(0, _int(etype)) + _ctx(2, _tlv(0x04, b'\x00' * 8))))
+        inner = _ctx(0, _int(5)) + _ctx(1, _int(11)) + _ctx(3, _gs(realm)) \
+            + _ctx(4, _princ(cname)) + _ctx(5, _tlv(0x61, _tlv(0x30, b''))) + ep
+        return _tlv(0x6b, _tlv(0x30, inner))
+
+    def krun(name, raws, expect):
+        evs = [e for e in (_krb_parse_message(r) for r in raws) if e]
+        for e in evs:                                    # attach a KDC for realism
+            e.setdefault('kdc', '10.0.0.1')
+        res = _krb_analyze(evs, {}, learn=False)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(evs), 'pass': ok})
+        return res
+
+    # clean: AES request with pre-auth, AES ticket back.
+    krun('krb-clean', [as_req(['alice'], ['krbtgt', 'CORP'], 'CORP', [18, 17], [2]),
+                       as_rep(['alice'], 'CORP', 18)], 'clean')
+    # kerberoast: TGS-REQ for a service SPN forcing RC4-only.
+    krun('krb-kerberoast', [tgs_req(['MSSQLSvc', 'db01.corp'], 'CORP', [23])],
+         'kerberoast')
+    # asrep-roast: no-preauth AS-REQ requesting RC4.
+    krun('krb-asrep-roast', [as_req(['svc_web'], ['krbtgt', 'CORP'], 'CORP', [23], [])],
+         'asrep-roast')
+    # downgrade: KDC hands back an RC4 ticket for a normally-pre-authing client.
+    krun('krb-downgrade', [as_req(['bob'], ['krbtgt', 'CORP'], 'CORP', [18], [2]),
+                           as_rep(['bob'], 'CORP', 23)], 'krb-downgrade')
+    # exposure: service TGS-REQ still offering RC4 alongside AES.
+    krun('krb-exposure', [tgs_req(['HTTP', 'web01.corp'], 'CORP', [18, 23])],
+         'krb-exposure')
+
+    # krb-parse: a TGS-REQ whose etype/SPN sit past a 400-byte truncation still yields
+    # the message kind, and the full packet yields the SPN + RC4 etype.
+    full = tgs_req(['MSSQLSvc', 'db01.corp'], 'CORP', [23], tgt=900)
+    tev, fev = _krb_parse_message(full[:400]), _krb_parse_message(full)
+    kp_ok = (tev and tev['kind'] == 'tgs-req' and fev
+             and fev['sname'] == ['MSSQLSvc', 'db01.corp'] and fev['etypes'] == [23])
+    scenarios.append({'name': 'krb-parse', 'expect': 'tgs-req/MSSQLSvc/rc4',
+                      'got': f"trunc={tev and tev['kind']} sname={fev and fev['sname']}",
+                      'pass': bool(kp_ok)})
 
     passed = all(s['pass'] for s in scenarios)
     scapy_result = {'ran': True, 'pass': passed,
@@ -13811,7 +14309,8 @@ def _cli(argv=None):
     rlst = sub.add_parser('relay-selftest', help='self-test the relay/coercion detectors (no root)')
     rlst.add_argument('--json', action='store_true', help='emit JSON')
 
-    sm = sub.add_parser('smb-watch', help='passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning scan')
+    sm = sub.add_parser('smb-watch',
+                        help='passive SMBv1 + LLMNR/NBT-NS/mDNS poisoning + Kerberos downgrade scan')
     sm.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     sm.add_argument('--seconds', '-s', type=int, default=20, help='capture window (5-50)')
     sm.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
@@ -14320,10 +14819,12 @@ def _cli(argv=None):
         else:
             smb = r.get('smb', {})
             nr = r.get('nameres', {})
+            krb = r.get('kerberos', {})
             print(f"SMB Watch [{r['interface']}] {r['seconds']}s: {r['verdict'].upper()}  "
                   f"(SMBv1 servers: {len(smb.get('v1_servers', []))}, "
                   f"SMB2/3 pkts: {smb.get('v2_count', 0)}; "
-                  f"name-res responders: {len(nr.get('responders', []))})")
+                  f"name-res responders: {len(nr.get('responders', []))}; "
+                  f"Kerberos msgs: {sum((krb.get('counts') or {}).values())})")
             if r.get('learned'):
                 print("  (baseline learned this run)")
             for s in smb.get('v1_servers', []):
@@ -14335,6 +14836,16 @@ def _cli(argv=None):
             q = nr.get('queries', {})
             print(f"  queries: LLMNR {q.get('llmnr', 0)}, NBT-NS {q.get('nbtns', 0)}, "
                   f"mDNS {q.get('mdns', 0)}")
+            if krb.get('kdcs'):
+                kdcs = ', '.join(k['ip'] + (' known' if k['known'] else ' NEW')
+                                 for k in krb['kdcs'])
+                print(f"  KDCs: {kdcs}"
+                      + (f"  realms: {', '.join(krb['realms'])}" if krb.get('realms')
+                         else ''))
+            for f in krb.get('findings', []):
+                et = '/'.join(f.get('etypes') or []) or '-'
+                who = f.get('sname') or f.get('principal') or '?'
+                print(f"  KRB {f['type']}: {who} [{et}]")
             for rs in r.get('reasons', []):
                 print(f"  - {rs}")
         return 0 if r.get('success') else 1

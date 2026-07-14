@@ -1123,9 +1123,10 @@ switches, plus pinning your real root/backup-root to priority 0/4096. **API:**
 `stp-selftest`.
 
 ### SMB Watch
-A **passive** Windows-endpoint attack-surface scanner in two parts (one capture),
-**detection-only**. It targets the two most common internal-network findings, which
-share one kill chain (**Responder → NTLM → SMB relay**).
+A **passive** Windows-endpoint attack-surface scanner in three parts (one capture),
+**detection-only**. Parts 1–2 target the two most common internal-network findings,
+which share one kill chain (**Responder → NTLM → SMB relay**); Part 3 adds a
+**Kerberos downgrade / roasting** watch over the same capture.
 
 **Part 1 — SMBv1.** SMBv1 is the deprecated (2014) SMB dialect and the **EternalBlue /
 WannaCry / NotPetya (MS17-010)** vector — disabled by default on modern Windows but
@@ -1151,15 +1152,40 @@ poisoner. What it flags:
 - **name-exposure** — LLMNR/NBT-NS queries present at all: hosts are one Responder
   away from credential theft; disable via GPO.
 
-Capture is done by `tcpdump -w` into a pcap (SMB tcp/445+139, LLMNR/NBT-NS/mDNS) and
-**dissected with Scapy** — modern tcpdump no longer decodes SMB and never decoded
-LLMNR/NBT-NS, so Scapy is required (Detector Self-Test → **Install Scapy**). The first
-scan **learns** the accepted mDNS responders (printers/Macs announcing themselves) and
-any SMBv1 hosts as the baseline (`data/smb_watch.json`); LLMNR/NBT-NS answers are
+**Part 3 — Kerberos downgrade / roasting (tcp+udp 88).** The same capture also reads
+Kerberos KDC traffic. Kerberos is ASN.1/DER; the fields a passive downgrade watch needs
+(message type, requested/issued **etypes**, the service **SPN**, and whether an AS-REQ
+carried **PA-ENC-TIMESTAMP** pre-auth) all sit near the start of each message, so a
+small tolerant DER walker reads them straight off the wire — no full dissector, and it
+keeps working on packets truncated by the capture snaplen. What it flags:
+
+- **kerberoast** — a **TGS-REQ** for a service SPN (`sname` ≠ `krbtgt`) that forces
+  **RC4** (etype 23) with no AES offered, so the returned service ticket is encrypted
+  with the account's RC4 key and **crackable offline** (Rubeus / `GetUserSPNs`); also a
+  KDC that actually **issues** an RC4 service ticket. *Fix:* AES-only + long/gMSA
+  passwords on service accounts.
+- **asrep-roast** — an **AS-REQ with no pre-auth** (the account has *"do not require
+  Kerberos preauthentication"*), especially one answered by an **AS-REP** — the AS-REP
+  is an offline-crackable hash (`GetNPUsers`). *Fix:* require pre-auth on every account.
+- **krb-downgrade** — the KDC actually **issues a DES/RC4 ticket** (weak encryption in
+  real use), or a client offers **only** weak etypes (AES stripped/disabled).
+- **krb-exposure** — RC4/DES still **enabled alongside** AES (legacy encryption that a
+  roaster can force).
+
+Kerberos attack verdicts are **never** baselined away; the baseline only remembers the
+**known KDC IPs + realms** to annotate output (a *new* KDC is called out).
+
+Capture is done by `tcpdump -w` into a pcap (SMB tcp/445+139, LLMNR/NBT-NS/mDNS,
+Kerberos tcp+udp/88) and **dissected with Scapy** — modern tcpdump no longer decodes SMB
+and never decoded LLMNR/NBT-NS, so Scapy is required (Detector Self-Test → **Install
+Scapy**). The first scan **learns** the accepted mDNS responders (printers/Macs
+announcing themselves), any SMBv1 hosts, and the Kerberos KDCs/realms as the baseline
+(`data/smb_watch.json`); LLMNR/NBT-NS answers and Kerberos downgrade/roasting are
 **never** baselined away. The hardening it nudges toward: disable SMBv1, turn off
-LLMNR (GPO) and NBT-NS (per-adapter / DHCP option 001), and enforce **SMB signing** so
-captured NTLM can't be relayed. **API:** `GET /api/net/smb-watch`,
-`POST /api/net/smb-baseline`. **CLI:** `smb-watch`, `smb-selftest`.
+LLMNR (GPO) and NBT-NS (per-adapter / DHCP option 001), enforce **SMB signing** so
+captured NTLM can't be relayed, and set accounts/DCs to **AES-only** Kerberos with
+pre-auth required. **API:** `GET /api/net/smb-watch`, `POST /api/net/smb-baseline`.
+**CLI:** `smb-watch`, `smb-selftest`.
 
 ### Relay/Coercion Watch
 A **passive** NTLM-relay + authentication-coercion scanner — the **defensive

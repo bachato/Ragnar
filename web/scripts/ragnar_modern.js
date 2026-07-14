@@ -5762,13 +5762,23 @@ async function relayTrustBaseline() {
 
 // ---- SMB Watch (SMBv1 + LLMNR/NBT-NS/mDNS poisoning / Responder) ------------
 const _SMB_VERDICT_STYLE = {
-    clean:            ['bg-green-950/40 border-green-900 text-green-400', '✓ No SMBv1 and no name-resolution poisoning'],
+    clean:            ['bg-green-950/40 border-green-900 text-green-400', '✓ No SMBv1, name-resolution poisoning, or Kerberos downgrade'],
     'name-exposure':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ LLMNR/NBT-NS in use — hosts are exposed to Responder poisoning'],
     'smbv1-offered':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ SMBv1 offered in negotiation — disable the fallback'],
+    'krb-exposure':   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Kerberos: weak (RC4/DES) encryption still enabled alongside AES'],
+    'krb-downgrade':  ['bg-red-950/60 border-red-800 text-red-300', '🛑 KERBEROS DOWNGRADE — a DES/RC4 ticket issued or AES stripped from a client'],
     'spoof-conflict': ['bg-red-950/60 border-red-800 text-red-300', '🛑 Conflicting name answers — a poisoner racing the real owner'],
     'smbv1-active':   ['bg-red-950/60 border-red-800 text-red-300', '🛑 SMBv1 in active use — EternalBlue/WannaCry (MS17-010) vector'],
     poisoning:        ['bg-red-950/60 border-red-800 text-red-300', '🛑 NAME POISONING — a host is answering LLMNR/NBT-NS (Responder/Inveigh)'],
+    'asrep-roast':    ['bg-red-950/60 border-red-800 text-red-300', '🛑 AS-REP ROASTING — a Kerberos account with no pre-auth (offline-crackable hash)'],
+    kerberoast:       ['bg-red-950/60 border-red-800 text-red-300', '🛑 KERBEROASTING — a TGS-REQ forcing RC4 on a service SPN (crackable service ticket)'],
     unknown:          ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+const _KRB_FINDING_STYLE = {
+    kerberoast:    'text-red-300',
+    'asrep-roast': 'text-red-300',
+    downgrade:     'text-red-300',
+    'weak-etype':  'text-amber-300',
 };
 function _smbFillIfaces() {
     const sel = document.getElementById('smb-iface');
@@ -5809,7 +5819,9 @@ async function runSmbWatch() {
         const [cls, label] = _SMB_VERDICT_STYLE[d.verdict] || _SMB_VERDICT_STYLE.unknown;
         const smb = d.smb || {}, nr = d.nameres || {}, q = nr.queries || {};
         let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
-        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · SMBv1 servers: ${(smb.v1_servers || []).length}, SMB2/3 pkts: ${smb.v2_count || 0} · responders: ${(nr.responders || []).length} · queries L${q.llmnr || 0}/N${q.nbtns || 0}/m${q.mdns || 0}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
+        const _kc = (d.kerberos || {}).counts || {};
+        const _kt = Object.values(_kc).reduce((a, b) => a + (b || 0), 0);
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · SMBv1 servers: ${(smb.v1_servers || []).length}, SMB2/3 pkts: ${smb.v2_count || 0} · responders: ${(nr.responders || []).length} · queries L${q.llmnr || 0}/N${q.nbtns || 0}/m${q.mdns || 0} · Kerberos msgs: ${_kt}${d.learned ? ' · <span class="text-gray-400">baseline learned now</span>' : ''}</p>`;
         if ((smb.v1_servers || []).length) {
             html += '<p class="text-xs uppercase text-gray-400 mt-2 mb-1">SMBv1 servers</p>' +
                 '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
@@ -5846,6 +5858,34 @@ async function runSmbWatch() {
         (nr.conflicts || []).forEach(c => {
             html += `<div class="mt-2 px-3 py-2 rounded border text-xs text-red-300 border-red-800 bg-red-950/40">Name <span class="font-mono">${escapeHtml(c.name)}</span> answered with conflicting IPs: <span class="font-mono">${escapeHtml((c.answers || []).join(', '))}</span></div>`;
         });
+        const krb = d.kerberos || {};
+        const kc = krb.counts || {};
+        const krbTotal = Object.values(kc).reduce((a, b) => a + (b || 0), 0);
+        if (krbTotal || (krb.kdcs || []).length) {
+            html += `<p class="text-xs uppercase text-gray-400 mt-3 mb-1">Kerberos (KDC tcp+udp/88)</p>`;
+            html += `<p class="text-xs text-gray-500 mb-1">AS-REQ ${kc['as-req'] || 0} · AS-REP ${kc['as-rep'] || 0} · TGS-REQ ${kc['tgs-req'] || 0} · TGS-REP ${kc['tgs-rep'] || 0} · errors ${krb.errors || 0}${(krb.realms || []).length ? ' · realms: ' + escapeHtml(krb.realms.join(', ')) : ''}</p>`;
+            if ((krb.kdcs || []).length) {
+                html += '<p class="text-xs text-gray-500 mb-1">KDCs: ' + krb.kdcs.map(k =>
+                    `<span class="font-mono ${k.known ? 'text-gray-400' : 'text-amber-300'}">${escapeHtml(k.ip)}${k.known ? '' : ' (new)'}</span>`).join(', ') + '</p>';
+            }
+            if ((krb.findings || []).length) {
+                html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                    '<tr class="text-left text-gray-500"><th class="px-2 py-1">Finding</th><th class="px-2 py-1">Principal / SPN</th><th class="px-2 py-1">Etypes</th></tr>' +
+                    '</thead><tbody>' +
+                    krb.findings.map(f => {
+                        const cls = _KRB_FINDING_STYLE[f.type] || 'text-gray-300';
+                        const who = f.sname || f.principal || '—';
+                        return `<tr class="border-t border-slate-800">
+                            <td class="px-2 py-1 ${cls}">${escapeHtml(f.type)}</td>
+                            <td class="px-2 py-1 font-mono">${escapeHtml(who)}</td>
+                            <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((f.etypes || []).join(', ') || '—')}</td>
+                        </tr>`;
+                    }).join('') +
+                    '</tbody></table>';
+            } else {
+                html += '<p class="text-xs text-green-400/80">No Kerberos downgrade, kerberoasting, or AS-REP roasting seen (AES only).</p>';
+            }
+        }
         if (d.reasons && d.reasons.length) {
             html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
                 d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
@@ -6683,7 +6723,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ndp: 'NDP Watch (IPv6 neighbor spoofing)', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', cert: 'Cert Watch', tls: 'TLS Watch (passive JA4/QUIC)', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', cdp: 'CDP Watch (Cisco Discovery leak/flood)', vtp: 'VTP Watch (VTP bomb / VLAN-DB wipe)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ndp: 'NDP Watch (IPv6 neighbor spoofing)', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', cert: 'Cert Watch', tls: 'TLS Watch (passive JA4/QUIC)', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning + Kerberos downgrade)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', cdp: 'CDP Watch (Cisco Discovery leak/flood)', vtp: 'VTP Watch (VTP bomb / VLAN-DB wipe)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
