@@ -39,9 +39,11 @@ stack — web UI, recon tooling, the WiFi Spectrum Analyzer, and WiFi Defense
 1. Stack the **Ethernet/USB HAT** on the Pi's 40-pin header (it passes the header
    through), then mount the **1.44" LCD HAT** on top. Confirm both share the GPIO
    pins cleanly — the LCD HAT uses SPI + a handful of GPIOs for its keys/joystick.
-2. Plug the **Alfa AWUS036AXM** into the Ethernet/USB HAT's USB-A port.
-3. Connect the RJ45 to your management network for the initial install and SSH.
-4. Enable **SPI** and **I2C** via `raspi-config` (needed for the LCD HAT), then
+   Connect the included micro USB bridge to the data micro USB port on the Pi and right
+   above it to the micro USB port on the Ethernet/USB hat. 
+3. Plug the **Alfa AWUS036AXM** into the Ethernet/USB HAT's USB-A port.
+4. Connect the RJ45 to your management network for the initial install and SSH.
+5. Enable **SPI** and **I2C** via `raspi-config` (needed for the LCD HAT), then
    run the installer — see [INSTALL.md](INSTALL.md).
 
 ## Software configuration
