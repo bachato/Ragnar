@@ -1416,15 +1416,33 @@ off-subnet traffic now flows through them (Yersinia, Loki, `scapy`). What it fla
   the enabler; the fix is MD5/HMAC (HSRP key-chains, VRRP AH) plus filtering FHRP
   multicast off access ports.
 
-The first scan **learns** the current groups and their active speakers/priorities
-as the trusted baseline (`data/fhrp_watch.json`); after a legitimate router or
-priority change, click **Trust current** to re-learn. HSRP and VRRP are fully
-decoded (priority-based detection); GLBP and CARP are best-effort (new-speaker
-presence, since `tcpdump` doesn't dissect GLBP). The BPF is
-`(udp and (port 1985 or port 3222)) or (ip proto 112) or (ip6 proto 112)`. Put the
-Pi on the routed VLAN or a SPAN/mirror to see the hellos. **API:**
-`GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline`. **CLI:** `fhrp-watch`,
-`fhrp-selftest`.
+**GLBP gets its own decoder and two hijack planes.** Neither `tcpdump` nor Scapy
+dissects GLBP, so it is decoded by a **hand-rolled byte parser** (per the Wireshark
+GLBP dissector: a 12-byte header then type/length/value TLVs — Hello, Virtual
+Forwarder, Auth). GLBP splits the gateway job across **two independent elections**,
+so it has two distinct hijacks:
+
+- **AVG (Active Virtual Gateway)** — one router owns the vIP and, crucially, decides
+  which virtual MAC each host is handed. Seizing it (a winning Hello priority) is a
+  takeover **worse than HSRP**: the attacker chooses *who* to MITM. This reuses the
+  priority rules above (surfaces as **hijack**).
+- **AVF (Active Virtual Forwarder)** — up to four AVFs each own a virtual MAC and
+  forward a slice of the hosts. **glbp-avf-hijack** fires when a non-baseline speaker
+  goes **Active** for a forwarder (or the same vMAC re-homes to a new source): it
+  quietly captures that forwarder's slice while the AVG election stays
+  healthy-looking — the stealthiest FHRP takeover. **glbp-weight-skew** fires when a
+  forwarder's advertised **weight** shifts far enough to steer which hosts route
+  through it (selective capture without an election change).
+
+The first scan **learns** the current groups, their active speakers/priorities, and
+the **GLBP forwarders** (owner, vMAC, weight per group/forwarder) as the trusted
+baseline (`data/fhrp_watch.json`); after a legitimate router/priority/forwarder
+change, click **Trust current** to re-learn. Capture is done to a pcap (BPF
+`(udp and (port 1985 or port 3222)) or (ip proto 112) or (ip6 proto 112)`), replayed
+through `tcpdump -r … -v` for the HSRP/VRRP/CARP parse and byte-decoded with Scapy
+for GLBP; CARP stays best-effort. Put the Pi on the routed VLAN or a SPAN/mirror to
+see the hellos. **API:** `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline`.
+**CLI:** `fhrp-watch`, `fhrp-selftest`.
 
 ### EIGRP Watch
 A **passive** routing-security scanner for Cisco's **EIGRP** — its interior gateway

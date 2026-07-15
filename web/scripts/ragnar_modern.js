@@ -6471,12 +6471,14 @@ async function eigrpTrustBaseline() {
 
 // ---- FHRP Watch (passive HSRP/VRRP/GLBP/CARP hijack scanner) ----------------
 const _FHRP_VERDICT_STYLE = {
-    clean:             ['bg-green-950/40 border-green-900 text-green-400', '✓ FHRP groups/speakers match the trusted baseline'],
-    'weak-auth':       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak / no FHRP authentication — a forged hello can win the election'],
-    'priority-change': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ A known FHRP speaker raised its priority — possible pre-takeover'],
-    'rogue-speaker':   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Unexpected FHRP speaker on the segment — not in the baseline'],
-    hijack:            ['bg-red-950/60 border-red-800 text-red-300', '🛑 FHRP HIJACK — a new speaker is winning the virtual-gateway election'],
-    unknown:           ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+    clean:              ['bg-green-950/40 border-green-900 text-green-400', '✓ FHRP groups/speakers/GLBP forwarders match the trusted baseline'],
+    'weak-auth':        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak / no FHRP authentication — a forged hello can win the election'],
+    'glbp-weight-skew': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ GLBP forwarder weight changed — load-share shift steers which hosts route through an AVF'],
+    'priority-change':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ A known FHRP speaker raised its priority — possible pre-takeover'],
+    'rogue-speaker':    ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Unexpected FHRP speaker on the segment — not in the baseline'],
+    'glbp-avf-hijack':  ['bg-red-950/60 border-red-800 text-red-300', '🛑 GLBP AVF HIJACK — a forwarder (vMAC) seized: stealth per-slice MITM while the gateway election looks healthy'],
+    hijack:             ['bg-red-950/60 border-red-800 text-red-300', '🛑 FHRP HIJACK — a new speaker is winning the virtual-gateway election'],
+    unknown:            ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
 };
 function _fhrpFillIfaces() {
     const sel = document.getElementById('fhrp-iface');
@@ -6535,6 +6537,27 @@ async function runFhrpWatch() {
                 }).join('') +
                 '</tbody></table>';
         });
+        if ((d.glbp_forwarders || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-3 mb-1">GLBP forwarder plane (AVF)</p>';
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Group/Fwd</th><th class="px-2 py-1">Owner</th><th class="px-2 py-1">vMAC</th><th class="px-2 py-1">VF prio</th><th class="px-2 py-1">Weight</th><th class="px-2 py-1">State</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>';
+            (d.glbp_forwarders || []).forEach(fwd => {
+                (fwd.owners || []).forEach(o => {
+                    const badge = o.baseline ? '<span class="text-green-400">✓ owner</span>' : '<span class="text-red-300">? new</span>';
+                    html += `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono">${fwd.group}/${fwd.forwarder}</td>
+                        <td class="px-2 py-1 font-mono ${o.baseline ? '' : 'text-red-300'}">${escapeHtml(o.src)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(o.vmac || '—')}</td>
+                        <td class="px-2 py-1 font-mono">${o.vf_priority == null ? '—' : o.vf_priority}</td>
+                        <td class="px-2 py-1 font-mono">${o.weight == null ? '—' : o.weight}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((o.states || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                });
+            });
+            html += '</tbody></table>';
+        }
         if (d.reasons && d.reasons.length) {
             html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
                 d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
