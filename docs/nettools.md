@@ -1500,6 +1500,9 @@ a SPAN/mirror to see EIGRP. The first scan **learns** the current routers and th
 advertised prefix→next-hop map as the baseline (`data/eigrp_watch.json`); after a
 legitimate topology change, click "Trust current". **API:** `GET /api/net/eigrp-watch`,
 `POST /api/net/eigrp-baseline`. **CLI:** `eigrp-watch`, `eigrp-selftest`.
+Validate it against **real** FRR EIGRP + injected attacks in an isolated
+network-namespace lab — see the [EIGRP FRR Namespace Lab](eigrp_lab.md)
+(`eigrp_lab.sh` + `eigrp_inject.py`).
 
 ### IS-IS Watch
 A **passive** routing-security scanner for **IS-IS** (ISO/IEC 10589) — the third
