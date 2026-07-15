@@ -71,11 +71,19 @@ USB using the **RuSense CSI Node Flasher** (Web Serial / esptool-js):
 
 1. Open the flasher page in **Chrome or Edge** (Web Serial isn't available in Firefox/Safari).
 2. Plug your ESP32 into a **data-capable** USB-C cable (charge-only cables won't work).
-3. Pick your board:
-   - **ESP32-S3** *(recommended, production)* — dual-core, 8 MB flash, the steadiest platform for live CSI.
-   - **ESP32-C6** *(Wi-Fi 6 research)* — RISC-V, 4 MB flash, dual-band 802.11ax for experiments.
+3. Pick your board. All ESP32-S3 variants live in one panel behind a **board dropdown**:
+   - **ESP32-S3-DevKitC-1 (N16R8)** *(recommended)* — headless, 16 MB flash. No display, so it
+     captures the full MGMT+DATA WiFi traffic — the best sensor for presence/motion/people-count.
+   - **Seeed XIAO ESP32S3** — thumbnail-sized (21 × 17.8 mm), 8 MB flash, headless (same full
+     capture as the DevKitC). **Attach the bundled U.FL antenna first** — without it the radio
+     hears nothing.
+   - **Seeed XIAO ESP32S3 Plus** — same tiny footprint with 16 MB flash, headless.
+   - **AMOLED display board** — 8 MB flash with an RM67162 screen; sensing is limited to a
+     single self-ping link, so prefer a headless board when the node's job is sensing.
+   - **ESP32-C6** *(Wi-Fi 6 research, separate panel)* — RISC-V, 4 MB flash, dual-band 802.11ax for experiments.
 4. Click **Forge**, select the `USB JTAG/serial debug unit` port, and let it flash.
-5. If the board isn't detected, hold **BOOT** while tapping **RST**, then retry.
+5. If the board isn't detected, hold **BOOT** while tapping **RST**, then retry. On the XIAO
+   boards those are the tiny **B** and **R** buttons — or hold **B** while plugging in the cable.
 6. **Provision WiFi** — flashing **erases** the node's saved config, so a fresh node
    falls back to wrong defaults and never connects. In the flasher's **🛰️ Provision
    WiFi** panel, enter your **2.4 GHz** SSID + password and your **Ragnar box's IP**
