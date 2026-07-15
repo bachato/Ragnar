@@ -16,9 +16,7 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 > **Co-authored by [Solarflere](https://www.instagram.com/solarflere).** The
 > Authority Verification suite was designed and built in collaboration with Solarflere.
 
-<img width="3375" height="5700" alt="image" src="https://github.com/user-attachments/assets/e8ab8188-56ed-4f43-9671-4b4cbf4efd3d" />
-
-
+<img width="2160" height="3648" alt="image" src="https://github.com/user-attachments/assets/94b9d369-ad1d-4eaa-add2-1447e381d429" />
 
 
 ### Tool index
@@ -399,18 +397,38 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
   transition, not every cycle, with a cooldown backstop). Active attacks
   (hijack / injection / poisoning / coercion / VLAN-hop / root-hijack …) page as
   **compromised**; posture/deviation findings (weak-auth, SMBv1, unsigned SMB,
-  name-exposure …) as **suspicious**.
+  name-exposure …) as **suspicious**. An already-alerted condition is
+  **remembered per check** — a run that comes back quiet (`unknown` /
+  `no-traffic`) does *not* re-arm the alert, so a finding the scanner only sees
+  on some cycles pages once, not on every sighting. It re-alerts only if the
+  check **escalates** (suspicious → compromised), if it stayed clean for 3
+  consecutive runs and then returned, or as a **daily reminder** while it
+  persists (`net_integrity_realert_hours`, default 24, `0` = never remind).
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
 STP · DTP · CDP · VTP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
-Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
-`tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
-cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
-several cycles, and each scanner self-noops cheaply when its protocol isn't on
-the segment. The dashboard shows every scanner's last-known verdict even on
-cycles it didn't run. Each scanner **learns its baseline on first sight**, so
-run the monitor on a trusted network first (or use each card's "Trust current").
+Relay/Coercion · NTP · ICMP · SNMP · Cert · TLS · LDAP. Because each of those
+does a short `tcpdump` capture, they're run a **round-robin batch at a time**
+(default 3 per cycle, configurable) so a cycle stays ~1 minute; a full sweep
+completes over several cycles, and each scanner self-noops cheaply when its
+protocol isn't on the segment. The dashboard shows every scanner's last-known
+verdict even on cycles it didn't run. Each scanner **learns its baseline on
+first sight**, so run the monitor on a trusted network first (or use each
+card's "Trust current").
+
+**Capture interface.** The capture-based scanners (and the DHCP Guardian check)
+listen on a **link-up wired port first** — the same auto used by the Switch &
+L2/L3 cards. That matters for the sensor deployment: Ragnar plugged into a
+switch port to watch it (mirror/SPAN or an isolated VLAN with no gateway) while
+managed over WiFi. The default route sits on `wlan0`, but STP/DTP/CDP/VTP/FHRP
+frames only exist on the cable — following the default route there would leave
+the monitor blind on the exact segment it's meant to watch. Pin a specific
+interface with the **capture on** selector (`net_integrity_interface`); with no
+wired link it falls back to the default-route interface. The path-scoped checks
+(DNS Doctor, RA-Guard posture) always test the host's actual traffic path, so
+they're unaffected. The status line shows which interface the last cycle
+captured on.
 
 **Off by default**, because it makes outbound DNS/DoH calls each cycle — opt in
 with the toggle. **Check now** runs the fast core immediately (works even while
@@ -419,7 +437,9 @@ the monitor is off); the extended scanners run on the background rotation.
 - Endpoint: `GET /api/net/integrity` · config: `net_integrity_monitor_enabled`,
   `net_integrity_interval_min`, `net_integrity_check_dhcp`,
   `net_integrity_extended_enabled`, `net_integrity_batch_size`,
-  `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`
+  `net_integrity_interface` (`''` = auto: wired link-up → default route),
+  `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`,
+  `net_integrity_realert_hours`
 
 ### Path MTU / Black-hole
 Discovers the **path MTU** to a target and flags an **MTU black hole** — a hop

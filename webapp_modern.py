@@ -1229,6 +1229,14 @@ _net_integrity_state = {
 }
 _net_integrity_rotation = 0       # round-robin cursor into the capture-based scanners
 
+# Per-check alert memory: key -> {'rank', 'ts', 'clean_streak'}. A finding is
+# alerted once; it must stay clean for _NI_CLEAN_RUNS_TO_RESET consecutive runs
+# of that check before it can alert again. Without this, a check that flaps
+# through 'unknown'/'no-traffic' (rank 0) between sightings re-arms the
+# transition edge and the same condition pages every few cycles.
+_ni_alert_memory = {}
+_NI_CLEAN_RUNS_TO_RESET = 3
+
 # Verdict severity. A check's verdict is CLEAN (0), a real posture/deviation finding
 # (1, "suspicious"), or an active attack (2, "compromised"). Anything not explicitly
 # clean-or-critical is treated as a rank-1 finding, so a new scanner's verdicts still
@@ -1266,6 +1274,13 @@ def _net_integrity_check_once():
     global _net_integrity_rotation
     cfg = shared_data.config
 
+    # Capture interface for the segment-scoped scanners: the configured pin
+    # (net_integrity_interface) or auto — a link-up wired port first, so a
+    # sensor plugged into a switch but managed over WiFi watches the cable,
+    # not wlan0 — falling back to the default-route interface.
+    mon_iface = str(cfg.get('net_integrity_interface') or '').strip() or None
+    cap_iface = nd._capture_iface(mon_iface)
+
     def watch(fn, **kw):
         try:
             r = fn(**kw)
@@ -1292,31 +1307,33 @@ def _net_integrity_check_once():
             ('arp', 'ARP', lambda: watch(nd.do_arp_check)),
             ('raguard', 'RA-Guard', lambda: watch(nd.do_raguard, action='check'))]
     if cfg.get('net_integrity_check_dhcp', True):
-        fast.append(('dhcp', 'DHCP', lambda: watch(nd.do_dhcp_guardian, quick=True)))
+        fast.append(('dhcp', 'DHCP', lambda: watch(nd.do_dhcp_guardian, quick=True,
+                                                   interface=cap_iface)))
 
     # Capture-based passive scanners — rotated a batch at a time so each cycle stays
-    # light. Each self-noops cheaply when its protocol isn't on the segment.
+    # light. Each self-noops cheaply when its protocol isn't on the segment. All
+    # capture on cap_iface (wired-preferred; see above).
     rotation = [
-        ('stp', 'STP', lambda: watch(nd.do_stp_watch)),
-        ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch)),
-        ('cdp', 'CDP', lambda: watch(nd.do_cdp_watch)),
-        ('vtp', 'VTP', lambda: watch(nd.do_vtp_watch)),
-        ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch)),
-        ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch)),
-        ('ndp', 'NDP', lambda: watch(nd.do_ndp_watch)),
-        ('fhrp', 'FHRP', lambda: watch(nd.do_fhrp_watch)),
-        ('ospf', 'OSPF', lambda: watch(nd.do_ospf_watch)),
-        ('eigrp', 'EIGRP', lambda: watch(nd.do_eigrp_watch)),
-        ('isis', 'IS-IS', lambda: watch(nd.do_isis_watch)),
-        ('bgp', 'BGP', lambda: watch(nd.do_bgp_watch, enrich=False)),
-        ('smb', 'SMB', lambda: watch(nd.do_smb_watch)),
-        ('relay', 'Relay', lambda: watch(nd.do_relay_watch)),
-        ('ntp', 'NTP', lambda: watch(nd.do_ntp_watch)),
-        ('icmp', 'ICMP', lambda: watch(nd.do_icmp_watch)),
-        ('snmp', 'SNMP', lambda: watch(nd.do_snmp_watch)),
+        ('stp', 'STP', lambda: watch(nd.do_stp_watch, interface=cap_iface)),
+        ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch, interface=cap_iface)),
+        ('cdp', 'CDP', lambda: watch(nd.do_cdp_watch, interface=cap_iface)),
+        ('vtp', 'VTP', lambda: watch(nd.do_vtp_watch, interface=cap_iface)),
+        ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch, interface=cap_iface)),
+        ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch, interface=cap_iface)),
+        ('ndp', 'NDP', lambda: watch(nd.do_ndp_watch, interface=cap_iface)),
+        ('fhrp', 'FHRP', lambda: watch(nd.do_fhrp_watch, interface=cap_iface)),
+        ('ospf', 'OSPF', lambda: watch(nd.do_ospf_watch, interface=cap_iface)),
+        ('eigrp', 'EIGRP', lambda: watch(nd.do_eigrp_watch, interface=cap_iface)),
+        ('isis', 'IS-IS', lambda: watch(nd.do_isis_watch, interface=cap_iface)),
+        ('bgp', 'BGP', lambda: watch(nd.do_bgp_watch, enrich=False, interface=cap_iface)),
+        ('smb', 'SMB', lambda: watch(nd.do_smb_watch, interface=cap_iface)),
+        ('relay', 'Relay', lambda: watch(nd.do_relay_watch, interface=cap_iface)),
+        ('ntp', 'NTP', lambda: watch(nd.do_ntp_watch, interface=cap_iface)),
+        ('icmp', 'ICMP', lambda: watch(nd.do_icmp_watch, interface=cap_iface)),
+        ('snmp', 'SNMP', lambda: watch(nd.do_snmp_watch, interface=cap_iface)),
         ('cert', 'Cert', lambda: watch(nd.do_cert_watch, discover=False)),
-        ('tls', 'TLS', lambda: watch(nd.do_tls_watch, interface=nd._default_route_iface())),
-        ('ldap', 'LDAP', lambda: watch(nd.do_ldap_watch, interface=nd._default_route_iface())),
+        ('tls', 'TLS', lambda: watch(nd.do_tls_watch, interface=cap_iface)),
+        ('ldap', 'LDAP', lambda: watch(nd.do_ldap_watch, interface=cap_iface)),
     ]
 
     to_run = list(fast)
@@ -1336,21 +1353,42 @@ def _net_integrity_check_once():
         results[key] = (label, v, r)
 
     now = datetime.now().isoformat()
+    try:
+        realert_s = max(0.0, float(cfg.get('net_integrity_realert_hours', 24))) * 3600
+    except (TypeError, ValueError):
+        realert_s = 24 * 3600
     worsened = []
     with _net_integrity_lock:
         checks = dict(_net_integrity_state.get('checks') or {})
         for key, (label, v, r) in results.items():
-            prev_rank = _ni_rank((checks.get(key) or {}).get('verdict'))
             new_rank = _ni_rank(v)
             checks[key] = {'label': label, 'verdict': v, 'reasons': r, 'ts': now,
                            'rank': new_rank}
-            if new_rank >= 1 and new_rank > prev_rank:
+            mem = _ni_alert_memory.get(key)
+            if new_rank == 0:
+                # Forget an alerted condition only after several consecutive
+                # clean runs of this check — one quiet capture (no-traffic /
+                # unknown) must not re-arm the alert edge.
+                if mem is not None:
+                    mem['clean_streak'] = mem.get('clean_streak', 0) + 1
+                    if mem['clean_streak'] >= _NI_CLEAN_RUNS_TO_RESET:
+                        _ni_alert_memory.pop(key, None)
+                continue
+            # Alert on first sighting, on escalation past what was already
+            # alerted, or as a periodic reminder for a still-bad condition.
+            if (mem is None or new_rank > mem['rank']
+                    or (realert_s and time.time() - mem['ts'] >= realert_s)):
                 worsened.append((label, v, r, new_rank))
+                _ni_alert_memory[key] = {'rank': max(new_rank, mem['rank'] if mem else 0),
+                                         'ts': time.time(), 'clean_streak': 0}
+            else:
+                mem['clean_streak'] = 0
         worst = max([c['rank'] for c in checks.values()] or [0])
         overall = {0: 'clean', 1: 'suspicious', 2: 'compromised'}[worst]
         dns_c = checks.get('dns') or {}
         _net_integrity_state.update({
             'enabled': True, 'ts': now, 'overall': overall, 'checks': checks,
+            'capture_iface': cap_iface,
             'dns': {'name': name, 'verdict': dns_c.get('verdict', 'unknown'),
                     'reasons': dns_c.get('reasons') or []},
             'arp': {'verdict': (checks.get('arp') or {}).get('verdict', 'unknown'),
@@ -1420,6 +1458,7 @@ def net_integrity_status():
     state['interval_min'] = shared_data.config.get('net_integrity_interval_min', 5)
     state['extended_enabled'] = bool(shared_data.config.get('net_integrity_extended_enabled', True))
     state['batch_size'] = shared_data.config.get('net_integrity_batch_size', 3)
+    state['interface'] = shared_data.config.get('net_integrity_interface', '') or ''
     return jsonify({'success': True, **state})
 
 

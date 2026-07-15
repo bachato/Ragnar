@@ -1201,7 +1201,7 @@ def _dhcp_capture(interface, seconds):
     (requests, distinct_clients, error). No traffic generated."""
     if not _have('tcpdump'):
         return 0, 0, 'tcpdump is not installed (needed for starvation capture)'
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return 0, 0, 'no interface to capture on'
     cmd = ['tcpdump', '-i', iface, '-n', '-e', '-v', '-l',
@@ -1221,7 +1221,7 @@ def do_dhcp_guardian(interface=None, capture_seconds=6, learn=True, quick=False)
     quick=True skips the passive starvation capture (rogue-server discovery
     only) — used by the background integrity monitor and the e-Paper page so
     they stay fast. verdict: clean / suspicious / rogue / starvation."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     gw = _default_gateway()
     _, resolv_dns, _ = _read_resolv_conf()
     reasons = []
@@ -2060,6 +2060,33 @@ def _default_route_iface():
     # First (lowest-metric) default route is the active one.
     m = re.search(r'default\b.*?\bdev\s+(\S+)', res['out'])
     return m.group(1) if m else None
+
+
+def _capture_iface(preferred=None):
+    """Best interface for segment-scoped passive capture (the L2/L3 Watch
+    scanners). Order: the caller's/configured preference, then a wired
+    (non-wireless, non-virtual) interface with link up — preferring the
+    default-route interface when it is itself wired — then the default-route
+    interface. The wired preference matters for the sensor deployment: Ragnar
+    plugged into a switch port to watch it (mirror/SPAN or isolated VLAN, no
+    gateway on that leg) while managed over WiFi — the default route sits on
+    wlan0, but STP/DTP/CDP/VTP/FHRP frames only exist on the cable."""
+    if _valid_iface(preferred or ''):
+        return preferred
+    wired = []
+    for name in _list_iface_names(include_virtual=False):
+        if _is_wireless(name) or name.startswith(('tun', 'tap', 'wg', 'zt', 'tailscale')):
+            continue
+        try:
+            with open(f'/sys/class/net/{name}/carrier') as f:
+                if f.read().strip() == '1':
+                    wired.append(name)
+        except OSError:      # admin-down or vanished — not a candidate
+            continue
+    dflt = _default_route_iface()
+    if wired:
+        return dflt if dflt in wired else sorted(wired)[0]
+    return dflt
 
 
 # Substrings that mark a public egress as a commercial-VPN / VPN-hosting ASN.
@@ -3514,7 +3541,7 @@ def do_igmp_watch(interface=None, seconds=12, learn=True, quick=False):
     """Passive IGMP-snooping security scanner (detection-only). Captures IGMP for
     a few seconds and classifies the segment: storm / anomaly / recon /
     unauthorized / clean. Learns the querier(s) + memberships on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -3989,7 +4016,7 @@ def do_ipv6_watch(interface=None, seconds=12, learn=True, quick=False):
     DHCPv6 for a few seconds and classifies the segment: storm / rogue-ra /
     rogue-dhcpv6 / anomaly / clean. Learns the trusted router(s)+server(s) on
     first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -4410,7 +4437,7 @@ def do_ndp_watch(interface=None, seconds=12, learn=True, quick=False):
     NS/NA for a few seconds and classifies the segment: storm / spoofed / dad-dos
     / clean. Learns the trusted target->MAC bindings + default router on first
     run. The IPv6 twin of ARP Watch."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -5225,7 +5252,7 @@ def do_ntp_watch(interface=None, seconds=15, learn=True, quick=False):
     seconds and classifies the segment's time sources: time-injection / rogue-server
     / kod / stratum-spoof / broadcast / recon / anomaly / clean. Learns the trusted
     time source(s) on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -5685,7 +5712,7 @@ def do_icmp_watch(interface=None, seconds=12, learn=True, quick=False):
     seconds and classifies the segment: redirect / rogue-irdp / flood / tunnel /
     recon / anomaly / clean. Trusts the host's default gateway; learns it on first
     run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -6149,7 +6176,7 @@ def do_snmp_watch(interface=None, seconds=12, learn=True, quick=False):
     seconds and classifies the segment: write-exposed / cleartext / amplification /
     enumeration / clean. Learns the segment's SNMP agents + community strings on
     first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -6703,7 +6730,7 @@ def do_cert_watch(targets='', interface=None, seconds=8, discover=False, learn=T
 
     discovered_n, disc_err = 0, None
     if discover:
-        iface = interface if _valid_iface(interface or '') else _default_route_iface()
+        iface = interface if _valid_iface(interface or '') else _capture_iface()
         if not iface or iface not in _list_iface_names(include_virtual=True):
             disc_err = 'no interface to capture on for discovery'
         else:
@@ -7183,7 +7210,7 @@ def do_relay_watch(interface=None, seconds=20, learn=True):
     """Passive NTLM-relay + coercion scanner (detection-only). One capture; classifies
     coercion attempts (PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce), suspected relays,
     and SMB-signing-not-required posture. Learns accepted unsigned servers on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -8114,7 +8141,7 @@ def do_smb_watch(interface=None, seconds=20, learn=True):
     (detection-only). One capture; classifies SMBv1 use, Responder-style name-resolution
     poisoning, and Kerberos downgrade / kerberoasting / AS-REP roasting. Learns accepted
     mDNS responders, known SMBv1 hosts, and known KDCs/realms on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -8714,7 +8741,7 @@ def do_isis_watch(interface=None, seconds=20, learn=True):
     """Passive IS-IS routing-security scanner (detection-only). Captures IS-IS for a
     few seconds and classifies: injection / rogue-router / storm / anomaly / weak-auth
     / clean. Learns the trusted routers + advertised prefixes on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -9204,7 +9231,7 @@ def do_stp_watch(interface=None, seconds=20, learn=True):
     """Passive spanning-tree / BPDU security scanner (detection-only). BPDUs are ~2s
     apart, so a slightly longer window. Learns the root(s) + legitimate bridges on
     first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -9570,7 +9597,7 @@ def _dtp_capture(interface, seconds):
 def do_dtp_watch(interface=None, seconds=30, learn=True):
     """Passive DTP / VLAN-hopping scanner (detection-only). DTP hellos are ~30s apart,
     so the default window is longer. Learns the trusted DTP speakers on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -9963,7 +9990,7 @@ def do_cdp_watch(interface=None, seconds=30, learn=True):
     """Passive CDP flood / spoof / info-leak scanner (detection-only). CDP hellos
     are ~60s apart, so the default window is longer. Learns the trusted CDP
     speakers on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -10356,7 +10383,7 @@ def do_vtp_watch(interface=None, seconds=30, learn=True):
     """Passive VTP bomb / rogue-server scanner (detection-only). VTP Summary
     Advertisements are ~30s apart (plus on every change), so the default window is
     longer. Learns the trusted domain/revision/server on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -10790,7 +10817,7 @@ def do_eigrp_watch(interface=None, seconds=15, learn=True):
     """Passive EIGRP routing-security scanner (detection-only). Captures EIGRP for a
     few seconds and classifies: injection / rogue-router / storm / anomaly / weak-auth
     / clean. Learns the trusted routers + advertised prefixes on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -11475,7 +11502,7 @@ def do_fhrp_watch(interface=None, seconds=15, learn=True, quick=False):
     FHRP hellos for a few seconds and classifies the segment: hijack / glbp-avf-hijack /
     rogue-speaker / priority-change / glbp-weight-skew / weak-auth / clean. Learns the
     trusted groups + GLBP forwarders on first run."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -12130,7 +12157,7 @@ def do_ospf_watch(interface=None, seconds=15, learn=True, quick=False):
     seconds and classifies the segment: weak_auth / anomaly / injection / storm /
     clean, with CVE/OSV advisories for observed exposure conditions. Learns the
     routers + Type-5 originators on first run; never forms an adjacency."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -12820,7 +12847,7 @@ def do_bgp_watch(interface=None, seconds=15, learn=True, quick=False, enrich=Tru
 
     enrich=True adds Team Cymru ASN names/owner (outbound TCP/43, soft-fails to
     AS-number-only if egress filters it)."""
-    iface = interface if _valid_iface(interface or '') else _default_route_iface()
+    iface = interface if _valid_iface(interface or '') else _capture_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
     if iface not in _list_iface_names(include_virtual=True):
@@ -13788,7 +13815,7 @@ def register_network_diagnostics(app, logger=None):
         iface = (request.args.get('interface') or '').strip() or None
         if iface is not None and not _valid_iface(iface):
             return _bad('Invalid interface')
-        iface = iface or _default_route_iface()
+        iface = iface or _capture_iface()
         secs = _clamp_int(request.args.get('seconds'), 12, 4, 30)
         no_quic = (request.args.get('no_quic') or '').lower() in ('1', 'true', 'yes')
         _log(f"net/tls-watch iface={iface or 'default-route'} secs={secs}")
@@ -13799,7 +13826,7 @@ def register_network_diagnostics(app, logger=None):
         iface = (request.args.get('interface') or '').strip() or None
         if iface is not None and not _valid_iface(iface):
             return _bad('Invalid interface')
-        iface = iface or _default_route_iface()
+        iface = iface or _capture_iface()
         secs = _clamp_int(request.args.get('seconds'), 15, 5, 60)
         _log(f"net/ldap-watch iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_ldap_watch(interface=iface, seconds=secs))
@@ -14764,7 +14791,7 @@ def _cli(argv=None):
 
     args = p.parse_args(argv)
     if args.cmd == 'tls-watch':
-        iface = args.iface or _default_route_iface()
+        iface = args.iface or _capture_iface()
         r = do_tls_watch(interface=iface, seconds=args.seconds, no_quic=args.no_quic)
         if args.json:
             print(json.dumps(r, indent=2, default=str))
@@ -14793,7 +14820,7 @@ def _cli(argv=None):
         return 0 if r['success'] else 1
 
     if args.cmd == 'ldap-watch':
-        iface = args.iface or _default_route_iface()
+        iface = args.iface or _capture_iface()
         r = do_ldap_watch(interface=iface, seconds=args.seconds)
         if args.json:
             print(json.dumps(r, indent=2, default=str))
