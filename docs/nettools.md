@@ -399,7 +399,13 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
   transition, not every cycle, with a cooldown backstop). Active attacks
   (hijack / injection / poisoning / coercion / VLAN-hop / root-hijack …) page as
   **compromised**; posture/deviation findings (weak-auth, SMBv1, unsigned SMB,
-  name-exposure …) as **suspicious**.
+  name-exposure …) as **suspicious**. An already-alerted condition is
+  **remembered per check** — a run that comes back quiet (`unknown` /
+  `no-traffic`) does *not* re-arm the alert, so a finding the scanner only sees
+  on some cycles pages once, not on every sighting. It re-alerts only if the
+  check **escalates** (suspicious → compromised), if it stayed clean for 3
+  consecutive runs and then returned, or as a **daily reminder** while it
+  persists (`net_integrity_realert_hours`, default 24, `0` = never remind).
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
@@ -434,7 +440,8 @@ the monitor is off); the extended scanners run on the background rotation.
   `net_integrity_interval_min`, `net_integrity_check_dhcp`,
   `net_integrity_extended_enabled`, `net_integrity_batch_size`,
   `net_integrity_interface` (`''` = auto: wired link-up → default route),
-  `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`
+  `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`,
+  `net_integrity_realert_hours`
 
 ### Path MTU / Black-hole
 Discovers the **path MTU** to a target and flags an **MTU black hole** — a hop

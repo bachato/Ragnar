@@ -1229,6 +1229,14 @@ _net_integrity_state = {
 }
 _net_integrity_rotation = 0       # round-robin cursor into the capture-based scanners
 
+# Per-check alert memory: key -> {'rank', 'ts', 'clean_streak'}. A finding is
+# alerted once; it must stay clean for _NI_CLEAN_RUNS_TO_RESET consecutive runs
+# of that check before it can alert again. Without this, a check that flaps
+# through 'unknown'/'no-traffic' (rank 0) between sightings re-arms the
+# transition edge and the same condition pages every few cycles.
+_ni_alert_memory = {}
+_NI_CLEAN_RUNS_TO_RESET = 3
+
 # Verdict severity. A check's verdict is CLEAN (0), a real posture/deviation finding
 # (1, "suspicious"), or an active attack (2, "compromised"). Anything not explicitly
 # clean-or-critical is treated as a rank-1 finding, so a new scanner's verdicts still
@@ -1345,16 +1353,36 @@ def _net_integrity_check_once():
         results[key] = (label, v, r)
 
     now = datetime.now().isoformat()
+    try:
+        realert_s = max(0.0, float(cfg.get('net_integrity_realert_hours', 24))) * 3600
+    except (TypeError, ValueError):
+        realert_s = 24 * 3600
     worsened = []
     with _net_integrity_lock:
         checks = dict(_net_integrity_state.get('checks') or {})
         for key, (label, v, r) in results.items():
-            prev_rank = _ni_rank((checks.get(key) or {}).get('verdict'))
             new_rank = _ni_rank(v)
             checks[key] = {'label': label, 'verdict': v, 'reasons': r, 'ts': now,
                            'rank': new_rank}
-            if new_rank >= 1 and new_rank > prev_rank:
+            mem = _ni_alert_memory.get(key)
+            if new_rank == 0:
+                # Forget an alerted condition only after several consecutive
+                # clean runs of this check — one quiet capture (no-traffic /
+                # unknown) must not re-arm the alert edge.
+                if mem is not None:
+                    mem['clean_streak'] = mem.get('clean_streak', 0) + 1
+                    if mem['clean_streak'] >= _NI_CLEAN_RUNS_TO_RESET:
+                        _ni_alert_memory.pop(key, None)
+                continue
+            # Alert on first sighting, on escalation past what was already
+            # alerted, or as a periodic reminder for a still-bad condition.
+            if (mem is None or new_rank > mem['rank']
+                    or (realert_s and time.time() - mem['ts'] >= realert_s)):
                 worsened.append((label, v, r, new_rank))
+                _ni_alert_memory[key] = {'rank': max(new_rank, mem['rank'] if mem else 0),
+                                         'ts': time.time(), 'clean_streak': 0}
+            else:
+                mem['clean_streak'] = 0
         worst = max([c['rank'] for c in checks.values()] or [0])
         overall = {0: 'clean', 1: 'suspicious', 2: 'compromised'}[worst]
         dns_c = checks.get('dns') or {}
