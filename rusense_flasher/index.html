@@ -21,6 +21,14 @@
       .prov-fields input::placeholder { color: #7f8ea3; }
       .prov-fields .prov-hint { grid-column: 1 / -1; margin: -.15rem 0 0; font-size: .8rem; line-height: 1.35; color: #9fb0c3; }
       @media (max-width: 560px) { .prov-fields { grid-template-columns: 1fr; } }
+      .s3-board-row { display: flex; align-items: center; gap: .6rem; margin: .35rem 0 .85rem; }
+      .s3-board-row label { color: #9fb0c3; font-size: .9rem; }
+      .s3-board-row select {
+        flex: 1; min-width: 0; padding: .55rem .7rem; border-radius: 8px;
+        border: 1px solid rgba(255,255,255,.18); background: rgba(0,0,0,.25);
+        color: #e8eef3; font-size: .95rem;
+      }
+      .s3-board-row select option { background: #101823; color: #e8eef3; }
     </style>
   </head>
   <body>
@@ -42,7 +50,7 @@
         <h1>Forge a <span>Sensor Node</span></h1>
         <p class="tagline">WiFi CSI &nbsp;⚔&nbsp; 2.4&nbsp;GHz mesh &nbsp;⚔&nbsp; presence · motion · people-count</p>
         <p class="desc">
-          Two longships to choose from. Either board listens to 2.4&nbsp;GHz WiFi
+          A whole fleet to choose from. Every board listens to 2.4&nbsp;GHz WiFi
           Channel&nbsp;State&nbsp;Information &mdash; up to 114 subcarriers at ~100&nbsp;Hz &mdash;
           and reports back to your RuSense server, where it surfaces under the
           <strong>Nodes</strong> tab once provisioned. Pick a board, plug it in, raise the sails.
@@ -81,14 +89,21 @@
         recommended</strong>; choose C6 only if you want Wi-Fi&nbsp;6 — and then make them all C6.
       </div>
 
-      <!-- ───────── ESP32-S3 (production) ───────── -->
+      <!-- ───────── ESP32-S3 (all boards — pick from dropdown) ───────── -->
       <section class="flash-panel" id="csi-s3">
-        <h2>📡 ESP32-S3 AMOLED Node <span class="panel-sub">(display board · self-ping sensing)</span></h2>
-        <p>
-          Dual-core LX7 @240&nbsp;MHz, 8&nbsp;MB flash. The recommended platform for live CSI
-          sensing &mdash; the steadiest, best-tested ship in the fleet. Plug it into USB, provision
-          it to your RuSense server, and it starts streaming CSI immediately.
-        </p>
+        <h2>📡 ESP32-S3 CSI Node <span class="panel-sub">(pick your board)</span></h2>
+
+        <div class="s3-board-row">
+          <label for="s3-board">Board:</label>
+          <select id="s3-board">
+            <option value="s3-devkit" selected>ESP32-S3-DevKitC-1 (N16R8) — headless · recommended</option>
+            <option value="s3-xiao">Seeed XIAO ESP32S3 — 8 MB · headless</option>
+            <option value="s3-xiao-plus">Seeed XIAO ESP32S3 Plus — 16 MB · headless</option>
+            <option value="s3-amoled">AMOLED display board — self-ping sensing</option>
+          </select>
+        </div>
+
+        <p id="s3-board-desc"></p>
 
         <div class="prereq">
           <div class="prereq-title">Before the forge fires</div>
@@ -96,52 +111,77 @@
             <li>Close Arduino IDE, Serial Monitor, or any other app holding the port</li>
             <li>Use a <strong>data-capable</strong> USB-C cable (charge-only cables are runes that do nothing)</li>
             <li>Click Forge and pick <code>USB JTAG/serial debug unit</code> from the port list</li>
-            <li>If the board isn&rsquo;t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong></li>
+            <li id="s3-boot-hint">If the board isn&rsquo;t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong></li>
           </ol>
         </div>
 
         <div class="chip-badges">
-          <span class="chip-badge"><span class="dot"></span>ESP32-S3 &middot; 8&nbsp;MB flash</span>
+          <span class="chip-badge"><span class="dot"></span><span id="s3-board-badge"></span></span>
         </div>
 
         <div class="flash-buttons">
-          <button class="btn-flash" onclick="flashDevice('manifest-csi-s3.json')">
+          <button id="s3-forge-btn" class="btn-flash" onclick="flashS3()">
             🔨 Forge S3 CSI Node
           </button>
         </div>
       </section>
 
-      <!-- ───────── ESP32-S3-DevKitC-1 N16R8 (headless sensor · recommended) ───────── -->
-      <section class="flash-panel" id="csi-s3-devkit">
-        <h2>📶 ESP32-S3-DevKitC-1 <span class="panel-sub">(N16R8 · headless · best sensing)</span></h2>
-        <p>
-          Plain dual-core LX7 @240&nbsp;MHz, 16&nbsp;MB flash, <strong>no display</strong>. With no
-          AMOLED panel to protect, it captures the full <strong>MGMT+DATA</strong> WiFi traffic &mdash;
-          the rich multipath a moving person actually shows up in. This is the
-          <strong>recommended sensor</strong> for presence / motion / people-count; AMOLED boards
-          sense on a single self-ping link and struggle to separate empty from occupied.
-        </p>
-
-        <div class="prereq">
-          <div class="prereq-title">Before the forge fires</div>
-          <ol>
-            <li>Close Arduino IDE, Serial Monitor, or any other app holding the port</li>
-            <li>Use a <strong>data-capable</strong> USB-C cable (charge-only cables are runes that do nothing)</li>
-            <li>Click Forge and pick <code>USB JTAG/serial debug unit</code> from the port list</li>
-            <li>If the board isn&rsquo;t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong></li>
-          </ol>
-        </div>
-
-        <div class="chip-badges">
-          <span class="chip-badge"><span class="dot"></span>ESP32-S3 &middot; 16&nbsp;MB flash &middot; no display</span>
-        </div>
-
-        <div class="flash-buttons">
-          <button class="btn-flash" onclick="flashDevice('manifest-csi-s3-devkit.json')">
-            🔨 Forge S3 DevKitC Sensor
-          </button>
-        </div>
-      </section>
+      <script>
+        const S3_BOARDS = {
+          "s3-devkit": {
+            manifest: "manifest-csi-s3-devkit.json",
+            badge: "ESP32-S3 · 16 MB flash · no display",
+            button: "🔨 Forge S3 DevKitC Sensor",
+            bootHint: "If the board isn’t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong>",
+            desc: "Plain dual-core LX7 @240 MHz, 16 MB flash, <strong>no display</strong>. With no " +
+                  "AMOLED panel to protect, it captures the full <strong>MGMT+DATA</strong> WiFi traffic — " +
+                  "the rich multipath a moving person actually shows up in. This is the " +
+                  "<strong>recommended sensor</strong> for presence / motion / people-count.",
+          },
+          "s3-xiao": {
+            manifest: "manifest-csi-s3-xiao.json",
+            badge: "ESP32-S3 · 8 MB flash · U.FL antenna · no display",
+            button: "🔨 Forge XIAO S3 Sensor",
+            bootHint: "If the board isn’t spotted, hold the tiny <strong>B</strong> (BOOT) button while tapping <strong>R</strong> (RESET) — or while plugging in the cable",
+            desc: "Seeed Studio XIAO ESP32S3 — thumbnail-sized (21 × 17.8 mm) dual-core LX7 " +
+                  "@240 MHz with 8 MB flash and <strong>no display</strong>, so it runs the same full " +
+                  "<strong>MGMT+DATA</strong> headless capture as the DevKitC. " +
+                  "<strong>Snap the bundled U.FL antenna on first</strong> — without it the radio hears nothing.",
+          },
+          "s3-xiao-plus": {
+            manifest: "manifest-csi-s3-xiao-plus.json",
+            badge: "ESP32-S3 · 16 MB flash · U.FL antenna · no display",
+            button: "🔨 Forge XIAO S3 Plus Sensor",
+            bootHint: "If the board isn’t spotted, hold the tiny <strong>B</strong> (BOOT) button while tapping <strong>R</strong> (RESET) — or while plugging in the cable",
+            desc: "Seeed Studio XIAO ESP32S3 <strong>Plus</strong> — same thumbnail footprint, upgraded to " +
+                  "16 MB flash. Headless like the DevKitC, so it captures the full " +
+                  "<strong>MGMT+DATA</strong> WiFi traffic. " +
+                  "<strong>Snap the bundled U.FL antenna on first</strong> — without it the radio hears nothing.",
+          },
+          "s3-amoled": {
+            manifest: "manifest-csi-s3.json",
+            badge: "ESP32-S3 · 8 MB flash · AMOLED display",
+            button: "🔨 Forge S3 AMOLED Node",
+            bootHint: "If the board isn’t spotted, hold <strong>BOOT</strong> while tapping <strong>RST</strong>",
+            desc: "AMOLED display board — dual-core LX7 @240 MHz, 8 MB flash, with the RM67162 " +
+                  "screen showing live status. The display limits it to single self-ping-link sensing, " +
+                  "which struggles to separate empty from occupied — pick a headless board if this node’s " +
+                  "job is sensing rather than showing.",
+          },
+        };
+        function s3BoardChanged() {
+          const b = S3_BOARDS[document.getElementById("s3-board").value];
+          document.getElementById("s3-board-desc").innerHTML = b.desc;
+          document.getElementById("s3-board-badge").textContent = b.badge;
+          document.getElementById("s3-boot-hint").innerHTML = b.bootHint;
+          document.getElementById("s3-forge-btn").textContent = b.button;
+        }
+        function flashS3() {
+          flashDevice(S3_BOARDS[document.getElementById("s3-board").value].manifest);
+        }
+        document.getElementById("s3-board").addEventListener("change", s3BoardChanged);
+        s3BoardChanged();
+      </script>
 
       <!-- ───────── ESP32-C6 (Wi-Fi 6 research) ───────── -->
       <section class="flash-panel" id="csi-c6">

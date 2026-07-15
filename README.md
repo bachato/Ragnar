@@ -204,7 +204,7 @@ bundled sensing engine reports **presence, motion, people-count**, and (with a t
 model) **coarse pose and resting vital signs**. No images are ever captured; it works in
 the dark and through walls.
 
-- **Flash a sensor node from your browser** — no toolchain needed: **[RuSense Flasher](https://pierregode.github.io/Ragnar/)** (ESP32-S3 / C6, Chrome/Edge).
+- **Flash a sensor node from your browser** — no toolchain needed: **[RuSense Flasher](https://pierregode.github.io/Ragnar/)** (ESP32-S3 DevKitC / Seeed XIAO ESP32S3 & Plus / AMOLED / C6, Chrome/Edge).
 - **Install the backend:** `sudo ./scripts/install_sensing.sh` (runs as `ragnar-sensing.service`).
 - **View it** under the RuSense tabs in the web dashboard at `http://<ragnar-ip>:8000`.
 
