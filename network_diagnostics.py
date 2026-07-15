@@ -32,10 +32,12 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import bgp_speaker
+import ldap_watch
 import path_asymmetry
 import tls_watch
 import wifi_analyzer
 import wifi_defense
+from ldap_watch import do_ldap_watch
 from tls_watch import do_tls_watch
 
 try:
@@ -10953,8 +10955,20 @@ def _eigrp_selftest():
 #   * rogue-speaker — a new speaker in a group that isn't (yet) winning.
 #   * priority-change — a known speaker whose priority jumped up (pre-takeover/reconfig).
 #   * weak-auth     — plaintext/no FHRP authentication (the enabler). Advisory.
-# HSRP + VRRP are fully decoded by tcpdump (priority-based detection). GLBP (tcpdump
-# does not dissect it) and CARP are lighter — new-speaker detection, best-effort.
+# HSRP + VRRP are fully decoded by tcpdump (priority-based detection); CARP is lighter
+# (advskew-based). GLBP gets a dedicated hand-rolled byte decoder (below) because
+# neither tcpdump nor Scapy dissects it — and GLBP is special: it has *two* election
+# planes, so it needs two hijack checks:
+#   * The AVG (Active Virtual Gateway) owns the vIP and hands each host a virtual MAC.
+#     Seizing it (a winning Hello priority) is a hijack worse than HSRP — the attacker
+#     picks which hosts to MITM. This reuses the generic priority rules above.
+#   * Up to four AVFs (Active Virtual Forwarders) each own a vMAC and forward a slice
+#     of the hosts. Seizing one AVF (going Active for a forwarder you don't own, or a
+#     vMAC re-homing to a new speaker) quietly captures that slice while the gateway
+#     election stays healthy-looking — the stealthiest FHRP takeover. The forwarder
+#     plane gets its own rules: glbp-avf-hijack and glbp-weight-skew (load-share shift).
+# The sensor must sit on the FHRP group's L2 segment (SPAN/mirror or a NIC in the
+# gateway VLAN) — HSRP is TTL 1, VRRP/GLBP link-local multicast. Off-segment: nothing.
 _FHRP_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 'data', 'fhrp_watch.json')
 _fhrp_watch_lock = threading.Lock()
@@ -10962,10 +10976,89 @@ _FHRP_EVENTS_CAP = 200
 # A priority at/above this from a source that isn't the baseline active is a takeover
 # attempt (HSRP/VRRP/GLBP max is 255/254; attackers use the top of the range).
 _FHRP_TAKEOVER_PRIO = 250
+# A GLBP forwarder weight swing this large (default weight is 100) is a load-share
+# manipulation — steering hosts onto/off an AVF without touching the election.
+_FHRP_GLBP_WEIGHT_DELTA = 40
+# GLBP wire enums (from the Wireshark GLBP dissector). GLBP rides UDP/3222 to
+# 224.0.0.102; its payload is a 12-byte header then type/length/value TLVs.
+_GLBP_VG_STATE = {4: 'Listen', 8: 'Speak', 0x10: 'Standby', 0x20: 'Active'}
+_GLBP_VF_STATE = {4: 'Listen', 8: 'Speak', 0x10: 'Standby', 0x20: 'Active'}
+_GLBP_AUTH = {0: 'none', 1: 'plaintext', 2: 'md5', 3: 'md5'}
 
 _FHRP_HSRP_SRC = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.1985\s*>')
 _FHRP_GLBP_SRC = re.compile(r'(\d+\.\d+\.\d+\.\d+)\.3222\s*>')
 _FHRP_L3_SRC = re.compile(r'^\s*(\S+?)\s*>')
+
+
+def _glbp_decode(payload):
+    """Hand-rolled GLBP (UDP/3222) decoder — neither tcpdump nor Scapy dissects GLBP.
+    Returns {group, hello, forwarders, auth} or None if it isn't a plausible GLBP
+    packet. Tolerant: never raises on malformed/truncated input.
+      header (12B): version(1)=3, unknown(1), group(2 BE), unknown(2), owner-id(6)
+      then TLVs: type(1), length(1, incl. header), value(length-2)
+      Hello   (type 1): value[1]=VG state, [3]=AVG priority, [20]=addr-type,
+                        [21]=addr-len, [22:]=virtual IP
+      VF R/R  (type 2): value[0]=forwarder#, [1]=VF state, [3]=VF priority,
+                        [4]=weight, [12:18]=virtual MAC
+      Auth    (type 3): value[0]=auth type (0 none / 1 plaintext / 2,3 md5)
+    """
+    try:
+        if len(payload) < 12 or payload[0] != 3:
+            return None
+        out = {'group': int.from_bytes(payload[2:4], 'big'),
+               'hello': None, 'forwarders': [], 'auth': None}
+        i, n = 12, len(payload)
+        while i + 2 <= n:
+            t, ln = payload[i], payload[i + 1]
+            if ln < 2 or i + ln > n:
+                break
+            v = payload[i + 2:i + ln]
+            if t == 1 and len(v) >= 22:                       # Hello (AVG plane)
+                vip = None
+                if v[20] == 1 and len(v) >= 26:               # IPv4 virtual address
+                    vip = '.'.join(str(b) for b in v[22:26])
+                out['hello'] = {'vg_state': _GLBP_VG_STATE.get(v[1], str(v[1])),
+                                'priority': v[3], 'vip': vip}
+            elif t == 2 and len(v) >= 18:                     # VF Request/Response
+                out['forwarders'].append({
+                    'forwarder': v[0],
+                    'vf_state': _GLBP_VF_STATE.get(v[1], str(v[1])),
+                    'priority': v[3], 'weight': v[4],
+                    'vmac': ':'.join('%02x' % b for b in v[12:18])})
+            elif t == 3 and len(v) >= 1:                      # Auth
+                out['auth'] = _GLBP_AUTH.get(v[0], 'unknown')
+            i += ln
+        return out
+    except Exception:
+        return None
+
+
+def _fhrp_glbp_from_pkts(pkts):
+    """Turn decoded GLBP packets [{src, src_mac, payload}] into (avg_events, vf_events).
+    avg_events feed the generic group analyzer (AVG election == a normal FHRP hijack);
+    vf_events feed the dedicated forwarder-plane analyzer."""
+    avg_events, vf_events = [], []
+    for pk in pkts:
+        d = _glbp_decode(pk.get('payload') or b'')
+        if not d:
+            continue
+        weak = (d['auth'] in (None, 'none', 'plaintext'))
+        if d['hello']:
+            h = d['hello']
+            avg_events.append({
+                'proto': 'glbp', 'version': None, 'src': pk.get('src'),
+                'group': d['group'], 'vip': h['vip'], 'priority': h['priority'],
+                'opcode': 'hello', 'state': h['vg_state'],
+                'authtype': d['auth'] or 'none', 'auth_weak': weak, 'advskew': None})
+        for f in d['forwarders']:
+            if not (1 <= f['forwarder'] <= 4):    # 0 == VF negotiation, not ownership
+                continue
+            vf_events.append({
+                'proto': 'glbp', 'group': d['group'], 'src': pk.get('src'),
+                'src_mac': pk.get('src_mac'), 'forwarder': f['forwarder'],
+                'vf_state': f['vf_state'], 'vf_prio': f['priority'],
+                'weight': f['weight'], 'vmac': f['vmac']})
+    return avg_events, vf_events
 
 
 def _parse_fhrp_capture(output):
@@ -11079,6 +11172,7 @@ def do_fhrp_baseline(action='get'):
         b = _fhrp_watch_load()
         return {'success': True, 'baseline': {
             'groups': sorted((b.get('groups') or {}).keys()),
+            'glbp_forwarders': sorted((b.get('glbp_forwarders') or {}).keys()),
         }}
 
 
@@ -11086,10 +11180,11 @@ def _fhrp_gkey(e):
     return f"{e['proto']}/{e['group']}" if e['group'] is not None else f"{e['proto']}/?"
 
 
-def _fhrp_analyze(events, seconds, baseline, learn=True):
+def _fhrp_analyze(events, seconds, baseline, learn=True, glbp_vf=None):
     """Pure classifier over parsed FHRP events. Returns the result payload (minus
     interface). Separated from capture so the self-test can drive it with synthetic
-    packets. May mutate+persist `baseline` when learn=True."""
+    packets. `glbp_vf` is the list of GLBP virtual-forwarder events for the AVF-plane
+    checks. May mutate+persist `baseline` when learn=True."""
     seconds = max(1, int(seconds))
 
     groups = {}
@@ -11131,7 +11226,8 @@ def _fhrp_analyze(events, seconds, baseline, learn=True):
         known = dict(baseline['groups'])
         had_baseline = True
 
-    PRIORITY = ['hijack', 'rogue-speaker', 'priority-change', 'weak-auth', 'clean']
+    PRIORITY = ['hijack', 'glbp-avf-hijack', 'rogue-speaker', 'priority-change',
+                'glbp-weight-skew', 'weak-auth', 'clean']
     verdict = 'clean'
     reasons = []
 
@@ -11185,13 +11281,105 @@ def _fhrp_analyze(events, seconds, baseline, learn=True):
                 f"authentication ({g['authtype'] or 'none'}) — this is what lets a "
                 f"forged higher-priority hello win the election; enable MD5/HMAC auth")
 
+    # ---- GLBP forwarder (AVF) plane -----------------------------------------
+    # A healthy GLBP forwarder has ONE stable Active owner + vMAC. A second speaker
+    # going Active for that forwarder — or the same vMAC re-homing to a new source —
+    # is a stealth slice-capture the AVG election never reveals.
+    forwarders = {}
+    for e in (glbp_vf or []):
+        fk = f"{e['group']}/{e['forwarder']}"
+        c = forwarders.setdefault(fk, {'group': e['group'], 'forwarder': e['forwarder'],
+                                       'owners': {}})
+        o = c['owners'].setdefault(e['src'], {
+            'src': e['src'], 'src_mac': e.get('src_mac'), 'vf_prio': None,
+            'weight': None, 'vmac': e['vmac'], 'states': set(), 'count': 0})
+        o['count'] += 1
+        o['vf_prio'] = e['vf_prio'] if o['vf_prio'] is None else max(o['vf_prio'],
+                                                                     e['vf_prio'])
+        o['weight'] = e['weight']
+        o['vmac'] = e['vmac']
+        if e['vf_state']:
+            o['states'].add(e['vf_state'])
+
+    known_fwd = dict(baseline.get('glbp_forwarders') or {})
+    if learn and 'glbp_forwarders' not in baseline and forwarders:
+        baseline['glbp_forwarders'] = {}
+        for fk, c in forwarders.items():
+            active = [o for o in c['owners'].values() if 'Active' in o['states']]
+            owner = (active[0] if active
+                     else max(c['owners'].values(), key=lambda o: o['vf_prio'] or 0))
+            # Learn EVERY speaker of the forwarder — GLBP redundancy means a forwarder
+            # legitimately has a standby speaker that shares the same vMAC in Listen
+            # state, so only a *new* speaker (not in this set) is suspect.
+            baseline['glbp_forwarders'][fk] = {
+                'speakers': sorted(c['owners'].keys()), 'owner': owner['src'],
+                'vmac': owner['vmac'], 'vf_prio': owner['vf_prio'],
+                'weight': owner['weight']}
+        known_fwd = dict(baseline['glbp_forwarders'])
+        learned = True
+    had_fwd_baseline = bool(known_fwd)
+
+    for fk in sorted(forwarders):
+        c = forwarders[fk]
+        base = known_fwd.get(fk) or {}
+        base_owner, base_vmac = base.get('owner'), base.get('vmac')
+        base_weight, base_prio = base.get('weight'), base.get('vf_prio')
+        base_speakers = set(base.get('speakers') or ([base_owner] if base_owner else []))
+        for src in sorted(c['owners']):
+            o = c['owners'][src]
+            active = 'Active' in o['states']
+            is_new = had_fwd_baseline and src not in base_speakers
+            winning = o['vf_prio'] is not None and (
+                o['vf_prio'] >= _FHRP_TAKEOVER_PRIO
+                or (base_prio is not None and o['vf_prio'] >= base_prio))
+            if is_new and (active or winning):
+                bump('glbp-avf-hijack')
+                stole = bool(base_vmac) and o['vmac'] == base_vmac
+                why = ('claiming the Active virtual MAC' if stole
+                       else f'going {"/".join(sorted(o["states"])) or "Active"} '
+                            f'with VF priority {o["vf_prio"]}')
+                reasons.append(
+                    f"GLBP AVF HIJACK on group {c['group']} forwarder "
+                    f"{c['forwarder']} (vMAC {o['vmac']}): new speaker {src} {why} — it "
+                    f"captures that forwarder's slice of hosts while the AVG election "
+                    f"stays healthy-looking (stealth MITM)")
+            elif is_new:
+                bump('rogue-speaker')
+                reasons.append(
+                    f"Unexpected GLBP forwarder speaker {src} on group {c['group']} "
+                    f"forwarder {c['forwarder']} — not a baseline speaker "
+                    f"(watch for it going Active)")
+            elif src == base_owner and base_weight is not None \
+                    and o['weight'] is not None \
+                    and abs(o['weight'] - base_weight) >= _FHRP_GLBP_WEIGHT_DELTA:
+                bump('glbp-weight-skew')
+                reasons.append(
+                    f"GLBP forwarder {c['group']}/{c['forwarder']} owner {src} changed "
+                    f"its weight {base_weight} → {o['weight']} — a load-share shift that "
+                    f"steers which hosts route through this AVF (may be object-tracking "
+                    f"or selective capture)")
+
+    def _pub_fwd(fk, c):
+        base = known_fwd.get(fk) or {}
+        base_speakers = set(base.get('speakers') or
+                            ([base.get('owner')] if base.get('owner') else []))
+        return {'group': c['group'], 'forwarder': c['forwarder'],
+                'owners': [{
+                    'src': s, 'vf_priority': o['vf_prio'], 'weight': o['weight'],
+                    'vmac': o['vmac'], 'states': sorted(o['states']),
+                    'baseline': s in base_speakers,
+                } for s, o in sorted(c['owners'].items())]}
+
+    glbp_forwarders_pub = [_pub_fwd(fk, forwarders[fk]) for fk in sorted(forwarders)]
+
     advisories = []
-    if groups:
+    if groups or glbp_forwarders_pub:
         advisories.append(
-            "Authenticate FHRP (HSRP/VRRP MD5 or key-chain), raise the real routers to "
-            "a high priority with preempt, and filter FHRP multicast on access ports "
-            "(only trunk/router ports should carry HSRP 1985 / GLBP 3222 / VRRP+CARP "
-            "IP-proto-112). Alert on any new speaker or priority change.")
+            "Authenticate FHRP (HSRP/VRRP MD5 or key-chain; GLBP MD5), raise the real "
+            "routers to a high priority with preempt, and filter FHRP multicast on "
+            "access ports (only trunk/router ports should carry HSRP 1985 / GLBP 3222 / "
+            "VRRP+CARP IP-proto-112). Alert on any new speaker, priority change, or "
+            "GLBP forwarder (AVF) ownership change.")
 
     def _pub(g):
         return {'gkey': g['gkey'], 'proto': g['proto'], 'group': g['group'],
@@ -11205,10 +11393,10 @@ def _fhrp_analyze(events, seconds, baseline, learn=True):
 
     if reasons:
         summary = reasons
-    elif not groups:
+    elif not groups and not glbp_forwarders_pub:
         summary = ['No FHRP traffic seen — no HSRP/VRRP/GLBP/CARP on this segment']
     else:
-        summary = ['All FHRP groups/speakers match the trusted baseline']
+        summary = ['All FHRP groups/speakers/GLBP forwarders match the trusted baseline']
 
     return {
         'success': True,
@@ -11219,33 +11407,74 @@ def _fhrp_analyze(events, seconds, baseline, learn=True):
         'packet_count': len(events),
         'rate': round(len(events) / seconds, 2),
         'groups': [_pub(groups[gk]) for gk in sorted(groups)],
+        'glbp_forwarders': glbp_forwarders_pub,
         'advisories': advisories,
     }
 
 
+def _fhrp_glbp_extract(pcap_path):
+    """Pull GLBP (UDP/3222) packets out of a pcap as [{src, src_mac, payload}] for the
+    hand-rolled decoder. Uses Scapy (lazy); returns [] if Scapy is unavailable so the
+    HSRP/VRRP path still works and GLBP falls back to text new-speaker detection."""
+    try:
+        from scapy.all import rdpcap, Ether, IP, IPv6, UDP, Raw
+    except Exception:
+        return []
+    pkts = []
+    try:
+        for p in rdpcap(pcap_path):
+            if not p.haslayer(UDP) or not p.haslayer(Raw):
+                continue
+            u = p[UDP]
+            if u.sport != 3222 and u.dport != 3222:
+                continue
+            ipl = p.getlayer(IP) or p.getlayer(IPv6)
+            if ipl is None:
+                continue
+            pkts.append({'src': ipl.src,
+                         'src_mac': p[Ether].src if p.haslayer(Ether) else None,
+                         'payload': bytes(p[Raw].load)})
+    except Exception:
+        return pkts
+    return pkts
+
+
 def _fhrp_capture(interface, seconds):
-    """Run one passive tcpdump window over FHRP hellos and return (raw, error).
-    Covers HSRP (udp 1985), GLBP (udp 3222), and VRRP/CARP (IP/IPv6 proto 112)."""
+    """One passive tcpdump window over FHRP hellos, returned as (text, glbp_pkts, err).
+    We capture to a pcap so GLBP can be byte-decoded, then replay it through
+    `tcpdump -r ... -v` to reuse the existing HSRP/VRRP/CARP text parser unchanged."""
     if not _have('tcpdump'):
-        return '', 'tcpdump is not installed. Click Install to add it.'
+        return '', [], 'tcpdump is not installed. Click Install to add it.'
     bpf = ('(udp and (port 1985 or port 3222)) or (ip proto 112) or '
            '(ip6 proto 112)')
-    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface,
-                '-nn', '-t', '-v', '-s', '256', '-c', '20000', bpf],
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pcap')
+    os.close(fd)
+    res = _run(['timeout', str(seconds), 'tcpdump', '-i', interface, '-p',
+                '-nn', '-s', '512', '-c', '20000', '-w', path, bpf],
                timeout=seconds + 8)
-    out = res['out']
-    if not out and res['err'] and ('permission' in res['err'].lower()
-                                   or "couldn't" in res['err'].lower()
-                                   or 'no such device' in res['err'].lower()
-                                   or 'syntax error' in res['err'].lower()):
-        return '', res['err'].strip()[:200]
-    return out, None
+    try:
+        if (os.path.getsize(path) <= 24 and res['err']
+                and ('permission' in res['err'].lower()
+                     or "couldn't" in res['err'].lower()
+                     or 'no such device' in res['err'].lower()
+                     or 'syntax error' in res['err'].lower())):
+            return '', [], res['err'].strip()[:200]
+        text = _run(['tcpdump', '-nn', '-t', '-v', '-r', path], timeout=20)['out']
+        glbp = _fhrp_glbp_extract(path)
+        return text, glbp, None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def do_fhrp_watch(interface=None, seconds=15, learn=True, quick=False):
     """Passive FHRP (HSRP/VRRP/GLBP/CARP) hijack scanner (detection-only). Captures
-    FHRP hellos for a few seconds and classifies the segment: hijack / rogue-speaker /
-    priority-change / weak-auth / clean. Learns the trusted groups on first run."""
+    FHRP hellos for a few seconds and classifies the segment: hijack / glbp-avf-hijack /
+    rogue-speaker / priority-change / glbp-weight-skew / weak-auth / clean. Learns the
+    trusted groups + GLBP forwarders on first run."""
     iface = interface if _valid_iface(interface or '') else _default_route_iface()
     if not iface:
         return {'success': False, 'error': 'no interface to capture on'}
@@ -11253,15 +11482,23 @@ def do_fhrp_watch(interface=None, seconds=15, learn=True, quick=False):
         return {'success': False, 'error': f'unknown interface: {iface}'}
     seconds = _clamp_int(seconds, 15, 4, 40)
 
-    text, err = _fhrp_capture(iface, seconds)
+    text, glbp_pkts, err = _fhrp_capture(iface, seconds)
     if err:
         return {'success': False, 'interface': iface, 'error': err,
                 'missing_tool': 'tcpdump' if 'not installed' in err else None}
     events = _parse_fhrp_capture(text)
+    # When Scapy byte-decoded GLBP, use those rich AVG events + forwarder plane and
+    # drop the best-effort text GLBP events to avoid double-counting.
+    glbp_vf = None
+    if glbp_pkts:
+        glbp_avg, glbp_vf = _fhrp_glbp_from_pkts(glbp_pkts)
+        if glbp_avg or glbp_vf:           # decoded something -> prefer the rich events
+            events = [e for e in events if e['proto'] != 'glbp'] + glbp_avg
+        # else: all GLBP packets were undecodable -> keep the text new-speaker fallback
 
     with _fhrp_watch_lock:
         baseline = _fhrp_watch_load()
-        result = _fhrp_analyze(events, seconds, baseline, learn=learn)
+        result = _fhrp_analyze(events, seconds, baseline, learn=learn, glbp_vf=glbp_vf)
         if result.get('learned'):
             _fhrp_watch_save(baseline)
         if result['verdict'] != 'clean':
@@ -11339,7 +11576,88 @@ def _fhrp_selftest():
     run('vrrp-hijack', vrrp('192.168.1.77', vrid=1, prio=254, authtype='ah'), 15,
         base, 'hijack')
 
-    # 8. parse: HSRP fields + VRRP fields + CARP + GLBP.
+    # ---- GLBP (byte-decoded: two election planes, AVG + AVF) ----------------
+    def glbp_vmac(group, fwd):
+        return bytes([0x00, 0x07, 0xb4, 0x00, group & 0xff, fwd & 0xff])
+
+    def glbp_pkt(src, group=1, avg_prio=100, vg_state=0x20, vip='192.168.1.1',
+                 forwarders=(), auth=2, include_hello=True):
+        """Fabricate a raw GLBP payload (header + optional Hello TLV + VF TLVs + Auth)
+        wrapped as a capture record. forwarders: (fwd#, vf_state, vf_prio, weight)."""
+        hdr = (bytes([3, 0]) + int(group).to_bytes(2, 'big') + bytes([0, 0])
+               + b'\x00\x00\x00\x00\x00\x01')          # owner-id
+        body = b''
+        if include_hello:
+            ipb = bytes(int(x) for x in vip.split('.'))
+            hv = (bytes([0, vg_state, 0, avg_prio, 0, 0]) + b'\x00\x00\x00\x00'
+                  + b'\x00\x00\x00\x00' + b'\x00\x00' + b'\x00\x00' + b'\x00\x00'
+                  + bytes([1, 4]) + ipb)                # addrtype=IPv4, addrlen=4, vip
+            body += bytes([1, len(hv) + 2]) + hv
+        for (fn, st, pr, wt) in forwarders:
+            vfv = bytes([fn, st, 0, pr, wt]) + b'\x00' * 7 + glbp_vmac(group, fn)
+            body += bytes([2, len(vfv) + 2]) + vfv
+        if auth is not None:
+            body += bytes([3, 4, auth, 0])
+        return {'src': src, 'src_mac': '00:11:22:33:44:55', 'payload': hdr + body}
+
+    def run_glbp(name, pkts, baseline, expect):
+        avg, vf = _fhrp_glbp_from_pkts(pkts)
+        res = _fhrp_analyze(avg, 15, dict(baseline or {}), learn=not baseline,
+                            glbp_vf=vf)
+        ok = res['verdict'] == expect
+        scenarios.append({'name': name, 'expect': expect, 'got': res['verdict'],
+                          'events': len(avg) + len(vf), 'pass': ok})
+        return res
+
+    # Baseline: GLBP group 1, AVG=.2 prio 100; forwarder 1 owned by .2 with .3 as a
+    # legitimate standby speaker (GLBP redundancy — both know the same vMAC).
+    gbase = {'groups': {'glbp/1': {'speakers': {'192.168.1.2': 100, '192.168.1.3': 100},
+                                   'vips': ['192.168.1.1'], 'max_prio': 100}},
+             'glbp_forwarders': {'1/1': {'speakers': ['192.168.1.2', '192.168.1.3'],
+                                         'owner': '192.168.1.2',
+                                         'vmac': '00:07:b4:00:01:01',
+                                         'vf_prio': 167, 'weight': 100}}}
+
+    # 8. glbp-clean: the AVG + its forwarder re-advertising, MD5 auth.
+    run_glbp('glbp-clean', [glbp_pkt('192.168.1.2', avg_prio=100,
+             forwarders=[(1, 0x20, 167, 100)], auth=2)], gbase, 'clean')
+
+    # 8b. glbp-standby-ok: a legit STANDBY forwarder speaker (.3) sharing the vMAC in
+    #     Listen state must NOT be flagged as an AVF hijack (regression guard).
+    run_glbp('glbp-standby-ok', [
+        glbp_pkt('192.168.1.2', avg_prio=100, forwarders=[(1, 0x20, 167, 100)], auth=2),
+        glbp_pkt('192.168.1.3', avg_prio=100, forwarders=[(1, 4, 100, 100)], auth=2)],
+        gbase, 'clean')
+
+    # 9. glbp-avg-hijack: a new speaker wins the AVG election (Hello priority 255).
+    run_glbp('glbp-avg-hijack', [glbp_pkt('192.168.1.66', avg_prio=255, auth=2)],
+             gbase, 'hijack')
+
+    # 10. glbp-avf-hijack: a new speaker goes Active for forwarder 1 (stealth slice
+    #     capture) without touching the AVG election — forwarder-plane only.
+    run_glbp('glbp-avf-hijack', [glbp_pkt('192.168.1.66',
+             forwarders=[(1, 0x20, 167, 100)], auth=2, include_hello=False)],
+             gbase, 'glbp-avf-hijack')
+
+    # 11. glbp-weight-skew: the real AVF owner drops its weight 100 -> 20 (load-share
+    #     manipulation to steer hosts).
+    run_glbp('glbp-weight-skew', [glbp_pkt('192.168.1.2', avg_prio=100,
+             forwarders=[(1, 0x20, 167, 20)], auth=2)], gbase, 'glbp-weight-skew')
+
+    # 12. glbp-decode: the byte decoder reads header + Hello + VF + auth correctly.
+    dec = _glbp_decode(glbp_pkt('192.168.1.2', group=7, avg_prio=200,
+                       forwarders=[(3, 0x20, 150, 80)], auth=1)['payload'])
+    d_ok = (dec and dec['group'] == 7 and dec['hello']['priority'] == 200
+            and dec['hello']['vg_state'] == 'Active' and dec['auth'] == 'plaintext'
+            and dec['forwarders'] and dec['forwarders'][0]['forwarder'] == 3
+            and dec['forwarders'][0]['weight'] == 80
+            and dec['forwarders'][0]['vmac'] == '00:07:b4:00:07:03')
+    scenarios.append({'name': 'glbp-decode', 'expect': 'group7/prio200/fwd3',
+                      'got': f"g={dec and dec['group']} "
+                             f"vmac={dec and dec['forwarders'][0]['vmac']}",
+                      'pass': bool(d_ok)})
+
+    # 13. parse: HSRP fields + VRRP fields + CARP + GLBP.
     pev = _parse_fhrp_capture(
         hsrp('192.168.1.2', prio=255, op='coup') + "\n"
         + vrrp('192.168.1.3', vrid=7, prio=200) + "\n"
@@ -11353,21 +11671,27 @@ def _fhrp_selftest():
     scenarios.append({'name': 'fhrp-parse', 'expect': 'hsrp/vrrp/carp/glbp',
                       'got': str(sorted(protos)), 'pass': p_ok})
 
-    # Optional Scapy end-to-end: craft real HSRP + VRRP -> pcap -> tcpdump -> parse.
+    # Optional Scapy end-to-end: craft real HSRP + VRRP -> pcap -> tcpdump -> parse,
+    # and a real GLBP packet -> pcap -> the byte extractor -> decoder.
     scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
     try:
         import tempfile
-        from scapy.all import Ether, IP, UDP, wrpcap
+        from scapy.all import Ether, IP, UDP, Raw, wrpcap
         from scapy.layers.hsrp import HSRP
         from scapy.layers.vrrp import VRRP
         if _have('tcpdump'):
+            gpayload = glbp_pkt('192.168.1.66', group=1,
+                                forwarders=[(1, 0x20, 167, 100)],
+                                include_hello=False)['payload']
             pkts = [
                 Ether() / IP(src='192.168.1.66', dst='224.0.0.2')
                 / UDP(sport=1985, dport=1985)
                 / HSRP(group=1, priority=255, state=16, virtualIP='192.168.1.1'),
                 Ether() / IP(src='192.168.1.3', dst='224.0.0.18', proto=112)
                 / VRRP(vrid=5, priority=254, ipcount=1, addrlist=['192.168.1.1'],
-                       version=2)]
+                       version=2),
+                Ether(src='de:ad:be:ef:00:66') / IP(src='192.168.1.66',
+                dst='224.0.0.102') / UDP(sport=3222, dport=3222) / Raw(gpayload)]
             with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
                 pcap_path = tf.name
             wrpcap(pcap_path, pkts)
@@ -11375,11 +11699,15 @@ def _fhrp_selftest():
             evs = _parse_fhrp_capture(res['out'])
             hs = next((e for e in evs if e['proto'] == 'hsrp'), {})
             vr = next((e for e in evs if e['proto'] == 'vrrp'), {})
+            _, gvf = _fhrp_glbp_from_pkts(_fhrp_glbp_extract(pcap_path))
+            glbp_ok = bool(gvf) and gvf[0]['forwarder'] == 1 \
+                and gvf[0]['vf_state'] == 'Active'
             ok = (hs.get('priority') == 255 and hs.get('src') == '192.168.1.66'
-                  and vr.get('priority') == 254 and vr.get('group') == 5)
+                  and vr.get('priority') == 254 and vr.get('group') == 5 and glbp_ok)
             scapy_result = {'ran': True, 'protos': sorted({e['proto'] for e in evs}),
                             'hsrp_prio': hs.get('priority'),
-                            'vrrp_prio': vr.get('priority'), 'pass': ok,
+                            'vrrp_prio': vr.get('priority'),
+                            'glbp_vf': len(gvf), 'pass': ok,
                             'tcpdump_out': res['out'].strip()[:200]}
             try:
                 os.remove(pcap_path)
@@ -12660,6 +12988,17 @@ def _tls_selftest():
                       'pass': all(c['pass'] for c in r['checks'])}}
 
 
+def _ldap_selftest():
+    """Adapt ldap_watch.selftest() to the aggregator's scenarios/scapy shape. The
+    LDAP parse+detect path is pure-Python, so it needs no Scapy for the harness."""
+    r = ldap_watch.selftest()
+    scen = [{'name': c['name'], 'pass': c['pass'],
+             'expect': c.get('want'), 'got': c.get('got')}
+            for c in r['checks']]
+    return {'success': r['success'], 'scenarios': scen,
+            'scapy': {'ran': True, 'pass': r['success']}}
+
+
 def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
@@ -12673,6 +13012,7 @@ def do_routing_selftest():
               'dtp': _dtp_selftest(), 'cdp': _cdp_selftest(), 'vtp': _vtp_selftest(),
               'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(), 'tls': _tls_selftest(),
+              'ldap': _ldap_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
@@ -13453,6 +13793,16 @@ def register_network_diagnostics(app, logger=None):
         no_quic = (request.args.get('no_quic') or '').lower() in ('1', 'true', 'yes')
         _log(f"net/tls-watch iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_tls_watch(interface=iface, seconds=secs, no_quic=no_quic))
+
+    @app.route('/api/net/ldap-watch', methods=['GET'])
+    def net_ldap_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        iface = iface or _default_route_iface()
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 60)
+        _log(f"net/ldap-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ldap_watch(interface=iface, seconds=secs))
 
     @app.route('/api/net/ipv6-watch', methods=['GET'])
     def net_ipv6_watch():
@@ -14236,6 +14586,16 @@ def _cli(argv=None):
     tst = sub.add_parser('tls-selftest', help='self-test the TLS Watch detectors (no root)')
     tst.add_argument('--json', action='store_true', help='emit JSON')
 
+    lw = sub.add_parser('ldap-watch',
+                        help='passive LDAP / Active Directory watch (bind/enum/CLDAP)')
+    lw.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    lw.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-60)')
+    lw.add_argument('--json', action='store_true', help='emit JSON')
+
+    lst = sub.add_parser('ldap-selftest',
+                         help='self-test the LDAP Watch detectors (no root)')
+    lst.add_argument('--json', action='store_true', help='emit JSON')
+
     v6 = sub.add_parser('ipv6-watch', help='passive IPv6 first-hop (RA/DHCPv6) scan')
     v6.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     v6.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
@@ -14373,7 +14733,8 @@ def _cli(argv=None):
     egst = sub.add_parser('eigrp-selftest', help='self-test the EIGRP detectors (no root)')
     egst.add_argument('--json', action='store_true', help='emit JSON')
 
-    fh = sub.add_parser('fhrp-watch', help='passive FHRP (HSRP/VRRP/GLBP/CARP) hijack scan')
+    fh = sub.add_parser('fhrp-watch',
+                        help='passive FHRP hijack scan (HSRP/VRRP/CARP + GLBP AVG & AVF planes)')
     fh.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     fh.add_argument('--seconds', '-s', type=int, default=15, help='capture window (4-40)')
     fh.add_argument('--no-learn', action='store_true', help='do not learn/update baseline')
@@ -14429,6 +14790,33 @@ def _cli(argv=None):
                 print(f"  [{'PASS' if sc['pass'] else 'FAIL'}] {sc['name']}")
             print(f"  scapy: {'available' if r['scapy']['ran'] else 'absent'}")
             print(f"TLS Watch self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ldap-watch':
+        iface = args.iface or _default_route_iface()
+        r = do_ldap_watch(interface=iface, seconds=args.seconds)
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            st = r.get('stats', {})
+            print(f"LDAP Watch [{r.get('interface')}] {r.get('seconds')}s: "
+                  f"{r['verdict'].upper()}  ({st.get('ldap_messages', 0)} msgs, "
+                  f"{st.get('binds', 0)} binds, {st.get('searches', 0)} searches, "
+                  f"{st.get('cldap', 0)} CLDAP)")
+            for f in r.get('findings', []):
+                print(f"  - {f['severity']:5} {f['code']}: {f['message']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ldap-selftest':
+        r = _ldap_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        else:
+            for sc in r['scenarios']:
+                print(f"  [{'PASS' if sc['pass'] else 'FAIL'}] {sc['name']}")
+            print(f"LDAP Watch self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'igmp-watch':
@@ -15134,6 +15522,13 @@ def _cli(argv=None):
                     tag = '' if sp['baseline'] else ' *NEW*'
                     print(f"    {sp['src']} prio={sp['priority']}"
                           f"{' ' + ','.join(sp['opcodes']) if sp['opcodes'] else ''}{tag}")
+            for fwd in r.get('glbp_forwarders', []):
+                print(f"  GLBP forwarder {fwd['group']}/{fwd['forwarder']}")
+                for o in fwd['owners']:
+                    tag = '' if o['baseline'] else ' *NEW*'
+                    print(f"    {o['src']} vMAC {o['vmac']} "
+                          f"vf_prio={o['vf_priority']} weight={o['weight']} "
+                          f"{'/'.join(o['states']) or '-'}{tag}")
             for rs in r.get('reasons', []):
                 print(f"  - {rs}")
         return 0 if r.get('success') else 1

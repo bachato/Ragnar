@@ -60,6 +60,7 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 | [VTP Watch](#vtp-watch) | Switch & L2/L3 | `GET /api/net/vtp-watch`, `POST /api/net/vtp-baseline` |
 | [SMB Watch](#smb-watch) | Switch & L2/L3 | `GET /api/net/smb-watch`, `POST /api/net/smb-baseline` |
 | [Relay/Coercion Watch](#relaycoercion-watch) | Switch & L2/L3 | `GET /api/net/relay-watch`, `POST /api/net/relay-baseline` |
+| [LDAP Watch](#ldap-watch) | Switch & L2/L3 | `GET /api/net/ldap-watch` |
 | [FHRP Watch](#fhrp-watch) | Switch & L2/L3 | `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline` |
 | [EIGRP Watch](#eigrp-watch) | Switch & L2/L3 | `GET /api/net/eigrp-watch`, `POST /api/net/eigrp-baseline` |
 | [IS-IS Watch](#is-is-watch) | Switch & L2/L3 | `GET /api/net/isis-watch`, `POST /api/net/isis-baseline` |
@@ -1217,6 +1218,57 @@ disable the Print Spooler on DCs, and patch (or RPC-filter) the coercion vectors
 **API:** `GET /api/net/relay-watch`, `POST /api/net/relay-baseline`. **CLI:**
 `relay-watch`, `relay-selftest`.
 
+### LDAP Watch
+A **passive** Active-Directory / LDAP observer — **detection-only, it never
+transmits**. It sniffs LDAP (**tcp/389**, Global Catalog **tcp/3268**), LDAPS /
+GC-S (**636 / 3269**, seen only as encrypted flows — the LDAP inside is TLS Watch's
+job), and connectionless **CLDAP** (**udp/389**). TCP byte streams are reassembled
+per flow and the **BER/ASN.1 `LDAPMessage`** envelope is decoded by a **hand-rolled
+definite-length decoder** (no library dissectors), which also tolerates
+snaplen-truncated packets. Everything is parsed straight off the wire (`ldap_watch.py`
+is a standalone module, imported by the toolbox).
+
+What it flags:
+
+- **cleartext-bind-credentials** / **sasl-plaintext-cleartext** — a simple or
+  SASL PLAIN/LOGIN/EXTERNAL bind whose password crosses **cleartext** 389/3268; the
+  credential is recoverable straight from the capture. *(compromised)*
+- **anonymous-bind** / **unauthenticated-bind** — an anonymous bind, or the RFC 4513
+  §5.1.2 "unauthenticated" mechanism (a non-empty DN with an **empty** password) the
+  server may silently treat as anonymous. *(suspicious)*
+- **starttls-stripped** — a StartTLS `ExtendedRequest` (OID `1.3.6.1.4.1.1466.20037`)
+  that is **refused** or after which the flow keeps talking cleartext — a
+  downgrade / TLS-strip. *(compromised)*
+- **directory-enumeration** — a whole-subtree `(objectClass=*)` from a domain base, or
+  a high volume of searches from one source — the **BloodHound / ldapdomaindump**
+  signature. *(suspicious)*
+- **sensitive-attribute** — a query for password/LAPS/gMSA/ACL material or
+  **`servicePrincipalName`** (Kerberoast recon; ties into [SMB Watch](#smb-watch)'s
+  Kerberos leg). *(warn, or high over cleartext)*
+- **filter-injection** — an assertion value carrying **unescaped** filter
+  metacharacters (`)(`, bare `(`/`)`), i.e. an LDAP-injection / auth-bypass probe.
+  *(compromised)*
+- **brute-force** — many binds from one client, or many `invalidCredentials` (49)
+  responses toward one client — password spraying / brute force. *(compromised)*
+- **cldap-reflection** / **cldap-amplification** — a CLDAP query from an off-subnet
+  (spoofable) source, or a response several times larger than its query — the DC is a
+  usable **UDP reflection/amplification** vector. *(warn / high)*
+
+Verdict is **clean → suspicious → compromised**. Capture is a short passive **Scapy**
+sniff (Scapy is imported lazily, so `--selftest` and offline parsing need zero
+third-party deps). The findings engine is pure Python and self-tests without root via
+fabricated BER messages (`ldap_watch.py --selftest`, and `test_ldapwatch.py`).
+
+For **continuous** monitoring there is an opt-in **least-privilege systemd unit**
+(`scripts/ragnar-ldapwatch.service`) that runs `ldap_watch.py --daemon` with **only
+`CAP_NET_RAW`** and streams **JSON-lines** findings (one object per line) to
+`/var/log/ragnar/ldapwatch.jsonl` for the web UI + Pushover.
+
+Hardening it drives: require **LDAPS/StartTLS** and reject simple binds on cleartext,
+**disable anonymous binds**, enforce **LDAP signing + channel binding (EPA)** on DCs,
+and restrict **UDP/389** at the edge. **API:** `GET /api/net/ldap-watch`. **CLI:**
+`ldap-watch`, `ldap-selftest`.
+
 ### DTP Watch
 A **passive** VLAN-hopping / switch-spoofing scanner for Cisco's **Dynamic Trunking
 Protocol** (proprietary; group MAC `01:00:0c:cc:cc:cc`, SNAP OUI `0x00000c`, PID
@@ -1364,15 +1416,33 @@ off-subnet traffic now flows through them (Yersinia, Loki, `scapy`). What it fla
   the enabler; the fix is MD5/HMAC (HSRP key-chains, VRRP AH) plus filtering FHRP
   multicast off access ports.
 
-The first scan **learns** the current groups and their active speakers/priorities
-as the trusted baseline (`data/fhrp_watch.json`); after a legitimate router or
-priority change, click **Trust current** to re-learn. HSRP and VRRP are fully
-decoded (priority-based detection); GLBP and CARP are best-effort (new-speaker
-presence, since `tcpdump` doesn't dissect GLBP). The BPF is
-`(udp and (port 1985 or port 3222)) or (ip proto 112) or (ip6 proto 112)`. Put the
-Pi on the routed VLAN or a SPAN/mirror to see the hellos. **API:**
-`GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline`. **CLI:** `fhrp-watch`,
-`fhrp-selftest`.
+**GLBP gets its own decoder and two hijack planes.** Neither `tcpdump` nor Scapy
+dissects GLBP, so it is decoded by a **hand-rolled byte parser** (per the Wireshark
+GLBP dissector: a 12-byte header then type/length/value TLVs — Hello, Virtual
+Forwarder, Auth). GLBP splits the gateway job across **two independent elections**,
+so it has two distinct hijacks:
+
+- **AVG (Active Virtual Gateway)** — one router owns the vIP and, crucially, decides
+  which virtual MAC each host is handed. Seizing it (a winning Hello priority) is a
+  takeover **worse than HSRP**: the attacker chooses *who* to MITM. This reuses the
+  priority rules above (surfaces as **hijack**).
+- **AVF (Active Virtual Forwarder)** — up to four AVFs each own a virtual MAC and
+  forward a slice of the hosts. **glbp-avf-hijack** fires when a non-baseline speaker
+  goes **Active** for a forwarder (or the same vMAC re-homes to a new source): it
+  quietly captures that forwarder's slice while the AVG election stays
+  healthy-looking — the stealthiest FHRP takeover. **glbp-weight-skew** fires when a
+  forwarder's advertised **weight** shifts far enough to steer which hosts route
+  through it (selective capture without an election change).
+
+The first scan **learns** the current groups, their active speakers/priorities, and
+the **GLBP forwarders** (owner, vMAC, weight per group/forwarder) as the trusted
+baseline (`data/fhrp_watch.json`); after a legitimate router/priority/forwarder
+change, click **Trust current** to re-learn. Capture is done to a pcap (BPF
+`(udp and (port 1985 or port 3222)) or (ip proto 112) or (ip6 proto 112)`), replayed
+through `tcpdump -r … -v` for the HSRP/VRRP/CARP parse and byte-decoded with Scapy
+for GLBP; CARP stays best-effort. Put the Pi on the routed VLAN or a SPAN/mirror to
+see the hellos. **API:** `GET /api/net/fhrp-watch`, `POST /api/net/fhrp-baseline`.
+**CLI:** `fhrp-watch`, `fhrp-selftest`.
 
 ### EIGRP Watch
 A **passive** routing-security scanner for Cisco's **EIGRP** — its interior gateway
