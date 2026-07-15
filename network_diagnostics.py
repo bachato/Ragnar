@@ -32,10 +32,12 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import bgp_speaker
+import ldap_watch
 import path_asymmetry
 import tls_watch
 import wifi_analyzer
 import wifi_defense
+from ldap_watch import do_ldap_watch
 from tls_watch import do_tls_watch
 
 try:
@@ -12660,6 +12662,17 @@ def _tls_selftest():
                       'pass': all(c['pass'] for c in r['checks'])}}
 
 
+def _ldap_selftest():
+    """Adapt ldap_watch.selftest() to the aggregator's scenarios/scapy shape. The
+    LDAP parse+detect path is pure-Python, so it needs no Scapy for the harness."""
+    r = ldap_watch.selftest()
+    scen = [{'name': c['name'], 'pass': c['pass'],
+             'expect': c.get('want'), 'got': c.get('got')}
+            for c in r['checks']]
+    return {'success': r['success'], 'scenarios': scen,
+            'scapy': {'ran': True, 'pass': r['success']}}
+
+
 def do_routing_selftest():
     """Run the IGMP / OSPF / BGP detector self-tests and report a combined result
     plus whether Scapy is available for the end-to-end packet-crafting leg. Drives
@@ -12673,6 +12686,7 @@ def do_routing_selftest():
               'dtp': _dtp_selftest(), 'cdp': _cdp_selftest(), 'vtp': _vtp_selftest(),
               'eigrp': _eigrp_selftest(),
               'fhrp': _fhrp_selftest(), 'tls': _tls_selftest(),
+              'ldap': _ldap_selftest(),
               'ospf': _ospf_selftest(), 'bgp': _bgp_selftest(),
               'bgp_speaker': bgp_speaker.selftest(), 'path_asymmetry': path_asymmetry.selftest()}
     return {
@@ -13453,6 +13467,16 @@ def register_network_diagnostics(app, logger=None):
         no_quic = (request.args.get('no_quic') or '').lower() in ('1', 'true', 'yes')
         _log(f"net/tls-watch iface={iface or 'default-route'} secs={secs}")
         return jsonify(do_tls_watch(interface=iface, seconds=secs, no_quic=no_quic))
+
+    @app.route('/api/net/ldap-watch', methods=['GET'])
+    def net_ldap_watch():
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        iface = iface or _default_route_iface()
+        secs = _clamp_int(request.args.get('seconds'), 15, 5, 60)
+        _log(f"net/ldap-watch iface={iface or 'default-route'} secs={secs}")
+        return jsonify(do_ldap_watch(interface=iface, seconds=secs))
 
     @app.route('/api/net/ipv6-watch', methods=['GET'])
     def net_ipv6_watch():
@@ -14236,6 +14260,16 @@ def _cli(argv=None):
     tst = sub.add_parser('tls-selftest', help='self-test the TLS Watch detectors (no root)')
     tst.add_argument('--json', action='store_true', help='emit JSON')
 
+    lw = sub.add_parser('ldap-watch',
+                        help='passive LDAP / Active Directory watch (bind/enum/CLDAP)')
+    lw.add_argument('--iface', '-i', default=None, help='interface (default: route)')
+    lw.add_argument('--seconds', '-s', type=int, default=15, help='capture window (5-60)')
+    lw.add_argument('--json', action='store_true', help='emit JSON')
+
+    lst = sub.add_parser('ldap-selftest',
+                         help='self-test the LDAP Watch detectors (no root)')
+    lst.add_argument('--json', action='store_true', help='emit JSON')
+
     v6 = sub.add_parser('ipv6-watch', help='passive IPv6 first-hop (RA/DHCPv6) scan')
     v6.add_argument('--iface', '-i', default=None, help='interface (default: route)')
     v6.add_argument('--seconds', '-s', type=int, default=12, help='capture window (4-40)')
@@ -14429,6 +14463,33 @@ def _cli(argv=None):
                 print(f"  [{'PASS' if sc['pass'] else 'FAIL'}] {sc['name']}")
             print(f"  scapy: {'available' if r['scapy']['ran'] else 'absent'}")
             print(f"TLS Watch self-test: {'OK' if r['success'] else 'FAILED'}")
+        return 0 if r['success'] else 1
+
+    if args.cmd == 'ldap-watch':
+        iface = args.iface or _default_route_iface()
+        r = do_ldap_watch(interface=iface, seconds=args.seconds)
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        elif not r.get('success'):
+            print(f"error: {r.get('error')}")
+        else:
+            st = r.get('stats', {})
+            print(f"LDAP Watch [{r.get('interface')}] {r.get('seconds')}s: "
+                  f"{r['verdict'].upper()}  ({st.get('ldap_messages', 0)} msgs, "
+                  f"{st.get('binds', 0)} binds, {st.get('searches', 0)} searches, "
+                  f"{st.get('cldap', 0)} CLDAP)")
+            for f in r.get('findings', []):
+                print(f"  - {f['severity']:5} {f['code']}: {f['message']}")
+        return 0 if r.get('success') else 1
+
+    if args.cmd == 'ldap-selftest':
+        r = _ldap_selftest()
+        if args.json:
+            print(json.dumps(r, indent=2, default=str))
+        else:
+            for sc in r['scenarios']:
+                print(f"  [{'PASS' if sc['pass'] else 'FAIL'}] {sc['name']}")
+            print(f"LDAP Watch self-test: {'OK' if r['success'] else 'FAILED'}")
         return 0 if r['success'] else 1
 
     if args.cmd == 'igmp-watch':
