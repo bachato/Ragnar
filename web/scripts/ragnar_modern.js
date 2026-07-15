@@ -5910,6 +5910,80 @@ async function smbTrustBaseline() {
     }
 }
 
+// ---- LDAP Watch (Active Directory / LDAP, passive) -------------------------
+const _LDAP_VERDICT_STYLE = {
+    clean:        ['bg-green-950/40 border-green-900 text-green-400', '✓ No LDAP/AD exposure or attack observed'],
+    suspicious:   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak LDAP posture / recon — anonymous binds, enumeration, or CLDAP exposure'],
+    compromised:  ['bg-red-950/60 border-red-800 text-red-300', '🛑 LDAP CREDENTIAL EXPOSURE / ATTACK — cleartext creds, StartTLS strip, injection, or brute force'],
+    unknown:      ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+};
+const _LDAP_SEV_STYLE = { high: 'text-red-300', warn: 'text-amber-300', low: 'text-gray-400', info: 'text-gray-500' };
+function _ldapFillIfaces() {
+    const sel = document.getElementById('ldap-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+async function runLdapWatch() {
+    const out = document.getElementById('ldap-results');
+    if (!out) return;
+    const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('ldap-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
+    const secsEl = document.getElementById('ldap-secs');
+    const secs = secsEl && secsEl.value ? secsEl.value : '15';
+    _ndBusy(btn, true, 'Listening…');
+    out.classList.remove('hidden');
+    out.innerHTML = '<p class="text-sm text-gray-400">Passively capturing LDAP / CLDAP…</p>';
+    try {
+        _ldapFillIfaces();
+        const qs = '?seconds=' + encodeURIComponent(secs) + (iface ? '&interface=' + encodeURIComponent(iface) : '');
+        const d = await fetchAPI('/api/net/ldap-watch' + qs);
+        if (!d || d.success === false) {
+            const msg = (d && d.error) || 'failed';
+            let extra = '';
+            if (d && d.missing_tool === 'scapy') extra = ' — install Scapy via Detector Self-Test';
+            out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml(msg) + escapeHtml(extra) + '</p>';
+            return;
+        }
+        const [cls, label] = _LDAP_VERDICT_STYLE[d.verdict] || _LDAP_VERDICT_STYLE.unknown;
+        const st = d.stats || {};
+        let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
+        html += `<p class="text-xs text-gray-500 mb-2">Interface: ${escapeHtml(d.interface || '—')} · ${d.seconds}s · ${st.ldap_messages || 0} messages · ${st.binds || 0} binds · ${st.searches || 0} searches · ${st.extended || 0} extended · ${st.cldap || 0} CLDAP · ${st.flows || 0} flows</p>`;
+        const findings = d.findings || [];
+        if (findings.length) {
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Sev</th><th class="px-2 py-1">Finding</th><th class="px-2 py-1">Source → Target</th><th class="px-2 py-1">Detail</th></tr>' +
+                '</thead><tbody>' +
+                findings.map(f => {
+                    const sev = _LDAP_SEV_STYLE[f.severity] || 'text-gray-400';
+                    return `<tr class="border-t border-slate-800 align-top">
+                        <td class="px-2 py-1 ${sev} uppercase">${escapeHtml(f.severity || '')}</td>
+                        <td class="px-2 py-1 ${sev}">${escapeHtml(f.code || '')}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml((f.src || '') + ' → ' + (f.dst || ''))}</td>
+                        <td class="px-2 py-1 text-gray-400 whitespace-normal">${escapeHtml(f.message || '')}</td>
+                    </tr>`;
+                }).join('') +
+                '</tbody></table>';
+        } else {
+            html += '<p class="text-sm text-green-400/80">No findings — LDAP/AD traffic looks clean (or none seen on this segment).</p>';
+        }
+        out.innerHTML = html;
+    } catch (e) {
+        out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
+    } finally {
+        _ndBusy(btn, false);
+    }
+}
+
 // ---- DTP Watch (passive VLAN-hopping / switch-spoofing scanner) -------------
 const _DTP_VERDICT_STYLE = {
     clean:               ['bg-green-950/40 border-green-900 text-green-400', '✓ No DTP trunk negotiation — ports are not forming trunks here'],
@@ -6397,12 +6471,14 @@ async function eigrpTrustBaseline() {
 
 // ---- FHRP Watch (passive HSRP/VRRP/GLBP/CARP hijack scanner) ----------------
 const _FHRP_VERDICT_STYLE = {
-    clean:             ['bg-green-950/40 border-green-900 text-green-400', '✓ FHRP groups/speakers match the trusted baseline'],
-    'weak-auth':       ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak / no FHRP authentication — a forged hello can win the election'],
-    'priority-change': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ A known FHRP speaker raised its priority — possible pre-takeover'],
-    'rogue-speaker':   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Unexpected FHRP speaker on the segment — not in the baseline'],
-    hijack:            ['bg-red-950/60 border-red-800 text-red-300', '🛑 FHRP HIJACK — a new speaker is winning the virtual-gateway election'],
-    unknown:           ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
+    clean:              ['bg-green-950/40 border-green-900 text-green-400', '✓ FHRP groups/speakers/GLBP forwarders match the trusted baseline'],
+    'weak-auth':        ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Weak / no FHRP authentication — a forged hello can win the election'],
+    'glbp-weight-skew': ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ GLBP forwarder weight changed — load-share shift steers which hosts route through an AVF'],
+    'priority-change':  ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ A known FHRP speaker raised its priority — possible pre-takeover'],
+    'rogue-speaker':    ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠ Unexpected FHRP speaker on the segment — not in the baseline'],
+    'glbp-avf-hijack':  ['bg-red-950/60 border-red-800 text-red-300', '🛑 GLBP AVF HIJACK — a forwarder (vMAC) seized: stealth per-slice MITM while the gateway election looks healthy'],
+    hijack:             ['bg-red-950/60 border-red-800 text-red-300', '🛑 FHRP HIJACK — a new speaker is winning the virtual-gateway election'],
+    unknown:            ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine'],
 };
 function _fhrpFillIfaces() {
     const sel = document.getElementById('fhrp-iface');
@@ -6461,6 +6537,27 @@ async function runFhrpWatch() {
                 }).join('') +
                 '</tbody></table>';
         });
+        if ((d.glbp_forwarders || []).length) {
+            html += '<p class="text-xs uppercase text-gray-400 mt-3 mb-1">GLBP forwarder plane (AVF)</p>';
+            html += '<table class="min-w-full text-xs text-gray-300 whitespace-nowrap"><thead>' +
+                '<tr class="text-left text-gray-500"><th class="px-2 py-1">Group/Fwd</th><th class="px-2 py-1">Owner</th><th class="px-2 py-1">vMAC</th><th class="px-2 py-1">VF prio</th><th class="px-2 py-1">Weight</th><th class="px-2 py-1">State</th><th class="px-2 py-1">Status</th></tr>' +
+                '</thead><tbody>';
+            (d.glbp_forwarders || []).forEach(fwd => {
+                (fwd.owners || []).forEach(o => {
+                    const badge = o.baseline ? '<span class="text-green-400">✓ owner</span>' : '<span class="text-red-300">? new</span>';
+                    html += `<tr class="border-t border-slate-800">
+                        <td class="px-2 py-1 font-mono">${fwd.group}/${fwd.forwarder}</td>
+                        <td class="px-2 py-1 font-mono ${o.baseline ? '' : 'text-red-300'}">${escapeHtml(o.src)}</td>
+                        <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(o.vmac || '—')}</td>
+                        <td class="px-2 py-1 font-mono">${o.vf_priority == null ? '—' : o.vf_priority}</td>
+                        <td class="px-2 py-1 font-mono">${o.weight == null ? '—' : o.weight}</td>
+                        <td class="px-2 py-1 text-gray-400">${escapeHtml((o.states || []).join(', ') || '—')}</td>
+                        <td class="px-2 py-1">${badge}</td>
+                    </tr>`;
+                });
+            });
+            html += '</tbody></table>';
+        }
         if (d.reasons && d.reasons.length) {
             html += '<ul class="text-xs text-gray-400 mt-2 list-disc pl-5">' +
                 d.reasons.map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
@@ -6723,7 +6820,7 @@ async function runRoutingSelftest() {
             : 'Scapy: <span class="text-amber-300">not installed</span> — end-to-end leg skipped';
         if (instBtn) instBtn.classList.toggle('hidden', !!d.scapy_available);
 
-        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ndp: 'NDP Watch (IPv6 neighbor spoofing)', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', cert: 'Cert Watch', tls: 'TLS Watch (passive JA4/QUIC)', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning + Kerberos downgrade)', relay: 'Relay/Coercion Watch (NTLM relay)', dtp: 'DTP Watch (VLAN hopping)', cdp: 'CDP Watch (Cisco Discovery leak/flood)', vtp: 'VTP Watch (VTP bomb / VLAN-DB wipe)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
+        const names = { igmp: 'IGMP Watch', ipv6: 'IPv6 First-Hop Watch', ndp: 'NDP Watch (IPv6 neighbor spoofing)', raguard: 'IPv6 RA Guard', ntp: 'NTP Watch', icmp: 'ICMP Watch', snmp: 'SNMP Watch', cert: 'Cert Watch', tls: 'TLS Watch (passive JA4/QUIC)', stp: 'STP/BPDU Watch (spanning tree)', smb: 'SMB Watch (SMBv1 + poisoning + Kerberos downgrade)', relay: 'Relay/Coercion Watch (NTLM relay)', ldap: 'LDAP Watch (Active Directory)', dtp: 'DTP Watch (VLAN hopping)', cdp: 'CDP Watch (Cisco Discovery leak/flood)', vtp: 'VTP Watch (VTP bomb / VLAN-DB wipe)', eigrp: 'EIGRP Watch (Cisco IGP)', isis: 'IS-IS Watch (IGP)', fhrp: 'FHRP Watch (HSRP/VRRP/GLBP/CARP)', ospf: 'OSPF Scanner', bgp: 'BGP Path Watch',
                         bgp_speaker: 'BGP Speaker (codec/FSM/RIB)', path_asymmetry: 'Path Asymmetry (OWD)' };
         const overall = d.success
             ? '<div class="mb-2 px-3 py-2 rounded border bg-green-950/40 border-green-900 text-green-400 text-sm">✓ All detector self-tests passed' + (d.scapy_available ? ' (including Scapy end-to-end)' : ' — install Scapy for the end-to-end leg') + '</div>'
