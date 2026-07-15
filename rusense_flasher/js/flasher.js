@@ -208,8 +208,28 @@ window.provisionDevice = async function () {
   }
   const ssid = ($("prov-ssid").value || "").trim();
   const password = $("prov-pass").value || "";               // don't trim — passwords may hold spaces
-  const targetIp = ($("prov-ip").value || "").trim();
+  let targetIp = ($("prov-ip").value || "").trim();
   const targetPort = parseInt($("prov-port").value, 10) || 5005;
+
+  /* Normalize the server IP. Users paste the dashboard URL ("http://192.168.0.147:8000/")
+   * here; the firmware's target_ip field holds at most 15 chars, so ":8000" gets silently
+   * truncated to ":8", inet_pton() rejects it, and the node's UDP sender never starts
+   * (boot log: "Invalid target IP: x.x.x.x:8 / Failed to initialize UDP sender"). Strip
+   * scheme/path/port down to the bare IPv4, and refuse anything that isn't one. */
+  let strippedPort = null;
+  if (targetIp) {
+    targetIp = targetIp.replace(/^[a-z]+:\/\//i, "").replace(/[/?#].*$/, "");
+    const portSuffix = targetIp.match(/^(.*):(\d{1,5})$/);
+    if (portSuffix) { targetIp = portSuffix[1]; strippedPort = portSuffix[2]; }
+    const octets = targetIp.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!octets || octets.slice(1).some((o) => parseInt(o, 10) > 255)) {
+      alert(
+        "Server IP must be a plain IPv4 address like 192.168.1.20 — no http://, no :port, no hostname.\n" +
+        "It's the address of your Ragnar box; the CSI stream goes to the UDP port in the Port field (default 5005)."
+      );
+      return;
+    }
+  }
   const nodeIdRaw = ($("prov-node").value || "").trim();
   const nodeId = nodeIdRaw === "" ? 1 : parseInt(nodeIdRaw, 10);
   if (!ssid)     { alert("Enter your 2.4 GHz WiFi SSID."); return; }
@@ -235,6 +255,10 @@ window.provisionDevice = async function () {
     const nvs = window.buildCsiCfgNvs({ ssid, password, target_ip: targetIp, target_port: targetPort, node_id: nodeId });
     log("WiFi SSID : " + ssid);
     log("Server    : " + targetIp + ":" + targetPort);
+    if (strippedPort) {
+      log("Note      : ':" + strippedPort + "' was stripped from the Server IP — CSI streams to UDP " +
+          targetPort + " (the Port field), not the web-dashboard port.");
+    }
     log("Node ID   : " + nodeId);
     log("Edge tier : 0 (raw CSI — server-side fusion)");
     log("NVS       : " + nvs.length + " bytes @ 0x9000 (csi_cfg)");
