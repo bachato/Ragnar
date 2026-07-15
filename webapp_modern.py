@@ -8815,6 +8815,18 @@ def _detect_local_cidr():
                     return str(_ipaddress.IPv4Network(cidr, strict=False))
                 except (ValueError, _ipaddress.NetmaskValueError):
                     continue
+
+    if shared_data.config.get('ethernet_scan_enabled', True):
+        try:
+            eth_info = get_active_ethernet_interface()
+            network_cidr = (
+                eth_info.get('network_cidr') if eth_info else None
+            )
+            if network_cidr:
+                return network_cidr
+        except Exception:
+            pass
+
     return None
 
 
