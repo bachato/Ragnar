@@ -398,12 +398,15 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
   (hijack / injection / poisoning / coercion / VLAN-hop / root-hijack …) page as
   **compromised**; posture/deviation findings (weak-auth, SMBv1, unsigned SMB,
   name-exposure …) as **suspicious**. An already-alerted condition is
-  **remembered per check** — a run that comes back quiet (`unknown` /
-  `no-traffic`) does *not* re-arm the alert, so a finding the scanner only sees
-  on some cycles pages once, not on every sighting. It re-alerts only if the
-  check **escalates** (suspicious → compromised), if it stayed clean for 3
-  consecutive runs and then returned, or as a **daily reminder** while it
-  persists (`net_integrity_realert_hours`, default 24, `0` = never remind).
+  **remembered per check** (persisted in `data/net_integrity_alerts.json`, so
+  service restarts and updates don't re-page standing findings) — a run that
+  comes back quiet (`unknown` / `no-traffic`, or a DNS answer that momentarily
+  agrees with public resolvers) does *not* re-arm the alert, so a finding the
+  scanner only sees on some cycles pages once, not on every sighting. It
+  re-alerts only if the check **escalates** (suspicious → compromised), if it
+  stayed clean for a **full 24 h** and then returned, or — optionally — as a
+  periodic reminder while it persists (`net_integrity_realert_hours`, default
+  `0` = never remind).
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
