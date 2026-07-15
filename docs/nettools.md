@@ -404,13 +404,27 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
 STP · DTP · CDP · VTP · IGMP · IPv6 first-hop · NDP · FHRP · OSPF · EIGRP · IS-IS · BGP · SMB ·
-Relay/Coercion · NTP · ICMP · SNMP · TLS. Because each of those does a short
-`tcpdump` capture, they're run a **round-robin batch at a time** (default 3 per
-cycle, configurable) so a cycle stays ~1 minute; a full sweep completes over
-several cycles, and each scanner self-noops cheaply when its protocol isn't on
-the segment. The dashboard shows every scanner's last-known verdict even on
-cycles it didn't run. Each scanner **learns its baseline on first sight**, so
-run the monitor on a trusted network first (or use each card's "Trust current").
+Relay/Coercion · NTP · ICMP · SNMP · Cert · TLS · LDAP. Because each of those
+does a short `tcpdump` capture, they're run a **round-robin batch at a time**
+(default 3 per cycle, configurable) so a cycle stays ~1 minute; a full sweep
+completes over several cycles, and each scanner self-noops cheaply when its
+protocol isn't on the segment. The dashboard shows every scanner's last-known
+verdict even on cycles it didn't run. Each scanner **learns its baseline on
+first sight**, so run the monitor on a trusted network first (or use each
+card's "Trust current").
+
+**Capture interface.** The capture-based scanners (and the DHCP Guardian check)
+listen on a **link-up wired port first** — the same auto used by the Switch &
+L2/L3 cards. That matters for the sensor deployment: Ragnar plugged into a
+switch port to watch it (mirror/SPAN or an isolated VLAN with no gateway) while
+managed over WiFi. The default route sits on `wlan0`, but STP/DTP/CDP/VTP/FHRP
+frames only exist on the cable — following the default route there would leave
+the monitor blind on the exact segment it's meant to watch. Pin a specific
+interface with the **capture on** selector (`net_integrity_interface`); with no
+wired link it falls back to the default-route interface. The path-scoped checks
+(DNS Doctor, RA-Guard posture) always test the host's actual traffic path, so
+they're unaffected. The status line shows which interface the last cycle
+captured on.
 
 **Off by default**, because it makes outbound DNS/DoH calls each cycle — opt in
 with the toggle. **Check now** runs the fast core immediately (works even while
@@ -419,6 +433,7 @@ the monitor is off); the extended scanners run on the background rotation.
 - Endpoint: `GET /api/net/integrity` · config: `net_integrity_monitor_enabled`,
   `net_integrity_interval_min`, `net_integrity_check_dhcp`,
   `net_integrity_extended_enabled`, `net_integrity_batch_size`,
+  `net_integrity_interface` (`''` = auto: wired link-up → default route),
   `pushover_notify_net_integrity`, `net_integrity_notify_cooldown_s`
 
 ### Path MTU / Black-hole

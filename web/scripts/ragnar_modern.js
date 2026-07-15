@@ -4323,7 +4323,7 @@ function renderNetIntegrity(d) {
     // Prefer the full per-check map (extended monitor); fall back to dns/arp/dhcp.
     let entries;
     if (d.checks && Object.keys(d.checks).length) {
-        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'cdp', 'vtp', 'igmp', 'ipv6', 'ndp', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'cert', 'tls'];
+        const order = ['dns', 'arp', 'dhcp', 'raguard', 'stp', 'dtp', 'cdp', 'vtp', 'igmp', 'ipv6', 'ndp', 'fhrp', 'ospf', 'eigrp', 'isis', 'bgp', 'smb', 'relay', 'ntp', 'icmp', 'snmp', 'cert', 'tls', 'ldap'];
         entries = Object.keys(d.checks).sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99))
             .map(k => [d.checks[k].label || k.toUpperCase(), d.checks[k].verdict, d.checks[k].reasons || []]);
     } else {
@@ -4337,7 +4337,8 @@ function renderNetIntegrity(d) {
         .concat(entries.map(e => _netintChip(e[0], e[1] || 'unknown'))).join(' ');
     const reasons = [].concat(...entries.filter(e => _netintRank(e[1]) >= 1).map(e => e[2]));
     const when = d.ts ? new Date(d.ts).toLocaleString() : (d.monitor_enabled ? 'awaiting first check…' : 'monitor off');
-    let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}${d.extended_enabled ? ' · extended (rotating passive scanners)' : ''}</span>`;
+    const capIf = d.capture_iface ? ' · capturing on ' + escapeHtml(d.capture_iface) : '';
+    let html = chips + `<span class="text-xs text-gray-500 w-full mt-1">Last check: ${escapeHtml(when)}${capIf}${d.extended_enabled ? ' · extended (rotating passive scanners)' : ''}</span>`;
     if (reasons.length) {
         html += '<ul class="text-xs text-gray-400 w-full list-disc pl-5 mt-1">' +
             reasons.slice(0, 4).map(r => '<li>' + escapeHtml(r) + '</li>').join('') + '</ul>';
@@ -4390,17 +4391,39 @@ async function netIntegrityRefresh(force) {
         if (btn) { btn.disabled = false; btn.textContent = btn.dataset.orig || 'Check now'; }
     }
 }
+function _netintFillIfaces() {
+    const sel = document.getElementById('netint-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function syncNetIntegrityFromServer() {
     const cb = document.getElementById('netint-enabled');
     const ext = document.getElementById('netint-extended');
     const batch = document.getElementById('netint-batch');
+    const ifaceSel = document.getElementById('netint-iface');
     try {
         const d = await fetchAPI('/api/net/integrity');
         if (cb) cb.checked = !!d.monitor_enabled;
         if (ext) ext.checked = d.extended_enabled !== false;
         if (batch && d.batch_size) batch.value = d.batch_size;
+        if (ifaceSel) { await _netintFillIfaces(); ifaceSel.value = d.interface || ''; }
         renderNetIntegrity(d);
     } catch (e) { /* offline */ }
+}
+function onNetIntegrityIfaceChanged(sel) {
+    const v = sel.value || '';
+    postAPI('/api/config', { net_integrity_interface: v })
+        .then(() => addConsoleMessage('Monitor capture interface: ' + (v || 'auto (wired first)'), 'info'))
+        .catch(err => addConsoleMessage('Failed to set capture interface: ' + err.message, 'error'));
 }
 function onNetIntegrityToggled(cb) {
     postAPI('/api/config', { net_integrity_monitor_enabled: cb.checked })

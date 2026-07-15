@@ -1266,6 +1266,13 @@ def _net_integrity_check_once():
     global _net_integrity_rotation
     cfg = shared_data.config
 
+    # Capture interface for the segment-scoped scanners: the configured pin
+    # (net_integrity_interface) or auto — a link-up wired port first, so a
+    # sensor plugged into a switch but managed over WiFi watches the cable,
+    # not wlan0 — falling back to the default-route interface.
+    mon_iface = str(cfg.get('net_integrity_interface') or '').strip() or None
+    cap_iface = nd._capture_iface(mon_iface)
+
     def watch(fn, **kw):
         try:
             r = fn(**kw)
@@ -1292,31 +1299,33 @@ def _net_integrity_check_once():
             ('arp', 'ARP', lambda: watch(nd.do_arp_check)),
             ('raguard', 'RA-Guard', lambda: watch(nd.do_raguard, action='check'))]
     if cfg.get('net_integrity_check_dhcp', True):
-        fast.append(('dhcp', 'DHCP', lambda: watch(nd.do_dhcp_guardian, quick=True)))
+        fast.append(('dhcp', 'DHCP', lambda: watch(nd.do_dhcp_guardian, quick=True,
+                                                   interface=cap_iface)))
 
     # Capture-based passive scanners — rotated a batch at a time so each cycle stays
-    # light. Each self-noops cheaply when its protocol isn't on the segment.
+    # light. Each self-noops cheaply when its protocol isn't on the segment. All
+    # capture on cap_iface (wired-preferred; see above).
     rotation = [
-        ('stp', 'STP', lambda: watch(nd.do_stp_watch)),
-        ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch)),
-        ('cdp', 'CDP', lambda: watch(nd.do_cdp_watch)),
-        ('vtp', 'VTP', lambda: watch(nd.do_vtp_watch)),
-        ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch)),
-        ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch)),
-        ('ndp', 'NDP', lambda: watch(nd.do_ndp_watch)),
-        ('fhrp', 'FHRP', lambda: watch(nd.do_fhrp_watch)),
-        ('ospf', 'OSPF', lambda: watch(nd.do_ospf_watch)),
-        ('eigrp', 'EIGRP', lambda: watch(nd.do_eigrp_watch)),
-        ('isis', 'IS-IS', lambda: watch(nd.do_isis_watch)),
-        ('bgp', 'BGP', lambda: watch(nd.do_bgp_watch, enrich=False)),
-        ('smb', 'SMB', lambda: watch(nd.do_smb_watch)),
-        ('relay', 'Relay', lambda: watch(nd.do_relay_watch)),
-        ('ntp', 'NTP', lambda: watch(nd.do_ntp_watch)),
-        ('icmp', 'ICMP', lambda: watch(nd.do_icmp_watch)),
-        ('snmp', 'SNMP', lambda: watch(nd.do_snmp_watch)),
+        ('stp', 'STP', lambda: watch(nd.do_stp_watch, interface=cap_iface)),
+        ('dtp', 'DTP', lambda: watch(nd.do_dtp_watch, interface=cap_iface)),
+        ('cdp', 'CDP', lambda: watch(nd.do_cdp_watch, interface=cap_iface)),
+        ('vtp', 'VTP', lambda: watch(nd.do_vtp_watch, interface=cap_iface)),
+        ('igmp', 'IGMP', lambda: watch(nd.do_igmp_watch, interface=cap_iface)),
+        ('ipv6', 'IPv6', lambda: watch(nd.do_ipv6_watch, interface=cap_iface)),
+        ('ndp', 'NDP', lambda: watch(nd.do_ndp_watch, interface=cap_iface)),
+        ('fhrp', 'FHRP', lambda: watch(nd.do_fhrp_watch, interface=cap_iface)),
+        ('ospf', 'OSPF', lambda: watch(nd.do_ospf_watch, interface=cap_iface)),
+        ('eigrp', 'EIGRP', lambda: watch(nd.do_eigrp_watch, interface=cap_iface)),
+        ('isis', 'IS-IS', lambda: watch(nd.do_isis_watch, interface=cap_iface)),
+        ('bgp', 'BGP', lambda: watch(nd.do_bgp_watch, enrich=False, interface=cap_iface)),
+        ('smb', 'SMB', lambda: watch(nd.do_smb_watch, interface=cap_iface)),
+        ('relay', 'Relay', lambda: watch(nd.do_relay_watch, interface=cap_iface)),
+        ('ntp', 'NTP', lambda: watch(nd.do_ntp_watch, interface=cap_iface)),
+        ('icmp', 'ICMP', lambda: watch(nd.do_icmp_watch, interface=cap_iface)),
+        ('snmp', 'SNMP', lambda: watch(nd.do_snmp_watch, interface=cap_iface)),
         ('cert', 'Cert', lambda: watch(nd.do_cert_watch, discover=False)),
-        ('tls', 'TLS', lambda: watch(nd.do_tls_watch, interface=nd._default_route_iface())),
-        ('ldap', 'LDAP', lambda: watch(nd.do_ldap_watch, interface=nd._default_route_iface())),
+        ('tls', 'TLS', lambda: watch(nd.do_tls_watch, interface=cap_iface)),
+        ('ldap', 'LDAP', lambda: watch(nd.do_ldap_watch, interface=cap_iface)),
     ]
 
     to_run = list(fast)
@@ -1351,6 +1360,7 @@ def _net_integrity_check_once():
         dns_c = checks.get('dns') or {}
         _net_integrity_state.update({
             'enabled': True, 'ts': now, 'overall': overall, 'checks': checks,
+            'capture_iface': cap_iface,
             'dns': {'name': name, 'verdict': dns_c.get('verdict', 'unknown'),
                     'reasons': dns_c.get('reasons') or []},
             'arp': {'verdict': (checks.get('arp') or {}).get('verdict', 'unknown'),
@@ -1420,6 +1430,7 @@ def net_integrity_status():
     state['interval_min'] = shared_data.config.get('net_integrity_interval_min', 5)
     state['extended_enabled'] = bool(shared_data.config.get('net_integrity_extended_enabled', True))
     state['batch_size'] = shared_data.config.get('net_integrity_batch_size', 3)
+    state['interface'] = shared_data.config.get('net_integrity_interface', '') or ''
     return jsonify({'success': True, **state})
 
 

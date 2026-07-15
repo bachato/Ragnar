@@ -1319,8 +1319,14 @@
                             <span>scanners/cycle</span>
                             <input type="number" id="netint-batch" min="1" max="15" value="3" onchange="onNetIntegrityBatchChanged(this)" class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs">
                         </label>
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400" title="Interface the capture-based scanners listen on. Auto prefers a wired port with link — so a sensor plugged into a switch but managed over WiFi watches the cable, not wlan0 — and falls back to the default-route interface.">
+                            <span>capture on</span>
+                            <select id="netint-iface" onchange="onNetIntegrityIfaceChanged(this)" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="">Auto (wired first)</option>
+                            </select>
+                        </label>
                     </div>
-                    <p class="text-xs text-gray-500 mt-2">"Check now" runs the fast core (DNS · ARP · DHCP) immediately; the extended scanners run on the background rotation once the monitor is enabled.</p>
+                    <p class="text-xs text-gray-500 mt-2">"Check now" runs the fast core (DNS · ARP · DHCP) immediately; the extended scanners run on the background rotation once the monitor is enabled. Capture-based scanners listen on a link-up <strong>wired</strong> port by default (or the interface pinned above) — DNS and RA-Guard always check the host's actual traffic path.</p>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
@@ -1507,7 +1513,7 @@
                         <p class="text-sm text-gray-400 mb-3">Passively captures NTP and flags <strong>time-injection</strong> (a source whose served time disagrees with the segment consensus / local clock), a <strong>rogue server</strong> (answering but not in the baseline), a <strong>Kiss-o'-Death</strong> (stratum-0 sync-DoS), <strong>stratum spoofing</strong> (a forged Stratum-1/GPS claim), a rogue <strong>broadcast</strong> time source, mode 6/7 <strong>monlist recon/amplification</strong>, and anomalies (implausible root dispersion, leap-alarm, refid loop). First scan learns the trusted time source(s) (<span class="font-mono">data/ntp_watch.json</span>); "Trust current" re-learns.</p>
                         <div class="flex flex-wrap items-center gap-2">
                             <select id="ntp-iface" title="Interface for the NTP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                                <option value="">Auto (default route)</option>
+                                <option value="">Auto (wired first)</option>
                             </select>
                             <input id="ntp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                             <button onclick="runNtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan NTP</button>
@@ -1522,7 +1528,7 @@
                         <p class="text-sm text-gray-400 mb-3">Passively captures SNMP (UDP 161/162) and flags <strong>write-exposed</strong> (a cleartext SetRequest), <strong>cleartext</strong> v1/v2c community exposure (worse for default strings like <span class="font-mono">public</span>/<span class="font-mono">private</span>), SNMP <strong>amplification</strong> (GetBulk with huge max-repetitions — a reflection-DDoS vector), and <strong>enumeration</strong> (a host walking the MIB). Only <strong>v3</strong> reads clean. First scan learns the segment's agents + community strings (<span class="font-mono">data/snmp_watch.json</span>) so later scans highlight <em>new</em> exposure; "Trust current" re-learns.</p>
                         <div class="flex flex-wrap items-center gap-2">
                             <select id="snmp-iface" title="Interface for the SNMP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                                <option value="">Auto (default route)</option>
+                                <option value="">Auto (wired first)</option>
                             </select>
                             <input id="snmp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                             <button onclick="runSnmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan SNMP</button>
@@ -1542,7 +1548,7 @@
                                     <input id="cert-discover" type="checkbox" class="accent-Ragnar-600"> Discover on
                                 </label>
                                 <select id="cert-iface" title="Interface for passive discovery" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                                    <option value="">Auto (default route)</option>
+                                    <option value="">Auto (wired first)</option>
                                 </select>
                                 <input id="cert-secs" type="number" min="4" max="30" value="8" title="discovery capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                                 <button onclick="runCertWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check Certs</button>
@@ -1585,7 +1591,7 @@
                     <p class="text-sm text-gray-400 mb-3">Provokes every DHCP server on the segment to reply (<span class="font-mono">broadcast-dhcp-discover</span>) and passively watches for a DISCOVER flood. The first scan learns the current server as the trusted baseline (<span class="font-mono">data/dhcp_baseline.json</span>); after a legitimate DHCP/router change, click "Trust current server".</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="dhcp-iface" title="Interface for the DHCP scan — pick your WiFi or LAN NIC to scan that segment" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <button onclick="runDhcpGuardian()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan DHCP</button>
                         <button onclick="dhcpTrustCurrent()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Set the current DHCP server(s) as the trusted baseline — use after a legitimate DHCP-server / router change">Trust current server</button>
@@ -1633,7 +1639,7 @@
                     <p class="text-sm text-gray-400 mb-3">Passively captures ICMPv6 <span class="font-mono">RA/RS/Redirect</span> + DHCPv6 and flags a <strong>rogue RA</strong> (new gateway, injected DNS/prefix, <span class="font-mono">pref high</span>, or router-lifetime 0), a <strong>rogue DHCPv6</strong> server (mitm6's DNS-takeover signature), an <strong>RA flood</strong>, and conflicting routers. First scan learns the trusted router(s)+server(s) (<span class="font-mono">data/ipv6_watch.json</span>); "Trust current" re-learns. Mitigate with switch <strong>RA-Guard</strong> (RFC 6105) / DHCPv6 snooping.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="ipv6-iface" title="Interface for the IPv6 capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="ipv6-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runIpv6Watch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan IPv6</button>
@@ -1648,7 +1654,7 @@
                     <p class="text-sm text-gray-400 mb-3">Passively captures ICMPv6 <span class="font-mono">Neighbor Solicitation / Advertisement</span> (135/136) and flags <strong>spoofed</strong> (two MACs claiming one address, the default router advertised by a rogue MAC, or a learned host's owner-MAC changing), <strong>dad-dos</strong> (one MAC answering every Duplicate Address Detection probe — <span class="font-mono">dos-new-ip6</span>, so no host can pick an address), and an NA <strong>flood</strong>. First scan learns the trusted target→MAC bindings + default router (<span class="font-mono">data/ndp_watch.json</span>); "Trust current" re-learns. Mitigate with switch <strong>IPv6 Snooping / ND Inspection</strong> (SAVI, RFC 6620).</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="ndp-iface" title="Interface for the NDP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="ndp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runNdpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan NDP</button>
@@ -1663,7 +1669,7 @@
                     <p class="text-sm text-gray-400 mb-3">Passively captures IPv4 ICMP and flags a <strong>redirect</strong> steering traffic to a non-gateway next-hop (or from a non-gateway source), a rogue <strong>IRDP</strong> router advertisement (type 9 gateway injection), an ICMP <strong>flood</strong> (ping-flood / smurf), <strong>tunnelling</strong> (oversized echo payloads = covert channel / exfil), and <strong>recon</strong> (timestamp / address-mask / information requests). Compares against the host's <strong>default gateway</strong> (learned into <span class="font-mono">data/icmp_watch.json</span>); "Trust current" re-seeds. <span class="text-gray-500">ICMPv6 redirects (type 137) are covered by IPv6 First-Hop Watch.</span></p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="icmp-iface" title="Interface for the ICMP capture — pick the LAN/WiFi NIC for the segment to watch" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="icmp-secs" type="number" min="4" max="40" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runIcmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan ICMP</button>
@@ -1678,7 +1684,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the chosen segment. The first scan learns the current querier(s) and host→group memberships as the trusted baseline (<span class="font-mono">data/igmp_watch.json</span>); after a legitimate multicast/router change, click "Trust current".</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="igmp-iface" title="Interface for the IGMP capture — pick the LAN/WiFi NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="igmp-secs" type="number" min="4" max="30" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runIgmpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan multicast</button>
@@ -1694,7 +1700,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the chosen segment (needs a SPAN/mirror port to see other hosts). Certificate findings apply to <strong>TLS 1.2 over TCP</strong> only — TLS 1.3 and QUIC encrypt the certificate, so those show fingerprints + SNI but a black-box cert. JA4S (server fingerprint) is off by default (FoxIO License 1.1).</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="tls-iface" title="Interface for the TLS/QUIC capture — pick the LAN/WiFi NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="tls-secs" type="number" min="4" max="30" value="12" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <label class="flex items-center gap-2 text-sm text-gray-300" title="Skip QUIC (UDP/443) observation"><input id="tls-noquic" type="checkbox" class="accent-Ragnar-600"> No QUIC</label>
@@ -1709,7 +1715,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the BPDU group MACs (IEEE <span class="font-mono">01:80:c2:00:00:00</span> + Cisco PVST+ <span class="font-mono">01:00:0c:cc:cc:cd</span>). The first scan learns the current root(s) — per VLAN for PVST+ — and legitimate bridges as the baseline (<span class="font-mono">data/stp_watch.json</span>); after a legitimate topology change, click "Trust current".</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="stp-iface" title="Interface for the BPDU capture — pick the switch-facing NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="stp-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runStpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan STP</button>
@@ -1724,7 +1730,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, DTP PID 0x2004). DTP hellos are ~30s apart, so give it a longer window. The first scan learns the current DTP speakers (real switches) as the baseline (<span class="font-mono">data/dtp_watch.json</span>); a new speaker sending trunk-forming DTP is the tell. Click "Trust current" after a legitimate switch change.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="dtp-iface" title="Interface for the DTP capture — pick the access-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="dtp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runDtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan DTP</button>
@@ -1739,7 +1745,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, CDP PID 0x2000). CDP hellos are ~60s apart, so give it a longer window. The first scan learns the current CDP speakers (real switches/phones) as the baseline (<span class="font-mono">data/cdp_watch.json</span>); "Trust current" re-learns. Mitigate by disabling CDP on access ports (<span class="font-mono">no cdp enable</span>) and preferring LLDP with minimal TLVs.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="cdp-iface" title="Interface for the CDP capture — pick the access-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="cdp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runCdpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan CDP</button>
@@ -1754,7 +1760,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the switch group MAC (<span class="font-mono">01:00:0c:cc:cc:cc</span>, VTP PID 0x2003). The first scan learns the domain, revision and VTP server as the baseline (<span class="font-mono">data/vtp_watch.json</span>); a higher revision from a source that isn't the known server is the bomb signal. Click "Trust current" after a legitimate VLAN change. Mitigate with <span class="font-mono">vtp mode transparent</span> (or VTPv3 + password), and always zero a switch's config-revision before connecting it.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="vtp-iface" title="Interface for the VTP capture — pick the access/trunk-port NIC you want to audit" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="vtp-secs" type="number" min="5" max="65" value="30" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runVtpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan VTP</button>
@@ -1769,7 +1775,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture (SMB tcp/445+139, LLMNR udp/5355, NBT-NS udp/137, mDNS udp/5353, Kerberos tcp+udp/88) — tcpdump captures, Scapy dissects. The first scan learns the accepted mDNS responders (printers/Macs), any SMBv1 hosts, and the Kerberos KDCs/realms as the baseline (<span class="font-mono">data/smb_watch.json</span>); LLMNR/NBT-NS answers and Kerberos downgrade/roasting are never trusted away. Click "Trust current" after a legitimate change. <span class="text-amber-400">Needs Scapy</span> (Detector Self-Test → Install Scapy).</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="smb-iface" title="Interface to audit — pick the LAN/access NIC where Windows clients live" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="smb-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runSmbWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan SMB</button>
@@ -1784,7 +1790,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on MSRPC/SMB (tcp/445 · 139 · 135). Coercion interfaces are matched by their DCE/RPC UUID in the RPC bind; NTLM challenges and SMB2 signing come from the payloads. tcpdump captures, Scapy dissects (<span class="text-amber-400">needs Scapy</span>). The first scan learns accepted unsigned servers as the baseline (<span class="font-mono">data/relay_watch.json</span>); coercion + relay are never baselined away. Fix: enforce SMB/LDAP signing + channel binding (EPA), patch the coercion vectors.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="relay-iface" title="Interface to audit — pick the NIC facing your servers/DCs" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="relay-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runRelayWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan relay/coercion</button>
@@ -1799,7 +1805,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive Scapy capture (LDAP 389 · GC 3268 · LDAPS 636 · GC-S 3269 · CLDAP udp/389). The BER parser is pure-Python (no library dissectors) and tolerates snaplen-truncated packets. <span class="text-amber-400">Needs Scapy</span> (Detector Self-Test → Install Scapy). Fix: require LDAPS/StartTLS, disable anonymous binds, enforce LDAP signing + channel binding (EPA), and restrict UDP/389 at the edge.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="ldap-iface" title="Interface to audit — pick the NIC facing your DCs / directory" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="ldap-secs" type="number" min="5" max="60" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runLdapWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan LDAP</button>
@@ -1813,7 +1819,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture (put the Pi on the routed VLAN or a SPAN/mirror to see OSPF). The first scan learns the current routers and Type-5 originators as the trusted baseline (<span class="font-mono">data/ospf_watch.json</span>); after a legitimate topology change, click "Trust current". Inspired by <span class="font-mono">OSPFwatcher</span> / <span class="font-mono">FRR-MAD</span>; software-version CVEs aren't visible on the wire, so exposure conditions are flagged with <a href="https://osv.dev" target="_blank" rel="noopener" class="text-cyan-400 underline">OSV</a> pointers.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="ospf-iface" title="Interface for the OSPF capture — pick the routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="ospf-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runOspfWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan OSPF</button>
@@ -1828,7 +1834,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture (put the Pi on the routed VLAN or a SPAN/mirror to see EIGRP). The first scan learns the current routers and advertised prefix→next-hop map as the baseline (<span class="font-mono">data/eigrp_watch.json</span>); after a legitimate topology change, click "Trust current". IPv4 route TLVs are fully decoded; IPv6 EIGRP gives speaker/AS/auth/K-values (per-prefix v6 TLVs aren't dissected by tcpdump).</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="eigrp-iface" title="Interface for the EIGRP capture — pick the routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="eigrp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runEigrpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan EIGRP</button>
@@ -1843,7 +1849,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the IS-IS multicast MACs (AllL1ISs <span class="font-mono">01:80:c2:00:00:14</span> + AllL2ISs <span class="font-mono">01:80:c2:00:00:15</span>). The first scan learns the current routers — resolved to names via the dynamic-hostname TLV — their areas, and the advertised prefix→originator map as the baseline (<span class="font-mono">data/isis_watch.json</span>); after a legitimate topology change, click "Trust current".</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="isis-iface" title="Interface for the IS-IS capture — pick the routed/core-facing NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="isis-secs" type="number" min="5" max="50" value="20" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runIsisWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan IS-IS</button>
@@ -1858,7 +1864,7 @@
                     <p class="text-sm text-gray-400 mb-3">One short passive capture on the routed segment (HSRP udp/1985, GLBP udp/3222, VRRP+CARP IP-proto-112). The first scan learns the current groups, active speakers/priorities, and GLBP forwarders as the trusted baseline (<span class="font-mono">data/fhrp_watch.json</span>); after a legitimate router/priority change, click "Trust current". HSRP+VRRP are decoded via tcpdump; <strong>GLBP is decoded by a hand-rolled byte parser</strong> (neither tcpdump nor Scapy dissects it) that reads the AVG priority, forwarder numbers, virtual MACs and weights; CARP is best-effort.</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="fhrp-iface" title="Interface for the FHRP capture — pick the routed/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="fhrp-secs" type="number" min="4" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runFhrpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan FHRP</button>
@@ -1873,7 +1879,7 @@
                     <p class="text-sm text-gray-400 mb-3"><span class="text-amber-400">BGP is unicast TCP/179 between routers</span>, so the Pi must be <strong>inline, on a SPAN/mirror, or a peer</strong> to observe it (unlike OSPF, it's not on the broadcast domain). The first scan learns the current peers and prefix→origin map as the baseline (<span class="font-mono">data/bgp_watch.json</span>); "Trust current" re-learns. Version CVEs aren't visible on the wire — exposure conditions are flagged with <a href="https://osv.dev" target="_blank" rel="noopener" class="text-cyan-400 underline">OSV</a> pointers. ASNs are enriched with owner names via <span class="font-mono">Team Cymru</span> (outbound TCP/43; soft-fails to AS-number-only if egress filters it).</p>
                     <div class="flex flex-wrap items-center gap-2">
                         <select id="bgp-iface" title="Interface for the BGP capture — pick the inline/uplink NIC or a SPAN/mirror port" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
-                            <option value="">Auto (default route)</option>
+                            <option value="">Auto (wired first)</option>
                         </select>
                         <input id="bgp-secs" type="number" min="5" max="40" value="15" title="capture seconds" class="w-20 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm">
                         <button onclick="runBgpWatch()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Scan BGP</button>
@@ -6603,7 +6609,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260714-locate-burst"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260715-netint-iface"></script>
 
 </body>
 </html>
