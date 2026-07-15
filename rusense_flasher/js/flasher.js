@@ -278,11 +278,76 @@ window.provisionDevice = async function () {
   }
 };
 
-/* ── Serial monitor ── */
-let serialPort    = null;
-let serialReader  = null;
-let serialWriter  = null;
-let serialReading = false;
+/* ── Serial monitor ──
+ * ESP32-S3/C6 nodes talk over the chip's native USB-Serial-JTAG. When the
+ * device resets (RST button, crash, brownout), that USB device re-enumerates
+ * and the open Web Serial port dies — so a monitor that stops reading on the
+ * first error silently hides boot-loops. Instead we announce the drop, keep
+ * re-attaching to the granted port, and flag rapid reset cycles. */
+let serialPort         = null;
+let serialReader       = null;
+let serialWriter       = null;
+let serialWantReconnect = false;
+let serialResetTimes   = [];
+
+function serialLogWrite(text) {
+  const el = $("serial-log");
+  el.textContent += text;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function attachSerial(port) {
+  const baud = parseInt($("serial-baud-select").value, 10);
+  await port.open({ baudRate: baud });
+  serialPort   = port;
+  serialWriter = port.writable.getWriter();
+  const decoder = new TextDecoderStream();
+  port.readable.pipeTo(decoder.writable).catch(() => {});
+  serialReader = decoder.readable.getReader();
+
+  (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await serialReader.read();
+        if (done) break;
+        serialLogWrite(value);
+      }
+    } catch (_) { /* port gone (device reset/unplug) or reader cancelled */ }
+    try { serialWriter.releaseLock(); } catch (_) {}
+    try { await port.close(); } catch (_) {}
+    if (serialPort === port) { serialPort = null; serialReader = null; serialWriter = null; }
+    if (serialWantReconnect) onSerialDropped();
+  })();
+}
+
+async function onSerialDropped() {
+  serialLogWrite("\n[⚡ port lost — the device reset or was unplugged; reconnecting…]\n");
+  const now = Date.now();
+  serialResetTimes = serialResetTimes.filter((t) => now - t < 15000);
+  serialResetTimes.push(now);
+  if (serialResetTimes.length === 3) {
+    serialLogWrite(
+      "[⚠️ 3 resets in <15 s — the node is BOOT-LOOPING. Most common cause: brownout at WiFi\n" +
+      " power-up (first boot after a forge runs full RF calibration = peak current). Try a\n" +
+      " direct USB-3 port with a short data cable — no hub. On XIAO boards also make sure\n" +
+      " the U.FL antenna is snapped on. Note: panic/brownout banners only print on UART0,\n" +
+      " which XIAO boards don't expose — over USB the log just cuts out like this.]\n");
+  }
+  while (serialWantReconnect && !serialPort) {
+    await new Promise((r) => setTimeout(r, 600));
+    if (!serialWantReconnect) return;
+    let ports = [];
+    try { ports = await navigator.serial.getPorts(); } catch (_) {}
+    for (const p of ports) {
+      if (!serialWantReconnect || serialPort) return;
+      try {
+        await attachSerial(p);
+        serialLogWrite("[🔌 reconnected]\n");
+        return;
+      } catch (_) { /* still re-enumerating or not this port — keep polling */ }
+    }
+  }
+}
 
 window.openLogs = async function () {
   if (!("serial" in navigator)) {
@@ -295,27 +360,10 @@ window.openLogs = async function () {
   if (serialPort) return;   // already connected
 
   try {
-    serialPort = await navigator.serial.requestPort();
-    const baud = parseInt($("serial-baud-select").value, 10);
-    await serialPort.open({ baudRate: baud });
-
-    serialWriter  = serialPort.writable.getWriter();
-    const decoder = new TextDecoderStream();
-    serialPort.readable.pipeTo(decoder.writable).catch(() => {});
-    serialReader  = decoder.readable.getReader();
-
-    serialReading = true;
-    (async () => {
-      while (serialReading) {
-        try {
-          const { value, done } = await serialReader.read();
-          if (done) break;
-          const el = $("serial-log");
-          el.textContent += value;
-          el.scrollTop = el.scrollHeight;
-        } catch (_) { break; }
-      }
-    })();
+    const port = await navigator.serial.requestPort();
+    serialWantReconnect = true;
+    serialResetTimes = [];
+    await attachSerial(port);
   } catch (_) {
     serialPort = null;
     $("serial-overlay").hidden = true;
@@ -323,7 +371,7 @@ window.openLogs = async function () {
 };
 
 async function closeSerial() {
-  serialReading = false;
+  serialWantReconnect = false;
   try { if (serialReader) { await serialReader.cancel(); serialReader = null; } } catch (_) {}
   try { if (serialWriter) { serialWriter.releaseLock(); serialWriter = null; } } catch (_) {}
   try { if (serialPort)   { await serialPort.close();   serialPort = null;   } } catch (_) {}
