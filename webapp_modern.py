@@ -9556,6 +9556,19 @@ _GIT_UPDATE_ID = [
     '-c', 'pull.rebase=false',
 ]
 
+# Serializes every git operation the webapp runs against the checkout. The
+# dashboard polls /api/system/check-updates every 5 minutes (per open tab) and
+# that check runs `git fetch` + a lock sweep — when it overlapped with a
+# user-clicked update, the pull failed on held ref locks (or had its live
+# index.lock deleted from under it) and the UI showed "Update failed. Fix
+# issues and retry." even though clicking again worked. Updates take this
+# blocking; the background check skips its fetch when an update holds it.
+_GIT_MUTEX = threading.Lock()
+
+# Locks younger than this are considered live (held by a running git process),
+# older ones are debris from an interrupted run and safe to sweep.
+_GIT_LOCK_STALE_SECONDS = 120
+
 
 def _ensure_git_safe_dir(repo_path: str) -> None:
     """Whitelist the checkout in the running user's global git config so root
@@ -9575,7 +9588,7 @@ def _ensure_git_safe_dir(repo_path: str) -> None:
         pass
 
 
-def _clear_git_locks(repo_path: str, warnings: list) -> None:
+def _clear_git_locks(repo_path: str, warnings: list, min_age_seconds: int = 0) -> None:
     """Remove EVERY stale *.lock under .git — not just the old hardcoded short
     list (index.lock/HEAD.lock/shallow.lock/refs/heads/main.lock).
 
@@ -9584,26 +9597,46 @@ def _clear_git_locks(repo_path: str, warnings: list) -> None:
     <branch>.lock, packed-refs.lock, config.lock, and ref locks for non-'main'
     branches. Sweeping all of them means a lock left by an interrupted run is
     auto-cleared on the next check/update — the service (root) can delete a lock
-    regardless of which user owns it, so this never needs a manual stop."""
+    regardless of which user owns it, so this never needs a manual stop.
+
+    min_age_seconds > 0 restricts the sweep to locks at least that old, so a
+    routine pass (background update check, update preflight) never deletes the
+    live lock of a git process that is still running."""
     git_dir = os.path.join(repo_path, '.git')
     if not os.path.isdir(git_dir):
         return
     # Primary: one find pass deletes nested ref locks too (coreutils always present).
     try:
+        find_cmd = ['sudo', 'find', git_dir, '-name', '*.lock', '-type', 'f']
+        if min_age_seconds > 0:
+            find_cmd.extend(['-mmin', f'+{max(1, min_age_seconds // 60)}'])
+        find_cmd.append('-delete')
         subprocess.run(
-            ['sudo', 'find', git_dir, '-name', '*.lock', '-type', 'f', '-delete'],
+            find_cmd,
             capture_output=True, text=True, check=False, timeout=20
         )
     except Exception as e:
         logger.debug(f"find-based lock sweep failed (continuing): {e}")
+
+    def _old_enough(path: str) -> bool:
+        if min_age_seconds <= 0:
+            return True
+        try:
+            return (time.time() - os.path.getmtime(path)) >= min_age_seconds
+        except OSError:
+            return False
+
     # Fallback for no-sudo / no-find edge cases: top-level locks + the refs/
     # tree only (never the huge objects/ dir).
     removed = []
     try:
         for name in os.listdir(git_dir):
             if name.endswith('.lock'):
+                lp = os.path.join(git_dir, name)
+                if not _old_enough(lp):
+                    continue
                 try:
-                    os.remove(os.path.join(git_dir, name))
+                    os.remove(lp)
                     removed.append(name)
                 except OSError:
                     pass
@@ -9612,6 +9645,8 @@ def _clear_git_locks(repo_path: str, warnings: list) -> None:
             for name in files:
                 if name.endswith('.lock'):
                     lp = os.path.join(root_dir, name)
+                    if not _old_enough(lp):
+                        continue
                     try:
                         os.remove(lp)
                         removed.append(os.path.relpath(lp, git_dir))
@@ -9652,10 +9687,11 @@ def _prepare_git_repo(repo_path: str, warnings: list) -> None:
         logger.warning(warning)
         warnings.append(warning)
 
-    # Remove ALL stale lock files (the common reason the first update attempt
+    # Remove stale lock files (the common reason the first update attempt
     # fails but a retry succeeds — and the ref/remote locks that used to need a
-    # manual service stop).
-    _clear_git_locks(repo_path, warnings)
+    # manual service stop). Age-gated so a live lock held by a still-running
+    # git process (e.g. a background update check's fetch) survives.
+    _clear_git_locks(repo_path, warnings, min_age_seconds=_GIT_LOCK_STALE_SECONDS)
 
     # Whitelist the checkout for the current user (safe.directory must live in
     # the global config; git ignores it from plain -c).
@@ -9737,8 +9773,20 @@ def _execute_git_update(repo_path: str, prepared: bool = False) -> dict:
             recovered = False
             err_lower = error_msg.lower()
 
-            # Lock file appeared during pull — clear every stale lock and retry
+            # Transient network trouble reaching origin — nothing to repair
+            # locally, just wait and retry.
+            if any(tok in err_lower for tok in (
+                    'could not resolve host', 'unable to access',
+                    'connection timed out', 'could not read from remote',
+                    'connection reset', 'early eof')):
+                result['warnings'].append("Transient network error contacting origin; retrying")
+                recovered = True
+
+            # Lock file appeared during pull — likely another git process (a
+            # background update check) still running. Wait for it to finish,
+            # then clear whatever lock remains and retry.
             if 'lock' in err_lower or 'another git process' in err_lower:
+                time.sleep(3)
                 _clear_git_locks(repo_path, result['warnings'])
                 recovered = True
 
@@ -9780,6 +9828,9 @@ def _execute_git_update(repo_path: str, prepared: bool = False) -> dict:
                     result['error'] = f"Git pull failed: {error_msg}"
                     return result
 
+            # Brief pause so a transient condition (network blip, concurrent
+            # git process winding down) has a chance to clear before the retry.
+            time.sleep(2)
             logger.info(f"Auto-recovery applied, retrying git pull...")
 
     # Ensure executable bits remain in place after pull
@@ -10012,29 +10063,39 @@ def check_updates():
         # Self-heal before any git command so a check never dead-ends on a stale
         # lock or a dubious-ownership error (same guards the update path uses).
         _ensure_git_safe_dir(repo_path)
-        _clear_git_locks(repo_path, [])
 
-        # Fetch latest changes from remote
-        try:
-            fetch_result = subprocess.run(['git', 'fetch'], cwd=repo_path, check=True, capture_output=True, text=True)
-            logger.info(f"Git fetch completed: {fetch_result.stdout}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Git fetch failed: {e.stderr}")
-            # Try to fix git safe directory issue and retry
+        # Fetch latest changes from remote — but never while an update holds
+        # the git mutex: a background check's fetch racing the update's pull
+        # (and the unconditional lock sweep that ran with it) is exactly what
+        # made first-click updates fail intermittently. If an update is in
+        # flight, answer from the refs we already have.
+        if _GIT_MUTEX.acquire(blocking=False):
             try:
-                subprocess.run(['git', 'config', '--global', '--add', 'safe.directory', repo_path], 
-                             cwd=repo_path, check=True, capture_output=True)
-                logger.info(f"Added {repo_path} to git safe directories")
-                # Retry fetch
-                fetch_result = subprocess.run(['git', 'fetch'], cwd=repo_path, check=True, capture_output=True, text=True)
-                logger.info(f"Git fetch completed after fixing safe directory: {fetch_result.stdout}")
-            except subprocess.CalledProcessError as e2:
-                logger.error(f"Git fetch still failed after fixing safe directory: {e2.stderr}")
-                return jsonify({
-                    'error': 'Failed to fetch from remote repository. Git safe directory issue detected.',
-                    'fix_command': f'git config --global --add safe.directory {repo_path}',
-                    'detailed_error': str(e2.stderr)
-                }), 500
+                _clear_git_locks(repo_path, [], min_age_seconds=_GIT_LOCK_STALE_SECONDS)
+                try:
+                    fetch_result = subprocess.run(['git', 'fetch'], cwd=repo_path, check=True, capture_output=True, text=True)
+                    logger.info(f"Git fetch completed: {fetch_result.stdout}")
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"Git fetch failed: {e.stderr}")
+                    # Try to fix git safe directory issue and retry
+                    try:
+                        subprocess.run(['git', 'config', '--global', '--add', 'safe.directory', repo_path],
+                                     cwd=repo_path, check=True, capture_output=True)
+                        logger.info(f"Added {repo_path} to git safe directories")
+                        # Retry fetch
+                        fetch_result = subprocess.run(['git', 'fetch'], cwd=repo_path, check=True, capture_output=True, text=True)
+                        logger.info(f"Git fetch completed after fixing safe directory: {fetch_result.stdout}")
+                    except subprocess.CalledProcessError as e2:
+                        logger.error(f"Git fetch still failed after fixing safe directory: {e2.stderr}")
+                        return jsonify({
+                            'error': 'Failed to fetch from remote repository. Git safe directory issue detected.',
+                            'fix_command': f'git config --global --add safe.directory {repo_path}',
+                            'detailed_error': str(e2.stderr)
+                        }), 500
+            finally:
+                _GIT_MUTEX.release()
+        else:
+            logger.info("Update in progress; skipping git fetch for this update check")
         
         # Get the current branch name
         try:
@@ -10160,7 +10221,8 @@ def perform_update():
     try:
         repo_path = os.getcwd()
         logger.info(f"Performing update in repository: {repo_path}")
-        update_result = _execute_git_update(repo_path)
+        with _GIT_MUTEX:
+            update_result = _execute_git_update(repo_path)
 
         if not update_result['success']:
             return jsonify({
@@ -10199,71 +10261,89 @@ def stash_and_update():
 
     logger.info("Auto stash + update requested via UI")
 
-    # Prepare the repo BEFORE the stash — on a fresh install the stash is
-    # the first git command this service ever runs, and it dies on dubious
-    # ownership / stale locks / root-owned files unless those are fixed
-    # first. This was exactly the "Update failed. Fix issues and retry."
-    # dead end users hit from the Settings tab.
-    preflight_warnings = []
-    _prepare_git_repo(repo_path, preflight_warnings)
+    # The whole stash → pull → pop sequence runs under the git mutex so a
+    # background update check's `git fetch` can never race it — that overlap
+    # was a root cause of "works on the second click".
+    with _GIT_MUTEX:
+        # Prepare the repo BEFORE the stash — on a fresh install the stash is
+        # the first git command this service ever runs, and it dies on dubious
+        # ownership / stale locks / root-owned files unless those are fixed
+        # first. This was exactly the "Update failed. Fix issues and retry."
+        # dead end users hit from the Settings tab.
+        preflight_warnings = []
+        _prepare_git_repo(repo_path, preflight_warnings)
 
-    try:
-        stash_proc = subprocess.run(
-            stash_cmd,
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
-        logger.error(f"Git stash failed: {error_msg}")
-        return jsonify({
-            'success': False,
-            'error': f'Git stash failed: {error_msg}',
-            'warnings': preflight_warnings
-        }), 500
-
-    stash_stdout = stash_proc.stdout.strip() or stash_proc.stderr.strip() or ''
-    stash_created = 'No local changes to save' not in stash_stdout
-    stash_ref = 'stash@{0}' if stash_created else None
-
-    if stash_created:
-        logger.info(f"Local changes stashed as {stash_ref}")
-    else:
-        logger.info("Auto stash requested but no local changes were found")
-
-    update_result = _execute_git_update(repo_path, prepared=True)
-    update_result['warnings'] = preflight_warnings + update_result['warnings']
-    if not update_result['success']:
-        # Preserve the stash so the operator can recover work manually
-        logger.error("Auto stash update failed after stashing; stash preserved for manual recovery")
-        return jsonify({
-            'success': False,
-            'error': update_result['error'] or 'Unknown error during git pull',
-            'warnings': update_result['warnings'],
-            'local_changes_preserved': stash_created
-        }), 500
-
-    if stash_created and stash_ref:
         try:
-            pop_proc = subprocess.run(
-                ['git', 'stash', 'pop', stash_ref],
+            stash_proc = subprocess.run(
+                stash_cmd,
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
                 check=True
             )
-            pop_msg = pop_proc.stdout.strip() or pop_proc.stderr.strip() or ''
-            if pop_msg:
-                logger.debug(f"Stash pop output: {pop_msg}")
-            logger.info(f"Reapplied local changes from {stash_ref}")
         except subprocess.CalledProcessError as e:
-            stash_pop_warning = e.stderr.strip() or e.stdout.strip() or str(e)
-            logger.warning(f"Failed to reapply stash {stash_ref}: {stash_pop_warning}")
-            update_result['warnings'].append(
-                "Local changes were saved but could not be re-applied automatically. Resolve conflicts and run 'git stash pop' manually."
-            )
+            error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
+            logger.error(f"Git stash failed: {error_msg}")
+            return jsonify({
+                'success': False,
+                'error': f'Git stash failed: {error_msg}',
+                'warnings': preflight_warnings
+            }), 500
+
+        stash_stdout = stash_proc.stdout.strip() or stash_proc.stderr.strip() or ''
+        stash_created = 'No local changes to save' not in stash_stdout
+        stash_ref = 'stash@{0}' if stash_created else None
+
+        if stash_created:
+            logger.info(f"Local changes stashed as {stash_ref}")
+        else:
+            logger.info("Auto stash requested but no local changes were found")
+
+        update_result = _execute_git_update(repo_path, prepared=True)
+        update_result['warnings'] = preflight_warnings + update_result['warnings']
+        if not update_result['success']:
+            # Put the tree back the way we found it so a failed update doesn't
+            # silently hide local changes in a stash (which also made the retry
+            # "work" for the wrong reason). If the pop itself fails, the stash
+            # stays preserved for manual recovery.
+            restored = False
+            if stash_created and stash_ref:
+                pop_back = subprocess.run(
+                    ['git', 'stash', 'pop', stash_ref],
+                    cwd=repo_path, capture_output=True, text=True, check=False
+                )
+                restored = pop_back.returncode == 0
+                if restored:
+                    logger.info("Update failed; local changes restored from auto stash")
+                else:
+                    logger.error("Auto stash update failed and stash could not be re-applied; stash preserved for manual recovery")
+            return jsonify({
+                'success': False,
+                'error': update_result['error'] or 'Unknown error during git pull',
+                'warnings': update_result['warnings'],
+                'local_changes_preserved': stash_created,
+                'local_changes_restored': restored
+            }), 500
+
+        if stash_created and stash_ref:
+            try:
+                pop_proc = subprocess.run(
+                    ['git', 'stash', 'pop', stash_ref],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                pop_msg = pop_proc.stdout.strip() or pop_proc.stderr.strip() or ''
+                if pop_msg:
+                    logger.debug(f"Stash pop output: {pop_msg}")
+                logger.info(f"Reapplied local changes from {stash_ref}")
+            except subprocess.CalledProcessError as e:
+                stash_pop_warning = e.stderr.strip() or e.stdout.strip() or str(e)
+                logger.warning(f"Failed to reapply stash {stash_ref}: {stash_pop_warning}")
+                update_result['warnings'].append(
+                    "Local changes were saved but could not be re-applied automatically. Resolve conflicts and run 'git stash pop' manually."
+                )
 
     _schedule_service_restart()
 
@@ -10545,22 +10625,23 @@ def pwn_stash_and_update():
 def resolve_git_conflicts():
     """Resolve git merge conflicts by resetting to HEAD then pulling latest."""
     repo_path = os.getcwd()
-    try:
-        # Hard reset clears both the index (staged conflicts) and working tree
-        subprocess.run(
-            ['git', 'reset', '--hard', 'HEAD'],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        logger.info("Git reset --hard HEAD completed")
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
-        logger.error(f"Git reset failed: {error_msg}")
-        return jsonify({'success': False, 'error': f'Git reset failed: {error_msg}'}), 500
+    with _GIT_MUTEX:
+        try:
+            # Hard reset clears both the index (staged conflicts) and working tree
+            subprocess.run(
+                ['git', 'reset', '--hard', 'HEAD'],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            logger.info("Git reset --hard HEAD completed")
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.strip() or e.stdout.strip() or str(e)
+            logger.error(f"Git reset failed: {error_msg}")
+            return jsonify({'success': False, 'error': f'Git reset failed: {error_msg}'}), 500
 
-    update_result = _execute_git_update(repo_path)
+        update_result = _execute_git_update(repo_path)
     if not update_result['success']:
         return jsonify({
             'success': False,
