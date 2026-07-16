@@ -621,6 +621,11 @@ parsed and classified. It never sends an SNMP request. What it flags:
   it's a **well-known default** (`public`, `private`, `community`, `cisco`, …) —
   trivially guessable even without a sniffer. The community strings actually seen are
   listed so you know exactly what leaked.
+- **Community reuse (blast radius)** — a cleartext community accepted by **2+
+  agents**: sniff it once, gain that access on every one. Reported as a
+  `community_reuse[]` block (community → the agents that accept it), **HIGH**, and
+  **CRITICAL** if that community was ever seen writing (one capture = write access
+  to N devices).
 - **Amplification** — a `GetBulk` with a large **max-repetitions**: the SNMP
   reflection / amplification DDoS vector (a small request eliciting a huge response).
 - **Enumeration** — one host issuing many `GetNext` / `GetBulk` requests: walking the

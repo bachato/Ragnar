@@ -6094,6 +6094,7 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
     agents = {}          # agent ip -> aggregate
     managers = set()
     communities = {}     # community -> aggregate (v1/v2c only)
+    comm_agents = {}     # community -> set of agent ips that accept it
     walk_by_src = {}     # source -> count of GetNext/GetBulk
     bulk_max = 0
     insecure = False     # any v1/v2c seen
@@ -6113,6 +6114,7 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
             insecure = True
             comm = e['community'] if e['community'] is not None else 'public'
             a['communities'].add(comm)
+            comm_agents.setdefault(comm, set()).add(agent_ip)
             c = communities.setdefault(comm, {
                 'community': comm, 'versions': set(), 'count': 0, 'writes': False})
             c['versions'].add(e['version'])
@@ -6189,6 +6191,28 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
                 f"NEW community string(s) since baseline: "
                 f"{', '.join(chr(34) + c + chr(34) for c in sorted(new_comms))}")
 
+    # --- community reuse: shared-secret blast radius ---
+    # A cleartext community accepted by 2+ agents means one sniff owns them all;
+    # if that community was ever seen writing, one capture is write access to N.
+    community_reuse = []
+    for comm in sorted(a for a, ags in comm_agents.items() if len(ags) >= 2):
+        ags = sorted(comm_agents[comm])
+        writes = communities[comm]['writes']
+        community_reuse.append({'community': comm, 'agents': ags,
+                                'writes': writes,
+                                'severity': 'critical' if writes else 'high'})
+        bump('write-exposed' if writes else 'cleartext')
+        if writes:
+            reasons.append(
+                f"Community \"{comm}\" is reused across {len(ags)} agents "
+                f"({', '.join(ags)}) AND was seen writing — one capture is write "
+                f"access to all of them (blast radius)")
+        else:
+            reasons.append(
+                f"Community \"{comm}\" is reused across {len(ags)} agents "
+                f"({', '.join(ags)}) — sniff it once, gain that access on every one "
+                f"(shared-secret blast radius)")
+
     # --- amplification: GetBulk with large max-repetitions ---
     if bulk_max >= _SNMP_BULK_AMP:
         bump('amplification')
@@ -6245,6 +6269,7 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
         'insecure': insecure,
         'agents': [_pub_agent(agents[a]) for a in sorted(agents)],
         'communities': [_pub_comm(communities[c]) for c in sorted(communities)],
+        'community_reuse': community_reuse,
         'managers': sorted(managers),
         'advisories': advisories,
     }
@@ -6352,6 +6377,31 @@ def _snmp_selftest():
     walk = "\n".join(line('10.0.0.9', '192.168.1.1', 42000 + i, 161, 'v3',
                           'GetNextRequest') for i in range(25))
     run('enumeration', walk, 12, base, 'enumeration')
+
+    # 5b. community reuse: one community ("netops") on two different agents.
+    reuse_text = "\n".join([
+        line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c', 'GetRequest',
+             community='netops'),
+        line('192.168.1.50', '192.168.1.2', 42001, 161, 'v2c', 'GetRequest',
+             community='netops')])
+    rr = run('community-reuse', reuse_text, 12,
+             {'agents': {}, 'communities': ['netops']}, 'cleartext')
+    reuse_ok = (any(r['community'] == 'netops' and r['agents'] == ['192.168.1.1', '192.168.1.2']
+                    and r['severity'] == 'high' for r in rr.get('community_reuse', [])))
+    scenarios.append({'name': 'community-reuse', 'expect': 'netops on 2 agents (high)',
+                      'got': str(rr.get('community_reuse')), 'pass': reuse_ok})
+    # 5c. reuse + write => critical blast radius.
+    reuse_w = "\n".join([
+        line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c', 'SetRequest',
+             community='rwsecret'),
+        line('192.168.1.50', '192.168.1.2', 42001, 161, 'v2c', 'GetRequest',
+             community='rwsecret')])
+    rw = _snmp_analyze(_parse_snmp_capture(reuse_w), 12,
+                       {'agents': {}, 'communities': ['rwsecret']}, learn=False)
+    rw_ok = any(r['community'] == 'rwsecret' and r['severity'] == 'critical'
+                for r in rw.get('community_reuse', []))
+    scenarios.append({'name': 'community-reuse-write', 'expect': 'rwsecret critical',
+                      'got': str(rw.get('community_reuse')), 'pass': rw_ok})
 
     # 6. parse: hidden-public + explicit community + v3 (no community).
     pev = _parse_snmp_capture(
