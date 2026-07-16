@@ -487,9 +487,13 @@ _arp_baseline_lock = threading.Lock()
 _ARP_IMPERSONATOR_MIN_IPS = 4
 
 
-def _neigh_entries():
-    """Parse `ip -4 neigh` into [(ip, mac, state)] for entries with a lladdr."""
-    res = _run(['ip', '-4', 'neigh', 'show'], timeout=5)
+def _neigh_entries(iface=None):
+    """Parse `ip -4 neigh` into [(ip, mac, state)] for entries with a lladdr.
+    Scoped to one interface's segment when `iface` is given."""
+    cmd = ['ip', '-4', 'neigh', 'show']
+    if iface:
+        cmd += ['dev', iface]
+    res = _run(cmd, timeout=5)
     out = []
     for line in res['out'].splitlines():
         m = re.match(r'^(\d+\.\d+\.\d+\.\d+)\b.*?\blladdr\s+([0-9a-fA-F:]{17})\s+(\w+)', line)
@@ -555,11 +559,18 @@ def do_arp_check(interface=None, learn=True):
     verdict: 'spoofed'    -- gateway MAC changed from the trusted baseline
              'suspicious' -- a MAC is impersonating several IPs
              'clean'      -- gateway matches baseline, no impersonators
-             'unknown'    -- no gateway, or its MAC couldn't be resolved"""
-    gw = _default_gateway()
+             'unknown'    -- no gateway, or its MAC couldn't be resolved
+
+    With `interface` set, the check is scoped to that segment: its own default
+    gateway (a higher-metric uplink still counts) and only the neighbours on that
+    interface — the right lens on a multi-homed box."""
+    iface = interface if _valid_iface(interface or '') else None
+    gw = _iface_gateway(iface) if iface else _default_gateway()
     if not gw:
         return {'success': True, 'verdict': 'unknown', 'gateway': None,
-                'reasons': ['no default gateway on this host — nothing to check'],
+                'interface': iface,
+                'reasons': [('no default gateway via %s — nothing to check' % iface)
+                            if iface else 'no default gateway on this host — nothing to check'],
                 'impersonators': [], 'neighbor_count': 0}
 
     gw_mac = _neigh_mac(gw)
@@ -586,7 +597,7 @@ def do_arp_check(interface=None, learn=True):
 
     # One MAC claiming many IPs (attacker impersonating multiple hosts). The
     # gateway MAC is excluded — a router legitimately fronts its own address.
-    entries = _neigh_entries()
+    entries = _neigh_entries(iface)
     mac_ips = {}
     for ip, mac, _ in entries:
         mac_ips.setdefault(mac, set()).add(ip)
@@ -602,7 +613,7 @@ def do_arp_check(interface=None, learn=True):
                            f"({', '.join(ips[:4])}{'…' if len(ips) > 4 else ''}) "
                            '— possible ARP spoofing')
 
-    return {'success': True, 'verdict': verdict,
+    return {'success': True, 'verdict': verdict, 'interface': iface,
             'gateway': {'ip': gw, 'mac': gw_mac, 'baseline': base_mac,
                         'learned': learned},
             'impersonators': impersonators,
@@ -14018,8 +14029,11 @@ def register_network_diagnostics(app, logger=None):
 
     @app.route('/api/net/arp-check', methods=['GET'])
     def net_arp_check():
-        _log("net/arp-check")
-        return jsonify(do_arp_check())
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"net/arp-check iface={iface or 'default-route'}")
+        return jsonify(do_arp_check(interface=iface))
 
     @app.route('/api/net/arp-baseline', methods=['GET', 'POST'])
     def net_arp_baseline():

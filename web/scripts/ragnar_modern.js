@@ -4471,15 +4471,32 @@ const _ARP_VERDICT_STYLE = {
     spoofed:    ['bg-red-950/60 border-red-800 text-red-300', '🛑 ARP spoofing / MITM detected'],
     unknown:    ['bg-slate-800 border-slate-700 text-slate-400', '— Could not determine (no gateway / no ARP reply)'],
 };
+function _arpFillIfaces() {
+    const sel = document.getElementById('arp-check-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function runArpCheck() {
     const out = document.getElementById('arp-results');
     if (!out) return;
     const btn = (typeof event !== 'undefined' && event && event.target) ? event.target : null;
+    const ifaceSel = document.getElementById('arp-check-iface');
+    const iface = ifaceSel && ifaceSel.value ? ifaceSel.value : '';
     _ndBusy(btn, true, 'Checking…');
     out.classList.remove('hidden');
     out.innerHTML = '<p class="text-sm text-gray-400">Reading neighbour table…</p>';
     try {
-        const d = await fetchAPI('/api/net/arp-check');
+        _arpFillIfaces();
+        const d = await fetchAPI('/api/net/arp-check' + (iface ? '?interface=' + encodeURIComponent(iface) : ''));
         if (!d || d.success === false) {
             out.innerHTML = '<p class="text-sm text-red-400">Error: ' + escapeHtml((d && d.error) || 'failed') + '</p>';
             return;
@@ -4489,6 +4506,7 @@ async function runArpCheck() {
         const mismatch = gw.baseline && gw.mac && gw.baseline !== gw.mac;
         let html = `<div class="mb-2 px-3 py-2 rounded border ${cls} text-sm">${label}</div>`;
         html += '<table class="min-w-full text-sm text-gray-300 whitespace-nowrap"><tbody>' +
+            `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Interface</td><td class="px-3 py-1.5 font-mono">${escapeHtml(d.interface || 'default route')}</td></tr>` +
             `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Gateway</td><td class="px-3 py-1.5 font-mono">${escapeHtml(gw.ip || '—')}</td></tr>` +
             `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Current MAC</td><td class="px-3 py-1.5 font-mono ${mismatch ? 'text-red-400' : ''}">${escapeHtml(gw.mac || '—')}</td></tr>` +
             `<tr class="border-t border-slate-800"><td class="px-3 py-1.5 text-gray-500">Trusted MAC</td><td class="px-3 py-1.5 font-mono">${escapeHtml(gw.baseline || '—')}${gw.learned ? ' <span class="text-xs text-gray-500">(learned now)</span>' : ''}</td></tr>` +

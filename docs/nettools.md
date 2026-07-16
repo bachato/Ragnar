@@ -326,8 +326,12 @@ spoofed** verdict:
   neighbour table, i.e. a host impersonating much of the segment → **suspicious**
   (the gateway's own MAC is excluded so a router fronting its address is fine).
 
-The result shows the verdict, the current vs. trusted gateway MAC (highlighted
-on mismatch), the neighbour count, any impersonator MACs and the reasons. This
+An **interface selector** scopes the check to one segment — that interface's own
+default gateway (a higher-metric uplink still counts) and only the neighbours on
+it — which is the right lens on a **multi-homed** box; *Auto* uses the default
+route and the full neighbour table. The result shows the verdict, the interface
+checked, the current vs. trusted gateway MAC (highlighted on mismatch), the
+neighbour count, any impersonator MACs and the reasons. This
 is the *active* complement to the passive duplicate-IP check in
 [L2 Link Health](#l2-link-health), and it feeds the
 [Network Integrity Monitor](#-network-integrity-monitor).
