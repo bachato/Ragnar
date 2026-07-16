@@ -12113,6 +12113,15 @@ def _parse_ospf_capture(output):
         av = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
         if av and cur['adv_router'] is None:
             cur['adv_router'] = av.group(1)
+        # Real tcpdump prints the per-LSA "Advertising Router X, seq 0x.., age Ns"
+        # line BEFORE the "X LSA (n), LSA-ID: Y" line, so stash that metadata and
+        # attach it to the next LSA header. (The self-test's single-line format
+        # carries seq/age on the header line itself; both are handled below.)
+        meta = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE +
+                         r',\s*seq\s+(0x[0-9a-fA-F]+)(?:,\s*age\s+(\d+))?', line)
+        if meta:
+            cur['_pend_lsa'] = {'adv': meta.group(1), 'seq': int(meta.group(2), 16),
+                                'age': int(meta.group(3)) if meta.group(3) else None}
         if cur['type'] == 'hello':
             hp = cur['hello'] or {'hello_timer': None, 'dead_timer': None,
                                   'mask': None, 'dr': None, 'neighbors': []}
@@ -12132,20 +12141,28 @@ def _parse_ospf_capture(output):
             if nb:
                 hp['neighbors'].append(nb.group(1))
             cur['hello'] = hp
-        # LSA record line (LS-Update / DD carry these)
+        # LSA header line ("X LSA (n), LSA-ID: Y"). Require an LSA-ID so sub-lines
+        # like "Router LSA Options: [none]" don't get parsed as ghost LSAs. seq/
+        # age/adv come from this line if present (single-line format), else from
+        # the preceding "Advertising Router ..." metadata line (real tcpdump).
         for rx, lsa_type in _OSPF_LSA_TYPES:
             if rx.search(line):
                 lid = re.search(r'LSA-ID:?\s+' + _OSPF_IPRE, line)
+                if not lid:
+                    break
+                pend = cur.get('_pend_lsa') or {}
                 adv = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
                 sq = re.search(r'seq\s+(0x[0-9a-fA-F]+)', line)
                 ag = re.search(r'age\s+(\d+)', line)
                 cur['lsas'].append({
                     'lsa_type': lsa_type,
-                    'lsa_id': lid.group(1) if lid else None,
-                    'adv_router': (adv.group(1) if adv else cur.get('adv_router')),
-                    'seq': int(sq.group(1), 16) if sq else None,
-                    'age': int(ag.group(1)) if ag else None,
+                    'lsa_id': lid.group(1),
+                    'adv_router': (adv.group(1) if adv else
+                                   pend.get('adv') or cur.get('adv_router')),
+                    'seq': int(sq.group(1), 16) if sq else pend.get('seq'),
+                    'age': int(ag.group(1)) if ag else pend.get('age'),
                 })
+                cur['_pend_lsa'] = None
                 break
     flush()
     return packets
@@ -12492,22 +12509,37 @@ def _ospf_selftest():
         import tempfile
         from scapy.all import IP, Ether, wrpcap  # noqa
         try:
-            from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello
+            from scapy.contrib.ospf import (OSPF_Hdr, OSPF_Hello, OSPF_LSUpd,
+                                            OSPF_Router_LSA)
         except Exception:
             OSPF_Hdr = None
         if OSPF_Hdr is not None and _have('tcpdump'):
-            pkt = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
-                   OSPF_Hdr(version=2, type=1, src='10.0.0.5', area='0.0.0.0',
-                            authtype=0) / OSPF_Hello(mask='255.255.255.0'))
+            hello = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
+                     OSPF_Hdr(version=2, type=1, src='10.0.0.5', area='0.0.0.0',
+                              authtype=0) / OSPF_Hello(mask='255.255.255.0'))
+            # An LS-Update too: real tcpdump prints seq/age on the "Advertising
+            # Router" line ABOVE the "Router LSA, LSA-ID" line — the layout that
+            # broke seq/age parsing (and MaxSeq/MaxAge/fight-back) until fixed.
+            lsu = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
+                   OSPF_Hdr(version=2, type=4, src='10.0.0.5', area='0.0.0.0') /
+                   OSPF_LSUpd(lsalist=[OSPF_Router_LSA(id='10.0.0.5', adrouter='10.0.0.5',
+                                                       seq=0x80000005, age=1)]))
             with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
                 pcap_path = tf.name
-            wrpcap(pcap_path, [pkt])
+            wrpcap(pcap_path, [hello, lsu])
             res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'proto', 'ospf'],
                        timeout=10)
             parsed = _parse_ospf_capture(res['out'])
             got_auth = next((x.get('auth') for x in parsed if x.get('auth') is not None), None)
+            lsas = [l for x in parsed for l in x.get('lsas', [])]
+            # Regression guard: seq parsed off REAL tcpdump, and no ghost LSAs
+            # (sub-lines like "Router LSA Options" must not create lsa_id=None).
+            seq_ok = any(l.get('seq') == 0x80000005 for l in lsas)
+            no_ghost = all(l.get('lsa_id') for l in lsas)
             scapy_result = {'ran': True, 'parsed_packets': len(parsed),
-                            'auth': got_auth, 'pass': len(parsed) >= 1,
+                            'auth': got_auth, 'lsa_seq_parsed': seq_ok,
+                            'no_ghost_lsa': no_ghost, 'lsas': len(lsas),
+                            'pass': len(parsed) >= 1 and seq_ok and no_ghost,
                             'tcpdump_out': res['out'].strip()[:200]}
             try:
                 os.remove(pcap_path)
