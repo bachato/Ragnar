@@ -249,8 +249,9 @@ class RIB:
         if r is None:
             r = {'prefix': prefix, 'first_seen': now, 'last_change': now,
                  'updates': 0, 'withdraws': 0, 'state': 'active',
-                 'origin_as': None, 'as_path': [], 'next_hop': None,
-                 'communities': [], '_changes': deque(maxlen=self._churn_cap)}
+                 'origin_as': None, 'as_path': [], 'prev_as_path': [],
+                 'next_hop': None, 'communities': [],
+                 '_changes': deque(maxlen=self._churn_cap)}
             self._routes[prefix] = r
         return r
 
@@ -267,6 +268,10 @@ class RIB:
                 if r['state'] != 'active' or r['as_path'] != new_path or r['next_hop'] != upd.get('next_hop'):
                     r['last_change'] = now
                     r['_changes'].append(now)
+                    # Remember the previous AS-path across a genuine path change so
+                    # the correlator can show old -> new (which carrier moved, how).
+                    if r['as_path'] and r['as_path'] != new_path:
+                        r['prev_as_path'] = list(r['as_path'])
                 r['state'] = 'active'
                 r['updates'] += 1
                 r['origin_as'] = origin_as
@@ -317,6 +322,7 @@ class RIB:
         now = now or time.time()
         return {'prefix': r['prefix'], 'state': r['state'],
                 'origin_as': r['origin_as'], 'as_path': list(r['as_path']),
+                'prev_as_path': list(r.get('prev_as_path') or []),
                 'next_hop': r['next_hop'], 'communities': list(r['communities']),
                 'updates': r['updates'], 'withdraws': r['withdraws'],
                 'first_seen': r['first_seen'], 'last_change': r['last_change'],

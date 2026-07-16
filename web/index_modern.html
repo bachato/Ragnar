@@ -1407,6 +1407,9 @@
                         <p class="text-xs text-amber-300/90 mb-2">Checks for ARP spoofing / MITM — the default gateway's MAC changed from the trusted baseline, or one MAC answering for many IPs (subnet impersonation).</p>
                         <p class="text-sm text-gray-400 mb-3">Reads the kernel neighbour table (no capture). The first check learns the gateway's MAC as the trusted baseline; after a legitimate router change, click "Trust current gateway" to re-learn it.</p>
                         <div class="flex flex-wrap gap-2">
+                            <select id="arp-check-iface" onfocus="_arpFillIfaces()" title="Interface to check — scopes to that segment's gateway + neighbours (for a multi-homed box); Auto uses the default route" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                <option value="">Auto (default route)</option>
+                            </select>
                             <button onclick="runArpCheck()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Check ARP</button>
                             <button onclick="netIntegrityTrustGateway()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-4 py-2 rounded text-sm whitespace-nowrap" title="Set the current gateway MAC as the trusted baseline — use after a legitimate router/gateway change">Trust current gateway</button>
                         </div>
@@ -6609,7 +6612,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260716-wifi-la"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260716-arp-iface"></script>
 
 </body>
 </html>

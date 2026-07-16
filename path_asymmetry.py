@@ -280,6 +280,76 @@ def correlate(event, rib):
     return out
 
 
+def correlate_multi(event, named_ribs, window_s=30.0):
+    """Correlate a data-plane event against MULTIPLE carrier RIBs — one BGP
+    session per carrier-facing router. For a multi-homed operator this names
+    *which* carrier's covering prefix churned (confirm) and which are stable, so
+    you know where to open the incident call. Returns the event annotated with a
+    per-carrier breakdown, `carriers_confirmed` / `carriers_stable` lists, an
+    upgraded `verdict`, and a scope hint.
+
+    Scope logic: one carrier moving => churn is in its AS or an upstream peer of
+    it; all covering carriers moving together => upstream of all of them (origin
+    AS or a major shared transit)."""
+    out = dict(event)
+    target = event.get('target')
+    carriers, confirmed, stable, absent = [], [], [], []
+    for name, rib in (named_ribs or {}).items():
+        route = rib.lookup(target) if (rib and target) else None
+        if route is None:
+            carriers.append({'carrier': name, 'status': 'absent'})
+            absent.append(name)
+            continue
+        recent = bool(route['flapping'] or
+                      (route['change_age_s'] is not None and route['change_age_s'] <= window_s))
+        status = 'confirm' if recent else 'stable'
+        carriers.append({'carrier': name, 'status': status, 'prefix': route['prefix'],
+                         'as_path': route['as_path'], 'prev_as_path': route.get('prev_as_path') or [],
+                         'origin_as': route['origin_as'], 'change_age_s': route['change_age_s'],
+                         'flapping': route['flapping'], 'flap_rate': route['flap_rate']})
+        (confirmed if recent else stable).append(name)
+
+    out['carriers'] = carriers
+    out['carriers_confirmed'] = confirmed
+    out['carriers_stable'] = stable
+    covering = confirmed + stable
+
+    if confirmed:
+        out['verdict'] = 'confirmed'
+        tag = []
+        if confirmed:
+            tag.append('%s confirm' % ', '.join(confirmed))
+        if stable:
+            tag.append('%s stable' % ', '.join(stable))
+        detail = []
+        for c in carriers:
+            if c['status'] != 'confirm':
+                continue
+            if c.get('prev_as_path'):
+                detail.append('%s: prefix %s AS-path %s -> %s' % (
+                    c['carrier'], c['prefix'], c['prev_as_path'], c['as_path']))
+            else:
+                detail.append('%s: prefix %s churned %.0fs ago (AS-path %s)' % (
+                    c['carrier'], c['prefix'], c['change_age_s'] or 0, c['as_path']))
+        out['attribution'] = 'confirmed [%s] :: BGP RIB corroborates: %s' % (
+            '; '.join(tag), '; '.join(detail))
+        if len(confirmed) == 1 and len(covering) > 1:
+            out['scope'] = ('single-carrier: churn is in %s or an upstream peer of it'
+                            % confirmed[0])
+        elif len(confirmed) > 1 and len(confirmed) == len(covering):
+            out['scope'] = ('all-carriers: upstream of every carrier — look at the '
+                            'origin AS or a major shared transit')
+        else:
+            out['scope'] = 'multi-carrier: %d of %d covering carriers moved' % (
+                len(confirmed), len(covering))
+    elif covering:
+        out['attribution'] = ('all carriers stable [%s] — asymmetry is data-plane '
+                              '(congestion/TE), not a routing change' % ', '.join(stable))
+    else:
+        out['attribution'] = 'no covering route in any carrier RIB (target off-domain)'
+    return out
+
+
 # --- self-test (no network for the detector; loopback for the wire) --------
 def selftest():
     scen = []
@@ -348,6 +418,41 @@ def selftest():
     hc = passive_hopcount_asymmetry(txt)
     check('passive-hopcount', hc['per_peer_hops'].get('8.8.8.8') == 7
           and hc['per_peer_hops'].get('1.1.1.1') == 5, hc['per_peer_hops'])
+
+    # 5. multi-carrier correlator: Carrier-A's covering prefix just changed its
+    #    AS-path while Carrier-B and Carrier-C stay stable — the event must be
+    #    upgraded to `confirmed` and name Carrier-A as the mover.
+    t0 = time.time()
+    rib_a = bgp_speaker.RIB()
+    rib_a.apply_update({'announced': ['9.9.9.0/24'], 'as_path': [64512, 64520],
+                        'next_hop': '10.0.0.1', 'communities': []}, now=t0 - 300)
+    rib_a.apply_update({'announced': ['9.9.9.0/24'], 'as_path': [64512, 64530],
+                        'next_hop': '10.0.0.1', 'communities': []}, now=t0 - 2)
+    rib_b = bgp_speaker.RIB()
+    rib_b.apply_update({'announced': ['9.9.9.0/24'], 'as_path': [64513, 64540],
+                        'next_hop': '10.0.0.2', 'communities': []}, now=t0 - 3600)
+    rib_c = bgp_speaker.RIB()
+    rib_c.apply_update({'announced': ['9.9.9.0/24'], 'as_path': [64514, 64550],
+                        'next_hop': '10.0.0.3', 'communities': []}, now=t0 - 3600)
+    ev = {'kind': 'asymmetry_detected', 'target': '9.9.9.9', 'asymmetry_ms': 10.0}
+    mc = correlate_multi(ev, {'Carrier-A': rib_a, 'Carrier-B': rib_b, 'Carrier-C': rib_c})
+    check('multi-carrier-confirm',
+          mc['verdict'] == 'confirmed' and mc['carriers_confirmed'] == ['Carrier-A']
+          and set(mc['carriers_stable']) == {'Carrier-B', 'Carrier-C'},
+          '%s conf=%s stable=%s' % (mc.get('verdict'), mc.get('carriers_confirmed'),
+                                    mc.get('carriers_stable')))
+    check('multi-carrier-old-new-path',
+          '[64512, 64520] -> [64512, 64530]' in mc['attribution'], mc['attribution'])
+    check('multi-carrier-scope-single',
+          'single-carrier' in mc.get('scope', ''), mc.get('scope'))
+    # all carriers stable -> not upgraded (data-plane), no false confirm
+    for r in (rib_a, rib_b, rib_c):
+        r.apply_update({'announced': ['9.9.9.0/24'], 'as_path': [1, 2],
+                        'next_hop': '10.0.0.1', 'communities': []}, now=t0 - 3600)
+    stable_ev = correlate_multi(dict(ev), {'Carrier-A': rib_a, 'Carrier-B': rib_b})
+    check('multi-carrier-all-stable-no-confirm',
+          stable_ev.get('verdict') != 'confirmed' and 'all carriers stable' in stable_ev['attribution'],
+          stable_ev.get('attribution'))
 
     return {'success': all(s['pass'] for s in scen), 'scenarios': scen}
 

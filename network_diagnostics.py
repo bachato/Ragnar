@@ -487,9 +487,13 @@ _arp_baseline_lock = threading.Lock()
 _ARP_IMPERSONATOR_MIN_IPS = 4
 
 
-def _neigh_entries():
-    """Parse `ip -4 neigh` into [(ip, mac, state)] for entries with a lladdr."""
-    res = _run(['ip', '-4', 'neigh', 'show'], timeout=5)
+def _neigh_entries(iface=None):
+    """Parse `ip -4 neigh` into [(ip, mac, state)] for entries with a lladdr.
+    Scoped to one interface's segment when `iface` is given."""
+    cmd = ['ip', '-4', 'neigh', 'show']
+    if iface:
+        cmd += ['dev', iface]
+    res = _run(cmd, timeout=5)
     out = []
     for line in res['out'].splitlines():
         m = re.match(r'^(\d+\.\d+\.\d+\.\d+)\b.*?\blladdr\s+([0-9a-fA-F:]{17})\s+(\w+)', line)
@@ -555,11 +559,18 @@ def do_arp_check(interface=None, learn=True):
     verdict: 'spoofed'    -- gateway MAC changed from the trusted baseline
              'suspicious' -- a MAC is impersonating several IPs
              'clean'      -- gateway matches baseline, no impersonators
-             'unknown'    -- no gateway, or its MAC couldn't be resolved"""
-    gw = _default_gateway()
+             'unknown'    -- no gateway, or its MAC couldn't be resolved
+
+    With `interface` set, the check is scoped to that segment: its own default
+    gateway (a higher-metric uplink still counts) and only the neighbours on that
+    interface — the right lens on a multi-homed box."""
+    iface = interface if _valid_iface(interface or '') else None
+    gw = _iface_gateway(iface) if iface else _default_gateway()
     if not gw:
         return {'success': True, 'verdict': 'unknown', 'gateway': None,
-                'reasons': ['no default gateway on this host — nothing to check'],
+                'interface': iface,
+                'reasons': [('no default gateway via %s — nothing to check' % iface)
+                            if iface else 'no default gateway on this host — nothing to check'],
                 'impersonators': [], 'neighbor_count': 0}
 
     gw_mac = _neigh_mac(gw)
@@ -586,7 +597,7 @@ def do_arp_check(interface=None, learn=True):
 
     # One MAC claiming many IPs (attacker impersonating multiple hosts). The
     # gateway MAC is excluded — a router legitimately fronts its own address.
-    entries = _neigh_entries()
+    entries = _neigh_entries(iface)
     mac_ips = {}
     for ip, mac, _ in entries:
         mac_ips.setdefault(mac, set()).add(ip)
@@ -602,7 +613,7 @@ def do_arp_check(interface=None, learn=True):
                            f"({', '.join(ips[:4])}{'…' if len(ips) > 4 else ''}) "
                            '— possible ARP spoofing')
 
-    return {'success': True, 'verdict': verdict,
+    return {'success': True, 'verdict': verdict, 'interface': iface,
             'gateway': {'ip': gw, 'mac': gw_mac, 'baseline': base_mac,
                         'learned': learned},
             'impersonators': impersonators,
@@ -12113,6 +12124,15 @@ def _parse_ospf_capture(output):
         av = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
         if av and cur['adv_router'] is None:
             cur['adv_router'] = av.group(1)
+        # Real tcpdump prints the per-LSA "Advertising Router X, seq 0x.., age Ns"
+        # line BEFORE the "X LSA (n), LSA-ID: Y" line, so stash that metadata and
+        # attach it to the next LSA header. (The self-test's single-line format
+        # carries seq/age on the header line itself; both are handled below.)
+        meta = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE +
+                         r',\s*seq\s+(0x[0-9a-fA-F]+)(?:,\s*age\s+(\d+))?', line)
+        if meta:
+            cur['_pend_lsa'] = {'adv': meta.group(1), 'seq': int(meta.group(2), 16),
+                                'age': int(meta.group(3)) if meta.group(3) else None}
         if cur['type'] == 'hello':
             hp = cur['hello'] or {'hello_timer': None, 'dead_timer': None,
                                   'mask': None, 'dr': None, 'neighbors': []}
@@ -12132,20 +12152,28 @@ def _parse_ospf_capture(output):
             if nb:
                 hp['neighbors'].append(nb.group(1))
             cur['hello'] = hp
-        # LSA record line (LS-Update / DD carry these)
+        # LSA header line ("X LSA (n), LSA-ID: Y"). Require an LSA-ID so sub-lines
+        # like "Router LSA Options: [none]" don't get parsed as ghost LSAs. seq/
+        # age/adv come from this line if present (single-line format), else from
+        # the preceding "Advertising Router ..." metadata line (real tcpdump).
         for rx, lsa_type in _OSPF_LSA_TYPES:
             if rx.search(line):
                 lid = re.search(r'LSA-ID:?\s+' + _OSPF_IPRE, line)
+                if not lid:
+                    break
+                pend = cur.get('_pend_lsa') or {}
                 adv = re.search(r'Advertising Router:?\s+' + _OSPF_IPRE, line)
                 sq = re.search(r'seq\s+(0x[0-9a-fA-F]+)', line)
                 ag = re.search(r'age\s+(\d+)', line)
                 cur['lsas'].append({
                     'lsa_type': lsa_type,
-                    'lsa_id': lid.group(1) if lid else None,
-                    'adv_router': (adv.group(1) if adv else cur.get('adv_router')),
-                    'seq': int(sq.group(1), 16) if sq else None,
-                    'age': int(ag.group(1)) if ag else None,
+                    'lsa_id': lid.group(1),
+                    'adv_router': (adv.group(1) if adv else
+                                   pend.get('adv') or cur.get('adv_router')),
+                    'seq': int(sq.group(1), 16) if sq else pend.get('seq'),
+                    'age': int(ag.group(1)) if ag else pend.get('age'),
                 })
+                cur['_pend_lsa'] = None
                 break
     flush()
     return packets
@@ -12492,22 +12520,37 @@ def _ospf_selftest():
         import tempfile
         from scapy.all import IP, Ether, wrpcap  # noqa
         try:
-            from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello
+            from scapy.contrib.ospf import (OSPF_Hdr, OSPF_Hello, OSPF_LSUpd,
+                                            OSPF_Router_LSA)
         except Exception:
             OSPF_Hdr = None
         if OSPF_Hdr is not None and _have('tcpdump'):
-            pkt = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
-                   OSPF_Hdr(version=2, type=1, src='10.0.0.5', area='0.0.0.0',
-                            authtype=0) / OSPF_Hello(mask='255.255.255.0'))
+            hello = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
+                     OSPF_Hdr(version=2, type=1, src='10.0.0.5', area='0.0.0.0',
+                              authtype=0) / OSPF_Hello(mask='255.255.255.0'))
+            # An LS-Update too: real tcpdump prints seq/age on the "Advertising
+            # Router" line ABOVE the "Router LSA, LSA-ID" line — the layout that
+            # broke seq/age parsing (and MaxSeq/MaxAge/fight-back) until fixed.
+            lsu = (Ether() / IP(src='10.0.0.5', dst='224.0.0.5', proto=89) /
+                   OSPF_Hdr(version=2, type=4, src='10.0.0.5', area='0.0.0.0') /
+                   OSPF_LSUpd(lsalist=[OSPF_Router_LSA(id='10.0.0.5', adrouter='10.0.0.5',
+                                                       seq=0x80000005, age=1)]))
             with tempfile.NamedTemporaryFile(suffix='.pcap', delete=False) as tf:
                 pcap_path = tf.name
-            wrpcap(pcap_path, [pkt])
+            wrpcap(pcap_path, [hello, lsu])
             res = _run(['tcpdump', '-nn', '-t', '-v', '-r', pcap_path, 'proto', 'ospf'],
                        timeout=10)
             parsed = _parse_ospf_capture(res['out'])
             got_auth = next((x.get('auth') for x in parsed if x.get('auth') is not None), None)
+            lsas = [l for x in parsed for l in x.get('lsas', [])]
+            # Regression guard: seq parsed off REAL tcpdump, and no ghost LSAs
+            # (sub-lines like "Router LSA Options" must not create lsa_id=None).
+            seq_ok = any(l.get('seq') == 0x80000005 for l in lsas)
+            no_ghost = all(l.get('lsa_id') for l in lsas)
             scapy_result = {'ran': True, 'parsed_packets': len(parsed),
-                            'auth': got_auth, 'pass': len(parsed) >= 1,
+                            'auth': got_auth, 'lsa_seq_parsed': seq_ok,
+                            'no_ghost_lsa': no_ghost, 'lsas': len(lsas),
+                            'pass': len(parsed) >= 1 and seq_ok and no_ghost,
                             'tcpdump_out': res['out'].strip()[:200]}
             try:
                 os.remove(pcap_path)
@@ -13294,7 +13337,7 @@ def do_routing_selftest():
 # correlate(). Both the collector session and the OWD reflector are long-lived
 # daemons, so these managers keep a single instance each with start/stop/status.
 
-_bgp_collector = {'speaker': None, 'events': []}     # correlated asymmetry events
+_bgp_collector = {'speakers': {}, 'events': []}     # name -> BGPSpeaker (multi-carrier)
 _bgp_collector_lock = threading.Lock()
 _owd_reflector = {'reflector': None}
 _owd_lock = threading.Lock()
@@ -13307,46 +13350,81 @@ def _collector_on_update(upd, changed):
     return None
 
 
+def _collector_statuses():
+    return [dict(sp.status(), name=name)
+            for name, sp in _bgp_collector['speakers'].items()]
+
+
 def do_bgp_collector(action='status', peer_ip=None, peer_as=None, local_as=None,
-                     router_id=None, port=179, hold=90):
-    """Manage the receive-only BGP collector session. Actions: start / stop /
-    status / rib. Never advertises a route — it only learns the peer's RIB."""
+                     router_id=None, port=179, hold=90, peers=None, peer=None):
+    """Manage the receive-only BGP collector — MULTI-SESSION: one session per
+    carrier-facing router, each with its own RIB, so a convergence event can name
+    which carrier moved. `peers` is a list of {ip, as, name}; a single peer_ip/
+    peer_as still works (backward compatible). Never advertises a route.
+    Actions: start / stop [peer] / status / rib [peer]."""
     with _bgp_collector_lock:
-        sp = _bgp_collector['speaker']
+        speakers = _bgp_collector['speakers']
         if action == 'start':
-            if sp and sp.state != 'Idle':
-                return {'success': False, 'error': 'collector already running',
-                        'status': sp.status()}
+            plist = list(peers or [])
+            if not plist and peer_ip:
+                plist = [{'ip': peer_ip, 'as': peer_as, 'name': peer_ip}]
+            if not plist:
+                return {'success': False, 'error': 'need peers[] or peer_ip/peer_as'}
             try:
-                ipaddress.ip_address(peer_ip or '')
                 ipaddress.ip_address(router_id or '')
-                peer_as = int(peer_as); local_as = int(local_as)
+                local_as = int(local_as)
                 port = _clamp_int(port, 179, 1, 65535)
                 hold = _clamp_int(hold, 90, 0, 65535)
             except (ValueError, TypeError):
-                return {'success': False, 'error': 'need valid peer_ip, router_id, '
-                        'peer_as, local_as'}
-            if not (0 < peer_as <= 0xFFFFFFFF and 0 < local_as <= 0xFFFFFFFF):
-                return {'success': False, 'error': 'AS numbers out of range'}
-            sp = bgp_speaker.BGPSpeaker(peer_ip, peer_as, local_as, router_id,
-                                        hold_time=hold, port=port,
-                                        on_update=_collector_on_update)
-            sp.start()
-            _bgp_collector['speaker'] = sp
+                return {'success': False, 'error': 'need valid router_id and local_as'}
+            if not (0 < local_as <= 0xFFFFFFFF):
+                return {'success': False, 'error': 'local_as out of range'}
+            started, errs = [], []
+            for pr in plist:
+                pip, pas = pr.get('ip'), pr.get('as')
+                name = str(pr.get('name') or pip)
+                try:
+                    ipaddress.ip_address(pip or '')
+                    pas = int(pas)
+                except (ValueError, TypeError):
+                    errs.append({'peer': name, 'error': 'invalid ip/as'})
+                    continue
+                if not (0 < pas <= 0xFFFFFFFF):
+                    errs.append({'peer': name, 'error': 'as out of range'})
+                    continue
+                ex = speakers.get(name)
+                if ex and ex.state != 'Idle':
+                    started.append(name)
+                    continue                          # already running
+                sp = bgp_speaker.BGPSpeaker(pip, pas, local_as, router_id,
+                                            hold_time=hold, port=port,
+                                            on_update=_collector_on_update)
+                sp.start()
+                speakers[name] = sp
+                started.append(name)
             time.sleep(0.3)
-            return {'success': True, 'status': sp.status()}
+            return {'success': bool(started), 'started': started, 'errors': errs,
+                    'sessions': _collector_statuses()}
         if action == 'stop':
-            if sp:
+            if peer and peer in speakers:
+                speakers[peer].stop()
+                speakers.pop(peer, None)
+                return {'success': True, 'stopped': [peer]}
+            for sp in list(speakers.values()):
                 sp.stop()
-            return {'success': True, 'stopped': True}
+            _bgp_collector['speakers'] = {}
+            return {'success': True, 'stopped': 'all'}
         if action == 'rib':
-            limit = 200
-            return {'success': True,
-                    'rib': sp.rib.snapshot(limit) if sp else {'total': 0, 'routes': []},
-                    'state': sp.state if sp else 'Idle'}
+            per = {name: {'state': sp.state, **{k: sp.rib.snapshot(0)[k]
+                          for k in ('total', 'active', 'flapping')}}
+                   for name, sp in speakers.items()}
+            target_peer = peer if peer in speakers else (
+                next(iter(speakers), None))
+            rib = speakers[target_peer].rib.snapshot(200) if target_peer else {
+                'total': 0, 'routes': []}
+            return {'success': True, 'peer': target_peer, 'peers': per, 'rib': rib}
         # status (default)
-        return {'success': True,
-                'status': sp.status() if sp else {'state': 'Idle', 'peer_ip': None},
+        return {'success': True, 'sessions': _collector_statuses(),
                 'events': _bgp_collector['events'][-20:]}
 
 
@@ -13399,20 +13477,25 @@ def do_path_asymmetry(target, port=path_asymmetry.DEFAULT_PORT, count=20,
         ev = det.add(*s)
         if ev:
             events.append(ev)
-    # correlate events against the live RIB (control-plane truth)
-    rib = None
+    # correlate events against every carrier's live RIB (control-plane truth) —
+    # names which carrier moved for a multi-homed setup.
+    named_ribs = {}
     with _bgp_collector_lock:
-        sp = _bgp_collector['speaker']
-        if sp and sp.state == 'Established':
-            rib = sp.rib
-    correlated = [path_asymmetry.correlate(e, rib) for e in events] if rib else events
+        for name, sp in _bgp_collector['speakers'].items():
+            if sp and sp.state == 'Established':
+                named_ribs[name] = sp.rib
+    if named_ribs:
+        correlated = [path_asymmetry.correlate_multi(e, named_ribs) for e in events]
+    else:
+        correlated = events
     if correlated:
         with _bgp_collector_lock:
             _bgp_collector['events'] = (_bgp_collector['events'] + correlated)[-_COLLECTOR_EVENT_CAP:]
     out = {'success': True, 'target': target, 'port': port,
            'probes_sent': count, 'replies': len(samples),
            'summary': det.summary(), 'events': correlated,
-           'rib_correlation': bool(rib)}
+           'rib_correlation': bool(named_ribs),
+           'carriers': sorted(named_ribs.keys())}
     if not samples:
         out['note'] = ('No reply from the OWD reflector at %s:%d. Run the reflector '
                        'on the target (`python3 path_asymmetry.py reflector %d`) or '
@@ -13946,8 +14029,11 @@ def register_network_diagnostics(app, logger=None):
 
     @app.route('/api/net/arp-check', methods=['GET'])
     def net_arp_check():
-        _log("net/arp-check")
-        return jsonify(do_arp_check())
+        iface = (request.args.get('interface') or '').strip() or None
+        if iface is not None and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"net/arp-check iface={iface or 'default-route'}")
+        return jsonify(do_arp_check(interface=iface))
 
     @app.route('/api/net/arp-baseline', methods=['GET', 'POST'])
     def net_arp_baseline():
@@ -14395,11 +14481,13 @@ def register_network_diagnostics(app, logger=None):
         action = (data.get('action') or 'status').strip()
         if action not in ('start', 'stop', 'status', 'rib'):
             return _bad('action must be start/stop/status/rib')
-        _log(f"net/bgp-collector {action} peer={data.get('peer_ip')}")
+        _log(f"net/bgp-collector {action} peer={data.get('peer_ip')} "
+             f"peers={len(data.get('peers') or [])}")
         return jsonify(do_bgp_collector(
             action, peer_ip=data.get('peer_ip'), peer_as=data.get('peer_as'),
             local_as=data.get('local_as'), router_id=data.get('router_id'),
-            port=data.get('port', 179), hold=data.get('hold', 90)))
+            port=data.get('port', 179), hold=data.get('hold', 90),
+            peers=data.get('peers'), peer=data.get('peer')))
 
     @app.route('/api/net/owd-reflector', methods=['GET', 'POST'])
     def net_owd_reflector():
