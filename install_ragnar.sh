@@ -186,7 +186,9 @@ detect_platform() {
         debian|ubuntu|raspbian)
             PKG_MGR="apt"
             UPDATE_CMD="apt-get update -y"
-            INSTALL_CMD="apt-get install -y"
+            # noninteractive: packages like iperf3 ask debconf questions that
+            # block forever when output is redirected (-y does not answer them)
+            INSTALL_CMD="DEBIAN_FRONTEND=noninteractive apt-get install -y"
             PKG_PRESENT_CMD="dpkg -s"
             ;;
         fedora|rhel|centos|rocky|almalinux)
@@ -210,7 +212,7 @@ detect_platform() {
         *)
             PKG_MGR="apt"
             UPDATE_CMD="apt-get update -y"
-            INSTALL_CMD="apt-get install -y"
+            INSTALL_CMD="DEBIAN_FRONTEND=noninteractive apt-get install -y"
             PKG_PRESENT_CMD="dpkg -s"
             log "WARNING" "Unknown distro; defaulting to apt commands"
             ;;
