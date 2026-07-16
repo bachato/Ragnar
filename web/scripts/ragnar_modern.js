@@ -3173,11 +3173,13 @@ function wifidefRender() {
             let title = '', body = '';
             if (x.type === 'deauth') {
                 title = x.severity === 'flood' ? '💥 Deauth/Disassoc FLOOD' : 'Deauth/Disassoc frames seen';
-                body = `<div>${x.count} frames.</div>` + (x.attackers || []).map(a =>
+                const scopeTag = x.scope ? ` <span class="text-gray-500">(${x.scope}${x.unprotected === x.count && x.count ? ', unprotected' : ''})</span>` : '';
+                body = `<div>${x.count} frames.${scopeTag}</div>` + (x.attackers || []).map(a =>
                     `<div class="font-mono text-[11px] text-gray-400">${a.src} → ${a.dst} ×${a.count}</div>`).join('');
             } else if (x.type === 'beacon_flood') {
-                title = '📡 Beacon flood (fake APs)';
-                body = `<div>${x.ssids} fake SSIDs from ${x.bssids} BSSIDs.</div>`;
+                title = x.severity === 'flood' ? '📡 Beacon flood (fake APs)' : '📡 Dense airspace (beacon)';
+                const laTag = (x.la_ratio != null) ? ` · <span class="${x.la_ratio >= 0.5 ? 'text-red-300' : 'text-gray-500'}">${Math.round(x.la_ratio * 100)}% randomized MACs</span>` : '';
+                body = `<div>${x.ssids} SSIDs from ${x.bssids} BSSIDs${laTag}.</div>`;
             } else if (x.type === 'karma') {
                 title = '🎣 KARMA / MANA rogue AP';
                 body = `<div class="font-mono text-[11px] text-gray-400">${x.bssid}</div><div>answered ${x.ssid_count} SSIDs: ${(x.ssids || []).join(', ')}</div>`;
@@ -4669,9 +4671,10 @@ async function runTlsWatch() {
                 const alpn = (s.alpn || []).join(',') || '—';
                 const neg = s.negotiated_version ? (_tlsVerName(s.negotiated_version) + (s.cipher ? ' ' + s.cipher : '')) : '—';
                 const bad = (s.findings || []).some(f => f.severity === 'high');
+                const dup = (s.count > 1) ? ` <span class="text-slate-500" title="${s.count} duplicate connections collapsed">×${s.count}</span>` : '';
                 html += `<tr class="border-t border-slate-800 align-top">
                     <td class="px-2 py-1 uppercase ${s.proto === 'quic' ? 'text-cyan-300' : 'text-gray-400'}">${escapeHtml(s.proto)}</td>
-                    <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(s.src)} → ${escapeHtml(s.dst)}</td>
+                    <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(s.src)} → ${escapeHtml(s.dst)}${dup}</td>
                     <td class="px-2 py-1 ${bad ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(s.sni || '—')}</td>
                     <td class="px-2 py-1 text-gray-400">${escapeHtml(alpn)}</td>
                     <td class="px-2 py-1 font-mono text-gray-300" title="${escapeHtml(s.ja4_r || '')}">${escapeHtml(s.ja4 || '—')}</td>

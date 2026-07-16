@@ -6,10 +6,16 @@ to a centralized attack log system accessible via the web API.
 """
 
 import json
+import os
+import sys
 import requests
 from datetime import datetime
-from logger import Logger
 import logging
+
+# logger is a core module in the repo root (this file is under python/).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from logger import Logger
 
 # Configure logger
 logger = Logger(name="attack_logger.py", level=logging.DEBUG)

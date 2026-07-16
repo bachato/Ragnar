@@ -62,6 +62,8 @@ _DEAUTH_FLOOD_MIN = 15      # deauth+disassoc frames => flood
 # environment — a real mdk3/mdk4/ESP32 flood produces hundreds, far above any home.
 _BEACON_FLOOD_SSIDS = 100         # distinct beaconed SSIDs => flood (tunable)
 _BEACON_FLOOD_BSSIDS = 150        # distinct beaconing BSSIDs => flood (tunable)
+_BEACON_LA_BSSID_MIN = 18         # burst of distinct BSSIDs to consider LA-ratio
+_BEACON_LA_RATIO = 0.5            # LA (randomized) BSSID fraction => fake-AP storm
 _KARMA_SSID_MIN = 5               # distinct SSIDs answered by ONE bssid => KARMA
 
 # Channels the hopper cycles when no fixed channel is requested (2.4 GHz + the
@@ -559,6 +561,9 @@ def _frame_to_event(pkt):
         "channel": None,
         "rssi": None,
         "reason": None,
+        # 802.11 Protected Frame bit (FC field 0x40). On PMF/802.11w networks a
+        # genuine teardown is protected; an unprotected deauth is a spoof attempt.
+        "protected": bool(int(getattr(d, "FCfield", 0)) & 0x40),
         "ts": float(getattr(pkt, "time", 0) or 0),
     }
     # SSID from the first SSID element (ID 0). Empty = wildcard/hidden.
@@ -1165,11 +1170,32 @@ def analyze(events, baseline=None, window_secs=None, thresholds=None):
             pairs[key] = pairs.get(key, 0) + 1
         top = sorted(pairs.items(), key=lambda kv: -kv[1])[:5]
         sev = "flood" if len(deauths) >= _DEAUTH_FLOOD_MIN else "seen"
+        # Scope: broadcast (to all clients — the classic mdk4 signature) vs
+        # targeted. And the Protected-Frame posture: an all-unprotected burst is a
+        # spoof, and on a PMF/6 GHz network it's an (ineffective but anomalous)
+        # bypass attempt worth surfacing.
+        _bcast = {"ff:ff:ff:ff:ff:ff", None}
+        bcast_n = sum(1 for e in deauths if e.get("dst") in _bcast)
+        unprotected = sum(1 for e in deauths if e.get("protected") is False)
+        reasons = {}
+        for e in deauths:
+            if e.get("reason") is not None:
+                reasons[e["reason"]] = reasons.get(e["reason"], 0) + 1
+        dom_reason = max(reasons, key=reasons.get) if reasons else None
+        scope = "broadcast" if bcast_n >= max(1, len(deauths) * 0.5) else "targeted"
+        detail = f"{len(deauths)} deauth/disassoc frames"
+        if sev == "flood":
+            detail += f" — {scope} flood/DoS in progress"
+        if dom_reason is not None:
+            detail += f" (reason {dom_reason})"
+        if unprotected == len(deauths) and len(deauths) >= _DEAUTH_FLOOD_MIN:
+            detail += " — all unprotected (spoofed; PMF-bypass attempt on 802.11w nets)"
         detections.append({
             "type": "deauth", "severity": sev, "count": len(deauths),
+            "scope": scope, "broadcast": bcast_n, "unprotected": unprotected,
+            "reason": dom_reason,
             "attackers": [{"src": k[0], "dst": k[1], "count": n} for k, n in top],
-            "detail": f"{len(deauths)} deauth/disassoc frames"
-                      + (" — flood/DoS in progress" if sev == "flood" else ""),
+            "detail": detail,
         })
 
     # --- Beacon flood ---
@@ -1178,19 +1204,34 @@ def analyze(events, baseline=None, window_secs=None, thresholds=None):
     # the local RF density (see get/set_thresholds). The live counts are always
     # reported (below, in `airspace`) so the user can see where they sit.
     if beacons:
+        la_ratio_min = float(th.get("beacon_la_ratio", _BEACON_LA_RATIO))
+        la_bssid_min = int(th.get("beacon_la_bssid_min", _BEACON_LA_BSSID_MIN))
         ssids = {e["ssid"] for e in beacons if e.get("ssid")}
         bssids = {e["src"] for e in beacons if e.get("src")}
         rnd_bssids = {b for b in bssids if _is_locally_administered(b)}
+        la_ratio = (len(rnd_bssids) / len(bssids)) if bssids else 0.0
         reasons = []
         if len(ssids) >= beacon_ssid_max:
             reasons.append(f"{len(ssids)} distinct SSIDs (≥{beacon_ssid_max})")
         if len(bssids) >= beacon_bssid_max:
             reasons.append(f"{len(bssids)} distinct BSSIDs (≥{beacon_bssid_max})")
+        # Randomized-BSSID burst: mdk4's beacon mode emits random (locally-
+        # administered) MACs, so a burst of high-LA BSSIDs is a fake-AP storm even
+        # BELOW the absolute count threshold — while ordinary neighbourhood density
+        # uses burned-in (global) MACs (~0% LA) and stays quiet. This is what makes
+        # detection robust in dense RF instead of guessing an absolute count.
+        la_burst = len(bssids) >= la_bssid_min and la_ratio >= la_ratio_min
+        if la_burst:
+            reasons.append(f"{len(rnd_bssids)}/{len(bssids)} BSSIDs randomized "
+                           f"(LA ratio {la_ratio:.0%} ≥ {la_ratio_min:.0%})")
         if reasons:
+            # Critical when the burst is randomized (mdk4 signature); a dense but
+            # non-randomized airspace over the absolute threshold is a warning.
+            sev = "flood" if (la_burst or la_ratio >= la_ratio_min) else "beacon_warn"
             detections.append({
-                "type": "beacon_flood", "severity": "flood",
+                "type": "beacon_flood", "severity": sev,
                 "ssids": len(ssids), "bssids": len(bssids),
-                "random_bssids": len(rnd_bssids),
+                "random_bssids": len(rnd_bssids), "la_ratio": round(la_ratio, 2),
                 "detail": "fake-AP/beacon flood — " + ", ".join(reasons),
             })
 
@@ -1250,7 +1291,7 @@ def analyze(events, baseline=None, window_secs=None, thresholds=None):
             ap["channel"] = e["channel"]
 
     sev_rank = {"flood": 3, "evil_twin": 3, "karma": 3,
-                "duplicate_ssid": 2, "seen": 1}
+                "duplicate_ssid": 2, "beacon_warn": 2, "seen": 1}
     threat = "clear"
     if detections:
         worst = max(sev_rank.get(d["severity"], 1) for d in detections)
@@ -1260,9 +1301,11 @@ def analyze(events, baseline=None, window_secs=None, thresholds=None):
     # the beacon-flood threshold (for calibration).
     b_ssids = {e["ssid"] for e in beacons if e.get("ssid")}
     b_bssids = {e["src"] for e in beacons if e.get("src")}
+    _b_rnd = len({b for b in b_bssids if _is_locally_administered(b)})
     airspace = {
         "ssids": len(b_ssids), "bssids": len(b_bssids),
-        "random_bssids": len({b for b in b_bssids if _is_locally_administered(b)}),
+        "random_bssids": _b_rnd,
+        "la_ratio": round(_b_rnd / len(b_bssids), 2) if b_bssids else 0.0,
         "beacon_ssid_threshold": beacon_ssid_max,
         "beacon_bssid_threshold": beacon_bssid_max,
     }
@@ -1406,27 +1449,49 @@ def selftest():
     check("deauth attacker identified",
           any(a["src"] == "aa:aa:aa:00:00:01" for a in
               types.get("deauth", {}).get("attackers", [])))
-    # 35 fake SSIDs is a flood in a home but below the default (100) threshold;
-    # the point of the fix is that beacon flood must be TUNABLE, not fire on
-    # raw density. Default => quiet; a lowered threshold => fires.
-    check("beacon flood NOT flagged at default threshold (35 < 100)",
-          "beacon_flood" not in types, str(types.get("beacon_flood")))
-    res_low = analyze(events, thresholds={"beacon_ssids": 25})
-    check("beacon flood fires when threshold is lowered",
-          any(d["type"] == "beacon_flood" for d in res_low["detections"]),
-          json.dumps([d.get("detail") for d in res_low["detections"]]))
-    check("airspace counts reported for calibration",
-          res["airspace"]["ssids"] >= 35
+    # The 35 fake APs use randomized (locally-administered) BSSIDs — the mdk4
+    # signature. Even below the absolute 100-SSID threshold, the LA-ratio burst
+    # detector flags this as a randomized-BSSID fake-AP storm (critical). This is
+    # the improvement: robust in dense RF without guessing an absolute count.
+    bf = types.get("beacon_flood", {})
+    check("beacon flood flagged via randomized-BSSID burst (35 LA MACs)",
+          bf.get("severity") == "flood", json.dumps(bf))
+    check("beacon flood reports la_ratio", bf.get("la_ratio", 0) >= 0.5, json.dumps(bf))
+    check("airspace counts + la_ratio reported for calibration",
+          res["airspace"]["ssids"] >= 35 and res["airspace"]["la_ratio"] >= 0.5
           and res["airspace"]["beacon_ssid_threshold"] == _BEACON_FLOOD_SSIDS,
           json.dumps(res["airspace"]))
-    # A dense-but-legit airspace (many SSIDs from GLOBAL/vendor MACs) must NOT
-    # trip beacon flood at the default threshold — this is the user's false pos.
+    # A dense-but-legit airspace (many SSIDs from GLOBAL/vendor MACs, ~0% LA) must
+    # NOT trip beacon flood — this is the dense-RF false positive the LA-ratio
+    # split is designed to avoid.
     dense = [{"kind": "beacon", "src": "00:1a:2b:%02x:%02x:00" % (i // 256, i % 256),
               "ssid": "Neighbour_%d" % i} for i in range(60)]
     dense_res = analyze(dense, baseline={})
-    check("dense legit airspace is NOT a beacon flood (default)",
+    check("dense legit airspace (global MACs) is NOT a beacon flood",
           not any(d["type"] == "beacon_flood" for d in dense_res["detections"]),
           json.dumps([d["detail"] for d in dense_res["detections"]]))
+    # A dense airspace over the absolute threshold but with global MACs is a
+    # WARNING (unusually dense), not a critical randomized storm.
+    dense2 = [{"kind": "beacon", "src": "00:1a:2b:%02x:%02x:00" % (i // 256, i % 256),
+               "ssid": "Neighbour_%d" % i} for i in range(120)]
+    dense2_res = analyze(dense2, thresholds={"beacon_bssids": 100})
+    bf2 = next((d for d in dense2_res["detections"] if d["type"] == "beacon_flood"), {})
+    check("dense global-MAC airspace over abs threshold is warning not critical",
+          bf2.get("severity") == "beacon_warn", json.dumps(bf2))
+    # Deauth scope + protected posture on the (targeted, unprotected) flood.
+    dd = types.get("deauth", {})
+    check("deauth scope = targeted", dd.get("scope") == "targeted", json.dumps(dd))
+    check("deauth reports unprotected count", dd.get("unprotected") == dd.get("count"),
+          json.dumps(dd))
+    check("deauth dominant reason parsed", dd.get("reason") == 7, json.dumps(dd))
+    # Broadcast deauth flood is recognized as broadcast scope.
+    bdeauth = [{"kind": "deauth", "src": "aa:aa:aa:00:00:01",
+                "dst": "ff:ff:ff:ff:ff:ff", "reason": 7, "protected": False}
+               for _ in range(20)]
+    bres = analyze(bdeauth)
+    bd = next((d for d in bres["detections"] if d["type"] == "deauth"), {})
+    check("broadcast deauth flood scope = broadcast", bd.get("scope") == "broadcast",
+          json.dumps(bd))
     check("KARMA detected", "karma" in types and types["karma"]["ssid_count"] >= 5,
           str(types.get("karma")))
     check("evil twin detected against baseline",

@@ -729,7 +729,7 @@ class SharedData:
             "net_integrity_interval_min": 5,        # minutes between checks
             "pushover_notify_net_integrity": True,  # alert on poison/spoof (when monitor on)
             "net_integrity_notify_cooldown_s": 300, # min seconds between any two alert sends
-            "net_integrity_realert_hours": 24,      # remind about a still-bad check after N h (0 = never)
+            "net_integrity_realert_hours": 0,       # remind about a still-bad check after N h (0 = never)
             "net_integrity_extended_enabled": True,  # also rotate the passive Watch scanners
             "net_integrity_batch_size": 3,           # capture-scanners run per cycle (round-robin)
             "net_integrity_interface": "",           # capture iface pin; '' = auto (wired link-up first)

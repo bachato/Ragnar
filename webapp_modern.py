@@ -1229,13 +1229,54 @@ _net_integrity_state = {
 }
 _net_integrity_rotation = 0       # round-robin cursor into the capture-based scanners
 
-# Per-check alert memory: key -> {'rank', 'ts', 'clean_streak'}. A finding is
-# alerted once; it must stay clean for _NI_CLEAN_RUNS_TO_RESET consecutive runs
-# of that check before it can alert again. Without this, a check that flaps
-# through 'unknown'/'no-traffic' (rank 0) between sightings re-arms the
-# transition edge and the same condition pages every few cycles.
+# Per-check alert memory: key -> {'rank', 'ts', 'clean_since'}. A finding is
+# alerted once; it re-arms only after the check has stayed clean for a full
+# _NI_REARM_CLEAN_S. Without this, a check that flaps through 'unknown' /
+# 'no-traffic' (rank 0) between sightings — or a finding the capture window
+# only catches occasionally, or a DNS answer that intermittently differs from
+# public resolvers (Tailscale MagicDNS) — re-arms the transition edge and the
+# same condition pages every few cycles. Persisted to datadir so service
+# restarts / updates don't wipe it and re-page every standing finding.
 _ni_alert_memory = {}
-_NI_CLEAN_RUNS_TO_RESET = 3
+_ni_memory_loaded = False
+_NI_REARM_CLEAN_S = 24 * 3600
+
+
+def _ni_store_path():
+    return os.path.join(shared_data.datadir, 'net_integrity_alerts.json')
+
+
+def _ni_load_memory():
+    """Load the persisted alert memory once per process."""
+    global _ni_memory_loaded
+    if _ni_memory_loaded:
+        return
+    _ni_memory_loaded = True
+    try:
+        with open(_ni_store_path()) as f:
+            data = json.load(f)
+        for k, v in (data.items() if isinstance(data, dict) else ()):
+            if isinstance(v, dict) and 'rank' in v:
+                _ni_alert_memory[k] = {
+                    'rank': int(v.get('rank', 1)),
+                    'ts': float(v.get('ts', 0) or 0),
+                    'clean_since': (float(v['clean_since'])
+                                    if v.get('clean_since') else None),
+                }
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug(f"[net-integrity] alert-memory load failed: {exc}")
+
+
+def _ni_save_memory():
+    try:
+        tmp = _ni_store_path() + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(_ni_alert_memory, f)
+        os.replace(tmp, _ni_store_path())
+    except Exception as exc:
+        logger.debug(f"[net-integrity] alert-memory save failed: {exc}")
 
 # Verdict severity. A check's verdict is CLEAN (0), a real posture/deviation finding
 # (1, "suspicious"), or an active attack (2, "compromised"). Anything not explicitly
@@ -1354,11 +1395,13 @@ def _net_integrity_check_once():
 
     now = datetime.now().isoformat()
     try:
-        realert_s = max(0.0, float(cfg.get('net_integrity_realert_hours', 24))) * 3600
+        realert_s = max(0.0, float(cfg.get('net_integrity_realert_hours', 0))) * 3600
     except (TypeError, ValueError):
-        realert_s = 24 * 3600
+        realert_s = 0.0
     worsened = []
+    mem_changed = False
     with _net_integrity_lock:
+        _ni_load_memory()
         checks = dict(_net_integrity_state.get('checks') or {})
         for key, (label, v, r) in results.items():
             new_rank = _ni_rank(v)
@@ -1366,23 +1409,29 @@ def _net_integrity_check_once():
                            'rank': new_rank}
             mem = _ni_alert_memory.get(key)
             if new_rank == 0:
-                # Forget an alerted condition only after several consecutive
-                # clean runs of this check — one quiet capture (no-traffic /
-                # unknown) must not re-arm the alert edge.
+                # Forget an alerted condition only once the check has stayed
+                # clean for a full day — one quiet capture (no-traffic /
+                # unknown), or DNS momentarily agreeing with public resolvers,
+                # must not re-arm the alert edge.
                 if mem is not None:
-                    mem['clean_streak'] = mem.get('clean_streak', 0) + 1
-                    if mem['clean_streak'] >= _NI_CLEAN_RUNS_TO_RESET:
+                    if not mem.get('clean_since'):
+                        mem['clean_since'] = time.time()
+                        mem_changed = True
+                    elif time.time() - mem['clean_since'] >= _NI_REARM_CLEAN_S:
                         _ni_alert_memory.pop(key, None)
+                        mem_changed = True
                 continue
             # Alert on first sighting, on escalation past what was already
-            # alerted, or as a periodic reminder for a still-bad condition.
+            # alerted, or — if configured — as a periodic reminder.
             if (mem is None or new_rank > mem['rank']
                     or (realert_s and time.time() - mem['ts'] >= realert_s)):
                 worsened.append((label, v, r, new_rank))
                 _ni_alert_memory[key] = {'rank': max(new_rank, mem['rank'] if mem else 0),
-                                         'ts': time.time(), 'clean_streak': 0}
-            else:
-                mem['clean_streak'] = 0
+                                         'ts': time.time(), 'clean_since': None}
+                mem_changed = True
+            elif mem.get('clean_since'):
+                mem['clean_since'] = None
+                mem_changed = True
         worst = max([c['rank'] for c in checks.values()] or [0])
         overall = {0: 'clean', 1: 'suspicious', 2: 'compromised'}[worst]
         dns_c = checks.get('dns') or {}
@@ -1396,6 +1445,8 @@ def _net_integrity_check_once():
             'dhcp': {'verdict': (checks.get('dhcp') or {}).get('verdict', 'unknown'),
                      'reasons': (checks.get('dhcp') or {}).get('reasons') or []},
         })
+    if mem_changed:
+        _ni_save_memory()
 
     # Alert when any check worsened into a bad state this cycle.
     if worsened:
