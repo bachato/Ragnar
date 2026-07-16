@@ -1544,7 +1544,11 @@ their areas, and the advertised prefix→originator map as the baseline
 Because IS-IS rides directly on L2, the hardening is HMAC authentication at both
 levels plus restricting which access ports may carry it. **API:**
 `GET /api/net/isis-watch`, `POST /api/net/isis-baseline`. **CLI:** `isis-watch`,
-`isis-selftest`.
+`isis-selftest`. For a **standalone deep monitor** — a pure-Python binary TLV
+parser with the full 16-detector set (adds HMAC-MD5-vs-SHA, DIS-takeover, P2P
+three-way, hello-padding, narrow-metrics, malformed-PDU), per-code severity +
+dedup, baseline learning and a hardened daemon — see
+[isiswatch](isiswatch.md) (`isiswatch.py`).
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
