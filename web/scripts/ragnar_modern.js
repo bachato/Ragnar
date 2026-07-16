@@ -4669,9 +4669,10 @@ async function runTlsWatch() {
                 const alpn = (s.alpn || []).join(',') || '—';
                 const neg = s.negotiated_version ? (_tlsVerName(s.negotiated_version) + (s.cipher ? ' ' + s.cipher : '')) : '—';
                 const bad = (s.findings || []).some(f => f.severity === 'high');
+                const dup = (s.count > 1) ? ` <span class="text-slate-500" title="${s.count} duplicate connections collapsed">×${s.count}</span>` : '';
                 html += `<tr class="border-t border-slate-800 align-top">
                     <td class="px-2 py-1 uppercase ${s.proto === 'quic' ? 'text-cyan-300' : 'text-gray-400'}">${escapeHtml(s.proto)}</td>
-                    <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(s.src)} → ${escapeHtml(s.dst)}</td>
+                    <td class="px-2 py-1 font-mono text-gray-400">${escapeHtml(s.src)} → ${escapeHtml(s.dst)}${dup}</td>
                     <td class="px-2 py-1 ${bad ? 'text-red-300' : 'text-gray-200'}">${escapeHtml(s.sni || '—')}</td>
                     <td class="px-2 py-1 text-gray-400">${escapeHtml(alpn)}</td>
                     <td class="px-2 py-1 font-mono text-gray-300" title="${escapeHtml(s.ja4_r || '')}">${escapeHtml(s.ja4 || '—')}</td>

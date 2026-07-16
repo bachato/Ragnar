@@ -968,6 +968,15 @@ hit, **suspicious** on any other high/warn finding (weak cipher, expired cert,
 legacy version), else **clean**. Needs a SPAN/mirror port to see other hosts on a
 switched segment.
 
+**Deduplicated results.** A browser routinely opens several parallel connections
+to the same host, and a QUIC client may retransmit its Initial — all with an
+identical fingerprint. These are collapsed into **one result** keyed on the
+client identity (proto · client IP · server IP:port · JA4 · SNI), carrying a
+`count` of how many connections merged (shown as `×N` in the table). QUIC
+retransmits are deduped at parse time (one session per connection); the
+representative is upgraded to whichever duplicate actually observed the server,
+so a completed handshake is never masked by an aborted one.
+
 **JA4S** (the server fingerprint) is licensed under the **FoxIO License 1.1**, not
 the BSD/MIT that covers the rest, so it lives in a separate, clearly identified
 file (`ja4s.py`) and is **off by default** — Ragnar never computes it unless the
