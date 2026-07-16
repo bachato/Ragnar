@@ -1704,8 +1704,18 @@ RIB*, but is **receive-only**: the FSM (Idle → Connect → OpenSent → OpenCo
 Established) sends only OPEN / KEEPALIVE and **never an UPDATE**, so it structurally
 **cannot advertise or withdraw a route**. It decodes UPDATEs into an Adj-RIB-In with
 per-prefix **churn/flap tracking** (a prefix changing origin/next-hop faster than a
-threshold is marked *flapping*) and longest-prefix lookup. Point it at a router
+threshold is marked *flapping*, and the previous AS-path is remembered so a change
+shows as `old → new`) and longest-prefix lookup. Point it at a router
 configured to peer with the Pi's AS (a route-server client / passive peer works well).
+
+**Multi-carrier mode** — start **one session per carrier-facing router** (each with
+its own thread + RIB) by passing a `peers` list instead of a single peer. When a
+convergence/asymmetry event fires, the verdict then **names which carrier moved and
+which are stable** — so a multi-homed operator knows which ISP to call. The scope is
+inferred from the pattern: *one* carrier's covering prefix churning → the change is
+in that carrier's AS or an upstream peer of it; *all* covering carriers moving
+together → upstream of every one of them (the origin AS or a shared major transit).
+Single-peer (`peer_ip`/`peer_as`) still works unchanged.
 
 **One-way-delay probe** (`path_asymmetry.py`) — a tiny UDP prober/reflector using the
 OWAMP/TWAMP 4-timestamp model (T1 send, T2 remote-recv, T3 remote-send, T4 recv). It
@@ -1718,20 +1728,25 @@ it flags a **shift** in asymmetry without false-alarming on a static clock skew.
 absolute number is trustworthy. Run the **reflector** on the far node (or here) so the
 other side can measure both directions.
 
-**Correlator** — when the collector is `Established`, each asymmetry event is
-annotated with control-plane truth from the RIB: the covering prefix, origin AS,
-AS-path, whether that prefix is currently flapping, and how recently it changed. The
-attribution heuristic then labels the event **route-churn** (RIB is flapping — the
-delay shift lines up with a real routing change), **recent path shift** (a fresh but
-stable change), or **stable / data-plane** (no matching control-plane change — the
-asymmetry is happening below BGP, e.g. a congested or re-routed transit leg).
+**Correlator** — when a collector session is `Established`, each asymmetry event is
+annotated with control-plane truth from the RIB(s): the covering prefix, origin AS,
+AS-path, whether that prefix is currently flapping, and how recently it changed. With
+multiple carrier sessions the correlator produces a **per-carrier breakdown**
+(`carriers_confirmed` / `carriers_stable`) and, when any carrier's covering prefix
+churned within the correlation window, upgrades the verdict to **`confirmed`** with a
+line like `confirmed [Carrier-A confirm; Carrier-B, Carrier-C stable] :: BGP RIB
+corroborates: Carrier-A: prefix 9.9.9.0/24 AS-path [64512, 64520] → [64512, 64530]`.
+Otherwise it labels the event **route-churn** (flapping), **recent path shift** (a
+fresh but stable change), or **stable / data-plane** (no matching control-plane
+change — the asymmetry is below BGP, e.g. a congested or re-routed transit leg).
 
 > **Safety:** the collector never originates routing information, and the OWD probe is
 > a handful of small UDP datagrams — neither injects state into the network. Both are
 > long-lived daemons managed with start/stop/status; nothing is persisted to disk.
 
 - Endpoints: `GET/POST /api/net/bgp-collector` `{action: start|stop|status|rib,
-  peer_ip, peer_as, local_as, router_id, port, hold}`,
+  local_as, router_id, port, hold, peer_ip, peer_as` (single) or `peers: [{ip, as,
+  name}, …]` (multi-carrier), `peer` (name, for per-session stop/rib)`}`,
   `GET/POST /api/net/owd-reflector` `{action: start|stop|status, port}`,
   `POST /api/net/path-asymmetry` `{target, count, clock_synced}`
 - CLI: `python3 path_asymmetry.py reflector [port]` runs a standalone reflector;

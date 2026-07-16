@@ -13326,7 +13326,7 @@ def do_routing_selftest():
 # correlate(). Both the collector session and the OWD reflector are long-lived
 # daemons, so these managers keep a single instance each with start/stop/status.
 
-_bgp_collector = {'speaker': None, 'events': []}     # correlated asymmetry events
+_bgp_collector = {'speakers': {}, 'events': []}     # name -> BGPSpeaker (multi-carrier)
 _bgp_collector_lock = threading.Lock()
 _owd_reflector = {'reflector': None}
 _owd_lock = threading.Lock()
@@ -13339,46 +13339,81 @@ def _collector_on_update(upd, changed):
     return None
 
 
+def _collector_statuses():
+    return [dict(sp.status(), name=name)
+            for name, sp in _bgp_collector['speakers'].items()]
+
+
 def do_bgp_collector(action='status', peer_ip=None, peer_as=None, local_as=None,
-                     router_id=None, port=179, hold=90):
-    """Manage the receive-only BGP collector session. Actions: start / stop /
-    status / rib. Never advertises a route — it only learns the peer's RIB."""
+                     router_id=None, port=179, hold=90, peers=None, peer=None):
+    """Manage the receive-only BGP collector — MULTI-SESSION: one session per
+    carrier-facing router, each with its own RIB, so a convergence event can name
+    which carrier moved. `peers` is a list of {ip, as, name}; a single peer_ip/
+    peer_as still works (backward compatible). Never advertises a route.
+    Actions: start / stop [peer] / status / rib [peer]."""
     with _bgp_collector_lock:
-        sp = _bgp_collector['speaker']
+        speakers = _bgp_collector['speakers']
         if action == 'start':
-            if sp and sp.state != 'Idle':
-                return {'success': False, 'error': 'collector already running',
-                        'status': sp.status()}
+            plist = list(peers or [])
+            if not plist and peer_ip:
+                plist = [{'ip': peer_ip, 'as': peer_as, 'name': peer_ip}]
+            if not plist:
+                return {'success': False, 'error': 'need peers[] or peer_ip/peer_as'}
             try:
-                ipaddress.ip_address(peer_ip or '')
                 ipaddress.ip_address(router_id or '')
-                peer_as = int(peer_as); local_as = int(local_as)
+                local_as = int(local_as)
                 port = _clamp_int(port, 179, 1, 65535)
                 hold = _clamp_int(hold, 90, 0, 65535)
             except (ValueError, TypeError):
-                return {'success': False, 'error': 'need valid peer_ip, router_id, '
-                        'peer_as, local_as'}
-            if not (0 < peer_as <= 0xFFFFFFFF and 0 < local_as <= 0xFFFFFFFF):
-                return {'success': False, 'error': 'AS numbers out of range'}
-            sp = bgp_speaker.BGPSpeaker(peer_ip, peer_as, local_as, router_id,
-                                        hold_time=hold, port=port,
-                                        on_update=_collector_on_update)
-            sp.start()
-            _bgp_collector['speaker'] = sp
+                return {'success': False, 'error': 'need valid router_id and local_as'}
+            if not (0 < local_as <= 0xFFFFFFFF):
+                return {'success': False, 'error': 'local_as out of range'}
+            started, errs = [], []
+            for pr in plist:
+                pip, pas = pr.get('ip'), pr.get('as')
+                name = str(pr.get('name') or pip)
+                try:
+                    ipaddress.ip_address(pip or '')
+                    pas = int(pas)
+                except (ValueError, TypeError):
+                    errs.append({'peer': name, 'error': 'invalid ip/as'})
+                    continue
+                if not (0 < pas <= 0xFFFFFFFF):
+                    errs.append({'peer': name, 'error': 'as out of range'})
+                    continue
+                ex = speakers.get(name)
+                if ex and ex.state != 'Idle':
+                    started.append(name)
+                    continue                          # already running
+                sp = bgp_speaker.BGPSpeaker(pip, pas, local_as, router_id,
+                                            hold_time=hold, port=port,
+                                            on_update=_collector_on_update)
+                sp.start()
+                speakers[name] = sp
+                started.append(name)
             time.sleep(0.3)
-            return {'success': True, 'status': sp.status()}
+            return {'success': bool(started), 'started': started, 'errors': errs,
+                    'sessions': _collector_statuses()}
         if action == 'stop':
-            if sp:
+            if peer and peer in speakers:
+                speakers[peer].stop()
+                speakers.pop(peer, None)
+                return {'success': True, 'stopped': [peer]}
+            for sp in list(speakers.values()):
                 sp.stop()
-            return {'success': True, 'stopped': True}
+            _bgp_collector['speakers'] = {}
+            return {'success': True, 'stopped': 'all'}
         if action == 'rib':
-            limit = 200
-            return {'success': True,
-                    'rib': sp.rib.snapshot(limit) if sp else {'total': 0, 'routes': []},
-                    'state': sp.state if sp else 'Idle'}
+            per = {name: {'state': sp.state, **{k: sp.rib.snapshot(0)[k]
+                          for k in ('total', 'active', 'flapping')}}
+                   for name, sp in speakers.items()}
+            target_peer = peer if peer in speakers else (
+                next(iter(speakers), None))
+            rib = speakers[target_peer].rib.snapshot(200) if target_peer else {
+                'total': 0, 'routes': []}
+            return {'success': True, 'peer': target_peer, 'peers': per, 'rib': rib}
         # status (default)
-        return {'success': True,
-                'status': sp.status() if sp else {'state': 'Idle', 'peer_ip': None},
+        return {'success': True, 'sessions': _collector_statuses(),
                 'events': _bgp_collector['events'][-20:]}
 
 
@@ -13431,20 +13466,25 @@ def do_path_asymmetry(target, port=path_asymmetry.DEFAULT_PORT, count=20,
         ev = det.add(*s)
         if ev:
             events.append(ev)
-    # correlate events against the live RIB (control-plane truth)
-    rib = None
+    # correlate events against every carrier's live RIB (control-plane truth) —
+    # names which carrier moved for a multi-homed setup.
+    named_ribs = {}
     with _bgp_collector_lock:
-        sp = _bgp_collector['speaker']
-        if sp and sp.state == 'Established':
-            rib = sp.rib
-    correlated = [path_asymmetry.correlate(e, rib) for e in events] if rib else events
+        for name, sp in _bgp_collector['speakers'].items():
+            if sp and sp.state == 'Established':
+                named_ribs[name] = sp.rib
+    if named_ribs:
+        correlated = [path_asymmetry.correlate_multi(e, named_ribs) for e in events]
+    else:
+        correlated = events
     if correlated:
         with _bgp_collector_lock:
             _bgp_collector['events'] = (_bgp_collector['events'] + correlated)[-_COLLECTOR_EVENT_CAP:]
     out = {'success': True, 'target': target, 'port': port,
            'probes_sent': count, 'replies': len(samples),
            'summary': det.summary(), 'events': correlated,
-           'rib_correlation': bool(rib)}
+           'rib_correlation': bool(named_ribs),
+           'carriers': sorted(named_ribs.keys())}
     if not samples:
         out['note'] = ('No reply from the OWD reflector at %s:%d. Run the reflector '
                        'on the target (`python3 path_asymmetry.py reflector %d`) or '
@@ -14427,11 +14467,13 @@ def register_network_diagnostics(app, logger=None):
         action = (data.get('action') or 'status').strip()
         if action not in ('start', 'stop', 'status', 'rib'):
             return _bad('action must be start/stop/status/rib')
-        _log(f"net/bgp-collector {action} peer={data.get('peer_ip')}")
+        _log(f"net/bgp-collector {action} peer={data.get('peer_ip')} "
+             f"peers={len(data.get('peers') or [])}")
         return jsonify(do_bgp_collector(
             action, peer_ip=data.get('peer_ip'), peer_as=data.get('peer_as'),
             local_as=data.get('local_as'), router_id=data.get('router_id'),
-            port=data.get('port', 179), hold=data.get('hold', 90)))
+            port=data.get('port', 179), hold=data.get('hold', 90),
+            peers=data.get('peers'), peer=data.get('peer')))
 
     @app.route('/api/net/owd-reflector', methods=['GET', 'POST'])
     def net_owd_reflector():
