@@ -258,6 +258,8 @@ CORE_FILES=(
 for f in "${CORE_FILES[@]}"; do
     if [ -f "${RAGNAR_DIR}/${f}" ]; then
         cp "${RAGNAR_DIR}/${f}" "${PAYLOAD_STAGE}/"
+    elif [ -f "${RAGNAR_DIR}/python/${f}" ]; then
+        cp "${RAGNAR_DIR}/python/${f}" "${PAYLOAD_STAGE}/"
     else
         log "WARNING" "File not found: ${f} (skipping)"
     fi

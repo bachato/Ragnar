@@ -3303,40 +3303,61 @@ def _igmp_scope(group):
 _IGMP_IP_RE = r'(\d{1,3}(?:\.\d{1,3}){3})'
 
 
+def _igmp_is_multicast(ip):
+    """True if `ip` is in the IPv4 multicast range 224.0.0.0/4 (224–239)."""
+    try:
+        return 224 <= int(ip.split('.')[0]) <= 239
+    except (ValueError, AttributeError, IndexError):
+        return False
+
+
 def _parse_igmp_capture(output):
     """Parse `tcpdump -nn -t -v 'igmp'` text into a list of membership events:
-    {src, group, kind, version}. kind is 'query' | 'report' | 'leave'.
+    {src, group, kind, version, ttl}. kind is 'query' | 'report' | 'leave'.
 
     Handles v1/v2 reports (dst == group), v2 leaves, and v3 reports whose group
     records tcpdump prints as `gaddr <addr> ...` (one event per group record).
-    Robust to tcpdump version differences: it keys off the `igmp` keyword and
-    pulls every group address it can find rather than a single rigid format."""
+    With -v, tcpdump prints an IP-header line ('... proto IGMP (2), ttl N ...')
+    just before each message; its TTL is captured and attached to the next event
+    (IGMP must be TTL 1 — anything else is off-link injection). Robust to tcpdump
+    version differences: it keys off the `igmp` keyword and pulls every group
+    address it can find rather than a single rigid format."""
     events = []
     ver_re = re.compile(r'igmp\s+v(\d)', re.I)
     src_re = re.compile(r'^' + _IGMP_IP_RE + r'\s*>\s*' + _IGMP_IP_RE)
     gaddr_re = re.compile(r'gaddr\s+' + _IGMP_IP_RE, re.I)
+    ttl_re = re.compile(r'\bttl\s+(\d+)', re.I)
     # v3 record modes that mean "leaving / no interest" vs joining.
     leave_modes = ('to_in', 'is_in', 'block')
+    pending_ttl = None
     for raw in output.splitlines():
         line = raw.strip()
-        if 'igmp' not in line.lower():
+        low = line.lower()
+        # IP-header line for an IGMP datagram: grab the TTL for the next event.
+        if 'proto igmp' in low and 'ttl' in low and not src_re.search(line):
+            tm = ttl_re.search(line)
+            pending_ttl = int(tm.group(1)) if tm else None
+            continue
+        if 'igmp' not in low:
             continue
         sm = src_re.search(line)
         src = sm.group(1) if sm else None
         dst = sm.group(2) if sm else None
         vm = ver_re.search(line)
         version = int(vm.group(1)) if vm else 2
+        ttl = pending_ttl
+        pending_ttl = None
         low = line.lower()
         if 'query' in low:
             events.append({'src': src, 'group': None, 'kind': 'query',
-                           'version': version})
+                           'version': version, 'ttl': ttl})
             continue
         if 'leave' in low:
             # v2 leave-group: the left group is named after "leave" or is dst.
             lm = re.search(r'leave.*?' + _IGMP_IP_RE, low)
             grp = (lm.group(1) if lm else None) or (dst if dst != '224.0.0.2' else None)
             events.append({'src': src, 'group': grp, 'kind': 'leave',
-                           'version': version})
+                           'version': version, 'ttl': ttl})
             continue
         if 'report' in low:
             gaddrs = gaddr_re.findall(line)
@@ -3347,14 +3368,14 @@ def _parse_igmp_capture(output):
                     seg = low.split(g.lower(), 1)[-1][:24]
                     kind = 'leave' if any(m in seg for m in leave_modes) and '{ }' in seg else 'report'
                     events.append({'src': src, 'group': g, 'kind': kind,
-                                   'version': version})
+                                   'version': version, 'ttl': ttl})
             else:
                 # v1/v2 report — the destination address IS the group.
                 grp = None
                 rm = re.search(r'report\s+' + _IGMP_IP_RE, low)
                 grp = rm.group(1) if rm else (dst if dst and dst not in _IGMP_WELL_KNOWN else dst)
                 events.append({'src': src, 'group': grp, 'kind': 'report',
-                               'version': version})
+                               'version': version, 'ttl': ttl})
     return events
 
 
@@ -3405,6 +3426,9 @@ def _igmp_analyze(events, seconds, baseline, learn=True):
     per_src = {}
     src_groups = {}
     members = {}
+    per_src_leave = {}
+    sg_kinds = {}                 # (src, group) -> set of {'report','leave'}
+    bad_ttl = {}                  # (src, ttl) -> a representative kind
     for e in events:
         s = e.get('src')
         if s:
@@ -3413,6 +3437,13 @@ def _igmp_analyze(events, seconds, baseline, learn=True):
         if g and e['kind'] == 'report':
             src_groups.setdefault(s, set()).add(g)
             members.setdefault(g, set()).add(s)
+        if s and e['kind'] == 'leave':
+            per_src_leave[s] = per_src_leave.get(s, 0) + 1
+        if g and e['kind'] in ('report', 'leave'):
+            sg_kinds.setdefault((s, g), set()).add(e['kind'])
+        ttl = e.get('ttl')
+        if ttl is not None and ttl != 1 and s:
+            bad_ttl.setdefault((s, ttl), e['kind'])
 
     trusted_q = set(baseline.get('queriers') or [])
     known_members = {g: set(v) for g, v in (baseline.get('members') or {}).items()}
@@ -3461,6 +3492,46 @@ def _igmp_analyze(events, seconds, baseline, learn=True):
         findings.append(('warn', 'anomaly',
                          f'mixed IGMP query versions {q_versions} — possible '
                          'version-downgrade to force weaker v1/v2'))
+
+    # (2b) crafted / off-link / bogus-group anomalies. These are signatures of a
+    # forged or injected message rather than a policy question, so they fire in
+    # both learn and enforce modes.
+    if any(e['kind'] == 'query' and e.get('src') == '0.0.0.0' for e in events):
+        categories.add('anomaly')
+        findings.append(('crit', 'anomaly',
+                         'IGMP query sourced from 0.0.0.0 — a spoofed querier '
+                         '(a real querier sends from its interface IP)'))
+    for (s, t), kind in sorted(bad_ttl.items()):
+        categories.add('anomaly')
+        findings.append(('crit', 'anomaly',
+                         f'IGMP {kind} from {s} arrived with IP TTL {t} (must be 1) '
+                         '— off-link injection / spoofed multicast control'))
+    for (s, g) in sorted(k for k in sg_kinds if k[1] and not _igmp_is_multicast(k[1])):
+        categories.add('anomaly')
+        findings.append(('crit', 'anomaly',
+                         f'{s} sent a report/leave for {g}, which is not a multicast '
+                         '(224.0.0.0/4) address — crafted/malformed message'))
+    for g in sorted(members):
+        if g in ('224.0.0.1', '224.0.0.2'):
+            for s in sorted(members[g]):
+                categories.add('anomaly')
+                findings.append(('crit', 'anomaly',
+                                 f'{s} reported membership in reserved group {g} '
+                                 f'({_IGMP_WELL_KNOWN.get(g)}) — bogus/crafted (these '
+                                 'are never joined via IGMP)'))
+    for (s, g) in sorted(k for k, v in sg_kinds.items()
+                         if k[1] and 'report' in v and 'leave' in v):
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'{s} both joined and left {g} in {seconds}s — join/leave '
+                         'flap (thrashes the snooping table)'))
+    leave_floods = sorted([(s, n) for s, n in per_src_leave.items()
+                           if n >= _IGMP_SRC_FLOOD], key=lambda x: -x[1])
+    for s, n in leave_floods:
+        categories.add('storm')
+        findings.append(('warn', 'storm',
+                         f'{s} sent {n} IGMP leaves in {seconds}s — leave flood '
+                         '(forces repeated group-specific queries; snooping DoS)'))
 
     # (3) reconnaissance — a source joining many distinct groups
     recon = sorted([(s, len(g)) for s, g in src_groups.items() if len(g) >= _IGMP_RECON_GROUPS],
@@ -3621,7 +3692,32 @@ def _igmp_selftest():
         {'queriers': ['192.168.1.1'], 'members': {'239.1.1.1': ['192.168.1.50']}},
         'unauthorized')
 
-    # 6. v3 group-record parse (via gaddr) — assert the group is extracted.
+    # 6. spoofed querier: a general query sourced from 0.0.0.0.
+    run('spoofed-querier', "0.0.0.0 > 224.0.0.1: igmp query v2", 12, {}, 'anomaly')
+    # 7. bad TTL: IGMP must be TTL 1; the IP-header line carries a higher TTL.
+    badttl = "\n".join([
+        "IP (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto IGMP (2), length 28)",
+        "    10.0.0.9 > 239.1.1.1: igmp v2 report 239.1.1.1"])
+    run('bad-ttl', badttl, 12, {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+    # 8. non-multicast group in a report — crafted.
+    run('non-multicast-group', "10.0.0.5 > 10.0.0.5: igmp v2 report 10.0.0.5", 12,
+        {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+    # 9. reserved-group membership report (all-hosts).
+    run('reserved-group', "10.0.0.9 > 224.0.0.1: igmp v2 report 224.0.0.1", 12,
+        {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+    # 10. join/leave flap: same host toggles a group.
+    flap = "\n".join([
+        "10.0.0.7 > 239.2.2.2: igmp v2 report 239.2.2.2",
+        "10.0.0.7 > 224.0.0.2: igmp v2 leave 239.2.2.2"])
+    run('join-leave-flap', flap, 12, {'queriers': ['192.168.1.1'], 'members': {}},
+        'anomaly')
+    # 11. leave flood from one source.
+    leave_storm = "\n".join(
+        ["10.0.0.8 > 224.0.0.2: igmp v2 leave 239.3.3.3" for _ in range(130)])
+    run('leave-storm', leave_storm, 5, {'queriers': ['192.168.1.1'], 'members': {}},
+        'storm')
+
+    # 12. v3 group-record parse (via gaddr) — assert the group is extracted.
     v3 = ("192.168.1.50 > 224.0.0.22: igmp v3 report, 1 group record(s) "
           "[gaddr 239.9.9.9 to_ex { }]")
     v3_events = _parse_igmp_capture(v3)
@@ -5998,6 +6094,7 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
     agents = {}          # agent ip -> aggregate
     managers = set()
     communities = {}     # community -> aggregate (v1/v2c only)
+    comm_agents = {}     # community -> set of agent ips that accept it
     walk_by_src = {}     # source -> count of GetNext/GetBulk
     bulk_max = 0
     insecure = False     # any v1/v2c seen
@@ -6017,6 +6114,7 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
             insecure = True
             comm = e['community'] if e['community'] is not None else 'public'
             a['communities'].add(comm)
+            comm_agents.setdefault(comm, set()).add(agent_ip)
             c = communities.setdefault(comm, {
                 'community': comm, 'versions': set(), 'count': 0, 'writes': False})
             c['versions'].add(e['version'])
@@ -6093,6 +6191,28 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
                 f"NEW community string(s) since baseline: "
                 f"{', '.join(chr(34) + c + chr(34) for c in sorted(new_comms))}")
 
+    # --- community reuse: shared-secret blast radius ---
+    # A cleartext community accepted by 2+ agents means one sniff owns them all;
+    # if that community was ever seen writing, one capture is write access to N.
+    community_reuse = []
+    for comm in sorted(a for a, ags in comm_agents.items() if len(ags) >= 2):
+        ags = sorted(comm_agents[comm])
+        writes = communities[comm]['writes']
+        community_reuse.append({'community': comm, 'agents': ags,
+                                'writes': writes,
+                                'severity': 'critical' if writes else 'high'})
+        bump('write-exposed' if writes else 'cleartext')
+        if writes:
+            reasons.append(
+                f"Community \"{comm}\" is reused across {len(ags)} agents "
+                f"({', '.join(ags)}) AND was seen writing — one capture is write "
+                f"access to all of them (blast radius)")
+        else:
+            reasons.append(
+                f"Community \"{comm}\" is reused across {len(ags)} agents "
+                f"({', '.join(ags)}) — sniff it once, gain that access on every one "
+                f"(shared-secret blast radius)")
+
     # --- amplification: GetBulk with large max-repetitions ---
     if bulk_max >= _SNMP_BULK_AMP:
         bump('amplification')
@@ -6149,6 +6269,7 @@ def _snmp_analyze(events, seconds, baseline, learn=True):
         'insecure': insecure,
         'agents': [_pub_agent(agents[a]) for a in sorted(agents)],
         'communities': [_pub_comm(communities[c]) for c in sorted(communities)],
+        'community_reuse': community_reuse,
         'managers': sorted(managers),
         'advisories': advisories,
     }
@@ -6256,6 +6377,31 @@ def _snmp_selftest():
     walk = "\n".join(line('10.0.0.9', '192.168.1.1', 42000 + i, 161, 'v3',
                           'GetNextRequest') for i in range(25))
     run('enumeration', walk, 12, base, 'enumeration')
+
+    # 5b. community reuse: one community ("netops") on two different agents.
+    reuse_text = "\n".join([
+        line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c', 'GetRequest',
+             community='netops'),
+        line('192.168.1.50', '192.168.1.2', 42001, 161, 'v2c', 'GetRequest',
+             community='netops')])
+    rr = run('community-reuse', reuse_text, 12,
+             {'agents': {}, 'communities': ['netops']}, 'cleartext')
+    reuse_ok = (any(r['community'] == 'netops' and r['agents'] == ['192.168.1.1', '192.168.1.2']
+                    and r['severity'] == 'high' for r in rr.get('community_reuse', [])))
+    scenarios.append({'name': 'community-reuse', 'expect': 'netops on 2 agents (high)',
+                      'got': str(rr.get('community_reuse')), 'pass': reuse_ok})
+    # 5c. reuse + write => critical blast radius.
+    reuse_w = "\n".join([
+        line('192.168.1.50', '192.168.1.1', 42000, 161, 'v2c', 'SetRequest',
+             community='rwsecret'),
+        line('192.168.1.50', '192.168.1.2', 42001, 161, 'v2c', 'GetRequest',
+             community='rwsecret')])
+    rw = _snmp_analyze(_parse_snmp_capture(reuse_w), 12,
+                       {'agents': {}, 'communities': ['rwsecret']}, learn=False)
+    rw_ok = any(r['community'] == 'rwsecret' and r['severity'] == 'critical'
+                for r in rw.get('community_reuse', []))
+    scenarios.append({'name': 'community-reuse-write', 'expect': 'rwsecret critical',
+                      'got': str(rw.get('community_reuse')), 'pass': rw_ok})
 
     # 6. parse: hidden-public + explicit community + v3 (no community).
     pev = _parse_snmp_capture(
@@ -8434,11 +8580,16 @@ _ISIS_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _isis_watch_lock = threading.Lock()
 _ISIS_EVENTS_CAP = 200
 _ISIS_STORM_RATE = 25           # IS-IS PDUs/s above this (with volume) == flood
+# LSP sequence number this close to the 0xFFFFFFFF wrap is the classic seq-number
+# attack: force the real owner to purge + re-originate from seq 1.
+_ISIS_SEQ_HIGH = 0xFFFFFF00
 _ISIS_SRC_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*'
                           r'(01:80:c2:00:00:1[45])')
 _ISIS_PDU_RE = re.compile(r'\b(L1|L2|p2p)\s+(Lan IIH|IIH|LSP|CSNP|PSNP)')
 _ISIS_SRCID_RE = re.compile(r'source-id:\s*([0-9a-fA-F.]+)')
 _ISIS_LSPID_RE = re.compile(r'lsp-id:\s*([0-9a-fA-F.\-]+),\s*seq:\s*(0x[0-9a-fA-F]+)')
+# Remaining Lifetime on the lsp-id line; 0 == a purge (LSP deletion / blackhole).
+_ISIS_LIFETIME_RE = re.compile(r'lifetime:?\s*(\d+)\s*s')
 _ISIS_AREA_RE = re.compile(r'Area address \(length: \d+\):\s*([0-9a-fA-F.]+)')
 _ISIS_HOST_RE = re.compile(r'Hostname:\s*(\S+)')
 _ISIS_PFX_RE = re.compile(r'IP(?:v4|v6) prefix:\s*([0-9a-fA-F:.]+/\d+),.*?Metric:\s*(\d+)')
@@ -8465,7 +8616,8 @@ def _parse_isis_capture(output):
             cur = {'src_mac': m.group(1).lower(), 'dst': m.group(2),
                    'level': None, 'kind': None, 'source_id': None, 'lsp_id': None,
                    'seq': None, 'areas': [], 'auth_present': False, 'auth': None,
-                   'hostname': None, 'prefixes': []}
+                   'hostname': None, 'prefixes': [], 'lifetime': None,
+                   'overload': False}
             continue
         if cur is None:
             continue
@@ -8484,6 +8636,13 @@ def _parse_isis_capture(output):
         if lsp:
             cur['lsp_id'] = lsp.group(1)
             cur['seq'] = lsp.group(2)
+        lt = _ISIS_LIFETIME_RE.search(line)
+        if lt and cur['lifetime'] is None:
+            cur['lifetime'] = int(lt.group(1))
+        # tcpdump renders the LSP overload (OL) bit in the type block, e.g.
+        # "Flags: [ L2 IS, Overload bit set ]".
+        if 'overload' in line.lower():
+            cur['overload'] = True
         ar = _ISIS_AREA_RE.search(line)
         if ar and ar.group(1) not in cur['areas']:
             cur['areas'].append(ar.group(1))
@@ -8655,6 +8814,51 @@ def _isis_analyze(events, seconds, baseline, learn=True):
                     f"{', '.join(base.get('areas') or []) or 'none'}) — area/topology "
                     f"change or a crafted hello")
 
+    # LSP-level attacks: purge (lifetime 0), overload bit, sequence-number wrap.
+    # Dedupe reasons per system so a re-flood doesn't spam the snapshot.
+    _purged, _overloaded, _seqhi = set(), set(), set()
+    for e in events:
+        if e['kind'] != 'lsp':
+            continue
+        sid = e['system_id']
+        if e.get('lifetime') == 0 and sid not in _purged:
+            _purged.add(sid)
+            bump('injection')
+            reasons.append(
+                f"IS-IS LSP PURGE: {_name(sid)} LSP {e.get('lsp_id') or ''} has "
+                f"Remaining Lifetime 0 — an LSP deletion/blackhole (a forged purge "
+                f"wipes a router's LSP from every database in the area)")
+        if e.get('overload') and sid not in _overloaded:
+            _overloaded.add(sid)
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS OVERLOAD bit set by {_name(sid)} — signals 'do not transit "
+                f"through me'; a forged OL bit steers traffic off the router (or is an "
+                f"unplanned overload/maintenance state)")
+        try:
+            seqv = int(e['seq'], 16) if e.get('seq') else 0
+        except (TypeError, ValueError):
+            seqv = 0
+        if seqv >= _ISIS_SEQ_HIGH and sid not in _seqhi:
+            _seqhi.add(sid)
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS LSP sequence number {e.get('seq')} from {_name(sid)} is near "
+                f"the 0xFFFFFFFF wrap — a sequence-number attack forcing the real owner "
+                f"to purge and re-originate")
+
+    # Mixed authentication: a system seen both authenticated and unauthenticated —
+    # an attacker's un-keyed PDUs racing the real router's keyed ones (or a
+    # mid-rollout key mismatch).
+    for sid in sorted(routers):
+        a = routers[sid]['auth']
+        if ('hmac' in a) and (a & {'none', 'cleartext'}):
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS system {_name(sid)} seen BOTH authenticated and "
+                f"unauthenticated (mixed-auth) — a spoofed/un-keyed PDU alongside the "
+                f"real router's keyed ones")
+
     # Weak / no authentication.
     if noauth_any:
         bump('weak-auth')
@@ -8806,12 +9010,14 @@ def _isis_selftest():
                       f"\t      Hostname: {hostname}"]
         return "\n".join(lines)
 
-    def lsp(srcmac, sysid, level=2, prefixes=(), auth='hmac', hostname=None, seq=0x10):
+    def lsp(srcmac, sysid, level=2, prefixes=(), auth='hmac', hostname=None, seq=0x10,
+            lifetime=1199, overload=False):
+        flags = f"L{level} IS" + (", Overload bit set" if overload else "")
         lines = [_hdr(srcmac, level),
                  f"\tL{level} LSP, hlen: 27, v: 1, pdu-v: 1, sys-id-len: 6 (0), "
                  f"max-area: 3 (0)",
-                 f"\t  lsp-id: {sysid}.00-00, seq: {seq:#010x}, lifetime:  1199s",
-                 f"\t  chksum: 0x1771 (correct), PDU length: 49, Flags: [ L{level} IS ]"]
+                 f"\t  lsp-id: {sysid}.00-00, seq: {seq:#010x}, lifetime:  {lifetime}s",
+                 f"\t  chksum: 0x1771 (correct), PDU length: 49, Flags: [ {flags} ]"]
         lines += _auth(auth)
         for (pfx, metric) in prefixes:
             lines += [f"\t    Extended IPv4 Reachability TLV #135, length: 8",
@@ -8855,6 +9061,21 @@ def _isis_selftest():
     # 6. weak-auth: known router + prefix, but no Authentication TLV.
     run('weak-auth', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='none',
                          prefixes=[('10.1.0.0/24', 10)]), 20, base, 'weak-auth')
+    # 6b. lsp-purge: known router LSP with Remaining Lifetime 0 (blackhole).
+    run('lsp-purge', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                         prefixes=[('10.1.0.0/24', 10)], lifetime=0), 20, base, 'injection')
+    # 6c. lsp-overload: known router sets the OL bit (traffic steering/denial).
+    run('lsp-overload', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                            prefixes=[('10.1.0.0/24', 10)], overload=True), 20, base,
+        'anomaly')
+    # 6d. seq-anomaly: LSP sequence number near the 0xFFFFFFFF wrap.
+    run('seq-anomaly', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                           prefixes=[('10.1.0.0/24', 10)], seq=0xFFFFFFF0), 20, base,
+        'anomaly')
+    # 6e. auth-mixed: same system authed (IIH hmac) and unauthed (LSP none).
+    run('auth-mixed', iih('00:11:22:33:44:55', '0000.0000.0001', auth='hmac') + "\n"
+        + lsp('00:11:22:33:44:55', '0000.0000.0001', auth='none',
+              prefixes=[('10.1.0.0/24', 10)]), 20, base, 'anomaly')
     # 7. parse: source-id, area, cleartext auth, hostname, LSP prefix.
     pev = _parse_isis_capture(
         iih('00:11:22:33:44:55', '0000.0000.0001', area='49.0001', auth='cleartext',
@@ -8870,6 +9091,16 @@ def _isis_selftest():
     scenarios.append({'name': 'isis-parse', 'expect': 'sysid/area/cleartext/host/pfx',
                       'got': f"auth={iih_ev.get('auth')} host={iih_ev.get('hostname')}",
                       'pass': p_ok})
+    # parse: Remaining Lifetime + overload flag off the LSP.
+    pev2 = _parse_isis_capture(lsp('00:11:22:33:44:55', '0000.0000.0001',
+                                   prefixes=[('10.1.0.0/24', 10)], lifetime=0,
+                                   overload=True))
+    lsp2 = next((e for e in pev2 if e['kind'] == 'lsp'), {})
+    p2_ok = lsp2.get('lifetime') == 0 and lsp2.get('overload') is True
+    scenarios.append({'name': 'isis-parse-lsp-flags',
+                      'expect': 'lifetime=0/overload=True',
+                      'got': f"lifetime={lsp2.get('lifetime')} overload={lsp2.get('overload')}",
+                      'pass': p2_ok})
 
     # Scapy end-to-end: real IIH (no auth) + LSP with a prefix -> tcpdump -> parse.
     scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}

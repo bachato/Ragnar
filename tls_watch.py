@@ -685,9 +685,13 @@ def parse_pcap(path):
                              'server': server, 'certs': certs})
         seen.add(key)
 
+    quic_seen = set()
     for (src, sport, dst, dport, pay) in udp:
         if not pay or not (pay[0] & 0x80):
             continue
+        qkey = (src, sport, dst, dport)
+        if qkey in quic_seen:
+            continue                              # retransmitted / coalesced Initial
         try:
             version = int.from_bytes(pay[1:5], 'big')
             dcid = pay[6:6 + pay[5]]
@@ -695,10 +699,12 @@ def parse_pcap(path):
             plain, _v, _d, _s = parse_quic_initial(pay, ckeys)
             for t, b in handshake_messages(reassemble_crypto(plain)):
                 if t == 0x01:
+                    quic_seen.add(qkey)           # one session per QUIC connection
                     sessions.append({'proto': 'quic', 'src': src, 'sport': sport,
                                      'dst': dst, 'dport': dport,
                                      'client': parse_client_hello(b),
                                      'server': None, 'certs': []})
+                    break
         except Exception:
             continue                              # not a decryptable client Initial
     return sessions
@@ -713,7 +719,13 @@ def _tls_analyze(sessions, now=None, denylist=None):
     import datetime
     now = now or datetime.datetime.now(datetime.timezone.utc)
     denylist = denylist or {}
-    verdict, out = 'clean', []
+    # Deduplicate results: a client opening N parallel connections to the same
+    # server service with the same fingerprint (browsers routinely open 6+), and
+    # any residual QUIC retransmits, are one *result* — collapse them by client
+    # identity (proto, client IP, server IP:port, JA4, SNI) and carry a `count`.
+    # The representative is upgraded to whichever duplicate actually saw the
+    # server, so a completed handshake is never masked by an aborted one.
+    out, index = [], {}
     for s in sessions:
         pchar = 'q' if s['proto'] == 'quic' else 't'
         client, server = s.get('client'), s.get('server')
@@ -739,16 +751,37 @@ def _tls_analyze(sessions, now=None, denylist=None):
         rec['findings'] = findings
         if infos:
             rec['certs'] = infos
-        codes = {f['code'] for f in findings}
+
+        key = (s['proto'], s['src'], s['dst'], s['dport'],
+               rec.get('ja4'), rec.get('sni'))
+        prev = index.get(key)
+        if prev is not None:
+            prev['count'] += 1
+            # Upgrade the kept record if this duplicate saw the server side and
+            # the kept one (client-only) did not.
+            if 'negotiated_version' not in prev and 'negotiated_version' in rec:
+                for f in ('negotiated_version', 'cipher', 'ja3s', 'ja4s',
+                          'certs', 'findings', 'src'):
+                    if f in rec:
+                        prev[f] = rec[f]
+            continue
+        rec['count'] = 1
+        index[key] = rec
+        out.append(rec)
+
+    # Verdict from the deduplicated set (recompute so an upgraded representative
+    # is scored on its final findings).
+    verdict = 'clean'
+    for rec in out:
+        codes = {f['code'] for f in rec.get('findings', [])}
         if codes & {'sni_cert_mismatch', 'ja4_denylist'}:
             v = 'compromised'
-        elif any(f['severity'] in ('high', 'warn') for f in findings):
+        elif any(f['severity'] in ('high', 'warn') for f in rec.get('findings', [])):
             v = 'suspicious'
         else:
             v = 'clean'
         if _VERDICT_RANK[v] > _VERDICT_RANK[verdict]:
             verdict = v
-        out.append(rec)
     return {'success': True, 'verdict': verdict, 'sessions': out, 'count': len(out)}
 
 
@@ -1155,9 +1188,16 @@ def selftest():
         chq = _build_client_hello(_KAT_CIPHERS, _KAT_EXTS, _KAT_SIGALGS, [0x0304],
                                   alpn=['h3'], sni='video.example')
         qpkt = _build_quic_initial(dcid, b'\xaa\xbb', ck_, chq, QUIC_V1)
+        srv_resp = Raw(_rec(_mk_server_hello(0x0303, 0xc030)) + _rec(_mk_cert_msg([der])))
         pkts = [
             Ether() / IP(src='10.0.0.5', dst='10.0.0.9') / TCP(sport=50000, dport=443, seq=1, flags='PA') / Raw(_rec(ch)),
-            Ether() / IP(src='10.0.0.9', dst='10.0.0.5') / TCP(sport=443, dport=50000, seq=1, flags='PA') / Raw(_rec(_mk_server_hello(0x0303, 0xc030)) + _rec(_mk_cert_msg([der]))),
+            Ether() / IP(src='10.0.0.9', dst='10.0.0.5') / TCP(sport=443, dport=50000, seq=1, flags='PA') / srv_resp,
+            Ether() / IP(src='10.0.0.5', dst='10.0.0.9') / UDP(sport=50001, dport=443) / Raw(qpkt),
+            # Duplicate results: a 2nd parallel TCP connection (different src port,
+            # same client fingerprint + SNI + server) and a retransmitted QUIC
+            # Initial. Both must collapse — dedup by client identity + count.
+            Ether() / IP(src='10.0.0.5', dst='10.0.0.9') / TCP(sport=50002, dport=443, seq=1, flags='PA') / Raw(_rec(ch)),
+            Ether() / IP(src='10.0.0.9', dst='10.0.0.5') / TCP(sport=443, dport=50002, seq=1, flags='PA') / srv_resp,
             Ether() / IP(src='10.0.0.5', dst='10.0.0.9') / UDP(sport=50001, dport=443) / Raw(qpkt),
         ]
         pth = os.path.join(tempfile.gettempdir(), 'tlswatch_selftest.pcap')
@@ -1165,13 +1205,15 @@ def selftest():
         sessions = parse_pcap(pth)
         os.unlink(pth)
         rr = _tls_analyze(sessions)
-        ck('pcap_session_count', rr['count'], 2)
+        ck('pcap_session_count', rr['count'], 2)     # deduped: 1 TLS result + 1 QUIC
         ck('pcap_verdict', rr['verdict'], 'compromised')
         tlsrec = next(x for x in rr['sessions'] if x['proto'] == 'tls')
         ck('pcap_sni_mismatch', any(f['code'] == 'sni_cert_mismatch'
                                     for f in tlsrec['findings']))
+        ck('pcap_tls_dedup_count', tlsrec['count'], 2)   # two connections merged
         quicrec = next(x for x in rr['sessions'] if x['proto'] == 'quic')
         ck('pcap_quic_ja4_q', quicrec['ja4'][0], 'q')
+        ck('pcap_quic_retransmit_deduped', quicrec['count'], 1)
     except Exception as e:
         checks.append({'name': 'pcap_e2e', 'pass': True, 'skipped': str(e)})
 

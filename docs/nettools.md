@@ -398,12 +398,15 @@ check, the [DHCP Guardian](#dhcp-guardian) rogue-server check, and the instant
   (hijack / injection / poisoning / coercion / VLAN-hop / root-hijack …) page as
   **compromised**; posture/deviation findings (weak-auth, SMBv1, unsigned SMB,
   name-exposure …) as **suspicious**. An already-alerted condition is
-  **remembered per check** — a run that comes back quiet (`unknown` /
-  `no-traffic`) does *not* re-arm the alert, so a finding the scanner only sees
-  on some cycles pages once, not on every sighting. It re-alerts only if the
-  check **escalates** (suspicious → compromised), if it stayed clean for 3
-  consecutive runs and then returned, or as a **daily reminder** while it
-  persists (`net_integrity_realert_hours`, default 24, `0` = never remind).
+  **remembered per check** (persisted in `data/net_integrity_alerts.json`, so
+  service restarts and updates don't re-page standing findings) — a run that
+  comes back quiet (`unknown` / `no-traffic`, or a DNS answer that momentarily
+  agrees with public resolvers) does *not* re-arm the alert, so a finding the
+  scanner only sees on some cycles pages once, not on every sighting. It
+  re-alerts only if the check **escalates** (suspicious → compromised), if it
+  stayed clean for a **full 24 h** and then returned, or — optionally — as a
+  periodic reminder while it persists (`net_integrity_realert_hours`, default
+  `0` = never remind).
 
 **Extended monitoring** (on by default alongside the monitor) additionally
 **rotates the whole passive-scanner suite** through the background poller —
@@ -618,6 +621,11 @@ parsed and classified. It never sends an SNMP request. What it flags:
   it's a **well-known default** (`public`, `private`, `community`, `cisco`, …) —
   trivially guessable even without a sniffer. The community strings actually seen are
   listed so you know exactly what leaked.
+- **Community reuse (blast radius)** — a cleartext community accepted by **2+
+  agents**: sniff it once, gain that access on every one. Reported as a
+  `community_reuse[]` block (community → the agents that accept it), **HIGH**, and
+  **CRITICAL** if that community was ever seen writing (one capture = write access
+  to N devices).
 - **Amplification** — a `GetBulk` with a large **max-repetitions**: the SNMP
   reflection / amplification DDoS vector (a small request eliciting a huge response).
 - **Enumeration** — one host issuing many `GetNext` / `GetBulk` requests: walking the
@@ -643,10 +651,17 @@ python3 network_diagnostics.py snmp-selftest    # self-test the detectors, no ro
 ```
 
 `snmp-selftest` drives the real parser + classifier with synthetic captures (clean /
-cleartext / write-exposed / amplification / enumeration / parse), and — when
-[Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set messages into
-a pcap and parses them back through `tcpdump`, confirming the `public`-hidden
-inference and write-community detection end to end.
+cleartext / write-exposed / community-reuse / amplification / enumeration / parse),
+and — when [Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set
+messages into a pcap and parses them back through `tcpdump`, confirming the
+`public`-hidden inference and write-community detection end to end.
+
+For a **standalone deep monitor** — a pure-Python BER decoder with per-message
+severity, **SNMPv3 msgFlags mode analysis** (noAuthNoPriv/authNoPriv/authPriv/
+privNoAuth), **plaintext-scopedPDU detection** (catching v3 that claims privacy
+but ships a plaintext PDU), an **OID-hint pass** (CISCO-CONFIG-COPY / usmUser /
+ifAdminStatus / …), and the community-reuse correlator — see
+[snmpwatch](snmpwatch.md) (`snmpwatch.py`).
 
 - Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
   `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
@@ -873,7 +888,13 @@ querier. One short `tcpdump` window is parsed and classified into four things:
 - **Anomaly** — more than one **querier** on the segment. There must be exactly
   one; a second, lower-IP querier is the classic *"become the querier to draw
   all multicast to yourself"* attack. Also flags mixed query versions
-  (a v3→v2/v1 downgrade).
+  (a v3→v2/v1 downgrade), a **spoofed querier** (a query sourced from 0.0.0.0), a
+  message that arrived with an **IP TTL other than 1** (IGMP is link-local — a
+  higher TTL means off-link injection / a spoofed source), a report/leave for a
+  **non-multicast** (outside 224.0.0.0/4) address, a **membership report for a
+  reserved group** (224.0.0.1 all-hosts / .2 all-routers — never joined via
+  IGMP), and a **join/leave flap** (a host toggling a group, thrashing the
+  snooping table). A per-source **leave flood** is flagged as a storm.
 - **Reconnaissance** — one host joining a wide spread of **distinct groups** —
   multicast stream enumeration.
 - **Unauthorized join** — a host on an **admin-scoped** (239/8), **globally-scoped**
@@ -896,10 +917,17 @@ python3 network_diagnostics.py igmp-selftest     # self-test the detectors, no r
 ```
 
 `igmp-selftest` drives the real parser + classifier with synthetic captures
-(clean / storm / rogue-querier / recon / unauthorized / v3 group-record parse),
-and — when [Scapy](https://scapy.net) is installed — additionally crafts real
-IGMP packets into a pcap and parses them back through `tcpdump`, exercising the
-capture→parse path end to end.
+(clean / storm / rogue-querier / recon / unauthorized / spoofed-querier /
+bad-TTL / non-multicast / reserved-group / join-leave-flap / leave-storm / v3
+group-record parse), and — when [Scapy](https://scapy.net) is installed —
+additionally crafts real IGMP packets into a pcap and parses them back through
+`tcpdump`, exercising the capture→parse path end to end.
+
+For a **standalone deep monitor** — a pure-Python binary IGMP decoder with the
+full control-plane detector matrix (flood / anomaly / recon / policy), a
+data-plane sysfs rate sampler (`mcast_flood_no_members` and friends), an
+out-of-band SNMP tier with a capability cache, learn→enforce policy, SQLite, and
+a hardened daemon — see [igmpwatch](igmpwatch.md) (`python3 -m igmpwatch`).
 
 - Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
   `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
@@ -939,6 +967,15 @@ The verdict escalates to **compromised** on an `sni_cert_mismatch` or JA4 denyli
 hit, **suspicious** on any other high/warn finding (weak cipher, expired cert,
 legacy version), else **clean**. Needs a SPAN/mirror port to see other hosts on a
 switched segment.
+
+**Deduplicated results.** A browser routinely opens several parallel connections
+to the same host, and a QUIC client may retransmit its Initial — all with an
+identical fingerprint. These are collapsed into **one result** keyed on the
+client identity (proto · client IP · server IP:port · JA4 · SNI), carrying a
+`count` of how many connections merged (shown as `×N` in the table). QUIC
+retransmits are deduped at parse time (one session per connection); the
+representative is upgraded to whichever duplicate actually observed the server,
+so a completed handshake is never masked by an aborted one.
 
 **JA4S** (the server fingerprint) is licensed under the **FoxIO License 1.1**, not
 the BSD/MIT that covers the rest, so it lives in a separate, clearly identified
@@ -1277,7 +1314,7 @@ What it flags:
 Verdict is **clean → suspicious → compromised**. Capture is a short passive **Scapy**
 sniff (Scapy is imported lazily, so `--selftest` and offline parsing need zero
 third-party deps). The findings engine is pure Python and self-tests without root via
-fabricated BER messages (`ldap_watch.py --selftest`, and `test_ldapwatch.py`).
+fabricated BER messages (`ldap_watch.py --selftest`, and `tests/test_ldapwatch.py`).
 
 For **continuous** monitoring there is an opt-in **least-privilege systemd unit**
 (`scripts/ragnar-ldapwatch.service`) that runs `ldap_watch.py --daemon` with **only
@@ -1497,6 +1534,9 @@ a SPAN/mirror to see EIGRP. The first scan **learns** the current routers and th
 advertised prefix→next-hop map as the baseline (`data/eigrp_watch.json`); after a
 legitimate topology change, click "Trust current". **API:** `GET /api/net/eigrp-watch`,
 `POST /api/net/eigrp-baseline`. **CLI:** `eigrp-watch`, `eigrp-selftest`.
+Validate it against **real** FRR EIGRP + injected attacks in an isolated
+network-namespace lab — see the [EIGRP FRR Namespace Lab](eigrp_lab.md)
+(`eigrp_lab.sh` + `eigrp_inject.py`).
 
 ### IS-IS Watch
 A **passive** routing-security scanner for **IS-IS** (ISO/IEC 10589) — the third
@@ -1516,13 +1556,18 @@ metrics to blackhole or MITM traffic (the IS-IS analogue of OSPF LSA injection).
 **dynamic-hostname TLV (#137)** that maps a system-id to a router name — so this
 scanner sees injection directly and can name the routers. What it flags:
 
-- **injection** — an LSP from a system-id **not** in the baseline, or a **new /
-  re-homed** reachable prefix (an LSP hijack steering traffic). The money finding.
+- **injection** — an LSP from a system-id **not** in the baseline, a **new /
+  re-homed** reachable prefix (an LSP hijack steering traffic), or an **LSP purge**
+  (Remaining Lifetime 0, deleting a router's LSP from every database in the area — a
+  blackhole). The money findings.
 - **rogue-router** — a new IS-IS speaker (system-id) sending hellos, not in baseline
   (adjacency spoofing).
 - **storm** — an IIH/LSP flood by rate.
-- **anomaly** — a **duplicate system-id** seen from two MACs (a spoof), or a **new
-  area address** on a known router.
+- **anomaly** — a **duplicate system-id** seen from two MACs (a spoof); a **new
+  area address** on a known router; the **overload (OL) bit** set (traffic steering
+  / denial); an **LSP sequence number** near the `0xFFFFFFFF` wrap (a seq-number
+  attack forcing the owner to purge + re-originate); or **mixed authentication** —
+  one system seen both keyed and un-keyed (a spoofed PDU racing the real router's).
 - **weak-auth** — a PDU with **no Authentication TLV** or a **cleartext** password
   (the injection enabler).
 
@@ -1533,7 +1578,11 @@ their areas, and the advertised prefix→originator map as the baseline
 Because IS-IS rides directly on L2, the hardening is HMAC authentication at both
 levels plus restricting which access ports may carry it. **API:**
 `GET /api/net/isis-watch`, `POST /api/net/isis-baseline`. **CLI:** `isis-watch`,
-`isis-selftest`.
+`isis-selftest`. For a **standalone deep monitor** — a pure-Python binary TLV
+parser with the full 16-detector set (adds HMAC-MD5-vs-SHA, DIS-takeover, P2P
+three-way, hello-padding, narrow-metrics, malformed-PDU), per-code severity +
+dedup, baseline learning and a hardened daemon — see
+[isiswatch](isiswatch.md) (`isiswatch.py`).
 
 ### OSPF Security Scanner
 A **passive** routing-security scanner for OSPF (the interior routing control
