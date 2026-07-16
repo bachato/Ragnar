@@ -122,7 +122,7 @@ back through the **real** detector (`tcpdump → _parse_eigrp_capture →
 _eigrp_analyze`) against the lab baseline — no transmit, no bridge, no root:
 
 ```bash
-python3 eigrp_inject.py --iface br-eigrp --scenario metric --dry-run
+python3 python/eigrp_inject.py --iface br-eigrp --scenario metric --dry-run
 # ... prints the parsed route (172.16.2.0/24 via 10.10.0.66) and:
 # --- detector verdict (lab baseline): injection ---
 ```

@@ -31,6 +31,9 @@ import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 
+# tls_watch is a core module in the repo root (this file is under python/).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import tls_watch as _tw
 
 # ---------------------------------------------------------------------------

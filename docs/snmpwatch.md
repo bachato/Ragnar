@@ -14,7 +14,7 @@ tag, and an OID-hint pass over the varbinds. The decoder is Scapy-free, so
 `--selftest` runs with no Scapy and no NIC.
 
 - **Test floor:** Raspberry Pi Zero 2 W.
-- **Self-test:** 82/82 (`python3 snmpwatch.py --selftest`).
+- **Self-test:** 82/82 (`python3 python/snmpwatch.py --selftest`).
 - **Deps:** Python 3.9+, Scapy (live capture only).
 
 ## What it detects
@@ -75,9 +75,9 @@ seen with that community (one capture = write access to N devices). Emitted as a
 ## Run
 
 ```bash
-python3 snmpwatch.py --selftest                         # 82/82, no root
-sudo python3 snmpwatch.py -i eth0 --json /var/lib/ragnar/snmpwatch.json
-sudo python3 snmpwatch.py -i eth0 -t 300 --json -       # bounded audit, JSON to stdout
+python3 python/snmpwatch.py --selftest                         # 82/82, no root
+sudo python3 python/snmpwatch.py -i eth0 --json /var/lib/ragnar/snmpwatch.json
+sudo python3 python/snmpwatch.py -i eth0 -t 300 --json -       # bounded audit, JSON to stdout
 ```
 
 Requires `CAP_NET_RAW` (sudo, or the systemd unit which grants only that).

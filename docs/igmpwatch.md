@@ -12,7 +12,7 @@ detect / eval path — the self-test runs with no Scapy and no NIC). Scapy is us
 only for live capture.
 
 - **Test floor:** Raspberry Pi Zero 2 W.
-- **Self-test:** 79/79 (`python3 selftest.py` or `python3 -m igmpwatch --self-test`).
+- **Self-test:** 79/79 (`python3 python/selftest.py` or `python3 -m igmpwatch --self-test`).
 - **Deps:** Python 3.9+, Scapy (live capture only), pyyaml (config), net-snmp
   `snmpbulkwalk` (SNMP tier only).
 

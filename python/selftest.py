@@ -13,13 +13,13 @@ import struct
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The igmpwatch package lives in the repo root (this file is under python/).
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 
 from igmpwatch import decode, detectors, dataplane, snmp, storage, config
 from igmpwatch import state as st
 from igmpwatch.alert import Alert, Deduper
-
-REPO = os.path.dirname(os.path.abspath(__file__))
 
 
 # --------------------------------------------------------------------------

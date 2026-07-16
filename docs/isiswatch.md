@@ -13,7 +13,7 @@ touches the control plane. Scapy is used for live capture only; the parser and
 detector engine are pure Python, so `--self-test` runs with no Scapy and no NIC.
 
 - **Test floor:** Raspberry Pi Zero 2 W.
-- **Self-test:** 79/79 (`python3 isiswatch.py --self-test`).
+- **Self-test:** 79/79 (`python3 python/isiswatch.py --self-test`).
 - **Deps:** Python 3.9+, Scapy (live capture only).
 
 ## Why IS-IS is different
@@ -62,13 +62,13 @@ first/last-seen timestamps, and sorted by severity in the snapshot.
 
 ```bash
 # Self-test (no root, no NIC needed) — 79/79
-python3 isiswatch.py --self-test
+python3 python/isiswatch.py --self-test
 
 # Live passive scan on a SPAN/segment interface
-sudo python3 isiswatch.py -i eth0 -v
+sudo python3 python/isiswatch.py -i eth0 -v
 
 # With an operator baseline + web-UI snapshot feed + a final report
-sudo python3 isiswatch.py -i eth0 \
+sudo python3 python/isiswatch.py -i eth0 \
     --baseline baseline.example.json \
     --web-json /run/ragnar/isiswatch.json \
     --json-out /var/log/ragnar/isis-report.json

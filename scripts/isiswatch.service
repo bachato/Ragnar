@@ -21,7 +21,7 @@ EnvironmentFile=-/etc/ragnar/isiswatch.env
 Environment=ISISWATCH_IFACE=eth0
 Environment=ISISWATCH_BASELINE=/etc/ragnar/isis-baseline.json
 ExecStartPre=/bin/mkdir -p /run/ragnar
-ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/isiswatch.py \
+ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/python/isiswatch.py \
     -i ${ISISWATCH_IFACE} -b ${ISISWATCH_BASELINE} \
     --web-json /run/ragnar/isiswatch.json
 Restart=on-failure

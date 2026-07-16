@@ -19,7 +19,7 @@ Environment=RAGNAR_IFACE=eth0
 ExecStartPre=/bin/mkdir -p /var/lib/ragnar
 # --json writes the report at exit; the process runs until stopped, so the
 # report is refreshed on restart. For a live-updating snapshot use a wrapper.
-ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/snmpwatch.py -i ${RAGNAR_IFACE} \
+ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/python/snmpwatch.py -i ${RAGNAR_IFACE} \
     --json /var/lib/ragnar/snmpwatch.json
 Restart=on-failure
 RestartSec=5

@@ -1314,7 +1314,7 @@ What it flags:
 Verdict is **clean → suspicious → compromised**. Capture is a short passive **Scapy**
 sniff (Scapy is imported lazily, so `--selftest` and offline parsing need zero
 third-party deps). The findings engine is pure Python and self-tests without root via
-fabricated BER messages (`ldap_watch.py --selftest`, and `test_ldapwatch.py`).
+fabricated BER messages (`ldap_watch.py --selftest`, and `tests/test_ldapwatch.py`).
 
 For **continuous** monitoring there is an opt-in **least-privilege systemd unit**
 (`scripts/ragnar-ldapwatch.service`) that runs `ldap_watch.py --daemon` with **only

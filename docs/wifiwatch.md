@@ -13,7 +13,7 @@ key off each frame's **capture timestamp** (not wall clock), so a replayed
 capture timestamps each alert to when the attack actually happened.
 
 - **Test floor:** Raspberry Pi Zero 2 W + Alfa AWUS036AXM (mt7921u).
-- **Self-test:** 30/30 (`python3 wifiwatch.py --self-test`).
+- **Self-test:** 30/30 (`python3 python/wifiwatch.py --self-test`).
 - **Deps:** Python 3.8+, Scapy (live capture only), `iw`.
 
 ## Detectors
@@ -64,11 +64,11 @@ census). Tunable to `0` in a known-clean environment.
 ## Run
 
 ```bash
-python3 wifiwatch.py --self-test                       # 30/30, no root/Scapy
-sudo python3 wifiwatch.py --iface wlan1 --echo         # live, echo to stderr
-sudo python3 wifiwatch.py --iface wlan1 --jsonl /var/lib/ragnar/wifiwatch/events.jsonl
-python3 wifiwatch.py --replay attack.pcap --echo       # replay a capture (no radio)
-python3 wifiwatch.py --replay attack.pcap --replay-freq 2437   # force channel if no radiotap
+python3 python/wifiwatch.py --self-test                       # 30/30, no root/Scapy
+sudo python3 python/wifiwatch.py --iface wlan1 --echo         # live, echo to stderr
+sudo python3 python/wifiwatch.py --iface wlan1 --jsonl /var/lib/ragnar/wifiwatch/events.jsonl
+python3 python/wifiwatch.py --replay attack.pcap --echo       # replay a capture (no radio)
+python3 python/wifiwatch.py --replay attack.pcap --replay-freq 2437   # force channel if no radiotap
 ```
 
 Monitor mode (bench): `sudo ./wifiwatch-setup-mon.sh wlan1 US`.
@@ -91,8 +91,8 @@ representative, **attack-free** period; it excludes the warmup census so it
 measures steady-state churn.
 
 ```bash
-sudo python3 wifiwatch-baseline.py --iface wlan1 --minutes 15
-python3 wifiwatch-baseline.py --replay ambient.pcap
+sudo python3 python/wifiwatch-baseline.py --iface wlan1 --minutes 15
+python3 python/wifiwatch-baseline.py --replay ambient.pcap
 ```
 
 ## Validating against real captures (`--replay`)

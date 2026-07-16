@@ -252,5 +252,5 @@ is saved to `/tmp/wifidef_doctor_*.log` to paste into a bug report.
 For a continuous, daemon-shaped monitor beyond the capture-window WIDS above —
 raw-byte 802.11 parsers, a warmup census, per-scope refractory alerting,
 JSON-lines output, pcap `--replay`, an ambient-calibration tool, and a hardened
-systemd unit — see **[wifiwatch](wifiwatch.md)** (`python3 wifiwatch.py`). It
+systemd unit — see **[wifiwatch](wifiwatch.md)** (`python3 python/wifiwatch.py`). It
 shares the LA-ratio beacon-flood and deauth scope/PMF logic documented above.

@@ -58,19 +58,19 @@ front.
 
 ```bash
 # live, on a mirror/monitor interface, JSON lines to stdout
-sudo python3 certwatch.py -i mon0 --json
+sudo python3 python/certwatch.py -i mon0 --json
 
 # offline triage from a capture (.gz ok)
-python3 certwatch.py -r handshakes.pcap
+python3 python/certwatch.py -r handshakes.pcap
 
 # widen the port set (or 'any' for all TCP — heavier)
-python3 certwatch.py -i eth0 --ports 443,8443,9443,10250 --warn-days 14
+python3 python/certwatch.py -i eth0 --ports 443,8443,9443,10250 --warn-days 14
 
 # batch-triage a directory of captures, collapsing repeat sightings
-python3 certwatch.py --pcap-dir /captures --recursive --dedupe --min-status WARN
+python3 python/certwatch.py --pcap-dir /captures --recursive --dedupe --min-status WARN
 
 # self-test (no wire, no interface needed)
-python3 certwatch.py --selftest
+python3 python/certwatch.py --selftest
 ```
 
 The default port set is the common TLS-bearing ports; keep it tight on the Zero
@@ -103,7 +103,7 @@ end in `--json` mode, and printed to stderr otherwise.
 
 ## Self-test
 
-`python3 certwatch.py --selftest` → **58/58**. The harness mints certs in-memory
+`python3 python/certwatch.py --selftest` → **58/58**. The harness mints certs in-memory
 (expired, not-yet-valid, expiring-soon, self-signed, weak-key, wildcard, no-SAN,
 long-validity, name-match/mismatch), ships a real openssl-minted SHA-1 cert as a
 fixture (the `cryptography` lib refuses to *sign* SHA-1), and synthesizes TLS

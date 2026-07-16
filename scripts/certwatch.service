@@ -22,7 +22,7 @@ EnvironmentFile=-/etc/ragnar/certwatch.env
 Environment=CERTWATCH_IFACE=eth0
 Environment=CERTWATCH_PORTS=443,465,636,853,993,995,8443,9443,10250
 Environment=CERTWATCH_WARN_DAYS=30
-ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/certwatch.py \
+ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/python/certwatch.py \
     -i ${CERTWATCH_IFACE} --ports ${CERTWATCH_PORTS} \
     --warn-days ${CERTWATCH_WARN_DAYS} --json
 Restart=on-failure

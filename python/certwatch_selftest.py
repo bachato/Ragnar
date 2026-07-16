@@ -7,10 +7,14 @@ flow reassembler. Two checks push real scapy IPv4/IPv6 packets through the live
 capture handler. Run via `python3 certwatch.py --selftest`.
 """
 
+import os
 import struct
 import sys
 import time
 from datetime import datetime, timezone
+
+# tls_watch is a core module in the repo root (this file is under python/).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import certwatch as cw
 import tls_watch as _tw

@@ -156,7 +156,8 @@ def _dry_run(pkt, scapy, baseline):
         path = tf.name
     scapy.wrpcap(path, [pkt])
     try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        # network_diagnostics is a core module in the repo root (this file is under python/).
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import network_diagnostics as nd
         res = nd._run(['tcpdump', '-nn', '-t', '-v', '-r', path], timeout=10)
         print('--- tcpdump ---')

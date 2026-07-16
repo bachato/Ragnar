@@ -190,7 +190,7 @@ Usage: sudo $0 <command>
   flap [lan|link]  churn topology to emit Update/Query TLVs (default lan)
   demo [sec]       watch (+route view) while flapping — one shot (default 24s)
   down             tear everything down
-  inject ...       shortcut: python3 eigrp_inject.py --iface $BR ...
+  inject ...       shortcut: python3 python/eigrp_inject.py --iface $BR ...
 EOF
 }
 
@@ -202,7 +202,7 @@ case "$cmd" in
     watch)  do_watch "$@" ;;
     flap)   do_flap "$@" ;;
     demo)   do_demo "$@" ;;
-    inject) need_root; python3 "$REPO/eigrp_inject.py" --iface "$BR" "$@" ;;
+    inject) need_root; python3 "$REPO/python/eigrp_inject.py" --iface "$BR" "$@" ;;
     ''|-h|--help|help) usage ;;
     *) usage; exit 1 ;;
 esac

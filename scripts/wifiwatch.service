@@ -21,7 +21,7 @@ WorkingDirectory=/home/ragnar/Ragnar
 Environment=RAGNAR_WIFI_IFACE=wlan1
 # Put the NIC in monitor mode first (needs the setup script installed).
 ExecStartPre=+/home/ragnar/Ragnar/wifiwatch-setup-mon.sh ${RAGNAR_WIFI_IFACE}
-ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/wifiwatch.py \
+ExecStart=/usr/bin/python3 /home/ragnar/Ragnar/python/wifiwatch.py \
     -i ${RAGNAR_WIFI_IFACE} -c /etc/ragnar/wifiwatch.json \
     --jsonl /var/lib/ragnar/wifiwatch/events.jsonl
 Restart=on-failure
