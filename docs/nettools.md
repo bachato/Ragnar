@@ -1522,13 +1522,18 @@ metrics to blackhole or MITM traffic (the IS-IS analogue of OSPF LSA injection).
 **dynamic-hostname TLV (#137)** that maps a system-id to a router name — so this
 scanner sees injection directly and can name the routers. What it flags:
 
-- **injection** — an LSP from a system-id **not** in the baseline, or a **new /
-  re-homed** reachable prefix (an LSP hijack steering traffic). The money finding.
+- **injection** — an LSP from a system-id **not** in the baseline, a **new /
+  re-homed** reachable prefix (an LSP hijack steering traffic), or an **LSP purge**
+  (Remaining Lifetime 0, deleting a router's LSP from every database in the area — a
+  blackhole). The money findings.
 - **rogue-router** — a new IS-IS speaker (system-id) sending hellos, not in baseline
   (adjacency spoofing).
 - **storm** — an IIH/LSP flood by rate.
-- **anomaly** — a **duplicate system-id** seen from two MACs (a spoof), or a **new
-  area address** on a known router.
+- **anomaly** — a **duplicate system-id** seen from two MACs (a spoof); a **new
+  area address** on a known router; the **overload (OL) bit** set (traffic steering
+  / denial); an **LSP sequence number** near the `0xFFFFFFFF` wrap (a seq-number
+  attack forcing the owner to purge + re-originate); or **mixed authentication** —
+  one system seen both keyed and un-keyed (a spoofed PDU racing the real router's).
 - **weak-auth** — a PDU with **no Authentication TLV** or a **cleartext** password
   (the injection enabler).
 

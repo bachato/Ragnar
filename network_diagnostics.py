@@ -8434,11 +8434,16 @@ _ISIS_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _isis_watch_lock = threading.Lock()
 _ISIS_EVENTS_CAP = 200
 _ISIS_STORM_RATE = 25           # IS-IS PDUs/s above this (with volume) == flood
+# LSP sequence number this close to the 0xFFFFFFFF wrap is the classic seq-number
+# attack: force the real owner to purge + re-originate from seq 1.
+_ISIS_SEQ_HIGH = 0xFFFFFF00
 _ISIS_SRC_RE = re.compile(r'^([0-9a-fA-F:]{17})\s*>\s*'
                           r'(01:80:c2:00:00:1[45])')
 _ISIS_PDU_RE = re.compile(r'\b(L1|L2|p2p)\s+(Lan IIH|IIH|LSP|CSNP|PSNP)')
 _ISIS_SRCID_RE = re.compile(r'source-id:\s*([0-9a-fA-F.]+)')
 _ISIS_LSPID_RE = re.compile(r'lsp-id:\s*([0-9a-fA-F.\-]+),\s*seq:\s*(0x[0-9a-fA-F]+)')
+# Remaining Lifetime on the lsp-id line; 0 == a purge (LSP deletion / blackhole).
+_ISIS_LIFETIME_RE = re.compile(r'lifetime:?\s*(\d+)\s*s')
 _ISIS_AREA_RE = re.compile(r'Area address \(length: \d+\):\s*([0-9a-fA-F.]+)')
 _ISIS_HOST_RE = re.compile(r'Hostname:\s*(\S+)')
 _ISIS_PFX_RE = re.compile(r'IP(?:v4|v6) prefix:\s*([0-9a-fA-F:.]+/\d+),.*?Metric:\s*(\d+)')
@@ -8465,7 +8470,8 @@ def _parse_isis_capture(output):
             cur = {'src_mac': m.group(1).lower(), 'dst': m.group(2),
                    'level': None, 'kind': None, 'source_id': None, 'lsp_id': None,
                    'seq': None, 'areas': [], 'auth_present': False, 'auth': None,
-                   'hostname': None, 'prefixes': []}
+                   'hostname': None, 'prefixes': [], 'lifetime': None,
+                   'overload': False}
             continue
         if cur is None:
             continue
@@ -8484,6 +8490,13 @@ def _parse_isis_capture(output):
         if lsp:
             cur['lsp_id'] = lsp.group(1)
             cur['seq'] = lsp.group(2)
+        lt = _ISIS_LIFETIME_RE.search(line)
+        if lt and cur['lifetime'] is None:
+            cur['lifetime'] = int(lt.group(1))
+        # tcpdump renders the LSP overload (OL) bit in the type block, e.g.
+        # "Flags: [ L2 IS, Overload bit set ]".
+        if 'overload' in line.lower():
+            cur['overload'] = True
         ar = _ISIS_AREA_RE.search(line)
         if ar and ar.group(1) not in cur['areas']:
             cur['areas'].append(ar.group(1))
@@ -8655,6 +8668,51 @@ def _isis_analyze(events, seconds, baseline, learn=True):
                     f"{', '.join(base.get('areas') or []) or 'none'}) — area/topology "
                     f"change or a crafted hello")
 
+    # LSP-level attacks: purge (lifetime 0), overload bit, sequence-number wrap.
+    # Dedupe reasons per system so a re-flood doesn't spam the snapshot.
+    _purged, _overloaded, _seqhi = set(), set(), set()
+    for e in events:
+        if e['kind'] != 'lsp':
+            continue
+        sid = e['system_id']
+        if e.get('lifetime') == 0 and sid not in _purged:
+            _purged.add(sid)
+            bump('injection')
+            reasons.append(
+                f"IS-IS LSP PURGE: {_name(sid)} LSP {e.get('lsp_id') or ''} has "
+                f"Remaining Lifetime 0 — an LSP deletion/blackhole (a forged purge "
+                f"wipes a router's LSP from every database in the area)")
+        if e.get('overload') and sid not in _overloaded:
+            _overloaded.add(sid)
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS OVERLOAD bit set by {_name(sid)} — signals 'do not transit "
+                f"through me'; a forged OL bit steers traffic off the router (or is an "
+                f"unplanned overload/maintenance state)")
+        try:
+            seqv = int(e['seq'], 16) if e.get('seq') else 0
+        except (TypeError, ValueError):
+            seqv = 0
+        if seqv >= _ISIS_SEQ_HIGH and sid not in _seqhi:
+            _seqhi.add(sid)
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS LSP sequence number {e.get('seq')} from {_name(sid)} is near "
+                f"the 0xFFFFFFFF wrap — a sequence-number attack forcing the real owner "
+                f"to purge and re-originate")
+
+    # Mixed authentication: a system seen both authenticated and unauthenticated —
+    # an attacker's un-keyed PDUs racing the real router's keyed ones (or a
+    # mid-rollout key mismatch).
+    for sid in sorted(routers):
+        a = routers[sid]['auth']
+        if ('hmac' in a) and (a & {'none', 'cleartext'}):
+            bump('anomaly')
+            reasons.append(
+                f"IS-IS system {_name(sid)} seen BOTH authenticated and "
+                f"unauthenticated (mixed-auth) — a spoofed/un-keyed PDU alongside the "
+                f"real router's keyed ones")
+
     # Weak / no authentication.
     if noauth_any:
         bump('weak-auth')
@@ -8806,12 +8864,14 @@ def _isis_selftest():
                       f"\t      Hostname: {hostname}"]
         return "\n".join(lines)
 
-    def lsp(srcmac, sysid, level=2, prefixes=(), auth='hmac', hostname=None, seq=0x10):
+    def lsp(srcmac, sysid, level=2, prefixes=(), auth='hmac', hostname=None, seq=0x10,
+            lifetime=1199, overload=False):
+        flags = f"L{level} IS" + (", Overload bit set" if overload else "")
         lines = [_hdr(srcmac, level),
                  f"\tL{level} LSP, hlen: 27, v: 1, pdu-v: 1, sys-id-len: 6 (0), "
                  f"max-area: 3 (0)",
-                 f"\t  lsp-id: {sysid}.00-00, seq: {seq:#010x}, lifetime:  1199s",
-                 f"\t  chksum: 0x1771 (correct), PDU length: 49, Flags: [ L{level} IS ]"]
+                 f"\t  lsp-id: {sysid}.00-00, seq: {seq:#010x}, lifetime:  {lifetime}s",
+                 f"\t  chksum: 0x1771 (correct), PDU length: 49, Flags: [ {flags} ]"]
         lines += _auth(auth)
         for (pfx, metric) in prefixes:
             lines += [f"\t    Extended IPv4 Reachability TLV #135, length: 8",
@@ -8855,6 +8915,21 @@ def _isis_selftest():
     # 6. weak-auth: known router + prefix, but no Authentication TLV.
     run('weak-auth', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='none',
                          prefixes=[('10.1.0.0/24', 10)]), 20, base, 'weak-auth')
+    # 6b. lsp-purge: known router LSP with Remaining Lifetime 0 (blackhole).
+    run('lsp-purge', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                         prefixes=[('10.1.0.0/24', 10)], lifetime=0), 20, base, 'injection')
+    # 6c. lsp-overload: known router sets the OL bit (traffic steering/denial).
+    run('lsp-overload', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                            prefixes=[('10.1.0.0/24', 10)], overload=True), 20, base,
+        'anomaly')
+    # 6d. seq-anomaly: LSP sequence number near the 0xFFFFFFFF wrap.
+    run('seq-anomaly', lsp('00:11:22:33:44:55', '0000.0000.0001', auth='hmac',
+                           prefixes=[('10.1.0.0/24', 10)], seq=0xFFFFFFF0), 20, base,
+        'anomaly')
+    # 6e. auth-mixed: same system authed (IIH hmac) and unauthed (LSP none).
+    run('auth-mixed', iih('00:11:22:33:44:55', '0000.0000.0001', auth='hmac') + "\n"
+        + lsp('00:11:22:33:44:55', '0000.0000.0001', auth='none',
+              prefixes=[('10.1.0.0/24', 10)]), 20, base, 'anomaly')
     # 7. parse: source-id, area, cleartext auth, hostname, LSP prefix.
     pev = _parse_isis_capture(
         iih('00:11:22:33:44:55', '0000.0000.0001', area='49.0001', auth='cleartext',
@@ -8870,6 +8945,16 @@ def _isis_selftest():
     scenarios.append({'name': 'isis-parse', 'expect': 'sysid/area/cleartext/host/pfx',
                       'got': f"auth={iih_ev.get('auth')} host={iih_ev.get('hostname')}",
                       'pass': p_ok})
+    # parse: Remaining Lifetime + overload flag off the LSP.
+    pev2 = _parse_isis_capture(lsp('00:11:22:33:44:55', '0000.0000.0001',
+                                   prefixes=[('10.1.0.0/24', 10)], lifetime=0,
+                                   overload=True))
+    lsp2 = next((e for e in pev2 if e['kind'] == 'lsp'), {})
+    p2_ok = lsp2.get('lifetime') == 0 and lsp2.get('overload') is True
+    scenarios.append({'name': 'isis-parse-lsp-flags',
+                      'expect': 'lifetime=0/overload=True',
+                      'got': f"lifetime={lsp2.get('lifetime')} overload={lsp2.get('overload')}",
+                      'pass': p2_ok})
 
     # Scapy end-to-end: real IIH (no auth) + LSP with a prefix -> tcpdump -> parse.
     scapy_result = {'ran': False, 'reason': 'scapy or tcpdump unavailable'}
