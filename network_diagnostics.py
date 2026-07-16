@@ -3303,40 +3303,61 @@ def _igmp_scope(group):
 _IGMP_IP_RE = r'(\d{1,3}(?:\.\d{1,3}){3})'
 
 
+def _igmp_is_multicast(ip):
+    """True if `ip` is in the IPv4 multicast range 224.0.0.0/4 (224–239)."""
+    try:
+        return 224 <= int(ip.split('.')[0]) <= 239
+    except (ValueError, AttributeError, IndexError):
+        return False
+
+
 def _parse_igmp_capture(output):
     """Parse `tcpdump -nn -t -v 'igmp'` text into a list of membership events:
-    {src, group, kind, version}. kind is 'query' | 'report' | 'leave'.
+    {src, group, kind, version, ttl}. kind is 'query' | 'report' | 'leave'.
 
     Handles v1/v2 reports (dst == group), v2 leaves, and v3 reports whose group
     records tcpdump prints as `gaddr <addr> ...` (one event per group record).
-    Robust to tcpdump version differences: it keys off the `igmp` keyword and
-    pulls every group address it can find rather than a single rigid format."""
+    With -v, tcpdump prints an IP-header line ('... proto IGMP (2), ttl N ...')
+    just before each message; its TTL is captured and attached to the next event
+    (IGMP must be TTL 1 — anything else is off-link injection). Robust to tcpdump
+    version differences: it keys off the `igmp` keyword and pulls every group
+    address it can find rather than a single rigid format."""
     events = []
     ver_re = re.compile(r'igmp\s+v(\d)', re.I)
     src_re = re.compile(r'^' + _IGMP_IP_RE + r'\s*>\s*' + _IGMP_IP_RE)
     gaddr_re = re.compile(r'gaddr\s+' + _IGMP_IP_RE, re.I)
+    ttl_re = re.compile(r'\bttl\s+(\d+)', re.I)
     # v3 record modes that mean "leaving / no interest" vs joining.
     leave_modes = ('to_in', 'is_in', 'block')
+    pending_ttl = None
     for raw in output.splitlines():
         line = raw.strip()
-        if 'igmp' not in line.lower():
+        low = line.lower()
+        # IP-header line for an IGMP datagram: grab the TTL for the next event.
+        if 'proto igmp' in low and 'ttl' in low and not src_re.search(line):
+            tm = ttl_re.search(line)
+            pending_ttl = int(tm.group(1)) if tm else None
+            continue
+        if 'igmp' not in low:
             continue
         sm = src_re.search(line)
         src = sm.group(1) if sm else None
         dst = sm.group(2) if sm else None
         vm = ver_re.search(line)
         version = int(vm.group(1)) if vm else 2
+        ttl = pending_ttl
+        pending_ttl = None
         low = line.lower()
         if 'query' in low:
             events.append({'src': src, 'group': None, 'kind': 'query',
-                           'version': version})
+                           'version': version, 'ttl': ttl})
             continue
         if 'leave' in low:
             # v2 leave-group: the left group is named after "leave" or is dst.
             lm = re.search(r'leave.*?' + _IGMP_IP_RE, low)
             grp = (lm.group(1) if lm else None) or (dst if dst != '224.0.0.2' else None)
             events.append({'src': src, 'group': grp, 'kind': 'leave',
-                           'version': version})
+                           'version': version, 'ttl': ttl})
             continue
         if 'report' in low:
             gaddrs = gaddr_re.findall(line)
@@ -3347,14 +3368,14 @@ def _parse_igmp_capture(output):
                     seg = low.split(g.lower(), 1)[-1][:24]
                     kind = 'leave' if any(m in seg for m in leave_modes) and '{ }' in seg else 'report'
                     events.append({'src': src, 'group': g, 'kind': kind,
-                                   'version': version})
+                                   'version': version, 'ttl': ttl})
             else:
                 # v1/v2 report — the destination address IS the group.
                 grp = None
                 rm = re.search(r'report\s+' + _IGMP_IP_RE, low)
                 grp = rm.group(1) if rm else (dst if dst and dst not in _IGMP_WELL_KNOWN else dst)
                 events.append({'src': src, 'group': grp, 'kind': 'report',
-                               'version': version})
+                               'version': version, 'ttl': ttl})
     return events
 
 
@@ -3405,6 +3426,9 @@ def _igmp_analyze(events, seconds, baseline, learn=True):
     per_src = {}
     src_groups = {}
     members = {}
+    per_src_leave = {}
+    sg_kinds = {}                 # (src, group) -> set of {'report','leave'}
+    bad_ttl = {}                  # (src, ttl) -> a representative kind
     for e in events:
         s = e.get('src')
         if s:
@@ -3413,6 +3437,13 @@ def _igmp_analyze(events, seconds, baseline, learn=True):
         if g and e['kind'] == 'report':
             src_groups.setdefault(s, set()).add(g)
             members.setdefault(g, set()).add(s)
+        if s and e['kind'] == 'leave':
+            per_src_leave[s] = per_src_leave.get(s, 0) + 1
+        if g and e['kind'] in ('report', 'leave'):
+            sg_kinds.setdefault((s, g), set()).add(e['kind'])
+        ttl = e.get('ttl')
+        if ttl is not None and ttl != 1 and s:
+            bad_ttl.setdefault((s, ttl), e['kind'])
 
     trusted_q = set(baseline.get('queriers') or [])
     known_members = {g: set(v) for g, v in (baseline.get('members') or {}).items()}
@@ -3461,6 +3492,46 @@ def _igmp_analyze(events, seconds, baseline, learn=True):
         findings.append(('warn', 'anomaly',
                          f'mixed IGMP query versions {q_versions} — possible '
                          'version-downgrade to force weaker v1/v2'))
+
+    # (2b) crafted / off-link / bogus-group anomalies. These are signatures of a
+    # forged or injected message rather than a policy question, so they fire in
+    # both learn and enforce modes.
+    if any(e['kind'] == 'query' and e.get('src') == '0.0.0.0' for e in events):
+        categories.add('anomaly')
+        findings.append(('crit', 'anomaly',
+                         'IGMP query sourced from 0.0.0.0 — a spoofed querier '
+                         '(a real querier sends from its interface IP)'))
+    for (s, t), kind in sorted(bad_ttl.items()):
+        categories.add('anomaly')
+        findings.append(('crit', 'anomaly',
+                         f'IGMP {kind} from {s} arrived with IP TTL {t} (must be 1) '
+                         '— off-link injection / spoofed multicast control'))
+    for (s, g) in sorted(k for k in sg_kinds if k[1] and not _igmp_is_multicast(k[1])):
+        categories.add('anomaly')
+        findings.append(('crit', 'anomaly',
+                         f'{s} sent a report/leave for {g}, which is not a multicast '
+                         '(224.0.0.0/4) address — crafted/malformed message'))
+    for g in sorted(members):
+        if g in ('224.0.0.1', '224.0.0.2'):
+            for s in sorted(members[g]):
+                categories.add('anomaly')
+                findings.append(('crit', 'anomaly',
+                                 f'{s} reported membership in reserved group {g} '
+                                 f'({_IGMP_WELL_KNOWN.get(g)}) — bogus/crafted (these '
+                                 'are never joined via IGMP)'))
+    for (s, g) in sorted(k for k, v in sg_kinds.items()
+                         if k[1] and 'report' in v and 'leave' in v):
+        categories.add('anomaly')
+        findings.append(('warn', 'anomaly',
+                         f'{s} both joined and left {g} in {seconds}s — join/leave '
+                         'flap (thrashes the snooping table)'))
+    leave_floods = sorted([(s, n) for s, n in per_src_leave.items()
+                           if n >= _IGMP_SRC_FLOOD], key=lambda x: -x[1])
+    for s, n in leave_floods:
+        categories.add('storm')
+        findings.append(('warn', 'storm',
+                         f'{s} sent {n} IGMP leaves in {seconds}s — leave flood '
+                         '(forces repeated group-specific queries; snooping DoS)'))
 
     # (3) reconnaissance — a source joining many distinct groups
     recon = sorted([(s, len(g)) for s, g in src_groups.items() if len(g) >= _IGMP_RECON_GROUPS],
@@ -3621,7 +3692,32 @@ def _igmp_selftest():
         {'queriers': ['192.168.1.1'], 'members': {'239.1.1.1': ['192.168.1.50']}},
         'unauthorized')
 
-    # 6. v3 group-record parse (via gaddr) — assert the group is extracted.
+    # 6. spoofed querier: a general query sourced from 0.0.0.0.
+    run('spoofed-querier', "0.0.0.0 > 224.0.0.1: igmp query v2", 12, {}, 'anomaly')
+    # 7. bad TTL: IGMP must be TTL 1; the IP-header line carries a higher TTL.
+    badttl = "\n".join([
+        "IP (tos 0x0, ttl 64, id 0, offset 0, flags [none], proto IGMP (2), length 28)",
+        "    10.0.0.9 > 239.1.1.1: igmp v2 report 239.1.1.1"])
+    run('bad-ttl', badttl, 12, {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+    # 8. non-multicast group in a report — crafted.
+    run('non-multicast-group', "10.0.0.5 > 10.0.0.5: igmp v2 report 10.0.0.5", 12,
+        {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+    # 9. reserved-group membership report (all-hosts).
+    run('reserved-group', "10.0.0.9 > 224.0.0.1: igmp v2 report 224.0.0.1", 12,
+        {'queriers': ['192.168.1.1'], 'members': {}}, 'anomaly')
+    # 10. join/leave flap: same host toggles a group.
+    flap = "\n".join([
+        "10.0.0.7 > 239.2.2.2: igmp v2 report 239.2.2.2",
+        "10.0.0.7 > 224.0.0.2: igmp v2 leave 239.2.2.2"])
+    run('join-leave-flap', flap, 12, {'queriers': ['192.168.1.1'], 'members': {}},
+        'anomaly')
+    # 11. leave flood from one source.
+    leave_storm = "\n".join(
+        ["10.0.0.8 > 224.0.0.2: igmp v2 leave 239.3.3.3" for _ in range(130)])
+    run('leave-storm', leave_storm, 5, {'queriers': ['192.168.1.1'], 'members': {}},
+        'storm')
+
+    # 12. v3 group-record parse (via gaddr) — assert the group is extracted.
     v3 = ("192.168.1.50 > 224.0.0.22: igmp v3 report, 1 group record(s) "
           "[gaddr 239.9.9.9 to_ex { }]")
     v3_events = _parse_igmp_capture(v3)

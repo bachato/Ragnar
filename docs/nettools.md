@@ -876,7 +876,13 @@ querier. One short `tcpdump` window is parsed and classified into four things:
 - **Anomaly** — more than one **querier** on the segment. There must be exactly
   one; a second, lower-IP querier is the classic *"become the querier to draw
   all multicast to yourself"* attack. Also flags mixed query versions
-  (a v3→v2/v1 downgrade).
+  (a v3→v2/v1 downgrade), a **spoofed querier** (a query sourced from 0.0.0.0), a
+  message that arrived with an **IP TTL other than 1** (IGMP is link-local — a
+  higher TTL means off-link injection / a spoofed source), a report/leave for a
+  **non-multicast** (outside 224.0.0.0/4) address, a **membership report for a
+  reserved group** (224.0.0.1 all-hosts / .2 all-routers — never joined via
+  IGMP), and a **join/leave flap** (a host toggling a group, thrashing the
+  snooping table). A per-source **leave flood** is flagged as a storm.
 - **Reconnaissance** — one host joining a wide spread of **distinct groups** —
   multicast stream enumeration.
 - **Unauthorized join** — a host on an **admin-scoped** (239/8), **globally-scoped**
@@ -899,10 +905,11 @@ python3 network_diagnostics.py igmp-selftest     # self-test the detectors, no r
 ```
 
 `igmp-selftest` drives the real parser + classifier with synthetic captures
-(clean / storm / rogue-querier / recon / unauthorized / v3 group-record parse),
-and — when [Scapy](https://scapy.net) is installed — additionally crafts real
-IGMP packets into a pcap and parses them back through `tcpdump`, exercising the
-capture→parse path end to end.
+(clean / storm / rogue-querier / recon / unauthorized / spoofed-querier /
+bad-TTL / non-multicast / reserved-group / join-leave-flap / leave-storm / v3
+group-record parse), and — when [Scapy](https://scapy.net) is installed —
+additionally crafts real IGMP packets into a pcap and parses them back through
+`tcpdump`, exercising the capture→parse path end to end.
 
 - Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
   `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
