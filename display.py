@@ -1119,15 +1119,19 @@ class Display:
     def _netdiag_wifi_scan(self):
         """Background-cached passive scan for the net-diag SIGNAL/SPECTRUM pages.
         A full passive scan takes several seconds, so it runs in a worker thread
-        and the page shows the last result — the render never blocks. Refreshes
-        at most ~every 45s, and only while a wifi page is on screen. Scans the
-        widest-band adapter (see _netdiag_scan_iface) so 5/6 GHz show up."""
+        and the page shows the last result — the render never blocks. Full
+        discovery sweeps run at most ~every 45s, and only while a wifi page is
+        on screen; between them a fast poll re-visits just the listed APs'
+        channels every ~1s so the signal bars move live. Scans the widest-band
+        adapter (see _netdiag_scan_iface) so 5/6 GHz show up."""
         st = getattr(self, '_netdiag_wifi_state', None)
         if st is None:
             st = self._netdiag_wifi_state = {'ts': 0, 'aps': None, 'scanning': False,
-                                             'spectrum': None, 'bands': None, 'iface': None}
+                                             'spectrum': None, 'bands': None, 'iface': None,
+                                             'fast_ts': 0, 'fast_scanning': False}
         now = time.time()
-        if not st['scanning'] and (now - st['ts']) > 45:
+        if (not st['scanning'] and not st.get('fast_scanning', False)
+                and (now - st['ts']) > 45):
             st['scanning'] = True
 
             def _worker():
@@ -1154,6 +1158,31 @@ class Display:
                 st['scanning'] = False
 
             threading.Thread(target=_worker, daemon=True).start()
+        elif (st.get('aps') and not st['scanning']
+              and not st.get('fast_scanning', False)
+              and (now - st.get('fast_ts', 0)) > 1.0):
+            # Fast path: passively re-visit only the channels of the APs
+            # already on screen. Values update in place (no re-sort) so the
+            # rows stay put while their bars move.
+            st['fast_scanning'] = True
+
+            def _fast_worker():
+                try:
+                    import wifi_analyzer as wa
+                    iface = st.get('iface') or self._netdiag_scan_iface()
+                    freqs = sorted({int(round(a['freq'])) for a in (st.get('aps') or [])
+                                    if a.get('freq')})
+                    sig = wa.fast_signal_poll(iface, freqs)
+                    for a in (st.get('aps') or []):
+                        s = sig.get(a.get('bssid'))
+                        if s is not None:
+                            a['signal'] = s
+                except Exception as e:
+                    logger.debug(f"netdiag fast signal poll error: {e}")
+                st['fast_ts'] = time.time()
+                st['fast_scanning'] = False
+
+            threading.Thread(target=_fast_worker, daemon=True).start()
         return st
 
     def _draw_signal_bar(self, draw, y, dbm, x0, x1):
@@ -3589,7 +3618,14 @@ class Display:
                         else:
                             self._netdiag_page = nextp
                     self._commit_netdiag_frame(image)
-                    self._netdiag_sleep(NETDIAG_CYCLE_SECONDS, bl, seq0)
+                    # WIFI/SIGNAL cards held in manual mode redraw every second
+                    # so the RSSI readings and bars move live as you walk
+                    # around; everything else keeps the normal cycle.
+                    live = (frozen and view != 'menu'
+                            and NETDIAG_CARD_NAMES[page % len(NETDIAG_CARD_NAMES)]
+                            in ("WIFI", "SIGNAL"))
+                    self._netdiag_sleep(1.0 if live else NETDIAG_CYCLE_SECONDS,
+                                        bl, seq0)
                     continue
                 # Not in net-diag mode: drop any stale one-shot result / freeze so
                 # re-entering the mode later starts clean on the pages.

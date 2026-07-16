@@ -1127,6 +1127,34 @@ def do_scan(interface="wlan0", band="all", passive=True):
     }
 
 
+def fast_signal_poll(interface, freqs, timeout=10):
+    """Quick passive scan restricted to `freqs` (MHz); returns
+    {bssid: signal_dbm} for every BSS heard fresh on those channels.
+
+    Dwelling on a handful of known channels takes well under a second (a full
+    all-band sweep takes several), so callers can refresh the signal of APs
+    they already know about near-live between full discovery scans. Results
+    the kernel merely cached from an earlier sweep (stale last-seen) are
+    dropped so a bar never freezes on an old reading."""
+    if not _valid_iface(interface) or not freqs:
+        return {}
+    args = [_IW, "dev", interface, "scan", "freq"]
+    args += [str(int(round(f))) for f in freqs]
+    args.append("passive")
+    rc, out, _err = _run(args, timeout=timeout)
+    if rc != 0:
+        return {}
+    sig = {}
+    for b in parse_scan(out):
+        if b.get("signal") is None:
+            continue
+        last = b.get("last_seen_ms")
+        if last is not None and last > 15000:
+            continue
+        sig[b["bssid"]] = b["signal"]
+    return sig
+
+
 def radius_from_fields(fields, tx_dbm=None, ple=_DEFAULT_PLE, rssi_offset=0.0,
                        antenna_gain=0.0, cable_loss=0.0, rssi0_override=None):
     """Compute the coverage rings from an AP's already-known scan fields — no

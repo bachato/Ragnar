@@ -86,6 +86,10 @@ Navigated as **cards**: `LINK · IP · SWITCH · DHCP · WIFI · SIGNAL · SPECT
 | **KEY2** | **Card-selection menu** (press again to leave) |
 | **KEY3** | **Pause / start auto-switch** — auto-cycle the cards every 5 s |
 
+Pause auto-switch (KEY3) on the **WIFI** or **SIGNAL** card and it redraws
+**every second** with live RSSI — SIGNAL's bars are refreshed by a fast passive
+poll of just the listed APs' channels, so they move as you walk around.
+
 Functions: **LINK/SWITCH** → Locate Port · L2 Health; **IP** → Ping GW · Ping
 WAN · DNS Doctor · Speedtest; **DHCP/WIFI/SIGNAL** are read-only. On the
 **SPECTRUM** card the ↑/↓ "functions" select the **band** (2.4 / 5 / 6 GHz) —

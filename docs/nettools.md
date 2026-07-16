@@ -140,10 +140,15 @@ The display auto-cycles six pages every **5 seconds**:
    runs in the background so the page never blocks the cycle.
 5. **WIFI** — the wireless link you're on: **SSID**, **RSSI** (dBm) + quality %,
    band/channel and TX rate, with a live signal bar under the facts (walk around
-   to find dead spots). Read passively from `iw dev … link` — no scan.
+   to find dead spots). Read passively from `iw dev … link` — no scan. Held in
+   manual mode, the WIFI and SIGNAL cards **redraw every second** instead of
+   the normal 5 s cycle, so the readings track you in real time.
 6. **SIGNAL** — a bar chart of the **strongest nearby networks' signal
    strengths** (SSID + RSSI), from a background [passive Wi-Fi
-   scan](wifi-analyzer.md) so the page never blocks.
+   scan](wifi-analyzer.md) so the page never blocks. Between full discovery
+   sweeps (~45 s) a **fast poll re-visits just the listed APs' channels every
+   second**, so the bars move live as you walk — rows stay put, only the
+   values change.
 7. **SPECTRUM** — the [WiFi Spectrum Analyzer](wifi-analyzer.md)'s **Bar view on
    the panel**: a live **channel-occupancy graph** for one band (a bar per
    channel, height ∝ the strongest AP's signal there, **DFS/radar channels drawn
