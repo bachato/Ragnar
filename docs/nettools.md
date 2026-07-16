@@ -651,10 +651,17 @@ python3 network_diagnostics.py snmp-selftest    # self-test the detectors, no ro
 ```
 
 `snmp-selftest` drives the real parser + classifier with synthetic captures (clean /
-cleartext / write-exposed / amplification / enumeration / parse), and — when
-[Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set messages into
-a pcap and parses them back through `tcpdump`, confirming the `public`-hidden
-inference and write-community detection end to end.
+cleartext / write-exposed / community-reuse / amplification / enumeration / parse),
+and — when [Scapy](https://scapy.net) is installed — crafts real SNMP v2c Get/Set
+messages into a pcap and parses them back through `tcpdump`, confirming the
+`public`-hidden inference and write-community detection end to end.
+
+For a **standalone deep monitor** — a pure-Python BER decoder with per-message
+severity, **SNMPv3 msgFlags mode analysis** (noAuthNoPriv/authNoPriv/authPriv/
+privNoAuth), **plaintext-scopedPDU detection** (catching v3 that claims privacy
+but ships a plaintext PDU), an **OID-hint pass** (CISCO-CONFIG-COPY / usmUser /
+ifAdminStatus / …), and the community-reuse correlator — see
+[snmpwatch](snmpwatch.md) (`snmpwatch.py`).
 
 - Endpoint: `GET /api/net/snmp-watch` `{interface, seconds}`,
   `POST /api/net/snmp-baseline` `{action: reset}` · binary: `tcpdump`
