@@ -332,6 +332,13 @@ is the *active* complement to the passive duplicate-IP check in
 [L2 Link Health](#l2-link-health), and it feeds the
 [Network Integrity Monitor](#-network-integrity-monitor).
 
+This snapshot view is complemented by a **standalone live-stream monitor** —
+[arp_guard](arp_guard.md) (`python/arp_guard.py`) — a four-layer packet pipeline
+(binding-flap · gratuitous-ARP rate/breadth · per-packet structural sanity ·
+out-of-band trusted-MAC pins) that catches the attack **in progress** (a raw-byte
+parser, JSON-lines alerts, pcap `--replay`, and a hardened daemon), which a
+neighbour-table snapshot can't see.
+
 - Endpoints: `GET /api/net/arp-check`,
   `GET|POST /api/net/arp-baseline` `{action:reset}` · uses `ip neigh` (iproute2)
 
