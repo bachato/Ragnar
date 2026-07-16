@@ -911,6 +911,12 @@ group-record parse), and — when [Scapy](https://scapy.net) is installed —
 additionally crafts real IGMP packets into a pcap and parses them back through
 `tcpdump`, exercising the capture→parse path end to end.
 
+For a **standalone deep monitor** — a pure-Python binary IGMP decoder with the
+full control-plane detector matrix (flood / anomaly / recon / policy), a
+data-plane sysfs rate sampler (`mcast_flood_no_members` and friends), an
+out-of-band SNMP tier with a capability cache, learn→enforce policy, SQLite, and
+a hardened daemon — see [igmpwatch](igmpwatch.md) (`python3 -m igmpwatch`).
+
 - Endpoint: `GET /api/net/igmp-watch` `{interface, seconds}`,
   `POST /api/net/igmp-baseline` `{action: reset}` · binary: `tcpdump`
 
