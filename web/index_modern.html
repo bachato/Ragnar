@@ -1429,7 +1429,12 @@
                                 <h3 class="text-lg font-semibold mb-1">Internet Speed Test</h3>
                                 <p class="text-sm text-gray-400">Measures download, upload and latency (takes ~30s).</p>
                             </div>
-                            <button id="speedtest-btn" onclick="runSpeedtest()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Start Test</button>
+                            <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                                <select id="speedtest-iface" onfocus="_speedtestFillIfaces()" title="Which interface the test originates from. Auto prefers a wired port that has an IP address — so a multi-homed box tests the cable, not wlan0. A monitor/SPAN port (link but no address) is skipped." class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300">
+                                    <option value="">Auto (Ethernet first)</option>
+                                </select>
+                                <button id="speedtest-btn" onclick="runSpeedtest()" class="w-full sm:w-auto bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Start Test</button>
+                            </div>
                         </div>
                         <div id="speedtest-results" class="hidden mt-4"></div>
                     </div>

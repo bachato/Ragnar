@@ -3412,14 +3412,29 @@ async function runMtr() {
     }
 }
 
+function _speedtestFillIfaces() {
+    const sel = document.getElementById('speedtest-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function runSpeedtest() {
     const btn = document.getElementById('speedtest-btn');
     const out = document.getElementById('speedtest-results');
+    const iface = (document.getElementById('speedtest-iface') || {}).value || '';
     _ndBusy(btn, true, 'Testing…');
     out.classList.remove('hidden');
     out.innerHTML = '<p class="text-sm text-gray-400">Running speed test (this can take ~30s)…</p>';
     try {
-        const data = await postAPI('/api/net/speedtest', {});
+        const data = await postAPI('/api/net/speedtest', { interface: iface });
         if (!data.success) {
             out.innerHTML = data.missing_tool
                 ? _ndMissingTool(data, 'runSpeedtest')
@@ -3437,7 +3452,7 @@ async function runSpeedtest() {
                 ${card('Upload', data.upload_mbps, 'Mbps')}
                 ${card('Ping', data.ping_ms, 'ms')}
             </div>
-            <p class="text-xs text-gray-500">Server: ${escapeHtml(String(data.server || '—'))}${data.server_location ? ' (' + escapeHtml(data.server_location) + ')' : ''} · ISP: ${escapeHtml(String(data.isp || '—'))}</p>`;
+            <p class="text-xs text-gray-500">Server: ${escapeHtml(String(data.server || '—'))}${data.server_location ? ' (' + escapeHtml(data.server_location) + ')' : ''} · ISP: ${escapeHtml(String(data.isp || '—'))}${data.interface ? ' · via ' + escapeHtml(data.interface) + (data.source_ip ? ' (' + escapeHtml(data.source_ip) + ')' : '') : ''}</p>`;
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     } finally {
