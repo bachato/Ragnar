@@ -1529,6 +1529,25 @@ _wt_seen = {}                 # pushover dedup: key -> {'rank', 'ts'}
 _wt_seen_loaded = False
 _wt_summary = {'enabled': False, 'ts': None, 'total': 0}
 
+# Cross-signal correlation: fold the same normalized alert stream into
+# attack-chain *incidents* (see incident_engine.py). Paged once per incident when
+# it first becomes a named campaign or escalates.
+_incident_engine = None
+_inc_notified = {}            # incident id -> {'pattern', 'severity'}
+_incidents_summary = {'total': 0, 'named': 0}
+
+
+def _inc_get():
+    global _incident_engine
+    if _incident_engine is None:
+        import incident_engine as _ie
+        try:
+            window = float(shared_data.config.get('incident_window_s', 600))
+        except (TypeError, ValueError):
+            window = 600.0
+        _incident_engine = _ie.IncidentEngine(window_s=window)
+    return _incident_engine
+
 
 def _wt_ring_path():
     return os.path.join(shared_data.datadir, 'watchtower_alerts.json')
@@ -1638,6 +1657,57 @@ def _watchtower_check_once():
         _wt_summary = summ
         _wt_save(wt)
 
+    # Correlate: fold every new alert into the incident engine, and collect any
+    # incident that just became a named campaign (or escalated) to page once.
+    incident_pages = []
+    if cfg.get('incident_correlation_enabled', True) and new:
+        try:
+            eng = _inc_get()
+            touched = {}
+            for a in new:
+                inc = eng.ingest(a)
+                if inc is not None:
+                    touched[inc.id] = inc
+            try:
+                min_conf = int(cfg.get('incident_notify_min_confidence', 50))
+            except (TypeError, ValueError):
+                min_conf = 50
+            import incident_engine as _ie
+            for iid, inc in touched.items():
+                d = inc.to_dict()
+                if not d['pattern'] or d['confidence'] < min_conf:
+                    continue
+                prev = _inc_notified.get(iid)
+                escalated = (prev is None or prev['pattern'] != d['pattern']
+                             or _ie.SEV_RANK.get(d['severity'], 0)
+                             > _ie.SEV_RANK.get(prev['severity'], 0))
+                if escalated:
+                    incident_pages.append(d)
+                    _inc_notified[iid] = {'pattern': d['pattern'],
+                                          'severity': d['severity']}
+            global _incidents_summary
+            _incidents_summary = eng.summary()
+        except Exception as exc:
+            logger.debug(f"[incident] correlation cycle failed: {exc}")
+
+    if incident_pages:
+        top = max(incident_pages, key=lambda d: (d['confidence']))
+        ents = ', '.join('%s' % v for vals in top['entities'].values()
+                         for v in vals[:3])
+        msg = (f"Incident: {top['label']} ({top['confidence']}% confidence) — "
+               f"{top['technique']}. Detectors: {', '.join(top['sources'])}. "
+               f"Entities: {ents}")
+        try:
+            from pushover_service import PushoverService
+            _po = getattr(shared_data, '_pushover_service', None)
+            if _po is None:
+                _po = PushoverService(shared_data)
+                shared_data._pushover_service = _po
+            _po.notify_watchtower(msg, priority=1)
+        except Exception as exc:
+            logger.debug(f"[incident] pushover alert skipped: {exc}")
+        logger.warning(f"[incident] {msg}")
+
     if notifiable:
         worst = max(notifiable, key=lambda a: a['rank'])
         by_src = collections.Counter(a['label'] for a in notifiable)
@@ -1715,6 +1785,40 @@ def watchtower_status():
         'notify_min_severity': cfg.get('watchtower_notify_min_severity', 'high'),
         'summary': summary,
         'alerts': alerts,
+    })
+
+
+@app.route('/api/net/incidents', methods=['GET'])
+def incidents_status():
+    """Correlated attack-chain incidents fused from the Watchtower alert stream.
+    `?min_severity=` and `?limit=` narrow the list; `?active_within=` (seconds)
+    returns only recently-active incidents."""
+    cfg = shared_data.config
+    try:
+        limit = max(1, min(200, int(request.args.get('limit', 50))))
+    except (TypeError, ValueError):
+        limit = 50
+    min_sev = request.args.get('min_severity') or None
+    try:
+        active_within = float(request.args['active_within']) \
+            if request.args.get('active_within') else None
+    except (TypeError, ValueError):
+        active_within = None
+    incidents, summary = [], {}
+    try:
+        with _watchtower_lock:
+            eng = _inc_get()
+            incidents = eng.incidents(min_severity=min_sev,
+                                      active_within=active_within)[:limit]
+            summary = eng.summary()
+    except Exception as exc:
+        logger.debug(f"[incident] status failed: {exc}")
+    return jsonify({
+        'success': True,
+        'enabled': bool(cfg.get('incident_correlation_enabled', True)),
+        'window_s': cfg.get('incident_window_s', 600),
+        'summary': summary,
+        'incidents': incidents,
     })
 
 

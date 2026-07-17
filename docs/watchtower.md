@@ -145,6 +145,15 @@ python3 watchtower.py --dir /var/log/ragnar --once            # dump current ale
 python3 watchtower.py --dir /var/log/ragnar --follow --min-severity high
 ```
 
+## Correlation
+
+The same normalized stream feeds the [incident correlation
+engine](incident-correlation.md), which fuses related alerts into named
+attack-chain *incidents* (e.g. an evil-twin beacon + a deauth + a captured
+handshake, all sharing one BSSID, become one "Evil-twin WPA handshake capture").
+Incidents lead both the dashboard card and the Diagnostics pane, above the raw
+alert feed.
+
 ## Limitations
 
 - **Same vantage as its sensors.** Watchtower only sees what the watchers see;

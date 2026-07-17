@@ -722,6 +722,7 @@
                     </div>
                     <button onclick="showTab('diagnostics')" class="shrink-0 bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Open pane</button>
                 </div>
+                <div id="dash-incidents" class="space-y-2 mb-3"></div>
                 <div id="dash-watchtower-chips" class="flex flex-wrap items-center gap-2 text-sm"></div>
                 <div id="dash-watchtower-list" class="mt-3 space-y-2"></div>
                 <p id="dash-watchtower-sources" class="text-xs text-gray-500 mt-3"></p>
@@ -1354,6 +1355,7 @@
                             <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
                         </label>
                     </div>
+                    <div id="watchtower-incidents" class="mt-3 space-y-2"></div>
                     <div id="watchtower-summary" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
                     <div class="mt-3 flex flex-wrap items-center gap-3">
                         <button onclick="watchtowerRefresh()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Refresh</button>
@@ -6660,7 +6662,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260717-watchtower"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260717-incidents"></script>
 
 </body>
 </html>
