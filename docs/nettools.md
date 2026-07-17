@@ -498,6 +498,18 @@ and the Python `speedtest-cli`, reporting download/upload in Mbps, ping in ms,
 and the chosen server and ISP. If neither client is present it self-installs
 `speedtest-cli` on demand so the button always works.
 
+**Interface selector.** `Auto (Ethernet first)` prefers a wired port, so a
+multi-homed box tests the cable rather than whatever holds the default route. A
+wired port only qualifies if it has an IPv4 address **and a default route** —
+Ragnar plugged into a switch for monitoring gets a DHCP lease on that segment but
+reaches the internet over WiFi, and binding the test to such a leg just times out
+as `Cannot retrieve speedtest configuration / urlopen error timed out`. When Auto
+lands on the default-route interface it runs unbound (the kernel's normal path);
+it only binds (`speedtest-cli --source`, Ookla `--interface`) when deliberately
+leaving that path. The result line reports `via <iface>`. Picking an interface
+that has no address, or an address but no default route, fails fast with a
+message naming the cause instead of hanging.
+
 - Endpoint: `POST /api/net/speedtest` · binary: `speedtest-cli` or `speedtest`
 
 ### Live Flow Telemetry
