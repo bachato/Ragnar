@@ -1109,6 +1109,13 @@ parse checks), and — when [Scapy](https://scapy.net) is installed — crafts a
 Neighbor Advertisement (with the target link-layer address option) into a pcap and
 parses it back through `tcpdump -e`, exercising the capture→parse path end to end.
 
+For a **standalone continuous daemon** — the IPv6 counterpart to
+[arp_guard](arp_guard.md), with a raw-byte ND parser, **20 coded findings**
+(`NDP-001…020`: NA cache-poison/flap, rogue-RA, prefix/RDNSS hijack,
+router-preference, RA/RS/NS floods, DAD-DoS, spoofed Redirect, hop-limit-≠-255,
+…) merged per packet, JSON-lines, and pcap `--replay` — see
+[ndpwatch](ndpwatch.md) (`python/ndpwatch.py`).
+
 - Endpoint: `GET /api/net/ndp-watch` `{interface, seconds}`,
   `POST /api/net/ndp-baseline` `{action: reset}` · binary: `tcpdump`
 
