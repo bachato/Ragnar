@@ -745,6 +745,12 @@ class SharedData:
             "watchtower_notify_min_severity": "high",  # page floor: critical/high/medium/low
             "watchtower_notify_cooldown_s": 300,     # min seconds between any two sends
             "watchtower_realert_hours": 0,           # re-page a still-standing finding after N h (0 = once)
+            # Incident correlation: fuse the Watchtower alert stream into
+            # attack-chain incidents (see incident_engine.py). Pure analysis over
+            # already-collected alerts; pages once per named campaign.
+            "incident_correlation_enabled": True,
+            "incident_window_s": 600,                # entity-correlation sliding window
+            "incident_notify_min_confidence": 50,    # page a named incident at/above this %
             # Browser terminal (interactive shell over the web UI). OFF by
             # default — it exposes a shell on the Pi (as the 'ragnar' user),
             # gated by login. Enable in Settings only if you want it.

@@ -4493,6 +4493,38 @@ function _wtSevChip(sev, n) {
     const [cls, icon] = _WT_SEV_STYLE[sev] || _WT_SEV_STYLE.info;
     return `<span class="px-2.5 py-1 rounded border ${cls}">${icon} ${escapeHtml(sev)}: ${n}</span>`;
 }
+// Correlated attack-chain incidents — the fused view. Rendered above the raw
+// alert list because an incident is the "so what" behind a cluster of alerts.
+function renderIncidents(incidents, elId, max) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    const list = (incidents || []).slice(0, max || 4);
+    if (!list.length) { el.innerHTML = ''; return; }
+    el.innerHTML = list.map(inc => {
+        const [cls] = _WT_SEV_STYLE[inc.severity] || _WT_SEV_STYLE.info;
+        const ents = Object.entries(inc.entities || {})
+            .map(([k, v]) => escapeHtml(v.slice(0, 3).join(', '))).filter(Boolean).join(' · ');
+        const conf = inc.confidence != null ? inc.confidence + '%' : '';
+        return `<div class="rounded-lg border ${cls} px-3 py-2">
+            <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                    <span class="text-[10px] uppercase tracking-wide opacity-70">Incident</span>
+                    <span class="text-sm font-semibold ml-1">${escapeHtml(inc.label || 'Correlated activity')}</span>
+                </div>
+                <span class="text-[10px] font-semibold shrink-0">${escapeHtml(inc.severity)} · ${conf}</span>
+            </div>
+            ${inc.technique ? `<div class="text-xs opacity-80 mt-0.5">${escapeHtml(inc.technique)}</div>` : ''}
+            <div class="text-xs opacity-60 mt-0.5">${escapeHtml((inc.sources || []).join(', '))}${ents ? ' · ' + ents : ''} · ${inc.alert_count || 0} alerts</div>
+        </div>`;
+    }).join('');
+}
+async function refreshIncidents(elId, minSev) {
+    const q = '/api/net/incidents?limit=6' + (minSev ? '&min_severity=' + encodeURIComponent(minSev) : '');
+    try {
+        const d = await fetchAPI(q);
+        renderIncidents((d && d.incidents) || [], elId, elId === 'dash-incidents' ? 3 : 6);
+    } catch (e) { /* offline — leave as-is */ }
+}
 function renderWatchtower(d) {
     const sumEl = document.getElementById('watchtower-summary');
     const srcEl = document.getElementById('watchtower-sources');
@@ -4548,6 +4580,7 @@ async function watchtowerRefresh() {
     const sev = (document.getElementById('watchtower-minsev') || {}).value || '';
     const q = '/api/net/watchtower?limit=100' + (sev ? '&min_severity=' + encodeURIComponent(sev) : '');
     try { renderWatchtower(await fetchAPI(q)); } catch (e) { /* offline — leave as-is */ }
+    refreshIncidents('watchtower-incidents');
 }
 async function syncWatchtowerFromServer() {
     const cb = document.getElementById('watchtower-enabled');
@@ -4556,6 +4589,7 @@ async function syncWatchtowerFromServer() {
         if (cb) cb.checked = !!d.enabled;
         renderWatchtower(d);
     } catch (e) { /* offline */ }
+    refreshIncidents('watchtower-incidents');
 }
 function onWatchtowerToggled(cb) {
     postAPI('/api/config', { watchtower_enabled: cb.checked })
@@ -4610,6 +4644,7 @@ function renderDashWatchtower(d) {
 async function refreshDashWatchtower() {
     try { renderDashWatchtower(await fetchAPI('/api/net/watchtower?limit=5&min_severity=medium')); }
     catch (e) { /* offline — leave as-is */ }
+    refreshIncidents('dash-incidents');
 }
 
 // ---- ARP Poisoning card (on-demand) ---------------------------------------
