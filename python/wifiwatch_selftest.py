@@ -42,13 +42,78 @@ def proberesp(bssid, ssid):
     return radiotap() + _dot11(5, '00:11:22:33:44:55', bssid, bssid, body)
 
 
-def probereq(ssid):
-    return radiotap() + _dot11(4, 'ff:ff:ff:ff:ff:ff', '00:11:22:33:44:55',
+def probereq(ssid, src='00:11:22:33:44:55'):
+    return radiotap() + _dot11(4, 'ff:ff:ff:ff:ff:ff', src,
                                'ff:ff:ff:ff:ff:ff', _ie(0, ssid.encode()))
 
 
 def deauth(src, dst, reason=7, protected=False, subtype=12):
     return radiotap() + _dot11(subtype, dst, src, src, struct.pack('<H', reason), protected)
+
+
+def _rsn(akm_types, mfpc=False, mfpr=False):
+    """RSN element body: CCMP group+pairwise, the given AKM suites, PMF caps."""
+    caps = (0x80 if mfpc else 0) | (0x40 if mfpr else 0)
+    body = b'\x01\x00'                                # version
+    body += b'\x00\x0f\xac\x04'                       # group cipher CCMP
+    body += b'\x01\x00' + b'\x00\x0f\xac\x04'         # 1 pairwise cipher CCMP
+    body += struct.pack('<H', len(akm_types))
+    for t in akm_types:
+        body += b'\x00\x0f\xac' + bytes([t])          # 00-0F-AC AKM suites
+    body += struct.pack('<H', caps)
+    return body
+
+
+def beacon_rsn(bssid, ssid, akm_types, freq=2437, mfpc=False, mfpr=False):
+    body = (b'\x00' * 8 + b'\x64\x00' + b'\x01\x00' + _ie(0, ssid.encode())
+            + _ie(48, _rsn(akm_types, mfpc, mfpr)))
+    return radiotap(freq) + _dot11(8, 'ff:ff:ff:ff:ff:ff', bssid, bssid, body)
+
+
+def _data(a1, a2, a3, payload, to_ds, from_ds, qos=False, protected=False):
+    subtype = 8 if qos else 0
+    fc0 = (2 << 2) | (subtype << 4)                   # type 2 = data
+    fc1 = (0x01 if to_ds else 0) | (0x02 if from_ds else 0) | (0x40 if protected else 0)
+    hdr = bytes([fc0, fc1, 0, 0]) + _mac(a1) + _mac(a2) + _mac(a3) + b'\x00\x00'
+    if qos:
+        hdr += b'\x00\x00'
+    return hdr
+
+
+# EAPOL Key Information bits (network order).
+_KI = {'mic': 0x0100, 'secure': 0x0200, 'ack': 0x0080, 'install': 0x0040,
+       'pairwise': 0x0008}
+
+
+def eapol(bssid, station, msg, pmkid=False, from_ap=None):
+    """Build a data frame carrying EAPOL-Key message `msg` (1-4). M1/M3 flow
+    AP->STA, M2/M4 STA->AP. Key Information is big-endian on the wire."""
+    if from_ap is None:
+        from_ap = msg in (1, 3)
+    info = _KI['pairwise']
+    if msg == 1:
+        info |= _KI['ack']
+    elif msg == 2:
+        info |= _KI['mic']
+    elif msg == 3:
+        info |= _KI['ack'] | _KI['mic'] | _KI['secure'] | _KI['install']
+    elif msg == 4:
+        info |= _KI['mic'] | _KI['secure']
+    kd = b''
+    if pmkid:
+        kd = bytes([0xdd, 0x14]) + b'\x00\x0f\xac\x04' + b'\x11' * 16   # PMKID KDE
+    # Key Descriptor: type(1) info(2,BE) keylen(2) replay(8) nonce(32) iv(16)
+    # rsc(8) reserved(8) mic(16) key_data_len(2,BE) key_data(N)
+    k = (bytes([2]) + struct.pack('>H', info) + b'\x00\x10' + b'\x00' * 8
+         + b'\x00' * 32 + b'\x00' * 16 + b'\x00' * 8 + b'\x00' * 8 + b'\x00' * 16
+         + struct.pack('>H', len(kd)) + kd)
+    eap = bytes([2, 3]) + struct.pack('>H', len(k)) + k                # EAPOL-Key
+    payload = b'\xaa\xaa\x03\x00\x00\x00\x88\x8e' + eap                # LLC/SNAP + EAPOL
+    if from_ap:                                                       # AP -> STA
+        hdr = _data(station, bssid, bssid, payload, to_ds=False, from_ds=True, qos=True)
+    else:                                                            # STA -> AP
+        hdr = _data(bssid, station, bssid, payload, to_ds=True, from_ds=False, qos=True)
+    return radiotap() + hdr + payload
 
 
 class H:
@@ -194,6 +259,93 @@ def run(verbose=True):
         wt.handle(deauth('aa:bb:cc:00:00:01', w.BROADCAST), ts=500 + i * 0.5)
     n_alerts = sum(1 for e in evs if e['detector'] == 'deauth_flood')
     h.ck('refractory rate-limits alerts (not one per frame)', 1 <= n_alerts <= 8)
+
+    # ---- EAPOL parser -----------------------------------------------------
+    f = w.parse_frame(eapol('aa:bb:cc:00:00:01', 'dd:ee:ff:00:00:09', 1))
+    h.ck('parse data frame ftype', f and f['ftype'] == 2)
+    h.ck('parse EAPOL M1', f and f['eapol'] and f['eapol']['msg'] == 1)
+    f2 = w.parse_frame(eapol('aa:bb:cc:00:00:01', 'dd:ee:ff:00:00:09', 2))
+    h.ck('parse EAPOL M2 (STA->AP)', f2 and f2['eapol']['msg'] == 2 and f2['to_ap'] is True)
+    f3 = w.parse_frame(eapol('aa:bb:cc:00:00:01', 'dd:ee:ff:00:00:09', 3))
+    h.ck('parse EAPOL M3', f3 and f3['eapol']['msg'] == 3)
+    f4 = w.parse_frame(eapol('aa:bb:cc:00:00:01', 'dd:ee:ff:00:00:09', 4))
+    h.ck('parse EAPOL M4', f4 and f4['eapol']['msg'] == 4)
+    fp = w.parse_frame(eapol('aa:bb:cc:00:00:01', 'dd:ee:ff:00:00:09', 1, pmkid=True))
+    h.ck('parse PMKID KDE in M1', fp and fp['eapol']['pmkid'] is True)
+    h.ck('no PMKID false-positive on plain M1', f and f['eapol']['pmkid'] is False)
+
+    # ---- PMKID harvest ----------------------------------------------------
+    wt, evs = _watch({'beacon_warmup_sec': 0})
+    wt.handle(eapol('aa:bb:cc:00:00:01', 'dd:ee:ff:00:00:09', 1, pmkid=True), ts=1)
+    ph = [e for e in evs if e['detector'] == 'pmkid_harvest']
+    h.ck('PMKID M1 -> pmkid_harvest critical', ph and ph[0]['severity'] == 'critical')
+    # a normal M1 without a PMKID must not trip it
+    wt, evs = _watch({'beacon_warmup_sec': 0})
+    wt.handle(eapol('aa:bb:cc:00:00:01', 'dd:ee:ff:00:00:09', 1), ts=1)
+    h.ck('plain M1 -> no pmkid_harvest',
+         not any(e['detector'] == 'pmkid_harvest' for e in evs))
+
+    # ---- deauth-and-capture handshake harvest -----------------------------
+    sta = 'dd:ee:ff:00:00:09'
+    wt, evs = _watch({'beacon_warmup_sec': 0})
+    wt.handle(deauth('aa:bb:cc:00:00:01', sta), ts=100)            # forced reconnect
+    for m in (1, 2, 3, 4):
+        wt.handle(eapol('aa:bb:cc:00:00:01', sta, m), ts=100.5 + m * 0.1)
+    hh = [e for e in evs if e['detector'] == 'handshake_harvest']
+    h.ck('deauth then 4-way -> handshake_harvest critical', hh and hh[0]['severity'] == 'critical')
+    h.ck('handshake_harvest reports messages', hh and len(hh[0]['detail']['msgs']) >= 2)
+    # a handshake with no preceding deauth is normal roaming -> quiet
+    wt, evs = _watch({'beacon_warmup_sec': 0})
+    for m in (1, 2, 3, 4):
+        wt.handle(eapol('aa:bb:cc:00:00:01', sta, m), ts=200 + m * 0.1)
+    h.ck('handshake without deauth -> no harvest alert',
+         not any(e['detector'] == 'handshake_harvest' for e in evs))
+    # deauth long before the handshake is outside the window -> quiet
+    wt, evs = _watch({'beacon_warmup_sec': 0, 'handshake_deauth_window': 10.0})
+    wt.handle(deauth('aa:bb:cc:00:00:01', sta), ts=300)
+    for m in (1, 2, 3, 4):
+        wt.handle(eapol('aa:bb:cc:00:00:01', sta, m), ts=320 + m * 0.1)
+    h.ck('stale deauth outside window -> no harvest',
+         not any(e['detector'] == 'handshake_harvest' for e in evs))
+
+    # ---- WPA3 downgrade / transition --------------------------------------
+    wt, evs = _watch({'beacon_warmup_sec': 0})
+    wt.handle(beacon_rsn('aa:aa:aa:00:00:01', 'SecureNet', [8, 2]), ts=1)   # SAE+PSK
+    tr = [e for e in evs if e['detector'] == 'wpa3_transition']
+    h.ck('SAE+PSK beacon -> wpa3_transition info', tr and tr[0]['severity'] == 'info')
+    # SSID seen as SAE, then a PSK-only BSSID appears -> active downgrade
+    wt, evs = _watch({'beacon_warmup_sec': 0})
+    wt.handle(beacon_rsn('aa:aa:aa:00:00:01', 'SecureNet', [8], mfpc=True, mfpr=True), ts=1)
+    wt.handle(beacon_rsn('66:66:66:66:66:66', 'SecureNet', [2]), ts=2)      # PSK-only twin
+    dg = [e for e in evs if e['detector'] == 'wpa_downgrade']
+    h.ck('WPA3 SSID reappearing PSK-only -> wpa_downgrade critical',
+         dg and dg[0]['severity'] == 'critical')
+    # a pure WPA3 network is not a downgrade
+    wt, evs = _watch({'beacon_warmup_sec': 0})
+    wt.handle(beacon_rsn('aa:aa:aa:00:00:01', 'PureWPA3', [8], mfpc=True, mfpr=True), ts=1)
+    h.ck('pure SAE network -> no downgrade/transition alert',
+         not any(e['detector'] in ('wpa_downgrade', 'wpa3_transition') for e in evs))
+
+    # ---- PNL leak ---------------------------------------------------------
+    wt, evs = _watch({'beacon_warmup_sec': 0, 'pnl_min_ssids': 4})
+    for s in ['HomeNet', 'Office', 'Starbucks', 'AirportFree', 'Hotel']:
+        wt.handle(probereq(s, src='11:22:33:44:55:66'), ts=1)
+    pl = [e for e in evs if e['detector'] == 'pnl_leak']
+    h.ck('client leaking 5 SSIDs -> pnl_leak', pl and pl[0]['severity'] == 'warning')
+    h.ck('pnl_leak lists the SSIDs', pl and pl[0]['detail']['ssid_count'] >= 4)
+    h.ck('pnl_leak names the station', pl and pl[0]['station'] == '11:22:33:44:55:66')
+    # a device probing for just one saved net is normal
+    wt, evs = _watch({'beacon_warmup_sec': 0, 'pnl_min_ssids': 4})
+    for _ in range(6):
+        wt.handle(probereq('HomeNet', src='11:22:33:44:55:66'), ts=1)
+    h.ck('single-SSID probe -> no pnl_leak',
+         not any(e['detector'] == 'pnl_leak' for e in evs))
+    # a randomized (locally-administered) MAC is not tracked as a device
+    wt, evs = _watch({'beacon_warmup_sec': 0, 'pnl_min_ssids': 4})
+    for s in ['A', 'B', 'C', 'D', 'E']:
+        wt.handle(probereq(s, src='02:11:22:33:44:55'), ts=1)   # LA bit set
+    h.ck('randomized-MAC probes -> no pnl_leak (privacy MAC)',
+         not any(e['detector'] == 'pnl_leak' for e in evs))
 
     total = h.n
     passed = total - h.fail
