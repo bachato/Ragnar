@@ -499,16 +499,37 @@ and the chosen server and ISP. If neither client is present it self-installs
 `speedtest-cli` on demand so the button always works.
 
 **Interface selector.** `Auto (Ethernet first)` prefers a wired port, so a
-multi-homed box tests the cable rather than whatever holds the default route. A
-wired port only qualifies if it has an IPv4 address **and a default route** —
-Ragnar plugged into a switch for monitoring gets a DHCP lease on that segment but
-reaches the internet over WiFi, and binding the test to such a leg just times out
-as `Cannot retrieve speedtest configuration / urlopen error timed out`. When Auto
-lands on the default-route interface it runs unbound (the kernel's normal path);
-it only binds (`speedtest-cli --source`, Ookla `--interface`) when deliberately
-leaving that path. The result line reports `via <iface>`. Picking an interface
-that has no address, or an address but no default route, fails fast with a
-message naming the cause instead of hanging.
+multi-homed box tests the cable rather than whatever holds the default route.
+When Auto lands on the default-route interface it runs **unbound** — the kernel's
+normal path, identical to having no selector at all. It only binds when
+deliberately leaving that path. The result line reports `via <iface>`.
+
+**Pinning binds the device, not the address.** This distinction is the whole
+ballgame on a box whose WiFi and LAN face the same router:
+
+- `speedtest-cli --source <ip>` sets a source *address*. It does **not** force
+  egress — the kernel still routes by destination, so the packet leaves via the
+  default-route NIC carrying the *other* NIC's address. That is indistinguishable
+  from spoofing, and an AP drops a frame whose source IP isn't that station's
+  lease. Result: `Cannot retrieve speedtest configuration / urlopen error timed
+  out`, on an interface that has perfectly good internet.
+- `SO_BINDTODEVICE` binds the *device* and actually pins the traffic. Ragnar uses
+  the Ookla client's `--interface` when that client is present, otherwise
+  `python/speedtest_bind.py`, which patches the socket layer with
+  `SO_BINDTODEVICE` and runs the same python client. (Needs `CAP_NET_RAW`.)
+
+Don't identify the client by binary name: on Debian/Raspberry Pi OS
+`/usr/bin/speedtest` is usually just an entry-point alias for the python
+speedtest-cli and **rejects** `--interface`. Ragnar asks `--help` instead.
+
+**Reachability is measured, not inferred.** Before a bound test, Ragnar
+TCP-probes the internet with the socket bound to that device, so it never claims
+an interface "has no route to the internet" when it demonstrably has one. A
+default route is not proof (the gateway may not work), and source-binding proves
+nothing at all — a probe bound to docker0's *address* reaches the internet fine,
+because the packet simply leaves via WiFi. Picking an interface with no address,
+or one the probe shows cannot reach the internet, fails fast with the real reason
+instead of hanging for the timeout.
 
 - Endpoint: `POST /api/net/speedtest` · binary: `speedtest-cli` or `speedtest`
 
