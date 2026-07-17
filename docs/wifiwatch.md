@@ -3,8 +3,8 @@
 `wifiwatch` is a standalone, **passive-only (RX-only)** wireless IDS — the deep,
 daemon-shaped companion to the integrated [WiFi Defense](wifi-defense.md) WIDS.
 It never transmits: no probe requests, no association, no deauth — nothing on
-air. It sniffs 802.11 management frames in monitor mode and flags four attack
-classes.
+air. It sniffs 802.11 management frames (plus EAPOL data frames) in monitor mode
+and flags AP/RF attacks **and** the WPA client/handshake layer.
 
 The 802.11 + radiotap parsing is **raw-byte** (no Scapy dissectors), so
 `--self-test` and `--replay` of a pcap run with no radio and the self-test needs
@@ -13,7 +13,7 @@ key off each frame's **capture timestamp** (not wall clock), so a replayed
 capture timestamps each alert to when the attack actually happened.
 
 - **Test floor:** Raspberry Pi Zero 2 W + Alfa AWUS036AXM (mt7921u).
-- **Self-test:** 30/30 (`python3 python/wifiwatch.py --self-test`).
+- **Self-test:** 51/51 (`python3 python/wifiwatch.py --self-test`).
 - **Deps:** Python 3.8+, Scapy (live capture only), `iw`.
 
 ## Detectors
@@ -24,6 +24,11 @@ capture timestamps each alert to when the attack actually happened.
 | `beacon_flood` | fake-AP storms (mdk3/mdk4 beacon mode) | subtype 8 |
 | `evil_twin` | rogue APs / evil twins (allowlist) | subtype 8 / 5 |
 | `karma_mana` | KARMA / MANA rogue APs | subtype 5 / 4 |
+| `pmkid_harvest` | EAPOL **M1 carrying a PMKID** — clientless offline-crack handle | EAPOL-Key (data) |
+| `handshake_harvest` | full **4-way handshake right after a deauth** — deauth-and-capture | deauth + EAPOL |
+| `wpa3_transition` | one AP offering **SAE + PSK together** — downgradeable | RSN in beacon/probe-resp |
+| `wpa_downgrade` | a known **WPA3 SSID reappearing WPA2-PSK-only** — WPA3 strip | RSN in beacon/probe-resp |
+| `pnl_leak` | a client **broadcasting its saved-network list** in directed probes | subtype 4 |
 
 - **deauth_flood** — thresholds per scope: broadcast **6 / 5 s** (critical),
   per-BSSID (deauth+disassoc) **25 / 5 s** (critical), targeted **12 / 5 s**
@@ -37,6 +42,31 @@ capture timestamps each alert to when the attack actually happened.
   allowlist → **critical**. An unlisted SSID from ≥ 2 BSSIDs → **info** (allowlist
   it to promote real threats to critical and silence the guesswork).
 - **karma_mana** — one BSSID answering ≥ 5 distinct SSIDs.
+
+### WPA client / handshake layer
+
+You cannot see a silent sniffer passively, but you *can* see the two things that
+put a **crackable handshake on the air**:
+
+- **pmkid_harvest** (critical) — an EAPOL **M1 that carries a PMKID KDE**. That
+  is exactly what `hcxdumptool`-style clientless attacks pull to crack a PSK
+  offline; a PMKID on the air is a standing exposure.
+- **handshake_harvest** (critical) — a client is **deauthed** and then completes
+  **≥ 2 of the 4** EAPOL messages within `handshake_deauth_window` (10 s). That
+  deauth-then-reconnect sequence is the classic forced-handshake capture; a
+  handshake with no preceding deauth is normal roaming and stays quiet.
+- **wpa3_transition** (info) — one BSSID advertising **SAE and PSK together**.
+  A WPA3 client can be steered down to WPA2-PSK, whose handshake cracks offline.
+  It's a property of the real AP's config, so informational — a hardening note.
+- **wpa_downgrade** (critical) — an SSID seen advertising **SAE** now appearing
+  from a BSSID offering **PSK only**. That's an evil twin stripping WPA3 — a live
+  downgrade, not a config choice.
+- **pnl_leak** (warning) — a **non-randomized** client MAC that directs probe
+  requests at `pnl_min_ssids` (4) or more distinct SSIDs is broadcasting its
+  Preferred Network List — the precise input an evil-twin/KARMA rig needs to
+  impersonate a network the device will auto-join. Probes from a
+  locally-administered (privacy-randomized) MAC are ignored: they aren't a stable
+  device to track and modern phones rotate them by design.
 
 ## Event schema (web-UI ready)
 
@@ -64,7 +94,7 @@ census). Tunable to `0` in a known-clean environment.
 ## Run
 
 ```bash
-python3 python/wifiwatch.py --self-test                       # 30/30, no root/Scapy
+python3 python/wifiwatch.py --self-test                       # 51/51, no root/Scapy
 sudo python3 python/wifiwatch.py --iface wlan1 --echo         # live, echo to stderr
 sudo python3 python/wifiwatch.py --iface wlan1 --jsonl /var/lib/ragnar/wifiwatch/events.jsonl
 python3 python/wifiwatch.py --replay attack.pcap --echo       # replay a capture (no radio)
