@@ -213,9 +213,63 @@ def do_whois(target):
     return {'success': True, 'output': (res['out'] or res['err']).strip(), 'error': None}
 
 
-def do_speedtest():
+def _egress_iface(preferred=None):
+    """Best interface to originate an *egress* test (speedtest) from: the
+    caller's pin, else a wired port that actually carries an IPv4 address, else
+    the default-route interface.
+
+    Deliberately NOT _capture_iface(): that one prefers any wired port with
+    carrier, which for the sensor deployment is exactly the SPAN/monitor leg
+    with no address and no gateway — fine to sniff, useless to originate from.
+    Requiring an IPv4 keeps 'wired by default' while skipping such a leg."""
+    if _valid_iface(preferred or ''):
+        return preferred
+    dflt = _default_route_iface()
+    wired = []
+    for name in _list_iface_names(include_virtual=False):
+        if _is_wireless(name) or name.startswith(('tun', 'tap', 'wg', 'zt', 'tailscale')):
+            continue
+        try:
+            with open(f'/sys/class/net/{name}/carrier') as f:
+                if f.read().strip() != '1':
+                    continue
+        except OSError:      # admin-down or vanished — not a candidate
+            continue
+        v4, _ = _iface_addrs(name)
+        if v4:
+            wired.append(name)
+    if wired:
+        return dflt if dflt in wired else sorted(wired)[0]
+    return dflt
+
+
+def do_speedtest(interface=None):
     """Run a bandwidth test. Supports both the Ookla `speedtest` CLI and the
-    python `speedtest-cli`; returns download/upload in Mbps."""
+    python `speedtest-cli`; returns download/upload in Mbps.
+
+    `interface` pins which local interface the test originates from; '' / None
+    auto-selects (a wired port with an address first — see _egress_iface), so a
+    multi-homed box tests the cable rather than whatever holds the default
+    route. speedtest-cli binds by source address (--source), the Ookla client by
+    interface name (--interface)."""
+    if interface:
+        # _valid_iface is only a name/injection guard — it does not check that
+        # the interface exists, so verify membership too or a typo surfaces as a
+        # confusing "no IPv4 address" further down.
+        if not _valid_iface(interface) or interface not in _list_iface_names(include_virtual=True):
+            return {'success': False, 'error': f'Unknown interface: {interface}'}
+    iface = _egress_iface(interface)
+    source_ip = None
+    if iface:
+        v4, _ = _iface_addrs(iface)
+        if v4:
+            source_ip = v4[0].split('/')[0]
+        elif interface:
+            # Explicitly asked for an interface that can't originate traffic.
+            return {'success': False,
+                    'error': f'{iface} has no IPv4 address — it cannot originate a '
+                             f'speed test (a monitor/SPAN port has link but no address).'}
+    meta = {'interface': iface, 'source_ip': source_ip}
     # Self-heal: if neither client is present, install speedtest-cli on demand.
     # A device updated from the UI may not have finished (or may have missed)
     # background tool provisioning, and the old behaviour was to just error out
@@ -223,11 +277,14 @@ def do_speedtest():
     if not _have('speedtest-cli') and not _have('speedtest'):
         do_install_tool('speedtest-cli')
     if _have('speedtest-cli'):
-        res = _run(['speedtest-cli', '--json'], timeout=120)
+        cmd = ['speedtest-cli', '--json']
+        if source_ip:
+            cmd += ['--source', source_ip]
+        res = _run(cmd, timeout=120)
         if res['rc'] == 0:
             try:
                 d = json.loads(res['out'])
-                return {'success': True,
+                return {'success': True, **meta,
                         'download_mbps': round(d.get('download', 0) / 1e6, 2),
                         'upload_mbps': round(d.get('upload', 0) / 1e6, 2),
                         'ping_ms': round(d.get('ping', 0), 2),
@@ -236,16 +293,19 @@ def do_speedtest():
                         'isp': (d.get('client') or {}).get('isp')}
             except ValueError:
                 pass
-        return {'success': False, 'error': res['err'] or res['out'] or 'speedtest failed'}
+        return {'success': False, **meta,
+                'error': res['err'] or res['out'] or 'speedtest failed'}
     if _have('speedtest'):
-        res = _run(['speedtest', '--format=json', '--accept-license', '--accept-gdpr'],
-                   timeout=120)
+        cmd = ['speedtest', '--format=json', '--accept-license', '--accept-gdpr']
+        if iface:
+            cmd += ['--interface', iface]
+        res = _run(cmd, timeout=120)
         if res['rc'] == 0:
             try:
                 d = json.loads(res['out'])
                 dl = d.get('download', {}).get('bandwidth', 0) * 8 / 1e6
                 ul = d.get('upload', {}).get('bandwidth', 0) * 8 / 1e6
-                return {'success': True,
+                return {'success': True, **meta,
                         'download_mbps': round(dl, 2),
                         'upload_mbps': round(ul, 2),
                         'ping_ms': round(d.get('ping', {}).get('latency', 0), 2),
@@ -254,8 +314,9 @@ def do_speedtest():
                         'isp': d.get('isp')}
             except ValueError:
                 pass
-        return {'success': False, 'error': res['err'] or res['out'] or 'speedtest failed'}
-    return {'success': False,
+        return {'success': False, **meta,
+                'error': res['err'] or res['out'] or 'speedtest failed'}
+    return {'success': False, **meta,
             'error': 'speedtest is not installed. Click Install to add it.',
             'missing_tool': 'speedtest-cli'}
 
@@ -14012,7 +14073,9 @@ def register_network_diagnostics(app, logger=None):
     @app.route('/api/net/speedtest', methods=['POST'])
     def net_speedtest():
         _log("net/speedtest")
-        return jsonify(do_speedtest())
+        body = request.get_json(silent=True) or {}
+        iface = str(body.get('interface') or '').strip() or None
+        return jsonify(do_speedtest(interface=iface))
 
     @app.route('/api/net/lldp', methods=['GET'])
     def net_lldp():

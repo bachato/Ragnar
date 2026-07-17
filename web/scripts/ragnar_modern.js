@@ -1139,6 +1139,7 @@ function showTab(tabName) {
     if (tabName === 'networks') { showTab('network'); showNetworkSubtab('archive'); return; }
     if (tabName === 'network-map') { showTab('network'); showNetworkSubtab('map'); return; }
     if (tabName === 'credentials') { showTab('discovered'); showDiscoveredSubtab('credentials'); return; }
+    if (tabName === 'diagnostics') { showTab('network'); showNetworkSubtab('diagnostics'); return; }
 
     currentTab = tabName;
 
@@ -1243,6 +1244,7 @@ function showNetworkSubtab(name) {
         populateMtrSources();
         syncNetDiagDisplayFromServer();
         syncNetIntegrityFromServer();
+        syncWatchtowerFromServer();
         _macWatchFillIfaces();
         _ntpFillIfaces();
         _snmpFillIfaces();
@@ -3410,14 +3412,29 @@ async function runMtr() {
     }
 }
 
+function _speedtestFillIfaces() {
+    const sel = document.getElementById('speedtest-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function runSpeedtest() {
     const btn = document.getElementById('speedtest-btn');
     const out = document.getElementById('speedtest-results');
+    const iface = (document.getElementById('speedtest-iface') || {}).value || '';
     _ndBusy(btn, true, 'Testing…');
     out.classList.remove('hidden');
     out.innerHTML = '<p class="text-sm text-gray-400">Running speed test (this can take ~30s)…</p>';
     try {
-        const data = await postAPI('/api/net/speedtest', {});
+        const data = await postAPI('/api/net/speedtest', { interface: iface });
         if (!data.success) {
             out.innerHTML = data.missing_tool
                 ? _ndMissingTool(data, 'runSpeedtest')
@@ -3435,7 +3452,7 @@ async function runSpeedtest() {
                 ${card('Upload', data.upload_mbps, 'Mbps')}
                 ${card('Ping', data.ping_ms, 'ms')}
             </div>
-            <p class="text-xs text-gray-500">Server: ${escapeHtml(String(data.server || '—'))}${data.server_location ? ' (' + escapeHtml(data.server_location) + ')' : ''} · ISP: ${escapeHtml(String(data.isp || '—'))}</p>`;
+            <p class="text-xs text-gray-500">Server: ${escapeHtml(String(data.server || '—'))}${data.server_location ? ' (' + escapeHtml(data.server_location) + ')' : ''} · ISP: ${escapeHtml(String(data.isp || '—'))}${data.interface ? ' · via ' + escapeHtml(data.interface) + (data.source_ip ? ' (' + escapeHtml(data.source_ip) + ')' : '') : ''}</p>`;
     } catch (e) {
         out.innerHTML = '<p class="text-sm text-red-400">Failed: ' + escapeHtml(e.message) + '</p>';
     } finally {
@@ -4462,6 +4479,137 @@ async function netIntegrityTrustGateway() {
     } catch (e) {
         addConsoleMessage('Failed to reset gateway baseline: ' + e.message, 'error');
     }
+}
+
+// ---- Watchtower: unified pane for the standalone watchers ------------------
+const _WT_SEV_STYLE = {
+    critical: ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
+    high:     ['bg-orange-950/50 border-orange-800 text-orange-300', '⚠'],
+    medium:   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠'],
+    low:      ['bg-slate-800 border-slate-700 text-slate-300', 'ℹ'],
+    info:     ['bg-slate-800 border-slate-700 text-slate-400', 'ℹ'],
+};
+function _wtSevChip(sev, n) {
+    const [cls, icon] = _WT_SEV_STYLE[sev] || _WT_SEV_STYLE.info;
+    return `<span class="px-2.5 py-1 rounded border ${cls}">${icon} ${escapeHtml(sev)}: ${n}</span>`;
+}
+function renderWatchtower(d) {
+    const sumEl = document.getElementById('watchtower-summary');
+    const srcEl = document.getElementById('watchtower-sources');
+    const listEl = document.getElementById('watchtower-alerts');
+    if (!sumEl || !listEl) return;
+    if (!d || d.success === false) { sumEl.innerHTML = ''; listEl.innerHTML = ''; return; }
+    if (!d.enabled) {
+        sumEl.innerHTML = '<span class="text-xs text-gray-500">Watchtower is off — enable it to aggregate the standalone watchers into this pane.</span>';
+        if (srcEl) srcEl.textContent = '';
+        listEl.innerHTML = '';
+        return;
+    }
+    const s = d.summary || {};
+    const bySev = s.by_severity || {};
+    const chips = ['critical', 'high', 'medium', 'low', 'info']
+        .filter(k => bySev[k]).map(k => _wtSevChip(k, bySev[k]));
+    const when = s.newest_ts ? new Date(s.newest_ts * 1000).toLocaleString() : '—';
+    sumEl.innerHTML = (chips.length ? chips.join(' ') : '<span class="text-xs text-green-400">✓ No alerts from any watcher</span>')
+        + `<span class="text-xs text-gray-500 w-full mt-1">${s.total || 0} alert(s) held · newest: ${escapeHtml(when)}</span>`;
+    // Source presence line: which watchers are actually logging.
+    if (srcEl) {
+        const srcs = (s.sources || []);
+        if (srcs.length) {
+            srcEl.innerHTML = srcs.map(x =>
+                `<span title="${x.present ? 'logging to ' + escapeHtml(x.path || '') : 'no log found — is the watcher running?'}" class="${x.present ? 'text-gray-400' : 'text-gray-600'}">${x.present ? '●' : '○'} ${escapeHtml(x.label || x.name)}</span>`
+            ).join(' &nbsp; ');
+        } else { srcEl.textContent = ''; }
+    }
+    // Alert list, newest-first.
+    const alerts = d.alerts || [];
+    if (!alerts.length) {
+        listEl.innerHTML = '<p class="text-xs text-gray-500">No alerts at this severity. Findings appear here as the running watchers emit them.</p>';
+        return;
+    }
+    listEl.innerHTML = alerts.map(a => {
+        const [cls] = _WT_SEV_STYLE[a.severity] || _WT_SEV_STYLE.info;
+        const t = a.ts ? new Date(a.ts * 1000).toLocaleString() : '';
+        const codes = (a.codes || []).join(', ');
+        const ep = [a.src, a.target].filter(Boolean).map(escapeHtml).join(' → ');
+        return `<div class="rounded-lg border ${cls} px-3 py-2">
+            <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                    <span class="text-xs uppercase tracking-wide opacity-80">${escapeHtml(a.label || a.source)}</span>
+                    <span class="text-sm ml-1">${escapeHtml(a.title || '')}</span>
+                </div>
+                <span class="text-[10px] uppercase font-semibold shrink-0">${escapeHtml(a.severity)}</span>
+            </div>
+            <div class="text-xs opacity-70 mt-0.5">${codes ? escapeHtml(codes) + ' · ' : ''}${ep ? ep + ' · ' : ''}${escapeHtml(t)}</div>
+        </div>`;
+    }).join('');
+}
+async function watchtowerRefresh() {
+    const sev = (document.getElementById('watchtower-minsev') || {}).value || '';
+    const q = '/api/net/watchtower?limit=100' + (sev ? '&min_severity=' + encodeURIComponent(sev) : '');
+    try { renderWatchtower(await fetchAPI(q)); } catch (e) { /* offline — leave as-is */ }
+}
+async function syncWatchtowerFromServer() {
+    const cb = document.getElementById('watchtower-enabled');
+    try {
+        const d = await fetchAPI('/api/net/watchtower?limit=100&min_severity=high');
+        if (cb) cb.checked = !!d.enabled;
+        renderWatchtower(d);
+    } catch (e) { /* offline */ }
+}
+function onWatchtowerToggled(cb) {
+    postAPI('/api/config', { watchtower_enabled: cb.checked })
+        .then(() => {
+            addConsoleMessage('Watchtower unified alerts ' + (cb.checked ? 'ON' : 'OFF'), 'info');
+            if (cb.checked) setTimeout(watchtowerRefresh, 300); else renderWatchtower({ success: true, enabled: false });
+        })
+        .catch(err => {
+            addConsoleMessage('Failed to toggle Watchtower: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+        });
+}
+
+// ---- Watchtower: Dashboard summary card -----------------------------------
+// Compact mirror of the Diagnostics pane: severity chips + the newest findings,
+// so an active attack is visible on the landing tab without digging.
+function renderDashWatchtower(d) {
+    const chipsEl = document.getElementById('dash-watchtower-chips');
+    const listEl = document.getElementById('dash-watchtower-list');
+    const srcEl = document.getElementById('dash-watchtower-sources');
+    if (!chipsEl || !listEl) return;
+    if (!d || d.success === false) return;
+    if (!d.enabled) {
+        chipsEl.innerHTML = '<span class="text-xs text-gray-500">Watchtower is off — enable it in Diagnostics to aggregate the watcher daemons here.</span>';
+        listEl.innerHTML = ''; if (srcEl) srcEl.textContent = '';
+        return;
+    }
+    const s = d.summary || {};
+    const bySev = s.by_severity || {};
+    const chips = ['critical', 'high', 'medium', 'low', 'info']
+        .filter(k => bySev[k]).map(k => _wtSevChip(k, bySev[k]));
+    chipsEl.innerHTML = chips.length ? chips.join(' ')
+        : '<span class="px-2.5 py-1 rounded border bg-green-950/40 border-green-900 text-green-400">✓ All clear — no watcher alerts</span>';
+    const alerts = (d.alerts || []).slice(0, 5);
+    listEl.innerHTML = alerts.map(a => {
+        const [cls] = _WT_SEV_STYLE[a.severity] || _WT_SEV_STYLE.info;
+        const t = a.ts ? new Date(a.ts * 1000).toLocaleString() : '';
+        return `<div class="rounded-lg border ${cls} px-3 py-2 text-sm">
+            <span class="text-xs uppercase tracking-wide opacity-80">${escapeHtml(a.label || a.source)}</span>
+            <span class="ml-1">${escapeHtml(a.title || '')}</span>
+            <span class="text-xs opacity-60 ml-1">· ${escapeHtml(t)}</span>
+        </div>`;
+    }).join('');
+    if (srcEl) {
+        const srcs = s.sources || [];
+        const on = srcs.filter(x => x.present).length;
+        srcEl.textContent = srcs.length
+            ? `${on}/${srcs.length} watchers logging: ` + srcs.map(x => (x.present ? '● ' : '○ ') + (x.label || x.name)).join('  ')
+            : '';
+    }
+}
+async function refreshDashWatchtower() {
+    try { renderDashWatchtower(await fetchAPI('/api/net/watchtower?limit=5&min_severity=medium')); }
+    catch (e) { /* offline — leave as-is */ }
 }
 
 // ---- ARP Poisoning card (on-demand) ---------------------------------------
@@ -7665,6 +7813,8 @@ async function loadTabData(tabName) {
 
 async function loadDashboardData() {
     try {
+        // Watchtower alerts — fire-and-forget so the stats path never waits on it.
+        refreshDashWatchtower();
         // OPTIMIZATION: Show loading state with pulse animation
         const statsElements = [
             'target-count', 'target-total-count', 'target-inactive-count',

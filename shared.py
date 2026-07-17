@@ -733,6 +733,18 @@ class SharedData:
             "net_integrity_extended_enabled": True,  # also rotate the passive Watch scanners
             "net_integrity_batch_size": 3,           # capture-scanners run per cycle (round-robin)
             "net_integrity_interface": "",           # capture iface pin; '' = auto (wired link-up first)
+            # Watchtower: unified alert pane for the standalone watcher daemons
+            # (arp_guard/ndpwatch/wifiwatch/certwatch/snmpwatch/isiswatch/igmpwatch).
+            # Tails their JSON-lines logs into one deduped feed + Pushover path.
+            # ON by default: it only reads log files the watchers already write
+            # (no capture, no outbound calls), and is a no-op until a watcher runs.
+            "watchtower_enabled": True,
+            "watchtower_interval_s": 30,             # seconds between log polls (min 5)
+            "watchtower_max_alerts": 500,            # rolling ring size (memory + persisted)
+            "watchtower_notify_enabled": True,       # Pushover on new findings (when on)
+            "watchtower_notify_min_severity": "high",  # page floor: critical/high/medium/low
+            "watchtower_notify_cooldown_s": 300,     # min seconds between any two sends
+            "watchtower_realert_hours": 0,           # re-page a still-standing finding after N h (0 = once)
             # Browser terminal (interactive shell over the web UI). OFF by
             # default — it exposes a shell on the Pi (as the 'ragnar' user),
             # gated by login. Enable in Settings only if you want it.

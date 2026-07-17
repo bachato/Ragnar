@@ -331,3 +331,33 @@ class PushoverService:
             daemon=True,
         ).start()
         return True
+
+    def notify_watchtower(self, message, priority=1, sound="siren"):
+        """Send a unified-Watchtower alert (a standalone watcher — arp_guard,
+        ndpwatch, wifiwatch, certwatch, … — raised a high/critical finding).
+
+        Gated by pushover_enabled + watchtower_notify_enabled, with a cooldown
+        backstop so a burst of watcher alerts in one poll can't page repeatedly.
+        The caller (the Watchtower monitor loop) already dedupes per finding, so
+        this is the last line of defence against notification spam. Sent on a
+        daemon thread so the poll loop never blocks. Returns True if dispatched."""
+        if not self.is_enabled():
+            return False
+        if not self.shared_data.config.get("watchtower_notify_enabled", True):
+            return False
+        try:
+            cooldown = float(self.shared_data.config.get("watchtower_notify_cooldown_s", 300))
+        except (TypeError, ValueError):
+            cooldown = 300.0
+        now = time.time()
+        with self._lock:
+            last = getattr(self, "_watchtower_last_sent", 0.0)
+            if now - last < cooldown:
+                return False
+            self._watchtower_last_sent = now
+        threading.Thread(
+            target=self.send,
+            args=(message, "Ragnar — Watchtower", priority, sound),
+            daemon=True,
+        ).start()
+        return True
