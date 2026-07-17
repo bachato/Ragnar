@@ -83,6 +83,15 @@ shaded. Toggle between:
   centred on its operating channel and spanning its channel width, peak = RSSI.
   This is the view that makes channel overlap and crowding obvious at a glance.
 
+**WIDS pivot:** clicking a BSSID in a **WiFi Defense** detection (or a row of
+its AP table) lands here with that AP pre-selected and marked by a red dashed
+**⚠ WIDS** locator line + outline in the spectrum, a red *"Flagged by WiFi
+Defense"* banner above the graph, and a red **⚠ WIDS** badge on its AP-table
+row. The highlight persists across re-scans (auto-refresh keeps tracking the
+rogue's RSSI) until dismissed from the banner; if the flagged BSSID isn't heard
+in the current survey the analyzer re-scans once and the banner reports it as
+not heard.
+
 **On the device (1.44" LCD HAT):** the Bar view is also available head-less as
 the **SPECTRUM** card in on-screen Network Diagnostic mode — a per-channel
 occupancy graph for one band (height ∝ the strongest AP's signal, DFS/radar
