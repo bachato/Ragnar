@@ -4553,6 +4553,49 @@ function onWatchtowerToggled(cb) {
         });
 }
 
+// ---- Watchtower: Dashboard summary card -----------------------------------
+// Compact mirror of the Diagnostics pane: severity chips + the newest findings,
+// so an active attack is visible on the landing tab without digging.
+function renderDashWatchtower(d) {
+    const chipsEl = document.getElementById('dash-watchtower-chips');
+    const listEl = document.getElementById('dash-watchtower-list');
+    const srcEl = document.getElementById('dash-watchtower-sources');
+    if (!chipsEl || !listEl) return;
+    if (!d || d.success === false) return;
+    if (!d.enabled) {
+        chipsEl.innerHTML = '<span class="text-xs text-gray-500">Watchtower is off — enable it in Diagnostics to aggregate the watcher daemons here.</span>';
+        listEl.innerHTML = ''; if (srcEl) srcEl.textContent = '';
+        return;
+    }
+    const s = d.summary || {};
+    const bySev = s.by_severity || {};
+    const chips = ['critical', 'high', 'medium', 'low', 'info']
+        .filter(k => bySev[k]).map(k => _wtSevChip(k, bySev[k]));
+    chipsEl.innerHTML = chips.length ? chips.join(' ')
+        : '<span class="px-2.5 py-1 rounded border bg-green-950/40 border-green-900 text-green-400">✓ All clear — no watcher alerts</span>';
+    const alerts = (d.alerts || []).slice(0, 5);
+    listEl.innerHTML = alerts.map(a => {
+        const [cls] = _WT_SEV_STYLE[a.severity] || _WT_SEV_STYLE.info;
+        const t = a.ts ? new Date(a.ts * 1000).toLocaleString() : '';
+        return `<div class="rounded-lg border ${cls} px-3 py-2 text-sm">
+            <span class="text-xs uppercase tracking-wide opacity-80">${escapeHtml(a.label || a.source)}</span>
+            <span class="ml-1">${escapeHtml(a.title || '')}</span>
+            <span class="text-xs opacity-60 ml-1">· ${escapeHtml(t)}</span>
+        </div>`;
+    }).join('');
+    if (srcEl) {
+        const srcs = s.sources || [];
+        const on = srcs.filter(x => x.present).length;
+        srcEl.textContent = srcs.length
+            ? `${on}/${srcs.length} watchers logging: ` + srcs.map(x => (x.present ? '● ' : '○ ') + (x.label || x.name)).join('  ')
+            : '';
+    }
+}
+async function refreshDashWatchtower() {
+    try { renderDashWatchtower(await fetchAPI('/api/net/watchtower?limit=5&min_severity=medium')); }
+    catch (e) { /* offline — leave as-is */ }
+}
+
 // ---- ARP Poisoning card (on-demand) ---------------------------------------
 const _ARP_VERDICT_STYLE = {
     clean:      ['bg-green-950/40 border-green-900 text-green-400', '✓ No ARP spoofing detected'],
@@ -7754,6 +7797,8 @@ async function loadTabData(tabName) {
 
 async function loadDashboardData() {
     try {
+        // Watchtower alerts — fire-and-forget so the stats path never waits on it.
+        refreshDashWatchtower();
         // OPTIMIZATION: Show loading state with pulse animation
         const statsElements = [
             'target-count', 'target-total-count', 'target-inactive-count',

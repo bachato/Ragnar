@@ -37,21 +37,27 @@ surfaces as `medium` rather than being dropped.
 
 ## Enabling it
 
-Off by default. Turn it on in **Diagnostics → Watchtower** (the toggle), or:
+**On by default** — unlike the Network Integrity Monitor, Watchtower makes no
+outbound calls and captures nothing; it only reads log files the watchers already
+write, and is a no-op until a watcher is actually running. Toggle it in
+**Diagnostics → Watchtower**, or:
 
 ```json
-"watchtower_enabled": true
+"watchtower_enabled": false
 ```
 
-Once enabled, a background poller reads the delta from each watcher log every
-`watchtower_interval_s` seconds, updates the pane, and pages new findings at or
+A background poller reads the delta from each watcher log every
+`watchtower_interval_s` seconds, updates the panes, and pages new findings at or
 above `watchtower_notify_min_severity`.
+
+> **Config changes need a service restart** to take effect — the running process
+> holds the config and the routes in memory (`sudo systemctl restart ragnar`).
 
 ### Config keys
 
 | Key | Default | Meaning |
 |---|---|---|
-| `watchtower_enabled` | `false` | master switch for the aggregator + poller |
+| `watchtower_enabled` | `true` | master switch for the aggregator + poller |
 | `watchtower_interval_s` | `30` | poll cadence (min 5s) |
 | `watchtower_max_alerts` | `500` | size of the rolling in-memory/persisted ring |
 | `watchtower_notify_enabled` | `true` | send Pushover for new findings |
@@ -103,12 +109,18 @@ The Watchtower card shows a source line — `● ARP Guard  ○ Cert Watch …` 
 can see at a glance which watchers are actually logging where Watchtower can read
 them (`●` present, `○` no log found / not running).
 
-## The pane
+## The panes
 
-Diagnostics → **Watchtower** shows: severity-count chips, the newest-alert time,
-a per-source presence line, and a newest-first alert list (source · title ·
-codes · endpoints · time). A severity filter (`all` … `critical`) narrows both
-the list and what the API returns.
+**Dashboard** — a Watchtower card sits under the stats grid on the landing tab:
+severity chips (or a green *All clear*), the five newest findings, and a
+`3/7 watchers logging: ● ARP Guard ○ Cert Watch …` source line. It refreshes with
+the dashboard (on open, then every 20s), so an active attack is visible without
+digging.
+
+**Diagnostics → Watchtower** — the full pane: severity-count chips, newest-alert
+time, per-source presence, and a newest-first alert list (source · title · codes ·
+endpoints · time). A severity filter (`all` … `critical`) narrows both the list
+and what the API returns.
 
 API: `GET /api/net/watchtower?limit=100&min_severity=high` →
 `{success, enabled, summary, alerts[]}`.

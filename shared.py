@@ -736,8 +736,9 @@ class SharedData:
             # Watchtower: unified alert pane for the standalone watcher daemons
             # (arp_guard/ndpwatch/wifiwatch/certwatch/snmpwatch/isiswatch/igmpwatch).
             # Tails their JSON-lines logs into one deduped feed + Pushover path.
-            # OFF by default; read-only over the logs. Enable in Diagnostics.
-            "watchtower_enabled": False,
+            # ON by default: it only reads log files the watchers already write
+            # (no capture, no outbound calls), and is a no-op until a watcher runs.
+            "watchtower_enabled": True,
             "watchtower_interval_s": 30,             # seconds between log polls (min 5)
             "watchtower_max_alerts": 500,            # rolling ring size (memory + persisted)
             "watchtower_notify_enabled": True,       # Pushover on new findings (when on)

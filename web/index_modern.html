@@ -734,6 +734,20 @@
                 </div>
             </div>
 
+            <!-- Watchtower: live security alerts from the standalone watcher daemons -->
+            <div id="dash-watchtower" class="glass rounded-xl p-6 mb-8">
+                <div class="flex items-center justify-between gap-4 mb-3">
+                    <div class="min-w-0">
+                        <h3 class="text-lg font-semibold">Watchtower</h3>
+                        <p class="text-xs text-gray-400">Live findings from the passive watcher daemons — ARP Guard · NDP (IPv6) · Wi-Fi · Cert · SNMP · IS-IS · IGMP</p>
+                    </div>
+                    <button onclick="showTab('diagnostics')" class="shrink-0 bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Open pane</button>
+                </div>
+                <div id="dash-watchtower-chips" class="flex flex-wrap items-center gap-2 text-sm"></div>
+                <div id="dash-watchtower-list" class="mt-3 space-y-2"></div>
+                <p id="dash-watchtower-sources" class="text-xs text-gray-500 mt-3"></p>
+            </div>
+
             <!-- Status Section -->
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
                 <!-- Current Status -->
