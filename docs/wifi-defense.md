@@ -118,6 +118,21 @@ You can also run it directly: `python3 wifi_defense.py dedicate --interface wlan
    re-scan on a loop as a live monitor — each capture starts only after the
    previous one finishes (no overlap). Hit **■ Stop** to end the loop.
 
+### Pivot to the Spectrum Analyzer
+
+Every BSSID in a detection card (evil twin / duplicate SSID, KARMA, the source
+MAC of a deauth attacker) and every row of the **Access Points seen** table is
+clickable — it jumps to **Network → WiFi Analyzer**, selects that AP and marks
+it in the spectrum with a red dashed **⚠ WIDS** locator (band filter is widened
+to *All* so it can't be hidden). A red *"Flagged by WiFi Defense"* banner above
+the spectrum shows what you're chasing; the highlight survives re-scans until
+you hit **✕ dismiss**. If the analyzer's last survey doesn't contain the BSSID
+it re-scans once, and the banner says so when the AP still isn't heard (rogue
+gone quiet, out of range of the survey radio, or beaconing intermittently).
+From there you get the analyzer's full toolkit on the rogue: RSSI history,
+channel + width, vendor OUI, and the **signal-radius rings** to walk it down
+physically.
+
 ---
 
 ## API & CLI
