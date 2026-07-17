@@ -12775,7 +12775,17 @@ async function performUpdate() {
         
     } catch (error) {
         console.error('Error performing update:', error);
-        addConsoleMessage('Update failed due to network error', 'error');
+        if (isLikelyNetworkError(error)) {
+            // The service may have restarted before the response reached us —
+            // verify the outcome instead of declaring failure.
+            addConsoleMessage('Connection dropped while updating — verifying whether the update completed...', 'info');
+            updateElement('update-info', 'Connection dropped. Verifying update...');
+            setTimeout(async () => {
+                await verifyServiceRestart();
+            }, 5000);
+            return;
+        }
+        addConsoleMessage(`Update failed: ${error.message}`, 'error');
         updateElement('update-btn-text', 'Update System');
         const updateBtn = document.getElementById('update-btn');
         updateBtn.disabled = false;
@@ -12831,6 +12841,17 @@ async function autoStashAndUpdate() {
         }
     } catch (error) {
         console.error('Auto update error:', error);
+        if (isLikelyNetworkError(error)) {
+            // The service may have restarted before the response reached us —
+            // verify the outcome instead of declaring failure.
+            addConsoleMessage('Connection dropped while updating — verifying whether the update completed...', 'info');
+            updateElement('update-info', 'Connection dropped. Verifying update...');
+            setButtonState(true, 'Verifying...');
+            setTimeout(async () => {
+                await verifyServiceRestart();
+            }, 5000);
+            return;
+        }
         addConsoleMessage(`Update failed: ${error.message}`, 'error');
         setButtonState(false, 'Update System');
         updateElement('update-info', 'Update failed. Fix issues and retry.');
@@ -16684,6 +16705,28 @@ function networkAwareFetch(endpoint, options = {}) {
     return fetch(resolvedEndpoint, options);
 }
 
+// Pull the server's own error message out of a failed response so the UI can
+// show the real reason instead of a bare status code.
+async function extractErrorDetail(response) {
+    try {
+        const body = await response.json();
+        if (body && typeof body.error === 'string' && body.error) {
+            return body.error;
+        }
+    } catch (parseError) {
+        // Non-JSON error body; fall through to the status code
+    }
+    return '';
+}
+
+// True when fetch itself failed (connection dropped/reset) as opposed to the
+// server answering with an error status. During updates this usually means
+// the service restarted before the response arrived — not a failure.
+function isLikelyNetworkError(error) {
+    return error instanceof TypeError ||
+        /failed to fetch|networkerror|load failed|network request failed/i.test(error?.message || '');
+}
+
 async function fetchAPI(endpoint, options = {}) {
     try {
         const response = await networkAwareFetch(endpoint, options);
@@ -16692,7 +16735,8 @@ async function fetchAPI(endpoint, options = {}) {
             throw new Error('Authentication required');
         }
         if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+            const detail = await extractErrorDetail(response);
+            throw new Error(detail || `HTTP error! status: ${response.status}`);
         }
         return await response.json();
     } catch (error) {
@@ -16715,7 +16759,8 @@ async function postAPI(endpoint, data) {
             throw new Error('Authentication required');
         }
         if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+            const detail = await extractErrorDetail(response);
+            throw new Error(detail || `HTTP error! status: ${response.status}`);
         }
         return await response.json();
     } catch (error) {
