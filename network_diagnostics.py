@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import ipaddress
 import os
+import sys
 import threading
 import time
 import socket
@@ -213,6 +214,56 @@ def do_whois(target):
     return {'success': True, 'output': (res['out'] or res['err']).strip(), 'error': None}
 
 
+def _probe_egress(iface, timeout=4.0):
+    """Can `iface` actually reach the internet? True / False / None (unknown).
+
+    Binds the probe socket to the *device* (SO_BINDTODEVICE) and TCP-connects to
+    a public endpoint, so the answer reflects that NIC and nothing else. This is
+    the only trustworthy signal we have:
+      - a default route only says a gateway is configured, not that it works;
+      - source-address binding proves nothing at all — a probe bound to docker0's
+        address reaches the internet fine, because the packet just leaves via the
+        default-route interface wearing that address.
+    Returns None when the bind is not permitted (needs CAP_NET_RAW), so callers
+    can proceed rather than block on a check they could not run."""
+    unknown = False
+    for dst in (('1.1.1.1', 443), ('8.8.8.8', 443)):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.settimeout(timeout)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode() + b'\0')
+            s.connect(dst)
+            return True
+        except PermissionError:
+            unknown = True
+        except OSError:
+            pass
+        finally:
+            s.close()
+    return None if unknown else False
+
+
+def _speedtest_client():
+    """Locate a speedtest client and learn how it can pin an interface.
+
+    Returns (kind, exe): kind 'ookla' (supports --interface, a real device bind)
+    or 'cli' (the python speedtest-cli, which only offers --source).
+
+    Do NOT infer the client from the binary name: on Debian/Raspberry Pi OS
+    /usr/bin/speedtest is usually just an entry-point alias for the python
+    speedtest-cli and rejects --interface outright. Ask --help instead."""
+    for name in ('speedtest', 'speedtest-cli'):
+        if not _have(name):
+            continue
+        h = _run([name, '--help'], timeout=10)
+        if '--interface' in ((h['out'] or '') + (h['err'] or '')):
+            return 'ookla', name
+    for name in ('speedtest-cli', 'speedtest'):
+        if _have(name):
+            return 'cli', name
+    return None, None
+
+
 def _speedtest_error(res, meta):
     """Turn a speedtest client failure into something actionable. 'Cannot
     retrieve speedtest configuration / urlopen error timed out' means it could
@@ -222,10 +273,10 @@ def _speedtest_error(res, meta):
     low = raw.lower()
     if 'retrieve speedtest configuration' in low or 'urlopen error' in low:
         if meta.get('bound'):
-            return (f"Could not reach speedtest.net from {meta.get('interface')} "
-                    f"({meta.get('source_ip')}). That interface likely has no route to "
-                    f"the internet — switch the selector to Auto, or pick the interface "
-                    f"carrying your internet connection. [{raw}]")
+            return (f"Could not reach speedtest.net with the test pinned to "
+                    f"{meta.get('interface')}, even though that interface can reach the "
+                    f"internet. speedtest.net may be blocked on that path, or the link "
+                    f"dropped mid-test — try Auto to compare. [{raw}]")
         return (f"Could not reach speedtest.net — no internet on this host, or "
                 f"speedtest.net is blocked/unreachable from here. [{raw}]")
     return raw
@@ -283,10 +334,15 @@ def do_speedtest(interface=None):
     python `speedtest-cli`; returns download/upload in Mbps.
 
     `interface` pins which local interface the test originates from; '' / None
-    auto-selects (a wired port with an address first — see _egress_iface), so a
-    multi-homed box tests the cable rather than whatever holds the default
-    route. speedtest-cli binds by source address (--source), the Ookla client by
-    interface name (--interface)."""
+    auto-selects (a wired port that can reach the internet first — see
+    _egress_iface), so a multi-homed box tests the cable rather than whatever
+    holds the default route.
+
+    Pinning binds the *device* (Ookla `--interface`, or SO_BINDTODEVICE via
+    speedtest_bind.py for the python client) — never speedtest-cli's `--source`,
+    which only sets a source address and does not force egress: on a box whose
+    WiFi and LAN face the same router, the packet still left via WiFi carrying
+    the LAN address and the router dropped it as spoofed."""
     if interface:
         # _valid_iface is only a name/injection guard — it does not check that
         # the interface exists, so verify membership too or a typo surfaces as a
@@ -304,50 +360,41 @@ def do_speedtest(interface=None):
             return {'success': False,
                     'error': f'{iface} has no IPv4 address — it cannot originate a '
                              f'speed test (a monitor/SPAN port has link but no address).'}
-    # Fail fast on a pin that cannot reach the internet: binding to it would just
-    # hang for the full timeout and surface as 'Cannot retrieve speedtest
-    # configuration', which tells the user nothing about the real cause.
-    if interface and iface and not _iface_has_default_route(iface):
-        return {'success': False,
-                'error': f'{iface} has an address but no default route — it cannot reach '
-                         f'the internet, so a speed test bound to it would time out. '
-                         f'Use Auto, or pick the interface that carries your internet '
-                         f'connection.'}
     # Only bind when deliberately leaving the kernel's normal path. If we landed
     # on the default-route interface anyway, binding adds nothing but risk — run
     # exactly as we did before the interface selector existed.
     bind = bool(iface and iface != _default_route_iface())
     meta = {'interface': iface, 'source_ip': source_ip if bind else None,
             'bound': bind}
+    # Ask the interface itself whether it can reach the internet, rather than
+    # inferring it from a default route. A wired port can hold a perfectly good
+    # default route to the same router as WiFi and still be the wrong thing to
+    # bind — and, conversely, we must never tell a user their interface "has no
+    # route to the internet" when it demonstrably does.
+    if bind:
+        reach = _probe_egress(iface)
+        if reach is False:
+            return {'success': False, **meta,
+                    'error': f'{iface} cannot reach the internet — verified by a direct '
+                             f'connection test bound to that interface. Use Auto, or pick '
+                             f'the interface that carries your internet connection.'}
     # Self-heal: if neither client is present, install speedtest-cli on demand.
     # A device updated from the UI may not have finished (or may have missed)
     # background tool provisioning, and the old behaviour was to just error out
     # telling the user to run the installer. Install it here so the button works.
     if not _have('speedtest-cli') and not _have('speedtest'):
         do_install_tool('speedtest-cli')
-    if _have('speedtest-cli'):
-        cmd = ['speedtest-cli', '--json']
-        if bind and source_ip:
-            cmd += ['--source', source_ip]
-        res = _run(cmd, timeout=120)
-        if res['rc'] == 0:
-            try:
-                d = json.loads(res['out'])
-                return {'success': True, **meta,
-                        'download_mbps': round(d.get('download', 0) / 1e6, 2),
-                        'upload_mbps': round(d.get('upload', 0) / 1e6, 2),
-                        'ping_ms': round(d.get('ping', 0), 2),
-                        'server': (d.get('server') or {}).get('sponsor'),
-                        'server_location': (d.get('server') or {}).get('name'),
-                        'isp': (d.get('client') or {}).get('isp')}
-            except ValueError:
-                pass
+
+    kind, exe = _speedtest_client()
+    if not kind:
         return {'success': False, **meta,
-                'error': _speedtest_error(res, meta)}
-    if _have('speedtest'):
-        cmd = ['speedtest', '--format=json', '--accept-license', '--accept-gdpr']
+                'error': 'speedtest is not installed. Click Install to add it.',
+                'missing_tool': 'speedtest-cli'}
+
+    if kind == 'ookla':
+        cmd = [exe, '--format=json', '--accept-license', '--accept-gdpr']
         if bind:
-            cmd += ['--interface', iface]
+            cmd += ['--interface', iface]      # a real device bind
         res = _run(cmd, timeout=120)
         if res['rc'] == 0:
             try:
@@ -365,9 +412,32 @@ def do_speedtest(interface=None):
                 pass
         return {'success': False, **meta,
                 'error': _speedtest_error(res, meta)}
-    return {'success': False, **meta,
-            'error': 'speedtest is not installed. Click Install to add it.',
-            'missing_tool': 'speedtest-cli'}
+
+    # python speedtest-cli. To pin an interface we must bind the *device*: its
+    # own --source only sets a source address, which does not force egress (the
+    # packet still leaves via the default-route NIC wearing the other NIC's IP,
+    # and gets dropped as spoofed). speedtest_bind.py patches the socket layer
+    # with SO_BINDTODEVICE and then runs the very same client.
+    if bind:
+        wrapper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'python', 'speedtest_bind.py')
+        cmd = [sys.executable or 'python3', wrapper, iface, '--json']
+    else:
+        cmd = [exe, '--json']
+    res = _run(cmd, timeout=120)
+    if res['rc'] == 0:
+        try:
+            d = json.loads(res['out'])
+            return {'success': True, **meta,
+                    'download_mbps': round(d.get('download', 0) / 1e6, 2),
+                    'upload_mbps': round(d.get('upload', 0) / 1e6, 2),
+                    'ping_ms': round(d.get('ping', 0), 2),
+                    'server': (d.get('server') or {}).get('sponsor'),
+                    'server_location': (d.get('server') or {}).get('name'),
+                    'isp': (d.get('client') or {}).get('isp')}
+        except ValueError:
+            pass
+    return {'success': False, **meta, 'error': _speedtest_error(res, meta)}
 
 
 # --------------------------------------------------------------------------
