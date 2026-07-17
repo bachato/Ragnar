@@ -1328,6 +1328,35 @@
                     </div>
                     <p class="text-xs text-gray-500 mt-2">"Check now" runs the fast core (DNS · ARP · DHCP) immediately; the extended scanners run on the background rotation once the monitor is enabled. Capture-based scanners listen on a link-up <strong>wired</strong> port by default (or the interface pinned above) — DNS and RA-Guard always check the host's actual traffic path.</p>
                 </div>
+                <!-- Watchtower: unified alert pane for the standalone passive watchers -->
+                <div class="glass rounded-xl p-4 sm:p-6 mb-4 sm:mb-6">
+                    <div class="flex items-center justify-between gap-4">
+                        <div class="min-w-0">
+                            <h3 class="text-lg font-semibold">Watchtower <span class="text-xs font-normal text-gray-500">— unified watcher alerts</span></h3>
+                            <p class="text-sm text-gray-400">One pane for the deep standalone watchers that each run as their own daemon — <strong>ARP&nbsp;Guard</strong>, <strong>NDP&nbsp;Watch</strong> (IPv6), <strong>Wi-Fi&nbsp;Watch</strong>, <strong>Cert&nbsp;Watch</strong>, <strong>SNMP</strong>, <strong>IS-IS</strong> and <strong>IGMP</strong>. Watchtower tails each one's JSON-lines log, normalizes them into a single feed, and pages new <strong>high/critical</strong> findings through one deduped Pushover path. Read-only over the logs — it captures nothing itself. Each watcher must be installed and running (its systemd unit) to appear here.</p>
+                        </div>
+                        <label class="toggle-switch relative inline-flex items-center cursor-pointer shrink-0">
+                            <input type="checkbox" id="watchtower-enabled" class="sr-only peer" onchange="onWatchtowerToggled(this)">
+                            <div class="w-11 h-6 bg-gray-700 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all"></div>
+                        </label>
+                    </div>
+                    <div id="watchtower-summary" class="mt-3 flex flex-wrap items-center gap-2 text-sm"></div>
+                    <div class="mt-3 flex flex-wrap items-center gap-3">
+                        <button onclick="watchtowerRefresh()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-1.5 rounded text-xs whitespace-nowrap">Refresh</button>
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400" title="Only show alerts at or above this severity">
+                            <span>show</span>
+                            <select id="watchtower-minsev" onchange="watchtowerRefresh()" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="">all</option>
+                                <option value="low">low+</option>
+                                <option value="medium">medium+</option>
+                                <option value="high" selected>high+</option>
+                                <option value="critical">critical</option>
+                            </select>
+                        </label>
+                        <span id="watchtower-sources" class="text-xs text-gray-500"></span>
+                    </div>
+                    <div id="watchtower-alerts" class="mt-3 space-y-2"></div>
+                </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                     <!-- Ping -->
                     <div class="glass rounded-xl p-4 sm:p-6">

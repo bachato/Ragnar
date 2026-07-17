@@ -14,6 +14,7 @@ import sys
 import json
 import csv
 import glob
+import collections
 import signal
 import logging
 import threading
@@ -1511,6 +1512,210 @@ def net_integrity_status():
     state['batch_size'] = shared_data.config.get('net_integrity_batch_size', 3)
     state['interface'] = shared_data.config.get('net_integrity_interface', '') or ''
     return jsonify({'success': True, **state})
+
+
+# ==========================================================================
+# Watchtower — unified alert pane for the standalone passive watchers.
+# The deep daemons (arp_guard, ndpwatch, wifiwatch, certwatch, snmpwatch,
+# isiswatch, igmpwatch) each write their own JSON-lines log; Watchtower tails
+# them all, normalizes into one shape, shows them in one pane, and pages the
+# high/critical ones through a single deduped Pushover path. Read-only over the
+# logs — it captures nothing. Opt-in via watchtower_enabled.
+# ==========================================================================
+
+_watchtower_lock = threading.Lock()
+_watchtower = None            # lazy watchtower.Watchtower instance
+_wt_seen = {}                 # pushover dedup: key -> {'rank', 'ts'}
+_wt_seen_loaded = False
+_wt_summary = {'enabled': False, 'ts': None, 'total': 0}
+
+
+def _wt_ring_path():
+    return os.path.join(shared_data.datadir, 'watchtower_alerts.json')
+
+
+def _wt_seen_path():
+    return os.path.join(shared_data.datadir, 'watchtower_seen.json')
+
+
+def _wt_get():
+    """Lazily build the aggregator, seeding its display ring from the persisted
+    file so the pane isn't blank right after a restart."""
+    global _watchtower
+    if _watchtower is not None:
+        return _watchtower
+    import watchtower as _wtmod
+    cfg = shared_data.config
+    dirs = cfg.get('watchtower_dirs') or None
+    try:
+        maxa = int(cfg.get('watchtower_max_alerts', 500))
+    except (TypeError, ValueError):
+        maxa = 500
+    wt = _wtmod.Watchtower(dirs=dirs, max_alerts=maxa, tail_only=True)
+    try:
+        with open(_wt_ring_path()) as f:
+            wt.load(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug(f"[watchtower] ring load failed: {exc}")
+    _watchtower = wt
+    return wt
+
+
+def _wt_load_seen():
+    global _wt_seen_loaded
+    if _wt_seen_loaded:
+        return
+    _wt_seen_loaded = True
+    try:
+        with open(_wt_seen_path()) as f:
+            data = json.load(f)
+        for k, v in (data.items() if isinstance(data, dict) else ()):
+            if isinstance(v, dict) and 'rank' in v:
+                _wt_seen[k] = {'rank': int(v.get('rank', 1)),
+                               'ts': float(v.get('ts', 0) or 0)}
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug(f"[watchtower] seen-memory load failed: {exc}")
+
+
+def _wt_save(wt):
+    """Persist the display ring + the pushover dedup memory (atomic)."""
+    try:
+        tmp = _wt_ring_path() + '.tmp'
+        # recent() is newest-first; persist oldest-first so load() re-appends in
+        # chronological order and the ring keeps its ordering across restarts.
+        ring = [dict(a, raw=None)
+                for a in reversed(wt.recent(limit=wt.max_alerts))]
+        with open(tmp, 'w') as f:
+            json.dump(ring, f)
+        os.replace(tmp, _wt_ring_path())
+    except Exception as exc:
+        logger.debug(f"[watchtower] ring save failed: {exc}")
+    try:
+        tmp = _wt_seen_path() + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(_wt_seen, f)
+        os.replace(tmp, _wt_seen_path())
+    except Exception as exc:
+        logger.debug(f"[watchtower] seen save failed: {exc}")
+
+
+def _watchtower_check_once():
+    """One poll cycle: read the delta from every watcher log, page the new
+    high/critical findings (deduped + merged), and refresh the summary."""
+    import watchtower as _wtmod
+    cfg = shared_data.config
+    wt = _wt_get()
+    new = wt.poll()
+
+    floor = _wtmod.SEV_RANK.get(cfg.get('watchtower_notify_min_severity', 'high'), 3)
+    try:
+        realert_s = max(0.0, float(cfg.get('watchtower_realert_hours', 0))) * 3600
+    except (TypeError, ValueError):
+        realert_s = 0.0
+
+    notifiable = []
+    with _watchtower_lock:
+        _wt_load_seen()
+        for a in new:
+            if a['rank'] < floor:
+                continue
+            mem = _wt_seen.get(a['key'])
+            now = time.time()
+            if (mem is None or a['rank'] > mem['rank']
+                    or (realert_s and now - mem['ts'] >= realert_s)):
+                notifiable.append(a)
+                _wt_seen[a['key']] = {'rank': max(a['rank'],
+                                                  mem['rank'] if mem else 0),
+                                      'ts': now}
+        summ = wt.summary()
+        summ.update({'enabled': True, 'ts': datetime.now().isoformat(),
+                     'new_this_cycle': len(new)})
+        global _wt_summary
+        _wt_summary = summ
+        _wt_save(wt)
+
+    if notifiable:
+        worst = max(notifiable, key=lambda a: a['rank'])
+        by_src = collections.Counter(a['label'] for a in notifiable)
+        bits = ', '.join(f'{n}×{c}' if c > 1 else n for n, c in by_src.items())
+        msg = (f"Watchtower: {len(notifiable)} new {worst['severity']} "
+               f"finding(s) [{bits}]. {worst['label']}: {worst['title']}")
+        try:
+            from pushover_service import PushoverService
+            _po = getattr(shared_data, '_pushover_service', None)
+            if _po is None:
+                _po = PushoverService(shared_data)
+                shared_data._pushover_service = _po
+            _po.notify_watchtower(msg, priority=(1 if worst['rank'] >= 4 else 0))
+        except Exception as exc:
+            logger.debug(f"[watchtower] pushover alert skipped: {exc}")
+        logger.warning(f"[watchtower] {msg}")
+    return _wt_summary
+
+
+def watchtower_monitor_loop():
+    """Background poller for the unified watcher-alert pane. No-op while
+    disabled; when enabled, polls every watchtower_interval_s seconds."""
+    import time as _time
+    _time.sleep(25)   # let the app + watchers settle first
+    while not getattr(shared_data, 'webapp_should_exit', False):
+        if not shared_data.config.get('watchtower_enabled', False):
+            with _watchtower_lock:
+                _wt_summary['enabled'] = False
+            _time.sleep(15)
+            continue
+        try:
+            _watchtower_check_once()
+        except Exception as exc:
+            logger.debug(f"[watchtower] monitor cycle failed: {exc}")
+        try:
+            interval = max(5, int(shared_data.config.get('watchtower_interval_s', 30)))
+        except (TypeError, ValueError):
+            interval = 30
+        for _ in range(interval // 5):
+            if getattr(shared_data, 'webapp_should_exit', False):
+                return
+            if not shared_data.config.get('watchtower_enabled', False):
+                break
+            _time.sleep(5)
+
+
+@app.route('/api/net/watchtower', methods=['GET'])
+def watchtower_status():
+    """Unified alert feed from the standalone watchers, for the Watchtower pane.
+    Reflects config even before the monitor has run. `?limit=` and
+    `?min_severity=` narrow the returned alert list."""
+    cfg = shared_data.config
+    try:
+        limit = max(1, min(500, int(request.args.get('limit', 100))))
+    except (TypeError, ValueError):
+        limit = 100
+    min_sev = request.args.get('min_severity') or None
+    alerts = []
+    try:
+        with _watchtower_lock:
+            wt = _wt_get()
+            alerts = [dict(a, raw=None) for a in wt.recent(limit=limit,
+                                                           min_severity=min_sev)]
+            summary = dict(_wt_summary)
+            if 'sources' not in summary:
+                summary = wt.summary()
+    except Exception as exc:
+        logger.debug(f"[watchtower] status failed: {exc}")
+        summary = {}
+    return jsonify({
+        'success': True,
+        'enabled': bool(cfg.get('watchtower_enabled', False)),
+        'interval_s': cfg.get('watchtower_interval_s', 30),
+        'notify_enabled': bool(cfg.get('watchtower_notify_enabled', True)),
+        'notify_min_severity': cfg.get('watchtower_notify_min_severity', 'high'),
+        'summary': summary,
+        'alerts': alerts,
+    })
 
 
 @app.route('/api/rusense/geofence', methods=['GET'])
@@ -20258,6 +20463,7 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         socketio.start_background_task(background_health_monitor)
         socketio.start_background_task(_rusense_notify_loop)
         socketio.start_background_task(net_integrity_monitor_loop)
+        socketio.start_background_task(watchtower_monitor_loop)
 
         logger.info("✅ All background threads started successfully")
 

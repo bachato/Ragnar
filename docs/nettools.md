@@ -33,6 +33,7 @@ It is split into three sub-tabs: **Diagnostics**, **Switch & L2/L3**, and
 | [DHCP Guardian](#dhcp-guardian) | Switch & L2/L3 | `GET /api/net/dhcp-guardian`, `POST /api/net/dhcp-baseline` |
 | [DHCP Snooping (inline)](#dhcp-snooping-inline) | Switch & L2/L3 | `GET /api/net/dhcp-snoop` + `/dhcp-snoop/status`, `/config`, `/setup` |
 | [Network Integrity Monitor](#-network-integrity-monitor) | Diagnostics | `GET /api/net/integrity` + config |
+| [Watchtower (unified watcher alerts)](watchtower.md) | Diagnostics | `GET /api/net/watchtower` + config |
 | [Path MTU / Black-hole](#path-mtu--black-hole) | Diagnostics | `POST /api/net/pmtu` |
 | [Captive Portal Check](#captive-portal-check) | Diagnostics | `GET /api/net/captive-portal` |
 | [LAN Throughput (iperf3)](#lan-throughput-iperf3) | Diagnostics | `POST /api/net/iperf3`, `/iperf3-server` |

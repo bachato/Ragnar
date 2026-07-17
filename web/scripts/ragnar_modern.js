@@ -1243,6 +1243,7 @@ function showNetworkSubtab(name) {
         populateMtrSources();
         syncNetDiagDisplayFromServer();
         syncNetIntegrityFromServer();
+        syncWatchtowerFromServer();
         _macWatchFillIfaces();
         _ntpFillIfaces();
         _snmpFillIfaces();
@@ -4462,6 +4463,94 @@ async function netIntegrityTrustGateway() {
     } catch (e) {
         addConsoleMessage('Failed to reset gateway baseline: ' + e.message, 'error');
     }
+}
+
+// ---- Watchtower: unified pane for the standalone watchers ------------------
+const _WT_SEV_STYLE = {
+    critical: ['bg-red-950/60 border-red-800 text-red-300', '🛑'],
+    high:     ['bg-orange-950/50 border-orange-800 text-orange-300', '⚠'],
+    medium:   ['bg-amber-950/50 border-amber-800 text-amber-300', '⚠'],
+    low:      ['bg-slate-800 border-slate-700 text-slate-300', 'ℹ'],
+    info:     ['bg-slate-800 border-slate-700 text-slate-400', 'ℹ'],
+};
+function _wtSevChip(sev, n) {
+    const [cls, icon] = _WT_SEV_STYLE[sev] || _WT_SEV_STYLE.info;
+    return `<span class="px-2.5 py-1 rounded border ${cls}">${icon} ${escapeHtml(sev)}: ${n}</span>`;
+}
+function renderWatchtower(d) {
+    const sumEl = document.getElementById('watchtower-summary');
+    const srcEl = document.getElementById('watchtower-sources');
+    const listEl = document.getElementById('watchtower-alerts');
+    if (!sumEl || !listEl) return;
+    if (!d || d.success === false) { sumEl.innerHTML = ''; listEl.innerHTML = ''; return; }
+    if (!d.enabled) {
+        sumEl.innerHTML = '<span class="text-xs text-gray-500">Watchtower is off — enable it to aggregate the standalone watchers into this pane.</span>';
+        if (srcEl) srcEl.textContent = '';
+        listEl.innerHTML = '';
+        return;
+    }
+    const s = d.summary || {};
+    const bySev = s.by_severity || {};
+    const chips = ['critical', 'high', 'medium', 'low', 'info']
+        .filter(k => bySev[k]).map(k => _wtSevChip(k, bySev[k]));
+    const when = s.newest_ts ? new Date(s.newest_ts * 1000).toLocaleString() : '—';
+    sumEl.innerHTML = (chips.length ? chips.join(' ') : '<span class="text-xs text-green-400">✓ No alerts from any watcher</span>')
+        + `<span class="text-xs text-gray-500 w-full mt-1">${s.total || 0} alert(s) held · newest: ${escapeHtml(when)}</span>`;
+    // Source presence line: which watchers are actually logging.
+    if (srcEl) {
+        const srcs = (s.sources || []);
+        if (srcs.length) {
+            srcEl.innerHTML = srcs.map(x =>
+                `<span title="${x.present ? 'logging to ' + escapeHtml(x.path || '') : 'no log found — is the watcher running?'}" class="${x.present ? 'text-gray-400' : 'text-gray-600'}">${x.present ? '●' : '○'} ${escapeHtml(x.label || x.name)}</span>`
+            ).join(' &nbsp; ');
+        } else { srcEl.textContent = ''; }
+    }
+    // Alert list, newest-first.
+    const alerts = d.alerts || [];
+    if (!alerts.length) {
+        listEl.innerHTML = '<p class="text-xs text-gray-500">No alerts at this severity. Findings appear here as the running watchers emit them.</p>';
+        return;
+    }
+    listEl.innerHTML = alerts.map(a => {
+        const [cls] = _WT_SEV_STYLE[a.severity] || _WT_SEV_STYLE.info;
+        const t = a.ts ? new Date(a.ts * 1000).toLocaleString() : '';
+        const codes = (a.codes || []).join(', ');
+        const ep = [a.src, a.target].filter(Boolean).map(escapeHtml).join(' → ');
+        return `<div class="rounded-lg border ${cls} px-3 py-2">
+            <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                    <span class="text-xs uppercase tracking-wide opacity-80">${escapeHtml(a.label || a.source)}</span>
+                    <span class="text-sm ml-1">${escapeHtml(a.title || '')}</span>
+                </div>
+                <span class="text-[10px] uppercase font-semibold shrink-0">${escapeHtml(a.severity)}</span>
+            </div>
+            <div class="text-xs opacity-70 mt-0.5">${codes ? escapeHtml(codes) + ' · ' : ''}${ep ? ep + ' · ' : ''}${escapeHtml(t)}</div>
+        </div>`;
+    }).join('');
+}
+async function watchtowerRefresh() {
+    const sev = (document.getElementById('watchtower-minsev') || {}).value || '';
+    const q = '/api/net/watchtower?limit=100' + (sev ? '&min_severity=' + encodeURIComponent(sev) : '');
+    try { renderWatchtower(await fetchAPI(q)); } catch (e) { /* offline — leave as-is */ }
+}
+async function syncWatchtowerFromServer() {
+    const cb = document.getElementById('watchtower-enabled');
+    try {
+        const d = await fetchAPI('/api/net/watchtower?limit=100&min_severity=high');
+        if (cb) cb.checked = !!d.enabled;
+        renderWatchtower(d);
+    } catch (e) { /* offline */ }
+}
+function onWatchtowerToggled(cb) {
+    postAPI('/api/config', { watchtower_enabled: cb.checked })
+        .then(() => {
+            addConsoleMessage('Watchtower unified alerts ' + (cb.checked ? 'ON' : 'OFF'), 'info');
+            if (cb.checked) setTimeout(watchtowerRefresh, 300); else renderWatchtower({ success: true, enabled: false });
+        })
+        .catch(err => {
+            addConsoleMessage('Failed to toggle Watchtower: ' + err.message, 'error');
+            cb.checked = !cb.checked;
+        });
 }
 
 // ---- ARP Poisoning card (on-demand) ---------------------------------------
