@@ -213,15 +213,50 @@ def do_whois(target):
     return {'success': True, 'output': (res['out'] or res['err']).strip(), 'error': None}
 
 
+def _speedtest_error(res, meta):
+    """Turn a speedtest client failure into something actionable. 'Cannot
+    retrieve speedtest configuration / urlopen error timed out' means it could
+    not reach speedtest.net at all — when we bound the socket to an interface
+    that is the prime suspect, otherwise it is plain no-internet/blocked."""
+    raw = (res['err'] or res['out'] or 'speedtest failed').strip()
+    low = raw.lower()
+    if 'retrieve speedtest configuration' in low or 'urlopen error' in low:
+        if meta.get('bound'):
+            return (f"Could not reach speedtest.net from {meta.get('interface')} "
+                    f"({meta.get('source_ip')}). That interface likely has no route to "
+                    f"the internet — switch the selector to Auto, or pick the interface "
+                    f"carrying your internet connection. [{raw}]")
+        return (f"Could not reach speedtest.net — no internet on this host, or "
+                f"speedtest.net is blocked/unreachable from here. [{raw}]")
+    return raw
+
+
+def _iface_has_default_route(iface):
+    """True if this interface has a default route (a gateway) of its own.
+
+    The only trustworthy 'can it reach the internet' signal we can get without
+    sending traffic. NOT `ip route get <ip> oif <iface>`: forcing oif makes the
+    kernel synthesize an answer for an interface that has no route at all (it
+    will happily report a route out of an address-less eth0, borrowing another
+    interface's src), so that check silently passes for exactly the interfaces
+    we need to exclude."""
+    res = _run(['ip', 'route', 'show', 'default', 'dev', iface], timeout=5)
+    return res['rc'] == 0 and bool(res['out'].strip())
+
+
 def _egress_iface(preferred=None):
     """Best interface to originate an *egress* test (speedtest) from: the
-    caller's pin, else a wired port that actually carries an IPv4 address, else
+    caller's pin, else a wired port that can actually reach the internet, else
     the default-route interface.
 
     Deliberately NOT _capture_iface(): that one prefers any wired port with
-    carrier, which for the sensor deployment is exactly the SPAN/monitor leg
-    with no address and no gateway — fine to sniff, useless to originate from.
-    Requiring an IPv4 keeps 'wired by default' while skipping such a leg."""
+    carrier, which for the sensor deployment is exactly the SPAN/monitor leg —
+    fine to sniff, useless to originate from. An address alone isn't enough
+    either: a Ragnar plugged into a switch gets a DHCP lease on that segment but
+    reaches the internet over WiFi, so a wired port only qualifies as egress if
+    it has a default route. Binding to one that doesn't is what produces
+    speedtest-cli's 'Cannot retrieve speedtest configuration / urlopen error
+    timed out'."""
     if _valid_iface(preferred or ''):
         return preferred
     dflt = _default_route_iface()
@@ -236,7 +271,7 @@ def _egress_iface(preferred=None):
         except OSError:      # admin-down or vanished — not a candidate
             continue
         v4, _ = _iface_addrs(name)
-        if v4:
+        if v4 and _iface_has_default_route(name):
             wired.append(name)
     if wired:
         return dflt if dflt in wired else sorted(wired)[0]
@@ -269,7 +304,21 @@ def do_speedtest(interface=None):
             return {'success': False,
                     'error': f'{iface} has no IPv4 address — it cannot originate a '
                              f'speed test (a monitor/SPAN port has link but no address).'}
-    meta = {'interface': iface, 'source_ip': source_ip}
+    # Fail fast on a pin that cannot reach the internet: binding to it would just
+    # hang for the full timeout and surface as 'Cannot retrieve speedtest
+    # configuration', which tells the user nothing about the real cause.
+    if interface and iface and not _iface_has_default_route(iface):
+        return {'success': False,
+                'error': f'{iface} has an address but no default route — it cannot reach '
+                         f'the internet, so a speed test bound to it would time out. '
+                         f'Use Auto, or pick the interface that carries your internet '
+                         f'connection.'}
+    # Only bind when deliberately leaving the kernel's normal path. If we landed
+    # on the default-route interface anyway, binding adds nothing but risk — run
+    # exactly as we did before the interface selector existed.
+    bind = bool(iface and iface != _default_route_iface())
+    meta = {'interface': iface, 'source_ip': source_ip if bind else None,
+            'bound': bind}
     # Self-heal: if neither client is present, install speedtest-cli on demand.
     # A device updated from the UI may not have finished (or may have missed)
     # background tool provisioning, and the old behaviour was to just error out
@@ -278,7 +327,7 @@ def do_speedtest(interface=None):
         do_install_tool('speedtest-cli')
     if _have('speedtest-cli'):
         cmd = ['speedtest-cli', '--json']
-        if source_ip:
+        if bind and source_ip:
             cmd += ['--source', source_ip]
         res = _run(cmd, timeout=120)
         if res['rc'] == 0:
@@ -294,10 +343,10 @@ def do_speedtest(interface=None):
             except ValueError:
                 pass
         return {'success': False, **meta,
-                'error': res['err'] or res['out'] or 'speedtest failed'}
+                'error': _speedtest_error(res, meta)}
     if _have('speedtest'):
         cmd = ['speedtest', '--format=json', '--accept-license', '--accept-gdpr']
-        if iface:
+        if bind:
             cmd += ['--interface', iface]
         res = _run(cmd, timeout=120)
         if res['rc'] == 0:
@@ -315,7 +364,7 @@ def do_speedtest(interface=None):
             except ValueError:
                 pass
         return {'success': False, **meta,
-                'error': res['err'] or res['out'] or 'speedtest failed'}
+                'error': _speedtest_error(res, meta)}
     return {'success': False, **meta,
             'error': 'speedtest is not installed. Click Install to add it.',
             'missing_tool': 'speedtest-cli'}
