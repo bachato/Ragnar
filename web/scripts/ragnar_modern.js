@@ -1139,6 +1139,7 @@ function showTab(tabName) {
     if (tabName === 'networks') { showTab('network'); showNetworkSubtab('archive'); return; }
     if (tabName === 'network-map') { showTab('network'); showNetworkSubtab('map'); return; }
     if (tabName === 'credentials') { showTab('discovered'); showDiscoveredSubtab('credentials'); return; }
+    if (tabName === 'diagnostics') { showTab('network'); showNetworkSubtab('diagnostics'); return; }
 
     currentTab = tabName;
 
