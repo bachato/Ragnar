@@ -2921,7 +2921,7 @@ function _wifidefUpdateRunUI() {
 // Must match wifi_defense.py `_BUILD`. If the running service reports something
 // else, the webapp is executing an OLD wifi_defense module (service not restarted
 // after a git pull) — the #1 cause of "the fix didn't work in the web UI".
-const WIFIDEF_BUILD = '20260713-dedicated';
+const WIFIDEF_BUILD = '20260718-airtime-ssid';
 
 function _wifidefFillIfaces() {
     fetch('/api/wifidef/interfaces').then(r => r.json()).then(d => {
@@ -3149,12 +3149,13 @@ function wifidefRenderAirtime(d) {
     }).join('') || '<span class="text-green-400 text-xs">✓ No link-quality issues in this capture.</span>';
     const tb = document.getElementById('wifidef-at-tbody');
     const aps = d.aps || [];
-    if (!aps.length) { tb.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-gray-500">No frames captured (wrong channel? adapter idle?).</td></tr>'; }
+    if (!aps.length) { tb.innerHTML = '<tr><td colspan="7" class="py-4 text-center text-gray-500">No frames captured (wrong channel? adapter idle?).</td></tr>'; }
     else tb.innerHTML = aps.map(a => {
         const retryCol = a.retry_pct >= 30 ? 'text-red-400' : a.retry_pct >= 15 ? 'text-amber-400' : 'text-gray-300';
         const airCol = a.airtime_pct >= 50 ? 'text-orange-400' : 'text-gray-300';
         const rate = a.rate_med != null ? `${a.rate_min}/${a.rate_med}/${a.rate_max}` : '—';
-        return `<tr class="border-b border-slate-800/50">
+        return `<tr class="border-b border-slate-800/50 cursor-pointer hover:bg-slate-800/40" title="Open in Spectrum Analyzer" onclick="wifiPivotFromDefense('${a.bssid}','${encodeURIComponent(a.ssid || '').replace(/'/g, '%27')}')">
+            <td class="py-1 pr-2">${a.ssid ? _esc(a.ssid) : '<span class="text-gray-600">—</span>'}</td>
             <td class="py-1 pr-2 font-mono text-[11px]">${a.bssid}</td>
             <td class="py-1 pr-2">${a.frames} <span class="text-gray-600 text-[10px]">(${a.data_frames} data)</span></td>
             <td class="py-1 pr-2 ${retryCol}">${a.retry_pct}%</td>
@@ -3213,7 +3214,7 @@ function wifidefRenderIsolation(d) {
     const bss = d.bss || [];
     if (!bss.length) {
         tb.innerHTML = '<tr><td colspan="7" class="py-4 text-center text-gray-500">No data frames captured — wrong channel, or the air is idle.</td></tr>';
-    } else tb.innerHTML = bss.map(b => `<tr class="border-b border-slate-800/50">
+    } else tb.innerHTML = bss.map(b => `<tr class="border-b border-slate-800/50 cursor-pointer hover:bg-slate-800/40" title="Open in Spectrum Analyzer" onclick="wifiPivotFromDefense('${b.bssid}','${encodeURIComponent(b.ssid || '').replace(/'/g, '%27')}')">
             <td class="py-1 pr-2">${b.ssid ? _esc(b.ssid) : '<span class="text-gray-600">—</span>'}</td>
             <td class="py-1 pr-2 font-mono text-[11px]">${b.bssid}</td>
             <td class="py-1 pr-2">${b.clients}</td>

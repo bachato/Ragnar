@@ -49,7 +49,7 @@ _STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # the web UI (WIFIDEF_BUILD in ragnar_modern.js). The UI compares them and warns
 # if the running (long-lived) webapp still has an OLD wifi_defense module loaded,
 # i.e. the service wasn't restarted after a git pull. Kills stale-service guesswork.
-_BUILD = "20260713-dedicated"
+_BUILD = "20260718-airtime-ssid"
 
 # Detection thresholds (per capture window)
 _DEAUTH_FLOOD_MIN = 15      # deauth+disassoc frames => flood
@@ -650,7 +650,7 @@ def _frame_rate_mbps(rt):
 
 def _airtime_event(pkt):
     """Normalize ANY 802.11 frame for airtime/retry/roaming stats (or None)."""
-    from scapy.all import Dot11
+    from scapy.all import Dot11, Dot11Elt
     if not pkt.haslayer(Dot11):
         return None
     d = pkt.getlayer(Dot11)
@@ -664,6 +664,18 @@ def _airtime_event(pkt):
         "bytes": len(bytes(d)),
         "rate_mbps": None, "rssi": None,
     }
+    # Beacons / probe responses name the BSS — lets the report show an SSID
+    # column instead of bare BSSIDs.
+    if d.type == 0 and d.subtype in (5, 8):
+        el = pkt.getlayer(Dot11Elt)
+        while el is not None and isinstance(el, Dot11Elt):
+            if el.ID == 0:
+                try:
+                    ev["ssid"] = el.info.decode(errors="replace") or None
+                except Exception:
+                    pass
+                break
+            el = el.payload.getlayer(Dot11Elt)
     try:
         from scapy.all import RadioTap
         if pkt.haslayer(RadioTap):
@@ -696,10 +708,12 @@ def analyze_airtime(events, seconds=None):
         b = e.get("bssid")
         # Airtime/retry keyed on the AP (BSSID) for data + mgmt frames.
         if b:
-            ap = aps.setdefault(b, {"bssid": b, "frames": 0, "retries": 0,
-                                    "airtime_us": 0.0, "rates": [], "rssi": None,
-                                    "data_frames": 0})
+            ap = aps.setdefault(b, {"bssid": b, "ssid": None, "frames": 0,
+                                    "retries": 0, "airtime_us": 0.0, "rates": [],
+                                    "rssi": None, "data_frames": 0})
             ap["frames"] += 1
+            if e.get("ssid"):
+                ap["ssid"] = e["ssid"]
             if e.get("retry"):
                 ap["retries"] += 1
             if e["type"] == 2:               # data
