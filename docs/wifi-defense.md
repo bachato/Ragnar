@@ -271,4 +271,10 @@ For a continuous, daemon-shaped monitor beyond the capture-window WIDS above —
 raw-byte 802.11 parsers, a warmup census, per-scope refractory alerting,
 JSON-lines output, pcap `--replay`, an ambient-calibration tool, and a hardened
 systemd unit — see **[wifiwatch](wifiwatch.md)** (`python3 python/wifiwatch.py`). It
-shares the LA-ratio beacon-flood and deauth scope/PMF logic documented above.
+shares the LA-ratio beacon-flood and deauth scope/PMF logic documented above,
+and adds the **WPA client / handshake layer** that this capture-window WIDS does
+not cover: **PMKID harvesting** (a clientless offline-crack handle on the air),
+**forced 4-way-handshake capture** (deauth-then-reconnect), **WPA3→WPA2
+downgrade** (transition-mode exposure and a live SAE-strip evil twin), and
+**PNL leakage** (your own devices broadcasting their saved-network lists — the
+exact input a KARMA rig needs).
