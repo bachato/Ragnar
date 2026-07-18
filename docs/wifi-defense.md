@@ -121,7 +121,8 @@ You can also run it directly: `python3 wifi_defense.py dedicate --interface wlan
 ### Pivot to the Spectrum Analyzer
 
 Every BSSID in a detection card (evil twin / duplicate SSID, KARMA, the source
-MAC of a deauth attacker) and every row of the **Access Points seen** table is
+MAC of a deauth attacker) and every row of the **Access Points seen**,
+**Airtime & link quality** and **Client isolation observer** tables is
 clickable — it jumps to **Network → WiFi Analyzer**, selects that AP and marks
 it in the spectrum with a red dashed **⚠ WIDS** locator (band filter is widened
 to *All* so it can't be hidden). A red *"Flagged by WiFi Defense"* banner above
@@ -154,11 +155,13 @@ Detection-only; the only state written is the trusted-AP baseline.
 
 A separate passive diagnostic (the "why is it slow" view). Capture all 802.11
 frames — ideally on a **fixed channel** (airtime % is only meaningful when not
-hopping) — and get, per AP: **airtime %** (estimated on-air time / capture time),
-**retry rate** (retransmit flag), the **PHY-rate spread** (min/median/max Mbps),
-plus **roaming churn** (clients re-associating/authing repeatedly). Findings flag
-high retry (≥30%), airtime hogs (≥50%) and unstable roaming. Route
-`GET /api/wifidef/airtime`; analysis is a pure function covered by selftest.
+hopping) — and get, per AP: the **SSID** (named from beacons/probe responses
+heard in the capture; a BSSID that only sent data frames shows —), **airtime %**
+(estimated on-air time / capture time), **retry rate** (retransmit flag), the
+**PHY-rate spread** (min/median/max Mbps), plus **roaming churn** (clients
+re-associating/authing repeatedly). Findings flag high retry (≥30%), airtime
+hogs (≥50%) and unstable roaming. Route `GET /api/wifidef/airtime`; analysis is
+a pure function covered by selftest.
 
 ## Client isolation observer
 

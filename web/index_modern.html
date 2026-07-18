@@ -2398,7 +2398,7 @@
             <div class="glass rounded-xl p-4 mt-5">
                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
                     <div>
-                        <h3 class="font-semibold text-sm">Airtime &amp; link quality</h3>
+                        <h3 class="font-semibold text-sm">Airtime &amp; link quality <span class="text-[11px] text-gray-500 font-normal">— click a row to inspect it in the Spectrum Analyzer</span></h3>
                         <p class="text-[11px] text-gray-500 mt-0.5 max-w-2xl">Passive per-AP <strong>airtime %</strong>, <strong>retry rate</strong> and <strong>PHY-rate</strong> spread, plus roaming churn — the "why is it slow" view. Best on a <strong>fixed channel</strong> (airtime % is only meaningful when not hopping).</p>
                     </div>
                     <div class="flex flex-wrap items-end gap-2">
@@ -2412,9 +2412,9 @@
                 <div class="overflow-x-auto">
                     <table class="w-full text-sm">
                         <thead><tr class="text-left text-gray-400 border-b border-slate-800">
-                            <th class="py-1 pr-2">BSSID</th><th class="py-1 pr-2">Frames</th><th class="py-1 pr-2">Retry %</th><th class="py-1 pr-2">Airtime %</th><th class="py-1 pr-2">Rate min/med/max</th><th class="py-1 pr-2">RSSI</th>
+                            <th class="py-1 pr-2">SSID</th><th class="py-1 pr-2">BSSID</th><th class="py-1 pr-2">Frames</th><th class="py-1 pr-2">Retry %</th><th class="py-1 pr-2">Airtime %</th><th class="py-1 pr-2">Rate min/med/max</th><th class="py-1 pr-2">RSSI</th>
                         </tr></thead>
-                        <tbody id="wifidef-at-tbody"><tr><td colspan="6" class="py-4 text-center text-gray-500">Press <span class="text-gray-300">Analyze airtime</span> (needs monitor mode).</td></tr></tbody>
+                        <tbody id="wifidef-at-tbody"><tr><td colspan="7" class="py-4 text-center text-gray-500">Press <span class="text-gray-300">Analyze airtime</span> (needs monitor mode).</td></tr></tbody>
                     </table>
                 </div>
                 <div id="wifidef-at-roam" class="mt-2 text-xs text-gray-400"></div>
@@ -2424,7 +2424,7 @@
             <div class="glass rounded-xl p-4 mt-5">
                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
                     <div>
-                        <h3 class="font-semibold text-sm">Client isolation observer</h3>
+                        <h3 class="font-semibold text-sm">Client isolation observer <span class="text-[11px] text-gray-500 font-normal">— click a row to inspect it in the Spectrum Analyzer</span></h3>
                         <p class="text-[11px] text-gray-500 mt-0.5 max-w-2xl">Audits whether an AP or mesh enforces <strong>client isolation</strong> — purely passively, from cleartext 802.11 headers (works on encrypted networks; payloads are never read). If the AP is seen <strong>relaying unicast frames between two of its own wireless clients</strong>, isolation is <strong>OFF</strong>; if clients address each other (or broadcast) but the AP relays nothing back, it's <strong>blocking</strong>. A multi-node SSID gets a mesh rollup incl. <strong>cross-node forwarding</strong>. Best on a <strong>fixed channel</strong> — catching a request <em>and</em> its relay needs to dwell on the BSS's channel.</p>
                     </div>
                     <div class="flex flex-wrap items-end gap-2">
@@ -6663,7 +6663,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260718-wids-pivot"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260718-wids-pivot2"></script>
 
 </body>
 </html>
