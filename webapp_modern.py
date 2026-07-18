@@ -5361,18 +5361,26 @@ def auth_regenerate_recovery():
 # STATIC FILE ROUTES
 # ============================================================================
 
+def _no_store(resp):
+    """Prevent browsers/PWAs from serving a stale cached copy (e.g. old title/manifest)."""
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
+
 @app.route('/')
 def index():
     """Serve the main dashboard page or captive portal for AP clients"""
     if is_ap_client_request():
         # KEY1 wardriving AP: land straight on the minimal wardriving page.
         if getattr(shared_data, 'wardrive_ap_active', False):
-            return send_from_directory('web', 'wardrive_mobile.html')
+            return _no_store(make_response(send_from_directory('web', 'wardrive_mobile.html')))
         # Serve captive portal for AP clients
-        return send_from_directory('web', 'captive_portal.html')
+        return _no_store(make_response(send_from_directory('web', 'captive_portal.html')))
     else:
         # Serve main dashboard for regular users
-        return send_from_directory('web', 'index_modern.html')
+        return _no_store(make_response(send_from_directory('web', 'index_modern.html')))
 
 
 # Minimal wardriving-only page (served by the KEY1 phone-access AP)
@@ -5421,7 +5429,12 @@ def captive_portal_detection():
 @app.route('/<path:filename>')
 def serve_static(filename):
     """Serve static files from web directory"""
-    return send_from_directory('web', filename)
+    resp = make_response(send_from_directory('web', filename))
+    # Keep the manifest and top-level HTML fresh so rebrands (title/PWA name)
+    # aren't pinned by a stale browser or installed-PWA cache.
+    if filename == 'manifest.json' or filename.endswith('.html'):
+        return _no_store(resp)
+    return resp
 
 
 @app.route('/api/system/headless')
