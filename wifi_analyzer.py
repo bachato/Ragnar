@@ -1784,6 +1784,25 @@ BSS aa:bb:cc:00:00:05(on wlan0)
 	HT operation:
 		 * primary channel: 6
 		 * secondary channel offset: no secondary
+BSS aa:bb:cc:00:00:06(on wlan0)
+	freq: 6115.0
+	signal: -58.00 dBm
+	SSID: HomeNet_7
+	RSN:	 * Version: 1
+		 * Authentication suites: SAE
+		 * Capabilities: MFP-required 16-PTKSA-RC (0x00cc)
+	HE capabilities:
+		HE RX MCS and NSS set <= 80 MHz
+			1 streams: MCS 0-11
+			2 streams: MCS 0-11
+	HE operation
+		 * primary channel: 33
+		 * channel width: 160
+	EHT capabilities:
+		EHT MAC Capabilities (0x0102):
+		EHT PHY Capabilities: (0x0c1b):
+	EHT Operation:
+		 * channel width: 3 (320 MHz)
 """
 
 
@@ -1794,7 +1813,7 @@ def selftest():
         results.append({"name": name, "pass": bool(cond), "detail": detail})
 
     aps = parse_scan(_SELFTEST_SCAN)
-    check("parses all 5 BSS", len(aps) == 5, f"got {len(aps)}")
+    check("parses all 6 BSS", len(aps) == 6, f"got {len(aps)}")
 
     by_id = {a["bssid"]: a for a in aps}
     a1 = by_id.get("aa:bb:cc:00:00:01", {})
@@ -1821,6 +1840,20 @@ def selftest():
 
     a5 = by_id.get("aa:bb:cc:00:00:05", {})
     check("hidden SSID flagged", a5.get("hidden") is True, str(a5.get("hidden")))
+
+    # Wi-Fi 7 (802.11be): EHT IEs must win over the HE IEs the same AP also
+    # advertises, and the 320 MHz width comes from the textual-width fallback
+    # (the EHT Operation IE has no dedicated parser yet).
+    a6 = by_id.get("aa:bb:cc:00:00:06", {})
+    check("Wi-Fi 7 label from EHT IEs (over HE)",
+          a6.get("standard") == "Wi-Fi 7" and a6.get("phy_mode") == "be",
+          f"{a6.get('standard')}/{a6.get('phy_mode')}")
+    check("6GHz ch33 detected for be AP",
+          a6.get("band") == "6" and a6.get("channel") == 33,
+          f"{a6.get('band')}/{a6.get('channel')}")
+    check("EHT 320MHz width", a6.get("width") == 320, str(a6.get("width")))
+    check("be PHY rate uses 320MHz multiplier",
+          (a6.get("max_phy_mbps") or 0) > 5000, str(a6.get("max_phy_mbps")))
 
     # Width/channel conversions
     check("freq_to_channel 2484 -> ch14", freq_to_channel(2484) == ("2.4", 14))

@@ -295,8 +295,9 @@ python3 wifi_analyzer.py selftest
 ```
 
 The self-test (`selftest`) drives the beacon parser (2.4/5/6 GHz, HT/VHT/HE
-widths, BSS-Load, security, generation, NSS, roaming, TPC), the
-congestion/interference analysis, SSID/device grouping, the AP-history change
-detector, the frequency↔channel conversions, the radius model and its
-two-point calibration, and the named-survey store — all against synthetic `iw`
-output, **54 checks, all offline**.
+widths, a Wi-Fi 7 / 802.11be AP with EHT IEs and 320 MHz width, BSS-Load,
+security, generation, NSS, roaming, TPC), the congestion/interference
+analysis, SSID/device grouping, the AP-history change detector, the
+frequency↔channel conversions, the radius model and its two-point
+calibration, and the named-survey store — all against synthetic `iw`
+output, **91 checks, all offline**.
