@@ -927,9 +927,12 @@ what's wrong at Layer 2 — no configuration, just plug in and scan:
 - **Duplicate IP** — the same IP claimed by different MACs (conflicting ARP).
 
 Findings are ranked (warn / info / ok). This is the one-tap "why is this
-segment misbehaving" check that normally needs a laptop and Wireshark.
+segment misbehaving" check that normally needs a laptop and Wireshark. An
+**interface selector** (Auto / WiFi / LAN) targets the capture at a chosen
+segment — Auto prefers a link-up wired port, falling back to the default-route
+interface.
 
-- Endpoint: `POST /api/net/l2-health` `{interface, seconds}` · binary: `tcpdump`
+- Endpoint: `POST /api/net/l2-health` `{interface?, seconds}` · binary: `tcpdump`
 
 ### IGMP Watch
 A **passive** IGMP-snooping security scanner for the IPv4 multicast control
@@ -1840,9 +1843,11 @@ Notes and safety:
 - Physical Ethernet only (`eth*`/`en*`) — locating a switch port only works on a
   wired link. Both methods require the port's link to be up (a cable in the
   switch); a dead/unplugged port can't blink.
+- The **interface selector** defaults to **Auto (wired)**, which picks the
+  link-up Ethernet port; with no wired link it errors rather than guessing.
 - Runs in the background so it completes even if your session blips.
 
-- Endpoint: `POST /api/net/locate-port` `{interface, count, method, force}` ·
+- Endpoint: `POST /api/net/locate-port` `{interface?, count, method, force}` ·
   `flap` uses `ip link`, `burst` uses a raw `AF_PACKET` socket
 
 ### PCAP Analyzer

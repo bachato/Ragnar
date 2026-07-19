@@ -1219,6 +1219,8 @@ function showNetworkSubtab(name) {
     } else if (name === 'switch') {
         loadLldp();
         _arpScanFillIfaces();
+        _locateFillIfaces();
+        _l2FillIfaces();
         _dhcpFillIfaces();
         _igmpFillIfaces();
         _ipv6FillIfaces();
@@ -4092,18 +4094,32 @@ async function analyzePcap() {
     }
 }
 
+function _l2FillIfaces() {
+    const sel = document.getElementById('l2-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function runL2Health() {
     const ifaceEl = document.getElementById('l2-iface');
     const out = document.getElementById('l2-results');
-    const iface = (ifaceEl.value || '').trim();
-    if (!iface) { ifaceEl.focus(); return; }
+    const iface = ifaceEl && ifaceEl.value ? ifaceEl.value : '';
     let secs = parseInt(document.getElementById('l2-secs').value, 10);
     if (!Number.isFinite(secs)) secs = 12;
     const btn = event && event.target ? event.target : null;
     _ndBusy(btn, true, 'Listening…');
     out.classList.remove('hidden');
-    out.innerHTML = '<p class="text-sm text-gray-400">Capturing on ' + escapeHtml(iface) + ' for ' + secs + 's…</p>';
+    out.innerHTML = '<p class="text-sm text-gray-400">Capturing on ' + (iface ? escapeHtml(iface) : 'the default segment') + ' for ' + secs + 's…</p>';
     try {
+        _l2FillIfaces();
         const d = await postAPI('/api/net/l2-health', { interface: iface, seconds: secs });
         if (!d.success) {
             out.innerHTML = d.missing_tool ? _ndMissingTool(d, 'runL2Health')
@@ -4124,7 +4140,7 @@ async function runL2Health() {
         if (d.ra_sources && d.ra_sources.length) detail.push('IPv6 RA source(s): ' + d.ra_sources.map(escapeHtml).join(', '));
         if (d.duplicate_ips && Object.keys(d.duplicate_ips).length) detail.push('Duplicate IPs: ' + Object.keys(d.duplicate_ips).map(escapeHtml).join(', '));
         out.innerHTML = `<ul class="space-y-1 mb-2">${findings}</ul>
-            <p class="text-xs text-gray-500 mb-1">${d.packets} pkts in ${d.seconds}s · ${d.broadcast} bcast / ${d.multicast} mcast (${d.bcast_mcast_per_s}/s)</p>
+            <p class="text-xs text-gray-500 mb-1">${d.packets} pkts in ${d.seconds}s on ${escapeHtml(d.interface || '—')} · ${d.broadcast} bcast / ${d.multicast} mcast (${d.bcast_mcast_per_s}/s)</p>
             <div class="mb-1">${protos}</div>
             ${detail.length ? '<p class="text-xs text-gray-400">' + detail.join(' &nbsp;·&nbsp; ') + '</p>' : ''}`;
     } catch (e) {
@@ -4137,11 +4153,24 @@ async function runL2Health() {
 // Blink a wired link in a pattern so its switch LED reveals the port. POSTs to
 // /api/net/locate-port; on the default-route guard it asks for confirmation and
 // re-sends with force.
+function _locateFillIfaces() {
+    const sel = document.getElementById('locate-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function locatePort(force) {
     const ifaceEl = document.getElementById('locate-iface');
     const out = document.getElementById('locate-results');
-    const iface = (ifaceEl.value || '').trim();
-    if (!iface) { ifaceEl.focus(); return; }
+    const iface = ifaceEl && ifaceEl.value ? ifaceEl.value : '';
     let count = parseInt(document.getElementById('locate-count').value, 10);
     if (!Number.isFinite(count)) count = 6;
     const methEl = document.getElementById('locate-method');
@@ -4150,6 +4179,7 @@ async function locatePort(force) {
     _ndBusy(btn, true, method === 'burst' ? 'Bursting…' : 'Flashing…');
     out.classList.remove('hidden');
     try {
+        _locateFillIfaces();
         const data = await postAPI('/api/net/locate-port', { interface: iface, count: count, method: method, force: !!force });
         if (!data.success) {
             if (data.needs_force) {
@@ -4165,7 +4195,7 @@ async function locatePort(force) {
     } catch (e) {
         // A flap on the interface serving this page can abort the request — that's
         // expected. (Burst never drops the link, so this path is flap-only.)
-        out.innerHTML = '<p class="text-amber-300">Flash started on ' + escapeHtml(iface)
+        out.innerHTML = '<p class="text-amber-300">Flash started on ' + escapeHtml(iface || 'the wired port')
             + '. If the UI dropped, that\'s the link flapping — watch the switch LED; it auto-restores.</p>';
     } finally {
         _ndBusy(btn, false);
