@@ -2288,9 +2288,18 @@ class Display:
         else:
             comp_str = "None"
 
+        # Speed row: only while we have a fix and are actually moving, so a
+        # stationary stop doesn't waste one of the few rows this panel affords.
+        rows = [("GPS", gps_str)]
+        spd = gps.get('speed_kmh')
+        if gps.get('has_fix') and spd is not None and spd > 0:
+            unit = self.config.get('wardriving_speed_unit', 'kmh')
+            rows.append(("Spd", _fmt_wd_speed(spd, unit)))
+        rows.append(("Comp", comp_str))
+
         pad_x = int(6 * sx)
         line_h = int(18 * sy)
-        for label, value in [("GPS", gps_str), ("Comp", comp_str)]:
+        for label, value in rows:
             val_str = str(value)
             vw = font_row.getlength(val_str)
             # Trim the value if it would collide with the label.
