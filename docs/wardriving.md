@@ -342,6 +342,7 @@ Shows the most actionable signals at a glance:
 - **Status line** — `GPS-Fix OK` / `Searching (N visible)` / `Connected` / `No GPS`. The visible count appears when there's no fix but the antenna is seeing satellites — it tells you whether you're antenna-limited or signal-limited.
 - **Coords line** — `lat, lon` once a fix is established.
 - **Sats line** — `Sats: used/in-view · SNR N dB · HDOP H`. HDOP is hidden while it's still the pre-fix 99.99 placeholder.
+- **Speed line** — velocity in the configured unit. Set **Config → Wardriving → Speed Unit** (`wardriving_speed_unit`, `kmh` or `mph`) to choose km/h or mph. This is display-only and applies everywhere speed is shown — GPS card, live map marker, kiosk readout, and the hardware display. Recorded data (`speed_kmh`) is always stored in km/h regardless of the setting.
 
 ### Network Position Preservation
 

@@ -504,8 +504,25 @@ const configMetadata = {
     wardriving_auto_export: {
         label: "Auto Export on Stop",
         description: "Automatically export a WiGLE CSV file when a wardriving session is stopped."
+    },
+    wardriving_speed_unit: {
+        label: "Speed Unit",
+        description: "Unit used to display GPS speed across the wardriving views (dashboard, map, kiosk, and hardware display). Choose km/h or mph. Recorded data is always stored in km/h; this only changes how it is shown."
     }
 };
+
+// Speed unit preference (kmh | mph), kept in sync with config so the various
+// speed readouts can format without re-fetching /api/config each tick.
+let _wdSpeedUnit = 'kmh';
+
+// Format a km/h value using the user's selected wardriving speed unit.
+function formatWardrivingSpeed(kmh, decimals = 1) {
+    if (kmh == null || typeof kmh !== 'number' || isNaN(kmh)) return '—';
+    if (_wdSpeedUnit === 'mph') {
+        return `${(kmh * 0.621371).toFixed(decimals)} mph`;
+    }
+    return `${kmh.toFixed(decimals)} km/h`;
+}
 
 function getConfigLabel(key) {
     if (configMetadata[key] && configMetadata[key].label) {
@@ -10785,6 +10802,9 @@ async function loadConfigData() {
         // Load GPS-backfill opt-in state (gates the map Backfill GPS button)
         loadWardrivingBackfillState();
 
+        // Load speed-unit (km/h vs mph) card state
+        loadWardrivingSpeedUnitState();
+
         // Load on-screen kiosk state + service badge
         loadKioskState();
 
@@ -18100,6 +18120,10 @@ function displayConfigForm(config) {
     const attacksEnabled = config.hasOwnProperty('enable_attacks') ? Boolean(config.enable_attacks) : true;
     updateAttackWarningBanner(attacksEnabled);
 
+    // Keep the speed-unit preference in sync so the live readouts format correctly,
+    // and reflect it on the Speed Unit card toggle.
+    applyWardrivingSpeedUnitState((config.wardriving_speed_unit === 'mph') ? 'mph' : 'kmh');
+
     // Render wardriving config settings into the dedicated Wardriving section slot
     const wdSlot = document.getElementById('wardriving-config-slot');
     if (wdSlot) {
@@ -22664,7 +22688,7 @@ function updateWardrivingUI(status) {
     const speedEl = document.getElementById('wd-speed-val');
     const headEl = document.getElementById('wd-heading-val');
     if (speedEl) {
-        speedEl.textContent = (gps.speed_kmh != null && gps.has_fix) ? `${gps.speed_kmh.toFixed(1)} km/h` : '—';
+        speedEl.textContent = (gps.speed_kmh != null && gps.has_fix) ? formatWardrivingSpeed(gps.speed_kmh) : '—';
     }
     if (headEl) {
         if (gps.course != null && gps.has_fix) {
@@ -23139,6 +23163,42 @@ async function loadWardrivingBackfillState() {
     } catch (e) { /* silent */ }
 }
 
+// Speed unit ('kmh' | 'mph') is display-only — recorded data stays in km/h.
+// Applies the choice to the card toggle, the label emphasis, and the module-level
+// _wdSpeedUnit used by formatWardrivingSpeed() for all live readouts.
+function applyWardrivingSpeedUnitState(unit) {
+    _wdSpeedUnit = (unit === 'mph') ? 'mph' : 'kmh';
+    const cb = document.getElementById('wardriving-speed-unit');
+    if (cb) cb.checked = (_wdSpeedUnit === 'mph');
+    const kmhLabel = document.getElementById('wd-speed-unit-kmh-label');
+    const mphLabel = document.getElementById('wd-speed-unit-mph-label');
+    if (kmhLabel) kmhLabel.className = 'text-sm font-semibold ' + (_wdSpeedUnit === 'kmh' ? 'text-Ragnar-400' : 'text-gray-500');
+    if (mphLabel) mphLabel.className = 'text-sm font-semibold ' + (_wdSpeedUnit === 'mph' ? 'text-Ragnar-400' : 'text-gray-500');
+}
+
+async function toggleWardrivingSpeedUnit() {
+    const cb = document.getElementById('wardriving-speed-unit');
+    if (!cb) return;
+    const unit = cb.checked ? 'mph' : 'kmh';
+    applyWardrivingSpeedUnitState(unit);
+    try {
+        await postAPI('/api/config', { wardriving_speed_unit: unit });
+        addConsoleMessage('Wardriving speed unit set to ' + (unit === 'mph' ? 'mph' : 'km/h'), 'success');
+    } catch (e) {
+        console.error('[Wardriving] speed unit toggle error:', e);
+        addConsoleMessage('Failed to update speed unit setting', 'error');
+        applyWardrivingSpeedUnitState(unit === 'mph' ? 'kmh' : 'mph');
+    }
+}
+
+async function loadWardrivingSpeedUnitState() {
+    try {
+        const res = await fetch('/api/config');
+        const cfg = await res.json();
+        applyWardrivingSpeedUnitState(cfg.wardriving_speed_unit === 'mph' ? 'mph' : 'kmh');
+    } catch (e) { /* silent */ }
+}
+
 // ============================================================================
 // ON-SCREEN KIOSK (Pi Flux / HDMI-DSI display)
 // ============================================================================
@@ -23367,7 +23427,7 @@ async function _refreshKioskWardrivingView() {
         setText('kiosk-gps-lon', _fmtCoord(gps.longitude, ['E', 'W']));
         setText('kiosk-gps-sats', gps.satellites ?? '—');
         const speed = gps.speed_kmh;
-        setText('kiosk-gps-speed', (typeof speed === 'number') ? speed.toFixed(1) + ' km/h' : '—');
+        setText('kiosk-gps-speed', (typeof speed === 'number') ? formatWardrivingSpeed(speed) : '—');
         setText('kiosk-gps-port', gps.port || '—');
     } catch (e) {
         /* network blip — keep last values */
@@ -23957,7 +24017,7 @@ async function _updateVikingPosition() {
                 _wdLastFixLon = gps.longitude;
             }
             const stationaryNote = stationary ? '<br><span style="color:#94a3b8">Stationär (drift dämpad)</span>' : '';
-            const popup = `<b>Ragnar</b><br>${speed.toFixed(1)} km/h${stationaryNote}`;
+            const popup = `<b>Ragnar</b><br>${formatWardrivingSpeed(speed)}${stationaryNote}`;
             if (!_wdVikingMarker) {
                 const icon = L.divIcon({
                     html: _VIKING_ICON_HTML,

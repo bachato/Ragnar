@@ -30,6 +30,19 @@ from logger import Logger
 import subprocess  
 from shared import detect_wifi_interface
 
+def _fmt_wd_speed(speed_kmh, unit, decimals=1):
+    """Format a km/h speed for the wardriving display in the configured unit.
+
+    Recorded data is always stored in km/h; ``unit`` ('kmh' or 'mph') only
+    controls presentation. Returns e.g. '12.3km/h' or '7.6mph'.
+    """
+    if speed_kmh is None:
+        return None
+    if unit == 'mph':
+        return f"{speed_kmh * 0.621371:.{decimals}f}mph"
+    return f"{speed_kmh:.{decimals}f}km/h"
+
+
 # Map rotation angle → PIL transpose operation
 _ROTATION_TRANSPOSE = {
     90:  Image.Transpose.ROTATE_90,
@@ -2422,7 +2435,8 @@ class Display:
                 stats_bottom.append(("Sats", str(sats)))
             spd = gps.get('speed_kmh')
             if spd is not None and spd > 0:
-                stats_bottom.append(("Speed", f"{spd:.1f}km/h"))
+                unit = self.config.get('wardriving_speed_unit', 'kmh')
+                stats_bottom.append(("Speed", _fmt_wd_speed(spd, unit)))
 
         # Companions — show each connected device separately so the user can
         # see a Huginn + Piglet + Piglet Core at a glance.
@@ -3400,7 +3414,8 @@ class Display:
                 spd = gps.get('speed_kmh')
                 gps_str = f"{gps.get('latitude', 0):.4f},{gps.get('longitude', 0):.4f}"
                 if spd is not None:
-                    gps_str += f" {spd:.0f}km/h"
+                    unit = self.config.get('wardriving_speed_unit', 'kmh')
+                    gps_str += f" {_fmt_wd_speed(spd, unit, decimals=0)}"
             elif gps.get('connected'):
                 in_view = gps.get('satellites_in_view')
                 snr = gps.get('snr_max')
