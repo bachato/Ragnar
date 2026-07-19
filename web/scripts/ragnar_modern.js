@@ -10802,6 +10802,9 @@ async function loadConfigData() {
         // Load GPS-backfill opt-in state (gates the map Backfill GPS button)
         loadWardrivingBackfillState();
 
+        // Load speed-unit (km/h vs mph) card state
+        loadWardrivingSpeedUnitState();
+
         // Load on-screen kiosk state + service badge
         loadKioskState();
 
@@ -18117,26 +18120,20 @@ function displayConfigForm(config) {
     const attacksEnabled = config.hasOwnProperty('enable_attacks') ? Boolean(config.enable_attacks) : true;
     updateAttackWarningBanner(attacksEnabled);
 
-    // Keep the speed-unit preference in sync so the live readouts format correctly.
-    _wdSpeedUnit = (config.wardriving_speed_unit === 'mph') ? 'mph' : 'kmh';
+    // Keep the speed-unit preference in sync so the live readouts format correctly,
+    // and reflect it on the Speed Unit card toggle.
+    applyWardrivingSpeedUnitState((config.wardriving_speed_unit === 'mph') ? 'mph' : 'kmh');
 
     // Render wardriving config settings into the dedicated Wardriving section slot
     const wdSlot = document.getElementById('wardriving-config-slot');
     if (wdSlot) {
-        const wdKeys = ['wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_speed_unit', 'wardriving_auto_export'];
+        const wdKeys = ['wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_auto_export'];
         let wdHtml = '<form id="wardriving-config-form" class="bg-slate-800 bg-opacity-50 rounded-lg p-4 mt-4"><h4 class="text-md font-bold mb-4 text-gray-300">Settings</h4><div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
         wdKeys.forEach(key => {
             const hasKey = Object.prototype.hasOwnProperty.call(config, key);
             let value = config[key];
             if (!hasKey && knownBooleans.includes(key)) value = true;
             if (!hasKey && alwaysShowKeys.has(key)) value = fallbackValues[key];
-            if (key === 'wardriving_speed_unit') {
-                const label = getConfigLabel(key);
-                const description = escapeHtml(getConfigDescription(key));
-                const unit = (value === 'mph') ? 'mph' : 'kmh';
-                wdHtml += `<div class="space-y-2"><label class="flex items-center gap-2 text-sm text-gray-400">${label}<span class="info-icon" tabindex="0" role="button" aria-label="${description}" data-tooltip="${description}">ⓘ</span></label><select name="${key}" class="w-full px-4 py-2 rounded-lg bg-slate-700 border border-slate-600 focus:border-Ragnar-500 focus:ring-1 focus:ring-Ragnar-500"><option value="kmh" ${unit === 'kmh' ? 'selected' : ''}>km/h</option><option value="mph" ${unit === 'mph' ? 'selected' : ''}>mph</option></select></div>`;
-                return;
-            }
             if (hasKey || knownBooleans.includes(key) || alwaysShowKeys.has(key)) {
                 const label = getConfigLabel(key);
                 const description = escapeHtml(getConfigDescription(key));
@@ -23163,6 +23160,42 @@ async function loadWardrivingBackfillState() {
         const cb = document.getElementById('wardriving-allow-backfill');
         if (cb) cb.checked = allow;
         applyWardrivingBackfillVisibility(allow);
+    } catch (e) { /* silent */ }
+}
+
+// Speed unit ('kmh' | 'mph') is display-only — recorded data stays in km/h.
+// Applies the choice to the card toggle, the label emphasis, and the module-level
+// _wdSpeedUnit used by formatWardrivingSpeed() for all live readouts.
+function applyWardrivingSpeedUnitState(unit) {
+    _wdSpeedUnit = (unit === 'mph') ? 'mph' : 'kmh';
+    const cb = document.getElementById('wardriving-speed-unit');
+    if (cb) cb.checked = (_wdSpeedUnit === 'mph');
+    const kmhLabel = document.getElementById('wd-speed-unit-kmh-label');
+    const mphLabel = document.getElementById('wd-speed-unit-mph-label');
+    if (kmhLabel) kmhLabel.className = 'text-sm font-semibold ' + (_wdSpeedUnit === 'kmh' ? 'text-Ragnar-400' : 'text-gray-500');
+    if (mphLabel) mphLabel.className = 'text-sm font-semibold ' + (_wdSpeedUnit === 'mph' ? 'text-Ragnar-400' : 'text-gray-500');
+}
+
+async function toggleWardrivingSpeedUnit() {
+    const cb = document.getElementById('wardriving-speed-unit');
+    if (!cb) return;
+    const unit = cb.checked ? 'mph' : 'kmh';
+    applyWardrivingSpeedUnitState(unit);
+    try {
+        await postAPI('/api/config', { wardriving_speed_unit: unit });
+        addConsoleMessage('Wardriving speed unit set to ' + (unit === 'mph' ? 'mph' : 'km/h'), 'success');
+    } catch (e) {
+        console.error('[Wardriving] speed unit toggle error:', e);
+        addConsoleMessage('Failed to update speed unit setting', 'error');
+        applyWardrivingSpeedUnitState(unit === 'mph' ? 'kmh' : 'mph');
+    }
+}
+
+async function loadWardrivingSpeedUnitState() {
+    try {
+        const res = await fetch('/api/config');
+        const cfg = await res.json();
+        applyWardrivingSpeedUnitState(cfg.wardriving_speed_unit === 'mph' ? 'mph' : 'kmh');
     } catch (e) { /* silent */ }
 }
 
