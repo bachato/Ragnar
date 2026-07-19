@@ -171,6 +171,15 @@ Used when the companion identifies as something other than HuginnESP — Ragnar 
 {"type":"WIFI","mac":"00:00:00:00:00:00","ssid":"wifiSSID","rssi":-84,"channel":1,"auth":"WPA2"}
 ```
 
+**Band split.** Companion counts are bucketed into 2.4 GHz and 5 GHz. The band
+is taken from an explicit `"band"` field when the firmware sends one (the
+multi-line text format's `Band:` line also counts), otherwise inferred from the
+channel — 1–14 is 2.4 GHz, 32+ is 5 GHz. A record with an unknown channel still
+counts toward the companion total but lands in neither bucket, so the two never
+over-report. The companion status bar shows `2.4G` / `5G` alongside the total
+**only once a 5 GHz network has actually been seen**, so a 2.4-only board
+(plain ESP32-S3) keeps its compact single-total display.
+
 #### BLE Devices (JSON, ALL mode, one line per device)
 ```json
 {"type":"BLE","mac":"AA:BB:CC:DD:EE:FF","name":"DeviceName","rssi":-60}

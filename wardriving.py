@@ -119,6 +119,11 @@ class _CompanionState:
         self.thread: threading.Thread | None = None
         self.connected: bool = False
         self.networks: int = 0
+        # Split by band so a dual-band companion (Huginn on an ESP32-C5) shows
+        # what each radio is actually contributing instead of one merged total.
+        # A 2.4-only board simply leaves networks_5 at 0.
+        self.networks_24: int = 0
+        self.networks_5: int = 0
         # Identity: 'Huginn' | 'Piglet' | 'Piglet Core' | 'Piglet Coordinator' | 'Companion'
         self.name: str = ''
         self.mesh_node_count: int = 0
@@ -141,6 +146,31 @@ class _CompanionState:
         self.wigle_col_map = None
         self.wigle_expect_header: bool = False
 
+    def count_network(self, channel=0, band=None) -> None:
+        """Record one newly-seen network, bucketed by band.
+
+        Band comes from an explicit `Band:` field when the companion sends one
+        (the HuginnESP text format does), otherwise from the channel number:
+        1-14 is 2.4 GHz, 32+ is 5 GHz. Channel 0/unknown still counts toward the
+        total but no band, so the two buckets never over-report.
+        """
+        self.networks += 1
+        label = str(band or '').strip().lower()
+        if label.startswith('2'):
+            self.networks_24 += 1
+            return
+        if label.startswith('5'):
+            self.networks_5 += 1
+            return
+        try:
+            ch = int(channel)
+        except (TypeError, ValueError):
+            return
+        if 1 <= ch <= 14:
+            self.networks_24 += 1
+        elif ch >= 32:
+            self.networks_5 += 1
+
     def active_coordinator_nodes(self) -> list:
         now_ts = time.time()
         expired = [m for m, n in self.coordinator_nodes.items()
@@ -156,6 +186,8 @@ class _CompanionState:
             'connected':         self.connected,
             'name':              self.name,
             'networks':          self.networks,
+            'networks_24':       self.networks_24,
+            'networks_5':        self.networks_5,
             'mesh_node_count':   self.mesh_node_count,
             'coordinator_board': self.coordinator_board,
             'coordinator_fw':    self.coordinator_fw,
@@ -4011,7 +4043,8 @@ class WardrivingEngine:
                         interface='esp32-serial'
                     )
                     if is_new:
-                        companion.networks += 1
+                        companion.count_network(channel=channel,
+                                                band=data.get('band'))
                 if from_companion and self._gps is not None:
                     self._gps.update_external_fix(lat, lon, alt,
                                                    source=companion.name or 'companion')
@@ -4175,7 +4208,7 @@ class WardrivingEngine:
                 interface='esp32-serial'
             )
             if is_new:
-                companion.networks += 1
+                companion.count_network(channel=channel, band=_field('band'))
 
     def _flush_serial_entry(self, gps_lat, gps_lon, gps_alt, companion: '_CompanionState'):
         """Flush a buffered HuginnESP multi-line entry to the session."""
@@ -4210,4 +4243,6 @@ class WardrivingEngine:
             interface='esp32-serial'
         )
         if is_new:
-            companion.networks += 1
+            # The multi-line format carries an explicit `Band:` line — prefer it
+            # over inferring from the channel number.
+            companion.count_network(channel=channel, band=buf.get('band'))

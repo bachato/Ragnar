@@ -22761,6 +22761,15 @@ function _companionBarHtml(c, single, status) {
         chips.push(`${sep}
             <span class="text-xs text-gray-400">WiFi:</span>
             <span class="text-xs font-bold text-emerald-400">${c.networks || 0}</span>`);
+        // Per-band breakdown for dual-band companions. Only rendered once a
+        // 5 GHz network has actually been seen, so a 2.4-only board (plain
+        // ESP32-S3) keeps the compact single-total bar it had before.
+        if ((c.networks_5 || 0) > 0) {
+            chips.push(`<span class="text-xs text-cyan-400">${c.networks_24 || 0}</span>
+                <span class="text-xs text-gray-500">2.4G</span>
+                <span class="text-xs text-purple-400">${c.networks_5 || 0}</span>
+                <span class="text-xs text-gray-500">5G</span>`);
+        }
     }
 
     // BLE — hidden for Piglet / Coordinator (WiFi-only firmware).
