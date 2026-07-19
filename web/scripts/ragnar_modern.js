@@ -504,8 +504,25 @@ const configMetadata = {
     wardriving_auto_export: {
         label: "Auto Export on Stop",
         description: "Automatically export a WiGLE CSV file when a wardriving session is stopped."
+    },
+    wardriving_speed_unit: {
+        label: "Speed Unit",
+        description: "Unit used to display GPS speed across the wardriving views (dashboard, map, kiosk, and hardware display). Choose km/h or mph. Recorded data is always stored in km/h; this only changes how it is shown."
     }
 };
+
+// Speed unit preference (kmh | mph), kept in sync with config so the various
+// speed readouts can format without re-fetching /api/config each tick.
+let _wdSpeedUnit = 'kmh';
+
+// Format a km/h value using the user's selected wardriving speed unit.
+function formatWardrivingSpeed(kmh, decimals = 1) {
+    if (kmh == null || typeof kmh !== 'number' || isNaN(kmh)) return '—';
+    if (_wdSpeedUnit === 'mph') {
+        return `${(kmh * 0.621371).toFixed(decimals)} mph`;
+    }
+    return `${kmh.toFixed(decimals)} km/h`;
+}
 
 function getConfigLabel(key) {
     if (configMetadata[key] && configMetadata[key].label) {
@@ -18100,16 +18117,26 @@ function displayConfigForm(config) {
     const attacksEnabled = config.hasOwnProperty('enable_attacks') ? Boolean(config.enable_attacks) : true;
     updateAttackWarningBanner(attacksEnabled);
 
+    // Keep the speed-unit preference in sync so the live readouts format correctly.
+    _wdSpeedUnit = (config.wardriving_speed_unit === 'mph') ? 'mph' : 'kmh';
+
     // Render wardriving config settings into the dedicated Wardriving section slot
     const wdSlot = document.getElementById('wardriving-config-slot');
     if (wdSlot) {
-        const wdKeys = ['wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_auto_export'];
+        const wdKeys = ['wardriving_scan_interval', 'wardriving_gps_port', 'wardriving_gps_baudrate', 'wardriving_speed_unit', 'wardriving_auto_export'];
         let wdHtml = '<form id="wardriving-config-form" class="bg-slate-800 bg-opacity-50 rounded-lg p-4 mt-4"><h4 class="text-md font-bold mb-4 text-gray-300">Settings</h4><div class="grid grid-cols-1 md:grid-cols-2 gap-4">';
         wdKeys.forEach(key => {
             const hasKey = Object.prototype.hasOwnProperty.call(config, key);
             let value = config[key];
             if (!hasKey && knownBooleans.includes(key)) value = true;
             if (!hasKey && alwaysShowKeys.has(key)) value = fallbackValues[key];
+            if (key === 'wardriving_speed_unit') {
+                const label = getConfigLabel(key);
+                const description = escapeHtml(getConfigDescription(key));
+                const unit = (value === 'mph') ? 'mph' : 'kmh';
+                wdHtml += `<div class="space-y-2"><label class="flex items-center gap-2 text-sm text-gray-400">${label}<span class="info-icon" tabindex="0" role="button" aria-label="${description}" data-tooltip="${description}">ⓘ</span></label><select name="${key}" class="w-full px-4 py-2 rounded-lg bg-slate-700 border border-slate-600 focus:border-Ragnar-500 focus:ring-1 focus:ring-Ragnar-500"><option value="kmh" ${unit === 'kmh' ? 'selected' : ''}>km/h</option><option value="mph" ${unit === 'mph' ? 'selected' : ''}>mph</option></select></div>`;
+                return;
+            }
             if (hasKey || knownBooleans.includes(key) || alwaysShowKeys.has(key)) {
                 const label = getConfigLabel(key);
                 const description = escapeHtml(getConfigDescription(key));
@@ -22664,7 +22691,7 @@ function updateWardrivingUI(status) {
     const speedEl = document.getElementById('wd-speed-val');
     const headEl = document.getElementById('wd-heading-val');
     if (speedEl) {
-        speedEl.textContent = (gps.speed_kmh != null && gps.has_fix) ? `${gps.speed_kmh.toFixed(1)} km/h` : '—';
+        speedEl.textContent = (gps.speed_kmh != null && gps.has_fix) ? formatWardrivingSpeed(gps.speed_kmh) : '—';
     }
     if (headEl) {
         if (gps.course != null && gps.has_fix) {
@@ -23367,7 +23394,7 @@ async function _refreshKioskWardrivingView() {
         setText('kiosk-gps-lon', _fmtCoord(gps.longitude, ['E', 'W']));
         setText('kiosk-gps-sats', gps.satellites ?? '—');
         const speed = gps.speed_kmh;
-        setText('kiosk-gps-speed', (typeof speed === 'number') ? speed.toFixed(1) + ' km/h' : '—');
+        setText('kiosk-gps-speed', (typeof speed === 'number') ? formatWardrivingSpeed(speed) : '—');
         setText('kiosk-gps-port', gps.port || '—');
     } catch (e) {
         /* network blip — keep last values */
@@ -23957,7 +23984,7 @@ async function _updateVikingPosition() {
                 _wdLastFixLon = gps.longitude;
             }
             const stationaryNote = stationary ? '<br><span style="color:#94a3b8">Stationär (drift dämpad)</span>' : '';
-            const popup = `<b>Ragnar</b><br>${speed.toFixed(1)} km/h${stationaryNote}`;
+            const popup = `<b>Ragnar</b><br>${formatWardrivingSpeed(speed)}${stationaryNote}`;
             if (!_wdVikingMarker) {
                 const icon = L.divIcon({
                     html: _VIKING_ICON_HTML,
