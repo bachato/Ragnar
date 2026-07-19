@@ -669,6 +669,17 @@ class GPSManager:
                     if lat is not None and lon is not None:
                         self.latitude = lat
                         self.longitude = lon
+                        # RMC status 'A' *is* a valid fix. fix_quality was
+                        # previously only ever set by GGA, so a receiver that
+                        # emits RMC without GGA (or with GGA disabled) parsed a
+                        # perfectly good position and then failed has_fix()'s
+                        # `fix_quality > 0` test forever — coordinates in hand,
+                        # UI stuck on "Searching...". Only promote from 0 so a
+                        # richer GGA quality (2=DGPS, 4=RTK) is never downgraded.
+                        # Staleness is still enforced by has_fix(): a later 'V'
+                        # stops refreshing last_update, so the fix ages out.
+                        if not self.fix_quality:
+                            self.fix_quality = 1
                     try:
                         knots = float(m.group('speed_knots')) if m.group('speed_knots') else None
                         self.speed_kmh = round(knots * 1.852, 1) if knots is not None else None
