@@ -312,6 +312,26 @@ else
     echo -e "${YELLOW}provision_network_tools.sh missing - skipping tool provisioning.${NC}"
 fi
 
+echo -e "${BLUE}Step 6.9: Ensuring persistent journal...${NC}"
+# Raspberry Pi OS defaults to Storage=auto, which keeps logs in RAM unless
+# /var/log/journal exists — so a board reset (e.g. a USB WiFi adapter browning
+# out the 5V rail) wipes the log that would have explained it and
+# `journalctl -b -1` reports "no persistent journal was found". Idempotent, and
+# capped so the journal can't fill the SD card. Mirrors install_ragnar.sh.
+if [ ! -d /var/log/journal ]; then
+    mkdir -p /var/log/journal
+    systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓${NC} Persistent journald logging enabled (survives reboots)"
+else
+    echo -e "  ${GREEN}✓${NC} Persistent journal already enabled"
+fi
+if ! grep -qE '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null; then
+    sed -i 's/^#\?SystemMaxUse=.*/SystemMaxUse=200M/' /etc/systemd/journald.conf 2>/dev/null || true
+    grep -qE '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null \
+        || echo 'SystemMaxUse=200M' >> /etc/systemd/journald.conf
+fi
+systemctl restart systemd-journald >/dev/null 2>&1 || true
+
 echo -e "${BLUE}Step 7: Starting ragnar service...${NC}"
 systemctl start ragnar.service
 

@@ -8,6 +8,7 @@ import time
 import glob
 import json
 import socket
+import struct
 import threading
 import logging
 
@@ -38,6 +39,46 @@ _NMEA_GSV_HEADER = re.compile(
     r'^\$(?P<talker>[A-Z]{2})GSV,(?P<total_msgs>\d+),(?P<msg_num>\d+),(?P<in_view>\d+),'
     r'(?P<body>.*?)\*[0-9A-Fa-f]{2}\s*$'
 )
+
+
+UBX_SYNC = b'\xb5\x62'
+
+
+def _ubx_frame(msg_class, msg_id, payload=b''):
+    """Build a UBX frame with its 8-bit Fletcher checksum."""
+    body = bytes((msg_class, msg_id)) + struct.pack('<H', len(payload)) + payload
+    ck_a = ck_b = 0
+    for byte in body:
+        ck_a = (ck_a + byte) & 0xFF
+        ck_b = (ck_b + ck_a) & 0xFF
+    return UBX_SYNC + body + bytes((ck_a, ck_b))
+
+
+def ubx_enable_nmea_sequence(save=True):
+    """Bytes that switch a u-blox port from UBX-only to NMEA output.
+
+    Some u-blox receivers (commonly the u-blox 7 USB pucks) ship or end up
+    configured to emit only UBX binary. We parse NMEA, so in that state a
+    perfectly healthy receiver yields no position at all. This is the standard
+    remedy, sent to the receiver over the same serial port:
+
+      CFG-PRT  add NMEA to the port's output mask, keeping UBX so anything
+               already speaking UBX (e.g. gpsd) keeps working
+      CFG-MSG  explicitly enable GGA/GSA/GSV/RMC in case they were switched off
+      CFG-CFG  persist, so the fix survives a replug
+    """
+    frames = [
+        # portID 3 = USB; mode/baud are ignored there but must be present.
+        # outProtoMask bit0=UBX bit1=NMEA -> 0x0003.
+        _ubx_frame(0x06, 0x00, struct.pack('<BBHIIHHHH',
+                                           3, 0, 0, 0, 0, 0x0007, 0x0003, 0, 0)),
+    ]
+    for msg_id in (0x00, 0x02, 0x03, 0x04):    # GGA, GSA, GSV, RMC
+        frames.append(_ubx_frame(0x06, 0x01, bytes((0xF0, msg_id, 1))))
+    if save:
+        frames.append(_ubx_frame(0x06, 0x09,
+                                 struct.pack('<IIIB', 0, 0x0000FFFF, 0, 0x17)))
+    return b''.join(frames)
 
 
 def _nmea_to_decimal(raw, direction):
@@ -570,9 +611,26 @@ class GPSManager:
                 if not raw:
                     continue
 
+                # A u-blox receiver can come up emitting only UBX *binary*
+                # frames (every one starts b5 62). We parse NMEA, so that state
+                # used to be invisible: healthy receiver, bytes flowing, every
+                # one silently dropped by the '$' test below, and the UI stuck
+                # on "Searching..." with nothing logged. Say so, once, with the
+                # fix — and surface it via get_status()['error'].
+                if UBX_SYNC in raw:
+                    self._ubx_seen = getattr(self, '_ubx_seen', 0) + 1
+                    if self._ubx_seen % 20 == 0 and not getattr(self, '_nmea_seen', 0):
+                        self._recover_from_ubx()
+                    continue
+
                 line = raw.decode('ascii', errors='ignore').strip()
                 if not line.startswith('$'):
                     continue
+
+                self._nmea_seen = getattr(self, '_nmea_seen', 0) + 1
+                if getattr(self, 'error', None) and 'UBX binary' in str(self.error):
+                    with self._lock:          # NMEA is flowing again — clear it
+                        self.error = None
 
                 self._parse_nmea(line)
 
@@ -580,6 +638,39 @@ class GPSManager:
                 if self._running:
                     logger.debug(f"GPS read error: {e}")
                     self._reconnect()
+
+    def _recover_from_ubx(self, max_attempts=3):
+        """Self-heal a receiver that is emitting UBX binary instead of NMEA.
+
+        Writes the standard CFG-PRT/CFG-MSG/CFG-CFG sequence back over the same
+        port. Without this the receiver is silently useless to us — we drop every
+        byte and the UI sits on "Searching..." forever — and the fix required a
+        human to notice and run scripts/gps_set_nmea.py by hand. Bounded retries
+        so a device that ignores the config (or isn't really u-blox) can't turn
+        into a write loop; after that we leave the actionable error in place.
+        """
+        attempts = getattr(self, '_ubx_fix_attempts', 0)
+        if attempts >= max_attempts:
+            return
+        self._ubx_fix_attempts = attempts + 1
+        try:
+            self._serial.write(ubx_enable_nmea_sequence())
+            self._serial.flush()
+            logger.warning(
+                f"GPS on {self.port} is emitting UBX binary, not NMEA — sent the "
+                f"NMEA-enable config (attempt {self._ubx_fix_attempts}/{max_attempts})")
+            with self._lock:
+                self.error = (
+                    "GPS was in UBX binary mode; sent NMEA-enable config. If this "
+                    "persists, run: sudo python3 scripts/gps_set_nmea.py "
+                    + str(self.port or ''))
+        except Exception as e:
+            msg = (f"GPS is emitting UBX binary, not NMEA, and the automatic fix "
+                   f"failed ({e}). Run: sudo python3 scripts/gps_set_nmea.py "
+                   f"{self.port or ''}")
+            logger.error(msg)
+            with self._lock:
+                self.error = msg
 
     def _reconnect(self):
         """Attempt to reconnect to GPS device."""
@@ -669,6 +760,17 @@ class GPSManager:
                     if lat is not None and lon is not None:
                         self.latitude = lat
                         self.longitude = lon
+                        # RMC status 'A' *is* a valid fix. fix_quality was
+                        # previously only ever set by GGA, so a receiver that
+                        # emits RMC without GGA (or with GGA disabled) parsed a
+                        # perfectly good position and then failed has_fix()'s
+                        # `fix_quality > 0` test forever — coordinates in hand,
+                        # UI stuck on "Searching...". Only promote from 0 so a
+                        # richer GGA quality (2=DGPS, 4=RTK) is never downgraded.
+                        # Staleness is still enforced by has_fix(): a later 'V'
+                        # stops refreshing last_update, so the fix ages out.
+                        if not self.fix_quality:
+                            self.fix_quality = 1
                     try:
                         knots = float(m.group('speed_knots')) if m.group('speed_knots') else None
                         self.speed_kmh = round(knots * 1.852, 1) if knots is not None else None

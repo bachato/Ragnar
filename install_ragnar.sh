@@ -1211,6 +1211,30 @@ EOF
     chmod +x $ragnar_PATH/kill_port_8000.sh
     chown ragnar:ragnar $ragnar_PATH/kill_port_8000.sh
 
+    # Persistent journal — so a crash leaves evidence behind.
+    #
+    # Default Raspberry Pi OS ships Storage=auto, which means journald only
+    # writes to disk if /var/log/journal exists; otherwise logs live in RAM and
+    # are wiped on every boot. On a field device that is exactly backwards: a
+    # board reset (e.g. a USB WiFi adapter browning out the 5V rail) erases the
+    # log that would have explained it, and `journalctl -b -1` answers
+    # "no persistent journal was found". Capped so it can't fill the SD card.
+    setup_persistent_journal() {
+        if [ ! -d /var/log/journal ]; then
+            log "INFO" "Enabling persistent journald logging (survives reboots)"
+            mkdir -p /var/log/journal
+            systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+        fi
+        # Cap total journal size; SD cards are small and wear out.
+        if ! grep -qE '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null; then
+            sed -i 's/^#\?SystemMaxUse=.*/SystemMaxUse=200M/' /etc/systemd/journald.conf 2>/dev/null || true
+            grep -qE '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null \
+                || echo 'SystemMaxUse=200M' >> /etc/systemd/journald.conf
+        fi
+        systemctl restart systemd-journald >/dev/null 2>&1 || true
+    }
+    setup_persistent_journal
+
     # Create ragnar service
     cat > /etc/systemd/system/ragnar.service << EOF
 [Unit]

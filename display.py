@@ -83,17 +83,23 @@ logger = Logger(name="display.py", level=logging.DEBUG)
 # Import button listener (only functional on Pi with GPIO)
 try:
     from epd_button import EPDButtonListener, PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC
-    from epd_button import NETDIAG_CARD_FUNCS, NETDIAG_CARD_NAMES
+    from epd_button import (NETDIAG_CARD_FUNCS, NETDIAG_CARD_NAMES,
+                            netdiag_card_funcs, netdiag_iface_choices,
+                            netdiag_auto_iface)
 except ImportError:
     EPDButtonListener = None
     PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC = 0, 1, 2, 3, 4, 5
-    NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL", "SPECTRUM"]
+    NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL",
+                          "SPECTRUM", "IFACE"]
     NETDIAG_CARD_FUNCS = {}
+    netdiag_card_funcs = (lambda page: [])
+    netdiag_iface_choices = (lambda: [])
+    netdiag_auto_iface = (lambda require_egress=False: None)
 
 # Network Diagnostic mode: number of auto-cycling sub-pages
-# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL, 6=SPECTRUM). See
+# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL, 6=SPECTRUM, 7=IFACE). See
 # Display._render_netdiag_page.
-NETDIAG_PAGE_COUNT = 7
+NETDIAG_PAGE_COUNT = 8
 NETDIAG_CYCLE_SECONDS = 5
 
 class Display:
@@ -1273,7 +1279,7 @@ class Display:
         name = names[page % len(names)]
         state = "auto" if not frozen else "manual"
         render_w = getattr(self, 'render_w', self.shared_data.width)
-        funcs = NETDIAG_CARD_FUNCS.get(page, [])
+        funcs = netdiag_card_funcs(page)
         if render_w < 150:
             # Narrow LCD HAT: show the page counter + the highlighted function
             # (the joystick's Up/Down selects it, press runs it). Cards with no
@@ -1423,7 +1429,7 @@ class Display:
                 return
             self._draw_signal_bars(draw, y, aps)
 
-        else:  # page 6: SPECTRUM — per-channel occupancy graph (band via func_idx)
+        elif page == 6:  # SPECTRUM — per-channel occupancy graph (band via func_idx)
             st = self._netdiag_wifi_scan()
             spectrum = st.get('spectrum')
             if spectrum is None:
@@ -1435,6 +1441,26 @@ class Display:
             band = ['2.4', '5', '6'][(func_idx if func_idx >= 0 else 0) % 3]
             self._draw_spectrum(draw, y, band, spectrum, st.get('bands') or {},
                                 st.get('iface'))
+
+        else:  # page 7: IFACE — which NIC the egress tests originate from.
+            # Up/Down highlights Auto or an interface (footer hint), press pins
+            # it. '*' marks the active selection; each row shows the NIC's IP
+            # (usable), 'no IP' (link up but unaddressed) or 'down'.
+            bl = self.button_listener
+            sel = getattr(bl, 'netdiag_iface', None) if bl else None
+            auto = netdiag_auto_iface()
+            rows = [(("*" if sel is None else "") + "Auto",
+                     f"> {auto}" if auto else 'none usable')]
+            for c in netdiag_iface_choices():
+                nm = c['name']
+                if len(nm) > 10:   # enx<mac> names — keep head + MAC tail
+                    nm = nm[:5] + '~' + nm[-4:]
+                label = ("*" if sel == c['name'] else "") + nm
+                if c['usb'] and len(label) <= 9:
+                    label += " USB"
+                status = c['ipv4'] or ('no IP' if c['up'] else 'down')
+                rows.append((label, status))
+            self._draw_stat_rows(draw, y, rows)
 
     def _draw_spectrum(self, draw, y, band, spectrum, supported, iface=None):
         """Channel-occupancy spectrum for one band on the LCD HAT: a bar per

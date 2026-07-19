@@ -28,9 +28,10 @@
 #
 # Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad,
 # navigated as a stack of "cards": LINK / IP / SWITCH / DHCP / WIFI (SSID+RSSI) /
-# SIGNAL (nearby strengths). Left/Right move between cards; Up/Down cycle the
-# test functions inside a card; the centre press runs the highlighted one. The
-# three keys are exits/toggles (everything acts on press — no long-press here):
+# SIGNAL (nearby strengths) / SPECTRUM / IFACE. Left/Right move between cards;
+# Up/Down cycle the test functions inside a card; the centre press runs the
+# highlighted one. The three keys are exits/toggles (everything acts on press —
+# no long-press here):
 #   Joy Left      : previous card    (as seen on the text)
 #   Joy Right     : next card        (as seen on the text)
 #   Joy Up / Down : cycle the highlighted function inside the card
@@ -39,16 +40,19 @@
 #   KEY2          : exit card → the card-selection menu (press again to leave it)
 #   KEY3          : pause / start auto-switch (auto-cycle the cards every 5 s)
 # Card functions (Up/Down + press): LINK/SWITCH → Locate Port · L2 Health;
-# IP → Ping GW · Ping WAN · DNS Doctor · Speedtest; DHCP/WIFI/SIGNAL are read-only.
+# IP → Ping GW · Ping WAN · DNS Doctor · Speedtest; DHCP/WIFI/SIGNAL are
+# read-only. The IFACE card pins which NIC the egress tests (speedtest, pings)
+# originate from — Up/Down highlights Auto or an interface, press selects it;
+# Auto follows the priority order built-in eth → USB eth → wlan1 → wlan0.
 # In the card-selection menu any joystick direction moves the highlight and press
-# enters the card. See epd_button.NETDIAG_CARD_FUNCS.
+# enters the card. See epd_button.netdiag_card_funcs.
 
 import logging
 import threading
 import time
 
 from epd_button import (EPDButtonListener, PAGE_COUNT, NETDIAG_HOLD_TIME,
-                        NETDIAG_CARD_FUNCS)
+                        netdiag_card_funcs)
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +61,9 @@ logger = logging.getLogger(__name__)
 AUTOSCROLL_INTERVAL = 5.0
 
 # Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP / WIFI / SIGNAL /
-# SPECTRUM). Mirrors display.NETDIAG_PAGE_COUNT; kept local so this module
-# needn't import display.py.
-NETDIAG_PAGE_COUNT = 7
+# SPECTRUM / IFACE). Mirrors display.NETDIAG_PAGE_COUNT; kept local so this
+# module needn't import display.py.
+NETDIAG_PAGE_COUNT = 8
 
 # Button pins
 KEY1_PIN = 21
@@ -265,6 +269,7 @@ class LCDHATInputListener(EPDButtonListener):
             if on:
                 self.netdiag_page = 0
                 self.netdiag_result = None
+                self.netdiag_iface = None   # fresh session tests on Auto again
                 # Card model: start on the card view, driven manually by the
                 # joystick. Auto-switch is off until KEY3 turns it on (frozen =
                 # auto-cycle paused).
@@ -322,7 +327,7 @@ class LCDHATInputListener(EPDButtonListener):
             self._netdiag_step_page(+1)
             return
         if name in ('up', 'down'):
-            funcs = NETDIAG_CARD_FUNCS.get(self.netdiag_page, [])
+            funcs = netdiag_card_funcs(self.netdiag_page)
             if funcs:
                 step = -1 if name == 'up' else 1
                 self.netdiag_func_idx = (self.netdiag_func_idx + step) % len(funcs)
@@ -332,7 +337,7 @@ class LCDHATInputListener(EPDButtonListener):
             if self.netdiag_result is not None:
                 self.netdiag_result = None
                 return
-            funcs = NETDIAG_CARD_FUNCS.get(self.netdiag_page, [])
+            funcs = netdiag_card_funcs(self.netdiag_page)
             if funcs:
                 idx = self.netdiag_func_idx % len(funcs)
                 self._run_netdiag_test(funcs[idx][1])
