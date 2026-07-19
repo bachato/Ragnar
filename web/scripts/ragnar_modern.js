@@ -1217,6 +1217,7 @@ function showNetworkSubtab(name) {
     } else if (name === 'hosts') {
         loadNetworkData();
     } else if (name === 'switch') {
+        _lldpFillIfaces();
         loadLldp();
         _arpScanFillIfaces();
         _locateFillIfaces();
@@ -3802,11 +3803,31 @@ function _poeCell(poe) {
     return '<span class="text-gray-500">—</span>';
 }
 
+function _lldpFillIfaces() {
+    const sel = document.getElementById('lldp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
+
 async function loadLldp() {
     const out = document.getElementById('lldp-results');
-    out.innerHTML = '<p class="text-gray-400">Loading neighbours…</p>';
+    const ifaceEl = document.getElementById('lldp-iface');
+    const iface = ifaceEl && ifaceEl.value ? ifaceEl.value : '';
+    out.innerHTML = '<p class="text-gray-400">Loading neighbours' +
+        (iface ? ' on ' + escapeHtml(iface) : '') + '…</p>';
     try {
-        const data = await fetchAPI('/api/net/lldp');
+        _lldpFillIfaces();
+        const data = await fetchAPI('/api/net/lldp' +
+            (iface ? '?interface=' + encodeURIComponent(iface) : ''));
         if (!data.success) {
             out.innerHTML = data.missing_tool
                 ? _ndMissingTool(data, 'loadLldp')

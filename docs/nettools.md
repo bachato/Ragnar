@@ -814,7 +814,17 @@ For each local interface it shows the discovered switch **name**, the
 Switches announce roughly every 30 seconds, so after plugging in give it up to
 a minute for the first neighbour to appear. Results export to CSV.
 
-- Endpoint: `GET /api/net/lldp` · binary: `lldpctl` (`lldpd`)
+**Interface selector.** The same Auto/WiFi/LAN dropdown as the other Switch
+L2/L3 cards. **Auto (all interfaces)** reports every neighbour this box can
+hear; picking one local port limits discovery to it — on a multi-homed Ragnar
+(LAN cable + USB NIC + WiFi) that is the difference between *"which switch is
+**this** port plugged into"* and a merged list you have to eyeball. Filtering is
+done by `lldpctl` itself, and an unknown interface name is rejected rather than
+returning an empty list that looks like "no switch found". When a chosen port
+has no neighbours, the note says so and suggests switching back to Auto.
+
+- Endpoint: `GET /api/net/lldp` · optional `?interface=<name>` · binary:
+  `lldpctl` (`lldpd`)
 
 #### PoE detection
 A PoE-capable switch advertises its power state in the LLDP/LLDP-MED
