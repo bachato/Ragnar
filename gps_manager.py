@@ -570,9 +570,31 @@ class GPSManager:
                 if not raw:
                     continue
 
+                # A u-blox receiver can come up emitting only UBX *binary*
+                # frames (every one starts b5 62). We parse NMEA, so that state
+                # used to be invisible: healthy receiver, bytes flowing, every
+                # one silently dropped by the '$' test below, and the UI stuck
+                # on "Searching..." with nothing logged. Say so, once, with the
+                # fix — and surface it via get_status()['error'].
+                if b'\xb5\x62' in raw:
+                    self._ubx_seen = getattr(self, '_ubx_seen', 0) + 1
+                    if self._ubx_seen == 20 and not getattr(self, '_nmea_seen', 0):
+                        msg = ("GPS is emitting UBX binary, not NMEA — no position "
+                               "will ever be parsed. Fix: sudo python3 "
+                               "scripts/gps_set_nmea.py " + str(self.port or ''))
+                        logger.error(msg)
+                        with self._lock:
+                            self.error = msg
+                    continue
+
                 line = raw.decode('ascii', errors='ignore').strip()
                 if not line.startswith('$'):
                     continue
+
+                self._nmea_seen = getattr(self, '_nmea_seen', 0) + 1
+                if getattr(self, 'error', None) and 'UBX binary' in str(self.error):
+                    with self._lock:          # NMEA is flowing again — clear it
+                        self.error = None
 
                 self._parse_nmea(line)
 
