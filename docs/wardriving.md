@@ -76,6 +76,25 @@ required).
 
 Optional USB GPS receiver (NMEA via pyserial). Auto-detected at startup.
 
+**u-blox receivers stuck in UBX binary mode.** Some u-blox 7 USB pucks
+(VID 1546) come up emitting only UBX binary frames instead of NMEA, which
+looks like a healthy receiver that never finds a position ("Searching..."
+forever). Ragnar detects this and reconfigures the receiver in place over
+the same serial port — no action needed; the journal logs
+`sent the NMEA-enable config (attempt N/3)` when it happens. The cheap
+pucks have no battery-backed RAM or flash, so the fix cannot be persisted
+on them and is reapplied automatically after every power cycle or replug.
+If the automatic recovery fails, the manual path is:
+
+```bash
+sudo systemctl stop ragnar
+sudo python3 scripts/gps_set_nmea.py /dev/ttyACM0 --verify
+sudo systemctl restart ragnar
+```
+
+`scripts/gps_diag.sh` answers "is it the receiver or is it us" — it reports
+whether the port is emitting NMEA, UBX binary, or nothing at all.
+
 ---
 
 ## Architecture

@@ -43,6 +43,11 @@ _NMEA_GSV_HEADER = re.compile(
 
 UBX_SYNC = b'\xb5\x62'
 
+# Start of a plausible NMEA sentence: '$' + talker/sentence letters + ','
+# (e.g. $GPGGA, $GNRMC, $PUBX). Deliberately loose about the exact talker,
+# strict that binary noise decoding to a stray '$' does not qualify.
+_NMEA_SHAPE = re.compile(r'^\$[A-Z]{4,5}\d*,')
+
 
 def _ubx_frame(msg_class, msg_id, payload=b''):
     """Build a UBX frame with its 8-bit Fletcher checksum."""
@@ -54,8 +59,8 @@ def _ubx_frame(msg_class, msg_id, payload=b''):
     return UBX_SYNC + body + bytes((ck_a, ck_b))
 
 
-def ubx_enable_nmea_sequence(save=True):
-    """Bytes that switch a u-blox port from UBX-only to NMEA output.
+def ubx_enable_nmea_frames(save=True):
+    """UBX frames that switch a u-blox port from UBX-only to NMEA output.
 
     Some u-blox receivers (commonly the u-blox 7 USB pucks) ship or end up
     configured to emit only UBX binary. We parse NMEA, so in that state a
@@ -66,6 +71,11 @@ def ubx_enable_nmea_sequence(save=True):
                already speaking UBX (e.g. gpsd) keeps working
       CFG-MSG  explicitly enable GGA/GSA/GSV/RMC in case they were switched off
       CFG-CFG  persist, so the fix survives a replug
+
+    Returned as a list (CFG-PRT first) rather than one blob: the receiver may
+    reinitialize the port while applying CFG-PRT and drop bytes that are
+    already in flight, so the sender must pace the frames — see
+    _recover_from_ubx(), and scripts/gps_set_nmea.py which does the same.
     """
     frames = [
         # portID 3 = USB; mode/baud are ignored there but must be present.
@@ -78,7 +88,12 @@ def ubx_enable_nmea_sequence(save=True):
     if save:
         frames.append(_ubx_frame(0x06, 0x09,
                                  struct.pack('<IIIB', 0, 0x0000FFFF, 0, 0x17)))
-    return b''.join(frames)
+    return frames
+
+
+def ubx_enable_nmea_sequence(save=True):
+    """The same frames as one byte string (drift check against the script)."""
+    return b''.join(ubx_enable_nmea_frames(save))
 
 
 def _nmea_to_decimal(raw, direction):
@@ -624,7 +639,12 @@ class GPSManager:
                     continue
 
                 line = raw.decode('ascii', errors='ignore').strip()
-                if not line.startswith('$'):
+                # Require real sentence shape ($GPGGA, $GNRMC, $PUBX, ...),
+                # not just a leading '$': in a UBX-only stream a binary chunk
+                # can decode to a line starting with '$', and one such fluke
+                # counted as NMEA would permanently disarm the UBX recovery
+                # below while the receiver stays unusable.
+                if not _NMEA_SHAPE.match(line):
                     continue
 
                 self._nmea_seen = getattr(self, '_nmea_seen', 0) + 1
@@ -654,8 +674,17 @@ class GPSManager:
             return
         self._ubx_fix_attempts = attempts + 1
         try:
-            self._serial.write(ubx_enable_nmea_sequence())
-            self._serial.flush()
+            # Pace the frames like scripts/gps_set_nmea.py does (the path that
+            # is proven on real hardware). Applying CFG-PRT can reinitialize
+            # the port, and the cheap u-blox 7 clones drop bytes that arrive
+            # while that happens — blasting the whole sequence in one write
+            # loses the CFG-MSG/CFG-CFG tail on exactly the receivers this
+            # recovery exists for.
+            frames = ubx_enable_nmea_frames()
+            for i, frame in enumerate(frames):
+                self._serial.write(frame)
+                self._serial.flush()
+                time.sleep(0.3 if i == 0 else 0.05)
             logger.warning(
                 f"GPS on {self.port} is emitting UBX binary, not NMEA — sent the "
                 f"NMEA-enable config (attempt {self._ubx_fix_attempts}/{max_attempts})")
@@ -703,6 +732,13 @@ class GPSManager:
             if port:
                 self._serial = pyserial.Serial(port, self.baudrate, timeout=1)
                 self.port = port
+                # Fresh device state: the u-blox 7 pucks have no battery/flash,
+                # so a replugged receiver comes back in whatever mode it ships
+                # in (often UBX-only). Stale counters from before the replug
+                # would block the UBX recovery exactly when it's needed again.
+                self._ubx_seen = 0
+                self._nmea_seen = 0
+                self._ubx_fix_attempts = 0
                 with self._lock:
                     self.connected = True
                     self.error = None
