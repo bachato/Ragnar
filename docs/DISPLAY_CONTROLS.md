@@ -43,8 +43,9 @@ In Default and Wardriving layers the keys act **on press**.
 > **Compact wardriving page on the 1.44" ST7735S:** the 128×128 panel is too
 > small for the full stat page, so it drops the "WARDRIVING" header and shows
 > only the essentials — the **2.4 / 5 / 6 GHz** network counts as large numbers,
-> the **GPS** fix, and the **companion** status — with the key hints in the
-> footer. Larger panels still get the full stat page.
+> the **GPS** fix, **speed** (only while moving), and the **companion** status —
+> with the key hints in the footer. Larger panels still get the full stat page.
+> The speed uses the **Speed Unit** setting (km/h or mph) from Config → Wardriving.
 >
 > The count font **auto-shrinks** as the numbers grow, so a long drive that
 > pushes a band into the thousands (or higher) still fits its column instead of
