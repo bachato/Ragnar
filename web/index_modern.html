@@ -2137,6 +2137,15 @@
                                 <button id="wifi-view-nets" onclick="wifiSetApView('nets')" class="px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-700">Networks</button>
                             </div>
                             <input id="wifi-ap-search" oninput="wifiRenderTable()" placeholder="filter SSID / vendor / BSSID" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs flex-1 min-w-[140px]">
+                            <select id="wifi-ap-std" onchange="wifiRenderTable()" title="filter by Wi-Fi generation" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-gray-300">
+                                <option value="">all gens</option>
+                                <option value="Wi-Fi 7">Wi-Fi 7</option>
+                                <option value="Wi-Fi 6E">Wi-Fi 6E</option>
+                                <option value="Wi-Fi 6">Wi-Fi 6</option>
+                                <option value="Wi-Fi 5">Wi-Fi 5</option>
+                                <option value="Wi-Fi 4">Wi-Fi 4</option>
+                                <option value="legacy">Legacy (a/b/g)</option>
+                            </select>
                             <label class="flex items-center gap-1 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifi-ap-issues" onchange="wifiRenderTable()" class="accent-amber-500"> issues only</label>
                             <button onclick="wifiExportCsv()" class="bg-slate-700 hover:bg-slate-600 text-gray-200 px-2.5 py-1 rounded text-xs">Export CSV</button>
                         </div>
@@ -6663,7 +6672,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260718-wids-pivot2"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260719-wifi-gen-filter"></script>
 
 </body>
 </html>
