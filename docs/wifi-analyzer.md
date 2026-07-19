@@ -6,10 +6,11 @@ software [Ekahau Sidekick 2](https://www.ekahau.com/products/sidekick/): the
 same survey-and-heatmap workflow a wireless engineer expects, on a Raspberry Pi
 Zero 2 W with an off-the-shelf Wi-Fi 6E dongle instead of a $4,000 instrument.
 
-> **Strictly passive.** The analyzer only ever runs `iw dev <iface> scan
+> **Strictly passive.** The analyzer only ever runs `iw dev <iface> scan -u
 > passive`, which *listens for beacons* and **never transmits a probe request**
 > to any AP, and reads the radio's own channel table with `iw phy`. No frame is
-> injected. It is a diagnostic/troubleshooting tool, not an attack tool.
+> injected. It is a diagnostic/troubleshooting tool, not an attack tool. (`-u`
+> only changes how the results are *printed* — see the Wi-Fi 7 note below.)
 
 ---
 
@@ -24,7 +25,7 @@ For every beaconing BSS it hears:
 | **RSSI (dBm)** | radiotap signal |
 | **Band** — 2.4 / 5 / 6 GHz | centre frequency |
 | **Channel** (number) | centre frequency |
-| **Channel width** — 20/40/80/160 MHz | HT / VHT / HE operation IEs |
+| **Channel width** — 20/40/80/160/320 MHz | HT / VHT / HE / EHT operation IEs |
 | **Security** — Open/WEP/WPA/WPA2/WPA3 | RSN / WPA IE (SAE ⇒ WPA3) |
 | **Channel utilisation %** | the AP-advertised **BSS-Load IE** — a real, passive medium-busy metric |
 | **Stations** | BSS-Load IE station count |
@@ -39,6 +40,18 @@ For every beaconing BSS it hears:
 
 Supported bands are detected **per radio**, so the tool lights up 2.4/5/6 GHz on
 the Alfa AWUS036AXM and 2.4/5 GHz on the Pi's onboard radio automatically.
+
+### Wi-Fi 7 (802.11be) detection
+
+`iw` (through at least 6.9) has **no scan-side EHT printer**: a Wi-Fi 7
+beacon's EHT IEs are silently dropped from `iw scan` output, so the AP would
+be mislabelled Wi-Fi 6/6E from the HE IEs it also advertises. The analyzer
+therefore scans with `-u` ("print unknown IEs"), which makes iw hex-dump the
+undecoded IEs as `Unknown Extension ID (…)` lines, and recognises the raw
+extension IDs itself: **106** (EHT Operation, also parsed for 320 MHz width
+and the wide-channel centre), **107** (Multi-Link) and **108** (EHT
+Capabilities). The decoded `EHT capabilities:` section headers are still
+matched too, so nothing breaks when iw eventually learns to print them.
 
 ---
 
