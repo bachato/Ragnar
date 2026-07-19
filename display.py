@@ -2226,14 +2226,30 @@ class Display:
         ]
         col_w = (w - 2) / 3.0
         y_lbl = int(6 * sy)
-        y_num = int(18 * sy)
+        # A long drive pushes counts into the thousands, and a fixed size would
+        # spill each number into its neighbour's column. Shrink the shared
+        # number font until the widest of the three fits its column — one size
+        # for all three so they stay visually consistent.
+        max_num_w = col_w - int(4 * sx)
+        widest = max((str(v) for _, v in bands), key=font_num.getlength)
+        num_size = int(22 * sy)
+        while num_size > 8 and font_num.getlength(widest) > max_num_w:
+            num_size -= 1
+            font_num = self._font_at('Arial.ttf', num_size)
+
+        # Vertically centre the numbers in the band under the labels, so the
+        # row stays balanced at whatever size the fit above settled on.
+        band_top = int(18 * sy)
+        band_bot = int(46 * sy)
         for i, (label, val) in enumerate(bands):
             cx = 1 + col_w * (i + 0.5)
             lw = font_lbl.getlength(label)
             draw.text((cx - lw / 2, y_lbl), label, font=font_lbl, fill=0)
             vs = str(val)
-            vw = font_num.getlength(vs)
-            draw.text((cx - vw / 2, y_num), vs, font=font_num, fill=0)
+            bbox = font_num.getbbox(vs)
+            vw, vh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            ty = band_top + (band_bot - band_top - vh) / 2 - bbox[1]
+            draw.text((cx - vw / 2 - bbox[0], ty), vs, font=font_num, fill=0)
 
         y = int(48 * sy)
         draw.line((int(4 * sx), y, w - int(4 * sx), y), fill=0)

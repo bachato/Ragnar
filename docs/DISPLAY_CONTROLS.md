@@ -45,6 +45,11 @@ In Default and Wardriving layers the keys act **on press**.
 > only the essentials — the **2.4 / 5 / 6 GHz** network counts as large numbers,
 > the **GPS** fix, and the **companion** status — with the key hints in the
 > footer. Larger panels still get the full stat page.
+>
+> The count font **auto-shrinks** as the numbers grow, so a long drive that
+> pushes a band into the thousands (or higher) still fits its column instead of
+> overlapping the neighbouring band. All three share one size so the row stays
+> visually even.
 
 ### Network Diagnostic mode
 
