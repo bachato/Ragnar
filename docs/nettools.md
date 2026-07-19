@@ -159,6 +159,15 @@ The display auto-cycles six pages every **5 seconds**:
    joystick picks the **band** (2.4 / 5 / 6 GHz); an unsupported band says so.
    Shares the same background passive scan as SIGNAL, so it never blocks the
    cycle. *(LCD HAT only — the 2.7" e-Paper HAT's card set stops at SWITCH.)*
+8. **IFACE** — pick which NIC the **egress tests** (Speed test, Ping GW, Ping
+   WAN) originate from. ↑/↓ highlights **Auto** or an interface, press selects
+   it; `*` marks the active choice and each row shows the NIC's IP, *no IP* or
+   *down*. **Auto** follows a fixed priority — **built-in Ethernet → USB
+   Ethernet → wlan1 → wlan0** — taking the first interface that is up and
+   addressed (and, for the speed test, verified able to reach the internet with
+   a device-bound probe), so a plugged-in cable is what gets tested instead of
+   whatever holds the default route. The selection resets to Auto each time the
+   mode is switched on. *(LCD HAT only.)*
 
    **Which radio it scans:** the SIGNAL and SPECTRUM cards auto-select the
    **widest-band adapter present** — so a tri-band dongle (e.g. the **Alfa
@@ -195,6 +204,12 @@ KEY4-long resolves a preset hostname (`netdiag_dns_test_name`, default
 press is never blocked, and the panel wakes immediately on a press rather than
 waiting out the 5 s cycle.
 
+The speed test and pings originate from the **priority interface** — built-in
+Ethernet → USB Ethernet → wlan1 → wlan0, first one up and addressed (the speed
+test also verifies it can reach the internet) — not from whatever holds the
+default route, so plugging in a cable is enough to test the cable. The result
+page shows the interface used.
+
 #### Field-test pad (1.44" LCD HAT + joystick)
 
 The Waveshare **1.44" LCD HAT** (ST7735S, 128×128) carries **3 keys plus a
@@ -203,9 +218,9 @@ Network Diagnostic Mode on/off directly (no web UI needed). Select the HAT in
 **Display settings** as *"1.44" ST7735S LCD HAT + joystick"*.
 
 The mode is navigated as a stack of **cards** — `LINK · IP · SWITCH · DHCP ·
-WIFI · SIGNAL · SPECTRUM`. **Left/Right move between cards; Up/Down cycle the test
-functions *inside* a card; the centre press runs the highlighted one** (the
-footer shows `>` + its name). While the mode is on:
+WIFI · SIGNAL · SPECTRUM · IFACE`. **Left/Right move between cards; Up/Down
+cycle the test functions *inside* a card; the centre press runs the highlighted
+one** (the footer shows `>` + its name). While the mode is on:
 
 | Input | Action |
 |-------|--------|
@@ -224,6 +239,7 @@ The functions selectable inside each card (Up/Down, then press):
 | **IP** | **Ping gateway** (LAN) · **Ping internet** (`8.8.8.8`, WAN) · **DNS Doctor** (poison/hijack verdict) · **Speed test** |
 | **DHCP** / **WIFI** / **SIGNAL** | read-only (no functions) |
 | **SPECTRUM** | Up/Down selects the **band** (2.4 / 5 / 6 GHz) whose live channel-occupancy spectrum is drawn (scanned on the widest-band adapter — plug in the Alfa for 5/6 GHz); press does nothing (nothing to run) |
+| **IFACE** | Up/Down highlights **Auto** or a NIC; press **pins the egress tests** (Speed test / pings) to it. Auto = built-in eth → USB eth → wlan1 → wlan0 |
 
 In the **card-selection menu** any joystick direction moves the highlight and
 press opens that card. The joystick arrows above are **as you read them on the

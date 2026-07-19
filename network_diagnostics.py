@@ -111,11 +111,19 @@ def _have_scapy():
 # Diagnostics: ping / traceroute / mtr / whois / speedtest
 # --------------------------------------------------------------------------
 
-def do_ping(target, count=4):
+def do_ping(target, count=4, interface=None):
+    """Ping `target`. `interface`, if given, pins the probes to that NIC
+    (ping -I <device>), so a multi-homed box tests the link the caller chose
+    rather than whatever holds the default route."""
     count = _clamp_int(count, 4, 1, 15)
     deadline = count + 3
-    res = _run(['ping', '-n', '-c', str(count), '-w', str(deadline), target],
-               timeout=deadline + 5)
+    cmd = ['ping', '-n', '-c', str(count), '-w', str(deadline)]
+    if interface:
+        if not _valid_iface(interface) or interface not in _list_iface_names(include_virtual=True):
+            return {'success': False, 'output': '', 'summary': {},
+                    'error': f'Unknown interface: {interface}'}
+        cmd += ['-I', interface]
+    res = _run(cmd + [target], timeout=deadline + 5)
     out = res['out'] or res['err']
     summary = {}
     m = re.search(r'(\d+) packets transmitted, (\d+) received.*?([\d.]+)% packet loss', out, re.S)
@@ -293,6 +301,15 @@ def _iface_has_default_route(iface):
     we need to exclude."""
     res = _run(['ip', 'route', 'show', 'default', 'dev', iface], timeout=5)
     return res['rc'] == 0 and bool(res['out'].strip())
+
+
+def _iface_default_gateway(iface):
+    """The gateway of this interface's own default route, or None. Lets a test
+    pinned to a NIC ping *that* link's gateway instead of the global one (which
+    may sit on a different segment entirely)."""
+    res = _run(['ip', 'route', 'show', 'default', 'dev', iface], timeout=5)
+    m = re.search(r'\bvia\s+(\S+)', res['out'] or '')
+    return m.group(1) if m else None
 
 
 def _egress_iface(preferred=None):
