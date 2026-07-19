@@ -519,6 +519,35 @@ In modes 2 and 4 the companion has no GPS, so Ragnar's GPS is the only source.
 Click **Start Wardriving** in the web UI. Ragnar begins scanning with all
 active wlan interfaces and ingesting whatever is on the serial port.
 
+### Adapter detection — "I plugged in a third adapter but only see wlan0/wlan1"
+
+Radios are enumerated from **both** `nmcli` **and** `/sys/class/net`, and the two
+lists are **unioned**. This matters because NetworkManager omits a radio
+entirely when it is unmanaged (Ragnar marks its own scan adapters unmanaged so
+NM doesn't add competing routes), left in monitor mode, or its driver loaded
+after NM started — so nmcli alone is never authoritative. Monitor child vifs
+(`wlan1mon`, `mon0`) are filtered out so they don't double up with their parent.
+
+On start, the log lists exactly what was found:
+
+```
+Wardriving detected 3 WiFi interface(s): wlan0, wlan1, wlan2
+```
+
+If an adapter is still missing, check in this order:
+
+```bash
+ls /sys/class/net          # is the radio enumerating at all?
+rfkill list                # soft/hard blocked? -> sudo rfkill unblock all
+dmesg | tail -30           # driver/power errors on plug-in
+```
+
+If the interface is **absent from `/sys/class/net`** it is not a Ragnar problem —
+the adapter isn't enumerating (driver, power, or a hard rfkill block). A
+freshly-plugged USB dongle commonly comes up **soft-blocked**: it appears in
+`/sys/class/net` and in the adapter list but scans zero networks. Ragnar logs a
+warning naming any blocked radio; clear it with `sudo rfkill unblock all`.
+
 ---
 
 ## Camera Recognition

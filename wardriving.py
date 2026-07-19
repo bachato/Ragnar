@@ -2382,8 +2382,19 @@ class WardrivingEngine:
         return {'success': True, 'deleted': deleted}
 
     def _detect_wifi_interfaces(self):
-        """Detect all available WiFi interfaces (including external USB adapters)."""
-        interfaces = []
+        """Detect all available WiFi interfaces (including external USB adapters).
+
+        Enumerated from BOTH nmcli and sysfs and then UNIONed — never
+        nmcli-with-sysfs-as-fallback. NetworkManager omits a radio entirely when
+        it is unmanaged (Ragnar marks its own scan adapters unmanaged so NM
+        doesn't add competing routes), left in monitor mode, or its driver
+        loaded after NM started. Treating sysfs as a fallback that only runs
+        when nmcli returned *nothing* silently dropped exactly those adapters,
+        so a third dongle never joined the sweep. sysfs is the authority on
+        "this radio exists"; nmcli only adds names sysfs might miss.
+        """
+        found = set()
+
         try:
             result = subprocess.run(
                 ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE', 'device'],
@@ -2393,21 +2404,56 @@ class WardrivingEngine:
                 for line in result.stdout.strip().split('\n'):
                     parts = line.split(':')
                     if len(parts) >= 3 and parts[1] == 'wifi':
-                        interfaces.append(parts[0])
+                        found.add(parts[0])
         except Exception as e:
             logger.debug(f"nmcli detection failed: {e}")
 
-        # Fallback: check sysfs
-        if not interfaces:
-            try:
-                import os
-                for name in sorted(os.listdir('/sys/class/net')):
-                    if os.path.isdir(f'/sys/class/net/{name}/wireless'):
-                        interfaces.append(name)
-            except Exception:
-                pass
+        # sysfs: every wireless netdev, including nl80211 *and* wext-only
+        # dongles that report no wireless/ dir but do have phy80211/.
+        try:
+            for name in os.listdir('/sys/class/net'):
+                if os.path.isdir(f'/sys/class/net/{name}/wireless') \
+                        or os.path.isdir(f'/sys/class/net/{name}/phy80211'):
+                    found.add(name)
+        except Exception as e:
+            logger.debug(f"sysfs wifi detection failed: {e}")
 
+        # Drop the monitor/child vifs our own tooling (and airmon-ng) creates,
+        # so a rebuilt monitor interface never doubles up with its parent.
+        interfaces = sorted(n for n in found
+                            if not n.endswith('mon') and not n.startswith('mon'))
+
+        blocked = [n for n in interfaces if self._iface_rfkill_blocked(n)]
+        if blocked:
+            # A soft-blocked dongle is present in sysfs but cannot scan; say so
+            # explicitly because the symptom (adapter listed, zero networks) is
+            # otherwise indistinguishable from a driver problem.
+            logger.warning(
+                f"Wardriving: {', '.join(blocked)} is rfkill-blocked and will not "
+                f"scan until unblocked — run 'sudo rfkill unblock all'")
+        logger.info(f"Wardriving detected {len(interfaces)} WiFi interface(s): "
+                    f"{', '.join(interfaces) or '(none)'}")
         return interfaces
+
+    @staticmethod
+    def _iface_rfkill_blocked(iface):
+        """True when this radio is soft/hard rfkill-blocked. A freshly plugged
+        USB dongle commonly comes up blocked, so it enumerates but never scans."""
+        try:
+            phy = os.path.realpath(f'/sys/class/net/{iface}/phy80211')
+            for entry in os.listdir(f'{phy}/rfkill'):
+                if not entry.startswith('rfkill'):
+                    continue
+                for kind in ('soft', 'hard'):
+                    try:
+                        with open(f'{phy}/rfkill/{entry}/{kind}') as f:
+                            if f.read().strip() == '1':
+                                return True
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return False
 
     def _scan_loop(self):
         """Main scanning loop — runs fast continuous scans."""
