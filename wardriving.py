@@ -1530,6 +1530,23 @@ class WardrivingEngine:
         if not self.interfaces:
             return {'error': 'No WiFi interfaces found'}
 
+        # Power check before spinning the radios up. USB Wi-Fi adapters are the
+        # heaviest load Ragnar adds (~0.5-1 A each), so an already-marginal 5 V
+        # rail browns out and resets the board the moment a second dongle starts
+        # scanning — a "crash" that leaves nothing in the logs because the OS
+        # never got to write any. Warn loudly rather than fail: plenty of rigs
+        # run fine, and this is the user's call.
+        try:
+            from resource_monitor import ResourceMonitor
+            power = ResourceMonitor().get_power_status()
+            if power.get('supported') and power.get('status') != 'ok':
+                logger.warning(
+                    f"Wardriving: POWER — {power.get('message')} "
+                    f"(throttle register {power.get('raw')}, "
+                    f"{len(self.interfaces)} radio(s) about to start)")
+        except Exception as e:
+            logger.debug(f"power status check failed: {e}")
+
         # Bring each interface up (rfkill unblock + ip link up). USB adapters
         # like the NETGEAR mt76x2u enumerate as admin-DOWN; iw scan on a DOWN
         # interface returns "Network is down" and zero results forever.
@@ -2563,6 +2580,44 @@ class WardrivingEngine:
         5745, 5765, 5785, 5805, 5825,
     ]
 
+    def _management_ifaces(self):
+        """Radios carrying Ragnar's own connectivity — never claimed from NM.
+
+        Association state alone is NOT a safe guard: it is a point-in-time
+        check, and the uplink is briefly unassociated while roaming, during the
+        boot race, or when a neighbouring scan knocks it off. Losing that race
+        means we mark the uplink 'managed no', NetworkManager then refuses to
+        reconnect it, and the box drops off the network for good — which looks
+        exactly like "Ragnar crashed". Adding adapters makes it worse: more
+        interfaces get prepared, and kernel renumbering can move the uplink to a
+        different wlanN than the one we checked.
+
+        So identity comes from stable sources instead: the interface holding the
+        default route, and the configured/auto-detected management interface.
+        """
+        protected = set()
+
+        # 1. Whoever holds the default route is by definition our uplink.
+        try:
+            r = subprocess.run(['ip', 'route', 'show', 'default'],
+                               capture_output=True, text=True, timeout=3)
+            for m in re.finditer(r'\bdev\s+(\S+)', r.stdout or ''):
+                protected.add(m.group(1))
+        except Exception as e:
+            logger.debug(f"default-route lookup failed: {e}")
+
+        # 2. The configured (or auto-detected) WiFi management interface.
+        try:
+            from shared import detect_wifi_interface
+            cfg = getattr(self.shared_data, 'config', {}) or {}
+            mgmt = detect_wifi_interface(cfg.get('wifi_interface', 'auto') or 'auto')
+            if mgmt:
+                protected.add(mgmt)
+        except Exception as e:
+            logger.debug(f"management interface lookup failed: {e}")
+
+        return protected
+
     def _is_associated(self, interface):
         """True if the interface is currently associated with an AP as a client.
         Used to decide whether wardriving can claim it exclusively from NM."""
@@ -2835,6 +2890,19 @@ class WardrivingEngine:
                            capture_output=True, timeout=3)
         except Exception as e:
             logger.debug(f"rfkill unblock failed: {e}")
+
+        # Never tear the uplink out of NetworkManager or reset its type. Doing
+        # so is unrecoverable (NM will not reconnect an unmanaged device), so
+        # the box would silently lose connectivity — see _management_ifaces.
+        # It still gets rfkill-unblocked and brought up above/below, which is
+        # harmless, and it remains scannable.
+        if interface in self._management_ifaces():
+            if interface not in self._iface_prepared:
+                logger.info(
+                    f"Wardriving: {interface} is the management/uplink radio — "
+                    f"scanning it but leaving NetworkManager and its mode alone")
+            self._iface_prepared.add(interface)
+            return
 
         # Claim non-associated interfaces from NetworkManager so its autoscan
         # doesn't race our scan trigger (kernel returns -EBUSY when NM has a

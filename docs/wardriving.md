@@ -548,6 +548,48 @@ freshly-plugged USB dongle commonly comes up **soft-blocked**: it appears in
 `/sys/class/net` and in the adapter list but scans zero networks. Ragnar logs a
 warning naming any blocked radio; clear it with `sudo rfkill unblock all`.
 
+### "Adding a second dongle crashes the whole box"
+
+Two distinct causes, and they look identical from the outside.
+
+**1. Power (most common).** A USB Wi-Fi adapter is the heaviest load you can add
+— an Alfa draws roughly **0.5–1 A**. On a Pi whose 5 V rail is already marginal,
+the second dongle browns out the board and it **resets**. Nothing appears in the
+logs, because the OS never got the chance to write any. Check the SoC's throttle
+register:
+
+```bash
+vcgencmd get_throttled     # 0x0 is healthy
+dmesg | grep -i voltage    # "Undervoltage detected!"
+```
+
+Any non-zero value means the supply has no headroom. Ragnar now reads this at
+wardriving start and logs a `Wardriving: POWER — …` warning naming the
+condition. The fix is hardware: a stronger PSU, or run the dongles from a
+**powered** USB hub so they don't draw off the Pi.
+
+**2. Losing the uplink (looks like a crash, box is actually still running).**
+Wardriving claims each scan adapter from NetworkManager (`managed no`) so NM's
+autoscan doesn't race the scan trigger. That operation is **unrecoverable** — NM
+will not reconnect a device it has been told not to manage. If it were applied
+to the radio carrying Ragnar's own connectivity, the box would drop off the
+network permanently while still running happily headless.
+
+The uplink is therefore protected by **stable identity** — the interface holding
+the default route, plus the configured/auto-detected management interface — and
+never by association state alone, which is a point-in-time check that loses the
+race while roaming, during the boot race, or when a scan knocks the link off.
+The protected radio is still scanned; only the NM claim and the mode reset are
+skipped. The log names it on start:
+
+```
+Wardriving: wlan0 is the management/uplink radio — scanning it but leaving
+NetworkManager and its mode alone
+```
+
+If a box ever does end up unmanaged, `sudo nmcli dev set wlan0 managed yes`
+restores it.
+
 ---
 
 ## Camera Recognition
