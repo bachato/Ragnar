@@ -2171,8 +2171,116 @@ class Display:
         except Exception:
             return None
 
+    def _render_wardriving_page_compact(self, image, draw, wd):
+        """Compact wardriving layout for the 1.44" ST7735S LCD HAT (128x128).
+
+        The square panel is too small for the full stat page, so we drop the
+        "WARDRIVING" header entirely and show only what matters on the move:
+        the 2.4 / 5 / 6 GHz network counts, GPS fix, and companion status.
+        The key controls stay in the footer.
+        """
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        h = getattr(self, 'render_h', self.shared_data.height)
+        font = self.shared_data.font_arial9
+        font_row = self.shared_data.font_arial11
+        font_lbl = self._font_at('Arial.ttf', int(9 * sy))
+        font_num = self._font_at('Arial.ttf', int(22 * sy))
+
+        draw.rectangle((1, 1, w - 1, h - 1), outline=0)
+
+        # Footer controls (drawn first so the content band knows its bottom).
+        # Colons/spaces dropped vs. the full page so the whole hint fits 128px.
+        ap_on = getattr(self.shared_data, 'wardrive_ap_active', False)
+        hint = "K1APoff K2Flip K3Map K4WiFi" if ap_on else "K1AP K2Flip K3Map K4WiFi"
+        footer_y = h - int(18 * sy)
+        draw.line((1, footer_y, w - 1, footer_y), fill=0)
+        _hint = hint
+        avail = w - int(8 * sx)
+        while _hint and font.getlength(_hint) > avail:
+            _hint = _hint[:-1]
+        draw.text((int(4 * sx), h - int(16 * sy)), _hint, font=font, fill=0)
+
+        # Not running: centred status placeholder (starting vs stopped).
+        if not wd or not wd.get('running'):
+            never_started = not (wd and wd.get('session_id'))
+            if self.shared_data.config.get('wardriving_on_boot', False) and never_started:
+                msg1, msg2 = "Starting...", "Waiting for engine"
+            else:
+                msg1, msg2 = "Stopped", "Enable in WebUI"
+            m1w = font_row.getlength(msg1)
+            m2w = font.getlength(msg2)
+            draw.text(((w - m1w) / 2, int(45 * sy)), msg1, font=font_row, fill=0)
+            draw.text(((w - m2w) / 2, int(62 * sy)), msg2, font=font, fill=0)
+            return
+
+        st = wd.get('stats', {})
+        gps = wd.get('gps', {})
+
+        # --- Band counts: 2.4 / 5 / 6 GHz as a three-column grid ---
+        bands = [
+            ("2.4G", st.get('band_2_4ghz', 0)),
+            ("5G",   st.get('band_5ghz', 0)),
+            ("6G",   st.get('band_6ghz', 0)),
+        ]
+        col_w = (w - 2) / 3.0
+        y_lbl = int(6 * sy)
+        y_num = int(18 * sy)
+        for i, (label, val) in enumerate(bands):
+            cx = 1 + col_w * (i + 0.5)
+            lw = font_lbl.getlength(label)
+            draw.text((cx - lw / 2, y_lbl), label, font=font_lbl, fill=0)
+            vs = str(val)
+            vw = font_num.getlength(vs)
+            draw.text((cx - vw / 2, y_num), vs, font=font_num, fill=0)
+
+        y = int(48 * sy)
+        draw.line((int(4 * sx), y, w - int(4 * sx), y), fill=0)
+        y += int(6 * sy)
+
+        # --- GPS + Companion rows (right-aligned key/value, roomy font) ---
+        if gps.get('has_fix'):
+            gps_str = f"{gps.get('latitude', 0):.3f},{gps.get('longitude', 0):.3f}"
+        elif gps.get('connected'):
+            in_view = gps.get('satellites_in_view')
+            if isinstance(in_view, (int, float)) and in_view > 0:
+                gps_str = f"Search {int(in_view)}v"
+            else:
+                gps_str = "Searching"
+        else:
+            gps_str = "No GPS"
+
+        companions = wd.get('companions') or []
+        active = [c for c in companions if c.get('connected')]
+        if active:
+            first = active[0].get('name') or 'Companion'
+            comp_str = first if len(active) == 1 else f"{first}+{len(active) - 1}"
+        else:
+            comp_str = "None"
+
+        pad_x = int(6 * sx)
+        line_h = int(18 * sy)
+        for label, value in [("GPS", gps_str), ("Comp", comp_str)]:
+            val_str = str(value)
+            vw = font_row.getlength(val_str)
+            # Trim the value if it would collide with the label.
+            while val_str and pad_x + font_row.getlength(label) + int(6 * sx) > w - pad_x - vw:
+                val_str = val_str[:-1]
+                vw = font_row.getlength(val_str)
+            draw.text((pad_x, y), label, font=font_row, fill=0)
+            draw.text((w - pad_x - vw, y), val_str, font=font_row, fill=0)
+            y += line_h
+
     def _render_wardriving_page(self, image, draw):
         """Render a wardriving status page for EPD e-paper displays."""
+        # Tiny 1.44" ST7735S LCD HAT (128x128): the full stat page won't fit,
+        # so render a header-less essentials-only layout instead.
+        _w = getattr(self, 'render_w', self.shared_data.width)
+        _h = getattr(self, 'render_h', self.shared_data.height)
+        if _w < 150 and _h < 150:
+            self._render_wardriving_page_compact(image, draw, self._get_wardriving_data())
+            return
         ap_on = getattr(self.shared_data, 'wardrive_ap_active', False)
         hint = "K1:AP-off K2:Flip K3:Map K4:WiFi" if ap_on else "K1:AP K2:Flip K3:Map K4:WiFi"
         self._draw_page_frame(draw, "WARDRIVING", hint=hint)

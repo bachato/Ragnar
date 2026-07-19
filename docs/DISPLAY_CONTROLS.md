@@ -40,6 +40,12 @@ In Default and Wardriving layers the keys act **on press**.
 | **KEY3** | Toggle the **live e‑paper map** (GPS track + network dots) |
 | **KEY4** | **Connect** to a known Wi‑Fi (wardriving keeps running) |
 
+> **Compact wardriving page on the 1.44" ST7735S:** the 128×128 panel is too
+> small for the full stat page, so it drops the "WARDRIVING" header and shows
+> only the essentials — the **2.4 / 5 / 6 GHz** network counts as large numbers,
+> the **GPS** fix, and the **companion** status — with the key hints in the
+> footer. Larger panels still get the full stat page.
+
 ### Network Diagnostic mode
 
 Each key gains a **short** and a **long** (hold ~0.6 s) press — see the full
