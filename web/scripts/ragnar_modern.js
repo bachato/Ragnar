@@ -1218,6 +1218,7 @@ function showNetworkSubtab(name) {
         loadNetworkData();
     } else if (name === 'switch') {
         loadLldp();
+        _arpScanFillIfaces();
         _dhcpFillIfaces();
         _igmpFillIfaces();
         _ipv6FillIfaces();
@@ -3836,17 +3837,31 @@ async function loadLldp() {
     }
 }
 
+function _arpScanFillIfaces() {
+    const sel = document.getElementById('arp-iface');
+    if (!sel || sel.dataset.filled === '1') return Promise.resolve();
+    return fetchAPI('/api/net/interfaces').then(x => {
+        (x.interfaces || []).forEach(i => {
+            const o = document.createElement('option');
+            o.value = i.name;
+            const tag = i.type === 'wifi' ? ' (WiFi)' : i.type === 'ethernet' ? ' (LAN)' : (i.type ? ' (' + i.type + ')' : '');
+            o.textContent = i.name + tag;
+            sel.appendChild(o);
+        });
+        sel.dataset.filled = '1';
+    }).catch(() => {});
+}
 async function runArpScan() {
     const ifaceEl = document.getElementById('arp-iface');
     const out = document.getElementById('arp-scan-results');
-    const iface = (ifaceEl.value || '').trim();
-    if (!iface) { ifaceEl.focus(); return; }
+    const iface = ifaceEl && ifaceEl.value ? ifaceEl.value : '';
     const btn = event && event.target ? event.target : null;
     _ndBusy(btn, true, 'Scanning…');
     out.classList.remove('hidden');
-    out.innerHTML = '<p class="text-sm text-gray-400">Scanning ' + escapeHtml(iface) + '…</p>';
+    out.innerHTML = '<p class="text-sm text-gray-400">Scanning ' + (iface ? escapeHtml(iface) : 'the default segment') + '…</p>';
     try {
-        const data = await fetchAPI('/api/net/arp-scan?interface=' + encodeURIComponent(iface));
+        _arpScanFillIfaces();
+        const data = await fetchAPI('/api/net/arp-scan' + (iface ? '?interface=' + encodeURIComponent(iface) : ''));
         if (!data.success) {
             out.innerHTML = data.missing_tool
                 ? _ndMissingTool(data, 'runArpScan')
@@ -3854,8 +3869,9 @@ async function runArpScan() {
             return;
         }
         _ndLastArp = data;
+        const usedIface = data.interface || iface;
         if (!data.hosts.length) {
-            out.innerHTML = '<p class="text-sm text-gray-400">No hosts responded on ' + escapeHtml(iface) + '.</p>';
+            out.innerHTML = '<p class="text-sm text-gray-400">No hosts responded on ' + escapeHtml(usedIface || 'the segment') + '.</p>';
             return;
         }
         const rows = data.hosts.map(h => `
@@ -3864,7 +3880,7 @@ async function runArpScan() {
                 <td class="px-3 py-1.5 font-mono">${escapeHtml(h.mac)}</td>
                 <td class="px-3 py-1.5">${escapeHtml(String(h.vendor || '—'))}</td>
             </tr>`).join('');
-        out.innerHTML = `<p class="text-xs text-gray-500 mb-2">${data.count} host(s) on ${escapeHtml(iface)}</p>
+        out.innerHTML = `<p class="text-xs text-gray-500 mb-2">${data.count} host(s) on ${escapeHtml(usedIface || 'the segment')}</p>
             <table class="min-w-full text-sm text-gray-300 whitespace-nowrap">
             <thead><tr class="text-left text-xs uppercase text-gray-500">
                 <th class="px-3 py-1.5">IP</th><th class="px-3 py-1.5">MAC</th><th class="px-3 py-1.5">Vendor</th>

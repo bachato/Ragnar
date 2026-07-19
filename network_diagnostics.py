@@ -632,11 +632,15 @@ def _parse_lldp_iface(local_if, info):
     }
 
 
-def do_arp_scan(interface):
+def do_arp_scan(interface=None):
     if not _have('arp-scan'):
         return {'success': False,
                 'error': 'arp-scan is not installed. Click Install to add it.',
                 'missing_tool': 'arp-scan', 'hosts': []}
+    interface = _capture_iface(interface)
+    if not interface:
+        return {'success': False, 'hosts': [],
+                'error': 'No suitable interface found — pick one explicitly.'}
     res = _run(['arp-scan', f'--interface={interface}', '--localnet'], timeout=40)
     if res['rc'] == 127:
         return {'success': False, 'error': res['err'] or 'arp-scan not found',
@@ -14204,10 +14208,10 @@ def register_network_diagnostics(app, logger=None):
     @app.route('/api/net/arp-scan', methods=['GET'])
     def net_arp_scan():
         iface = (request.args.get('interface') or '').strip()
-        if not _valid_iface(iface):
-            return _bad('Invalid or missing interface')
-        _log(f"net/arp-scan {iface}")
-        return jsonify(do_arp_scan(iface))
+        if iface and not _valid_iface(iface):
+            return _bad('Invalid interface')
+        _log(f"net/arp-scan {iface or 'auto'}")
+        return jsonify(do_arp_scan(iface or None))
 
     @app.route('/api/net/arp-check', methods=['GET'])
     def net_arp_check():

@@ -829,11 +829,14 @@ column showing:
 > guaranteed "no power".
 
 ### ARP Scan
-Sweeps the local segment with ARP to enumerate **live hosts** on a chosen
-interface, returning IP, MAC and (where known) NIC vendor for each responder.
-The fastest way to inventory a subnet you're attached to. Results export to CSV.
+Sweeps the local segment with ARP to enumerate **live hosts**, returning IP,
+MAC and (where known) NIC vendor for each responder. The fastest way to
+inventory a subnet you're attached to. An **interface selector**
+(Auto / WiFi / LAN) targets the sweep at a chosen segment — Auto prefers a
+link-up wired port, falling back to the default-route interface. Results
+export to CSV.
 
-- Endpoint: `GET /api/net/arp-scan?interface=<iface>` · binary: `arp-scan`
+- Endpoint: `GET /api/net/arp-scan[?interface=<iface>]` · binary: `arp-scan`
 
 > This is an **inventory** sweep, not a security check. For ARP **spoofing /
 > poisoning** detection (gateway-MAC watch + subnet impersonation), see
