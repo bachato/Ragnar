@@ -1621,7 +1621,7 @@
                             <h3 class="text-lg font-semibold">Switch Discovery (LLDP / CDPv1/v2 / EDP / FDP)</h3>
                             <p class="text-sm text-gray-400">Neighbouring switches via LLDP, Cisco CDPv1/v2, Extreme EDP, Foundry FDP and Nortel SONMP: name, port, VLAN, PoE and management IP.</p>
                         </div>
-                        <div class="flex gap-2 w-full sm:w-auto"><button onclick="loadLldp()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportLldpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
+                        <div class="flex flex-wrap gap-2 w-full sm:w-auto"><select id="lldp-iface" onchange="loadLldp()" title="Local port to query — Auto reports neighbours on every interface" class="w-full sm:w-auto bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-gray-300"><option value="">Auto (all interfaces)</option></select><button onclick="loadLldp()" class="flex-1 bg-Ragnar-600 hover:bg-Ragnar-700 text-white px-4 py-2 rounded text-sm whitespace-nowrap">Refresh</button><button onclick="exportLldpCsv()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-600 text-gray-200 px-3 py-2 rounded text-sm whitespace-nowrap">Export CSV</button></div>
                     </div>
                     <div id="lldp-results" class="mt-3 overflow-x-auto text-sm text-gray-400">Loading…</div>
                 </div>
@@ -6679,7 +6679,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260719-huginn-band-split"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260719-lldp-iface-dropdown"></script>
 
 </body>
 </html>

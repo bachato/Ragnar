@@ -461,11 +461,16 @@ def do_speedtest(interface=None):
 # Switch & L2: LLDP/CDP/EDP neighbor discovery + ARP scan
 # --------------------------------------------------------------------------
 
-def do_lldp():
+def do_lldp(interface=None):
     """Return discovered switch neighbors via lldpctl. lldpd (configured with
     -c -e -f -s) also decodes CDPv1/v2 (Cisco), EDP (Extreme), FDP (Foundry)
     and SONMP (Nortel) in addition to LLDP. VLAN id/name are included when the
-    neighbor advertises them."""
+    neighbor advertises them.
+
+    `interface` limits discovery to one local port; '' / None reports every
+    interface (the default). On a multi-homed box — a Ragnar with a LAN cable,
+    a USB NIC and WiFi — that is the difference between "which switch am I
+    plugged into on *this* port" and a merged list you have to eyeball."""
     if not _have('lldpctl'):
         return {'success': False,
                 'error': 'lldpd/lldpctl is not installed. Click Install to add it '
@@ -473,9 +478,19 @@ def do_lldp():
                          'Cisco, Extreme, Foundry and Nortel switches are seen too).',
                 'missing_tool': 'lldpd',
                 'neighbors': []}
-    res = _run(['lldpctl', '-f', 'json'], timeout=15)
+    if interface:
+        # Name/injection guard plus an existence check, so a typo surfaces as a
+        # clear error rather than an empty neighbour list that looks like "no
+        # switch found".
+        if not _valid_iface(interface) or interface not in _list_iface_names(include_virtual=True):
+            return {'success': False, 'error': f'Unknown interface: {interface}',
+                    'neighbors': []}
+    # lldpctl takes trailing interface names to filter natively.
+    cmd = ['lldpctl', '-f', 'json'] + ([interface] if interface else [])
+    res = _run(cmd, timeout=15)
     if res['rc'] != 0 and not res['out']:
-        return {'success': False, 'error': res['err'] or 'lldpctl failed', 'neighbors': []}
+        return {'success': False, 'error': res['err'] or 'lldpctl failed',
+                'interface': interface, 'neighbors': []}
     neighbors = []
     try:
         data = json.loads(res['out'])
@@ -487,11 +502,18 @@ def do_lldp():
                 neighbors.append(_parse_lldp_iface(local_if, info))
     except ValueError as e:
         return {'success': False, 'error': f'could not parse lldpctl output: {e}',
-                'neighbors': [], 'output': res['out']}
-    return {'success': True, 'neighbors': neighbors,
-            'note': ('No neighbors yet? Switches announce every ~30s; give it up '
-                     'to a minute after connecting, and ensure the port isn\'t on a hub.')
-            if not neighbors else None}
+                'interface': interface, 'neighbors': [], 'output': res['out']}
+    if not neighbors:
+        note = ('No neighbors yet? Switches announce every ~30s; give it up '
+                'to a minute after connecting, and ensure the port isn\'t on a hub.')
+        if interface:
+            note = (f'No neighbours on {interface}. ' + note +
+                    ' If the cable is on a different port, switch to Auto (all '
+                    'interfaces) to see every neighbour this box can hear.')
+    else:
+        note = None
+    return {'success': True, 'interface': interface, 'neighbors': neighbors,
+            'note': note}
 
 
 def _first_key(d):
@@ -14230,7 +14252,8 @@ def register_network_diagnostics(app, logger=None):
     @app.route('/api/net/lldp', methods=['GET'])
     def net_lldp():
         _log("net/lldp")
-        return jsonify(do_lldp())
+        iface = (request.args.get('interface') or '').strip() or None
+        return jsonify(do_lldp(interface=iface))
 
     @app.route('/api/net/arp-scan', methods=['GET'])
     def net_arp_scan():
