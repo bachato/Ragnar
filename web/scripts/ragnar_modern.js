@@ -1429,9 +1429,11 @@ function wifiRenderTable() {
     if (_wifiState.apView === 'nets') return wifiRenderNets();
     const q = (document.getElementById('wifi-ap-search').value || '').toLowerCase();
     const issuesOnly = document.getElementById('wifi-ap-issues').checked;
+    const std = (document.getElementById('wifi-ap-std') || {}).value || '';
     let aps = d.aps.filter(a =>
         (!q || (a.ssid || '').toLowerCase().includes(q) || (a.vendor || '').toLowerCase().includes(q) || a.bssid.includes(q))
-        && (!issuesOnly || (a.security_findings && a.security_findings.length)));
+        && (!issuesOnly || (a.security_findings && a.security_findings.length))
+        && (!std || a.standard === std));
     const k = _wifiState.sortKey, dir = _wifiState.sortDir;
     aps = aps.slice().sort((x, y) => {
         let a = x[k], b = y[k];
@@ -1471,7 +1473,9 @@ function wifiRenderTable() {
 function wifiRenderNets() {
     const d = _wifiState.data; if (!d || !d.groups) return;
     const q = (document.getElementById('wifi-ap-search').value || '').toLowerCase();
-    let nets = d.groups.networks.filter(n => !q || n.ssid.toLowerCase().includes(q));
+    const std = (document.getElementById('wifi-ap-std') || {}).value || '';
+    let nets = d.groups.networks.filter(n =>
+        (!q || n.ssid.toLowerCase().includes(q)) && (!std || n.standard === std));
     const el = document.getElementById('wifi-nets-view');
     document.getElementById('wifi-ap-count').textContent = `(${nets.length} networks · ${d.groups.device_count} devices)`;
     el.innerHTML = nets.map(n => `<div class="flex items-center justify-between gap-2 py-1.5 border-b border-slate-800/50">

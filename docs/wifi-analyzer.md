@@ -45,10 +45,12 @@ the Alfa AWUS036AXM and 2.4/5 GHz on the Pi's onboard radio automatically.
 ## AP inventory, networks & export
 
 The AP table is sortable on 9 columns (SSID, Vendor, Band, Channel, Width, Rate,
-Signal, Security, Utilisation), with a **search** box and an **issues-only**
-filter. Generation and security are shown as inline badges (Wi‑Fi 6E, 802.1X,
-PMF, WPS, 11k/v/r). A **Networks** view collapses BSSIDs that share an SSID into
-one logical network (bands, AP count, best signal). **Export CSV** dumps the full
+Signal, Security, Utilisation), with a **search** box, an **issues-only**
+filter, and a **generation filter** (Wi‑Fi 7 / 6E / 6 / 5 / 4 / legacy — applies
+to both the AP and Networks views). Generation and security are shown as inline
+badges (Wi‑Fi 6E, 802.1X, PMF, WPS, 11k/v/r). A **Networks** view collapses
+BSSIDs that share an SSID into one logical network (bands, AP count, best
+signal). **Export CSV** dumps the full
 enriched inventory for offline analysis.
 
 ---
