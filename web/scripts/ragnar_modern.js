@@ -22670,6 +22670,7 @@ function updateWardrivingUI(status) {
     updateElement('wd-wpa-count', String(stats.wpa_networks || 0));
     updateElement('wd-band24', String(stats.band_2_4ghz || 0));
     updateElement('wd-band5', String(stats.band_5ghz || 0));
+    updateElement('wd-band6', String(stats.band_6ghz || 0));
     updateElement('wd-scans-done', `Scans: ${status.scans_completed || 0}`);
 
     // BT, Cell, Camera counts
