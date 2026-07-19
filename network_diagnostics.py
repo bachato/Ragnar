@@ -3263,8 +3263,12 @@ def do_locate_port(interface, count=6, on_ms=800, off_ms=800, force=False, metho
                 link stays up. Never drops connectivity, so no force is needed
                 — safe even on the default route."""
     interface = (interface or '').strip()
-    if not interface:
-        return {'success': False, 'error': 'interface required'}
+    auto = not interface
+    if auto:
+        # _capture_iface prefers a link-up wired port — exactly what locate
+        # needs; if it falls through to a wireless default route, the
+        # ethernet check below rejects it with the auto-specific message.
+        interface = _capture_iface(None) or ''
     method = (method or 'flap').strip().lower()
     if method not in ('flap', 'burst'):
         method = 'flap'
@@ -3272,8 +3276,14 @@ def do_locate_port(interface, count=6, on_ms=800, off_ms=800, force=False, metho
     match = next((i for i in do_interfaces(include_virtual=True).get('interfaces', [])
                   if i['name'] == interface), None)
     if match is None:
-        return {'success': False, 'error': f'unknown interface: {interface}'}
+        return {'success': False, 'error': f'unknown interface: {interface}'
+                if interface else 'no wired Ethernet port found — plug in a cable or pick an interface.'}
     if match.get('type') != 'ethernet' or not interface.startswith(('eth', 'en')):
+        if auto:
+            return {'success': False,
+                    'error': 'no wired Ethernet port with link found — locating a '
+                             'switch port needs a cable; pick an interface explicitly '
+                             'if one exists.'}
         return {'success': False,
                 'error': f'{interface} is not a physical Ethernet port; locating '
                          'a switch port only works on a wired link.'}
@@ -3317,9 +3327,9 @@ def do_l2_health(interface, seconds=12):
     bridge(s) and topology churn (loop smell), CDP/LLDP/DTP/VTP control frames,
     broadcast/multicast storm rate, rogue DHCP servers, rogue IPv6 RA sources,
     and duplicate IPs (conflicting ARP). One 'what's wrong at L2' snapshot."""
-    interface = (interface or '').strip()
+    interface = _capture_iface((interface or '').strip() or None)
     if not interface:
-        return {'success': False, 'error': 'interface required'}
+        return {'success': False, 'error': 'No suitable interface found — pick one explicitly.'}
     if not _have('tcpdump'):
         return {'success': False, 'missing_tool': 'tcpdump',
                 'error': 'tcpdump is not installed. Click Install to add it.'}
