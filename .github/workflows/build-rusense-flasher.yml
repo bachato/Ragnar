@@ -45,19 +45,26 @@ jobs:
           echo "$PWD/bin" >> $GITHUB_PATH
 
       - name: Configure arduino-cli and add ESP32 board index
+        # Use the STABLE index (not package_esp32_dev_index.json) — the dev
+        # index serves pre-release alphas, and an unpinned install pulls the
+        # highest version (e.g. 4.0.0-alpha1), whose stricter gpio_num_t typing
+        # breaks GFX 1.6.7. Pin an explicit stable core for reproducible builds.
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls \
-            "https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json"
+            "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
           arduino-cli core update-index
 
       - name: Install ESP32 board core
-        run: arduino-cli core install esp32:esp32
+        # 3.3.0 is the first STABLE core with the ESP32-C5 target (it's absent
+        # from 3.2.x — that's why the old workflow needed the dev/alpha index).
+        run: arduino-cli core install esp32:esp32@3.3.0
 
       - name: Install Arduino libraries
         # Arduino_GFX is only needed by the S3 LCD build (Waveshare 480x480
-        # ST7701 panel). C5 is headless and uses no external libs.
-        run: arduino-cli lib install "GFX Library for Arduino"
+        # ST7701 panel). C5 is headless and uses no external libs. Pinned so a
+        # future GFX release can't silently break the build.
+        run: arduino-cli lib install "GFX Library for Arduino@1.6.7"
 
       - name: Compile ESP32-C5 Coordinator (headless)
         # CDCOnBoot=cdc → Serial is HWCDC (USB-Serial-JTAG, /dev/ttyACM0).
@@ -71,9 +78,16 @@ jobs:
       - name: Compile ESP32-S3 LCD Coordinator
         # USBMode=hwcdc keeps Serial on USB-Serial-JTAG (CDC ACM).
         # PSRAM=opi for the N16R8 OPI PSRAM Waveshare S3-Touch-LCD-4B.
+        #
+        # -fpermissive: GFX 1.6.7 compiles ALL its databus .cpp files (even the
+        # unused i80 Arduino_ESP32LCD8.cpp — this panel is RGB, not i80), and
+        # that file assigns int8_t pins to gpio_num_t, which the newer IDF
+        # rejects. -fpermissive downgrades it to a warning (compiler.cpp.extra_flags
+        # is empty by default, so overriding it drops nothing).
         run: |
           arduino-cli compile \
             --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,PartitionScheme=default_8MB,PSRAM=opi,FlashSize=8M" \
+            --build-property "compiler.cpp.extra_flags=-fpermissive" \
             --export-binaries \
             "espnow_bridge_firmware/espnow_bridge_s3_lcd"
 
