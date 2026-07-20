@@ -370,7 +370,23 @@ not ride the 3-second status poll.
 | **GPS constellations** | per-constellation satellites in view and peak SNR (GPS / GLONASS / Galileo / BeiDou / QZSS / NavIC) |
 | **Radios** | every wireless interface present, whether it is scanning, its driver / mode / link state, the USB adapter behind it — and **when it is not scanning, the reason** |
 | **Power** | per-USB-device declared draw and which interface it backs, summed USB budget, `usb_max_current_enable`, supply throttle/under-voltage flags (now and since boot), core voltage, temperature, and Pi 5 PMIC board power |
-| **Errors** | everything currently complaining — engine, GPS, radios, companions and supply — gathered into one list |
+| **Errors** | everything currently complaining — engine, GPS, radios, companions, supply and **stalled feeds** — gathered into one list |
+
+> **Declared, not measured.** The per-device milliamps come from the USB
+> descriptor's `bMaxPower`. No Pi meters per-port current, and the figure is
+> frequently understated — a tri-band adapter that really pulls several hundred
+> milliamps may declare 100 mA. Treat the total as the budget the host *thinks*
+> it has handed out, not as consumption. `usb_max_current_enable` is a Pi 5
+> setting and is only shown on a Pi 5.
+
+> **Stalled feeds.** A feed that has *stopped* looks identical to a weak one in
+> the summary numbers — the last-known satellite count and SNR simply sit at
+> their final value. So **Last NMEA** and **Last scan** turn red once they go
+> stale (30 s and 60 s), and the Errors group says so in words. When GPS and
+> scanning go quiet within a minute of each other, it adds a note that both hang
+> off USB, so a bus/hub glitch or a dip on the USB rail fits better than an RF
+> or per-device fault — check `dmesg` for USB resets. That correlation is
+> invisible if you only read the satellite counts.
 | **Session** | id, duration, network totals, open/WEP/WPA, per-band, Bluetooth, cell towers, cameras, trackpoints, strongest AP, DB path |
 | **Scanning** | running, band mode, scans completed, networks last scan, last scan age, interfaces, plus per-adapter driver / bands / USB / manufacturer / network count |
 | **Coverage** | BSSIDs seen by 2+ adapters, and per adapter its unique count, *only-here* count and median best RSSI — the antenna-comparison view (dashboard only) |
