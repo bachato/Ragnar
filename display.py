@@ -115,6 +115,13 @@ except ImportError:
 NETDIAG_PAGE_COUNT = 8
 NETDIAG_CYCLE_SECONDS = 5
 
+# Wardriving screens on the 1.44" ST7735S LCD HAT (128x128), paged with the
+# joystick while wardriving runs. Mirrored by lcdhat_input.WARDRIVE_PAGE_COUNT.
+#   0=STATS  1=MAP  2=GPS  3=SESSION  4=VIKING
+# The 2.7" e-paper HAT is unaffected — it keeps its KEY3 stats/map toggle.
+WARDRIVE_PAGE_COUNT = 5
+WD_PAGE_STATS, WD_PAGE_MAP, WD_PAGE_GPS, WD_PAGE_SESSION, WD_PAGE_VIKING = range(5)
+
 class Display:
     def __init__(self, shared_data):
         """Initialize the display and start the main image and shared data update threads."""
@@ -796,15 +803,23 @@ class Display:
             return False
 
     def _sleep_interruptible(self, current_page):
-        """Sleep for screen_delay but wake early if button changes the page."""
+        """Sleep for screen_delay but wake early if button changes the page.
+
+        Also watches the wardriving sub-page so the LCD HAT's joystick paging
+        through the wardriving screens redraws promptly instead of waiting out
+        the full screen_delay.
+        """
         if not self.button_listener:
             time.sleep(self.shared_data.screen_delay)
             return
+        wd_page = getattr(self.button_listener, 'wardrive_page', 0)
         # Check every 0.1s if page changed, otherwise do full sleep
         steps = max(1, int(self.shared_data.screen_delay / 0.1))
         for _ in range(steps):
             if self.button_listener.current_page != current_page:
                 return  # Page changed, skip remaining sleep
+            if getattr(self.button_listener, 'wardrive_page', 0) != wd_page:
+                return  # Wardriving sub-page changed (joystick)
             time.sleep(0.1)
 
     def _get_cached_page_data(self, key, fetch_fn, ttl=10):
@@ -2184,7 +2199,85 @@ class Display:
         except Exception:
             return None
 
+    def _wd_compact_page(self):
+        """Which wardriving screen the LCD joystick has paged to (0..N-1)."""
+        try:
+            return int(getattr(self.button_listener, 'wardrive_page', 0) or 0) % WARDRIVE_PAGE_COUNT
+        except (TypeError, ValueError, AttributeError):
+            return WD_PAGE_STATS
+
     def _render_wardriving_page_compact(self, image, draw, wd):
+        """Dispatch to the wardriving screen the joystick has selected on the
+        1.44" ST7735S LCD HAT (128x128). See WARDRIVE_PAGE_COUNT."""
+        page = self._wd_compact_page()
+        if page == WD_PAGE_MAP:
+            self._render_wd_compact_map(image, draw, wd)
+        elif page == WD_PAGE_GPS:
+            self._render_wd_compact_gps(image, draw, wd)
+        elif page == WD_PAGE_SESSION:
+            self._render_wd_compact_session(image, draw, wd)
+        elif page == WD_PAGE_VIKING:
+            self._render_wd_compact_viking(image, draw, wd)
+        else:
+            self._render_wd_compact_stats(image, draw, wd)
+
+    def _draw_wd_compact_chrome(self, draw, title=None):
+        """Shared border + footer for the compact wardriving screens.
+
+        The footer carries the LCD HAT's wardriving key map (K1 leaves for the
+        Ragnar screens, K2 reconnects Wi-Fi, K3 toggles the phone AP) plus a
+        "n/N" page counter so the joystick paging is discoverable. Returns the
+        y of the footer divider so callers know where their content band ends.
+        """
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        h = getattr(self, 'render_h', self.shared_data.height)
+        font = self.shared_data.font_arial9
+
+        draw.rectangle((1, 1, w - 1, h - 1), outline=0)
+
+        ap_on = getattr(self.shared_data, 'wardrive_ap_active', False)
+        hint = "K1Exit K2WiFi K3APoff" if ap_on else "K1Exit K2WiFi K3AP"
+        page_str = f"{self._wd_compact_page() + 1}/{WARDRIVE_PAGE_COUNT}"
+
+        footer_y = h - int(18 * sy)
+        draw.line((1, footer_y, w - 1, footer_y), fill=0)
+
+        # Page counter is pinned right; the hint is trimmed to whatever is left
+        # so a longer hint never overruns it on the 128 px panel.
+        pw = font.getlength(page_str)
+        draw.text((w - int(4 * sx) - pw, h - int(16 * sy)), page_str, font=font, fill=0)
+        avail = w - int(8 * sx) - pw - int(4 * sx)
+        _hint = hint
+        while _hint and font.getlength(_hint) > avail:
+            _hint = _hint[:-1]
+        draw.text((int(4 * sx), h - int(16 * sy)), _hint, font=font, fill=0)
+
+        if title:
+            tw = font.getlength(title)
+            draw.text(((w - tw) / 2, int(3 * sy)), title, font=font, fill=0)
+
+        return footer_y
+
+    def _wd_compact_not_running(self, draw, wd):
+        """Shared 'Starting.../Stopped' placeholder. True if it was drawn."""
+        if wd and wd.get('running'):
+            return False
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        font = self.shared_data.font_arial9
+        font_row = self.shared_data.font_arial11
+        never_started = not (wd and wd.get('session_id'))
+        if self.shared_data.config.get('wardriving_on_boot', False) and never_started:
+            msg1, msg2 = "Starting...", "Waiting for engine"
+        else:
+            msg1, msg2 = "Stopped", "Enable in WebUI"
+        draw.text(((w - font_row.getlength(msg1)) / 2, int(45 * sy)), msg1, font=font_row, fill=0)
+        draw.text(((w - font.getlength(msg2)) / 2, int(62 * sy)), msg2, font=font, fill=0)
+        return True
+
+    def _render_wd_compact_stats(self, image, draw, wd):
         """Compact wardriving layout for the 1.44" ST7735S LCD HAT (128x128).
 
         The square panel is too small for the full stat page, so we drop the
@@ -2201,31 +2294,12 @@ class Display:
         font_lbl = self._font_at('Arial.ttf', int(9 * sy))
         font_num = self._font_at('Arial.ttf', int(22 * sy))
 
-        draw.rectangle((1, 1, w - 1, h - 1), outline=0)
-
-        # Footer controls (drawn first so the content band knows its bottom).
-        # Colons/spaces dropped vs. the full page so the whole hint fits 128px.
-        ap_on = getattr(self.shared_data, 'wardrive_ap_active', False)
-        hint = "K1APoff K2Flip K3Map K4WiFi" if ap_on else "K1AP K2Flip K3Map K4WiFi"
-        footer_y = h - int(18 * sy)
-        draw.line((1, footer_y, w - 1, footer_y), fill=0)
-        _hint = hint
-        avail = w - int(8 * sx)
-        while _hint and font.getlength(_hint) > avail:
-            _hint = _hint[:-1]
-        draw.text((int(4 * sx), h - int(16 * sy)), _hint, font=font, fill=0)
+        # Border + footer controls (drawn first so the content band knows its
+        # bottom). Colons/spaces dropped so the whole hint fits 128px.
+        self._draw_wd_compact_chrome(draw)
 
         # Not running: centred status placeholder (starting vs stopped).
-        if not wd or not wd.get('running'):
-            never_started = not (wd and wd.get('session_id'))
-            if self.shared_data.config.get('wardriving_on_boot', False) and never_started:
-                msg1, msg2 = "Starting...", "Waiting for engine"
-            else:
-                msg1, msg2 = "Stopped", "Enable in WebUI"
-            m1w = font_row.getlength(msg1)
-            m2w = font.getlength(msg2)
-            draw.text(((w - m1w) / 2, int(45 * sy)), msg1, font=font_row, fill=0)
-            draw.text(((w - m2w) / 2, int(62 * sy)), msg2, font=font, fill=0)
+        if self._wd_compact_not_running(draw, wd):
             return
 
         st = wd.get('stats', {})
@@ -2309,6 +2383,218 @@ class Display:
             draw.text((pad_x, y), label, font=font_row, fill=0)
             draw.text((w - pad_x - vw, y), val_str, font=font_row, fill=0)
             y += line_h
+
+    def _wd_compact_rows(self, draw, rows, top, footer_y):
+        """Draw right-aligned key/value rows in a compact screen's content band,
+        stopping before the footer divider so nothing overprints the hints."""
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        font_row = self.shared_data.font_arial11
+        pad_x = int(6 * sx)
+        # 13px lines fit 7 rows in the 128px panel's content band; at 15 the
+        # last row (GPS course / session trackpoints) fell off the bottom.
+        line_h = int(13 * sy)
+        y = top
+        for label, value in rows:
+            if y + line_h > footer_y:
+                break
+            val_str = str(value)
+            vw = font_row.getlength(val_str)
+            # Trim the value if it would collide with the label.
+            while val_str and pad_x + font_row.getlength(label) + int(6 * sx) > w - pad_x - vw:
+                val_str = val_str[:-1]
+                vw = font_row.getlength(val_str)
+            draw.text((pad_x, y), label, font=font_row, fill=0)
+            draw.text((w - pad_x - vw, y), val_str, font=font_row, fill=0)
+            y += line_h
+        return y
+
+    def _render_wd_compact_gps(self, image, draw, wd):
+        """Compact GPS detail screen — the fix quality behind the stats page's
+        one-line summary: position, altitude, satellites, HDOP, speed, course."""
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        footer_y = self._draw_wd_compact_chrome(draw, title="GPS")
+        if self._wd_compact_not_running(draw, wd):
+            return
+
+        gps = (wd.get('gps') or {})
+        rows = []
+        if gps.get('has_fix'):
+            lat, lon = gps.get('latitude'), gps.get('longitude')
+            rows.append(("Lat", f"{lat:.5f}" if isinstance(lat, (int, float)) else "-"))
+            rows.append(("Lon", f"{lon:.5f}" if isinstance(lon, (int, float)) else "-"))
+            alt = gps.get('altitude')
+            if isinstance(alt, (int, float)):
+                rows.append(("Alt", f"{alt:.0f}m"))
+        elif gps.get('connected'):
+            rows.append(("Fix", "Searching"))
+        else:
+            rows.append(("Fix", "No GPS"))
+
+        used = gps.get('satellites')
+        in_view = gps.get('satellites_in_view')
+        if isinstance(used, (int, float)) or isinstance(in_view, (int, float)):
+            u = int(used) if isinstance(used, (int, float)) else 0
+            v = int(in_view) if isinstance(in_view, (int, float)) else 0
+            rows.append(("Sats", f"{u}/{v}"))
+        hdop = gps.get('hdop')
+        if isinstance(hdop, (int, float)) and hdop > 0:
+            rows.append(("HDOP", f"{hdop:.1f}"))
+
+        spd = gps.get('speed_kmh')
+        if isinstance(spd, (int, float)):
+            unit = self.config.get('wardriving_speed_unit', 'kmh')
+            rows.append(("Spd", _fmt_wd_speed(spd, unit)))
+        course = gps.get('course')
+        if gps.get('has_fix') and isinstance(course, (int, float)):
+            rows.append(("Crs", f"{course:.0f}"))
+
+        self._wd_compact_rows(draw, rows, int(15 * sy), footer_y)
+
+    def _render_wd_compact_session(self, image, draw, wd):
+        """Compact session totals — the running tally the stats page's band
+        columns don't show: duration, security mix, Bluetooth, cells, track."""
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        footer_y = self._draw_wd_compact_chrome(draw, title="SESSION")
+        if self._wd_compact_not_running(draw, wd):
+            return
+
+        st = (wd.get('stats') or {})
+
+        dur = st.get('duration_seconds')
+        if isinstance(dur, (int, float)) and dur >= 0:
+            total = int(dur)
+            h, rem = divmod(total, 3600)
+            m, s = divmod(rem, 60)
+            dur_str = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+        else:
+            dur_str = "-"
+
+        rows = [
+            ("Time", dur_str),
+            ("Nets", st.get('total_networks', 0)),
+            ("Open", st.get('open_networks', 0)),
+            ("WEP", st.get('wep_networks', 0)),
+            ("BT", st.get('bluetooth_devices', 0)),
+            ("Cell", st.get('cell_towers', 0)),
+            ("Track", st.get('gps_trackpoints', 0)),
+        ]
+        self._wd_compact_rows(draw, rows, int(15 * sy), footer_y)
+
+    def _render_wd_compact_map(self, image, draw, wd):
+        """Compact live map — GPS breadcrumb + located networks, auto-scaled to
+        the 128x128 panel. Same data as the e-paper map page, drawn without the
+        big title frame so the plot gets nearly the whole screen."""
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        font = self.shared_data.font_arial9
+        footer_y = self._draw_wd_compact_chrome(draw, title="MAP")
+        if self._wd_compact_not_running(draw, wd):
+            return
+
+        track, nets, here = self._wardrive_map_points(wd)
+        top = int(14 * sy)
+        bottom = footer_y - int(2 * sy)
+        left = int(3 * sx)
+        right = w - int(3 * sx)
+
+        pts = list(track) + nets + ([here] if here else [])
+        if not pts:
+            msg = "Waiting for GPS..."
+            draw.text(((w - font.getlength(msg)) / 2, (top + bottom) / 2),
+                      msg, font=font, fill=0)
+            return
+
+        lats = [p[0] for p in pts]
+        lons = [p[1] for p in pts]
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+        lon_scale = math.cos(math.radians((min_lat + max_lat) / 2.0)) or 1.0
+        d_lat = max(max_lat - min_lat, 1e-5)
+        d_lon = max((max_lon - min_lon) * lon_scale, 1e-5)
+        scale = min((right - left) / d_lon, (bottom - top) / d_lat)
+        off_x = left + ((right - left) - d_lon * scale) / 2.0
+        off_y = top + ((bottom - top) - d_lat * scale) / 2.0
+
+        def X(lon):
+            return off_x + (lon - min_lon) * lon_scale * scale
+
+        def Y(lat):
+            return off_y + (max_lat - lat) * scale
+
+        # Networks first so the track draws over them.
+        for lat, lon in nets:
+            x, y = X(lon), Y(lat)
+            draw.point((x, y), fill=0)
+        if len(track) > 1:
+            draw.line([(X(p[1]), Y(p[0])) for p in track], fill=0, width=1)
+        if here:
+            x, y = X(here[1]), Y(here[0])
+            r = int(3 * sx)
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=0)
+            draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=0)
+
+    def _render_wd_compact_viking(self, image, draw, wd):
+        """Full-screen Ragnar viking — the 'am I still alive?' glance screen.
+
+        Uses the live animated character sprite when one is loaded so the panel
+        moves, falling back to the static ragnar1 mascot. Scaled up to fill the
+        content band above the footer, preserving aspect ratio.
+        """
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        font = self.shared_data.font_arial9
+        footer_y = self._draw_wd_compact_chrome(draw)
+
+        sd = self.shared_data
+        vk = getattr(sd, 'imagegen', None) or getattr(sd, 'ragnar1', None)
+        top = int(2 * sy)
+        band_h = footer_y - top - int(2 * sy)
+        if vk is None or band_h <= 0:
+            msg = "RAGNAR"
+            draw.text(((w - font.getlength(msg)) / 2, footer_y / 2), msg, font=font, fill=0)
+            return
+        try:
+            # Fill the band on the tighter axis so the whole viking stays visible.
+            ratio = min((w - 4) / vk.width, band_h / vk.height)
+            if ratio > 0:
+                vk = vk.resize((max(1, int(vk.width * ratio)),
+                                max(1, int(vk.height * ratio))), Image.NEAREST)
+            image.paste(vk, ((w - vk.width) // 2, top + (band_h - vk.height) // 2))
+        except Exception as e:
+            logger.debug(f"viking page render failed: {e}")
+
+    def _wardrive_map_points(self, wd=None):
+        """Pull the live session's GPS track, located networks and current fix.
+
+        Shared by the e-paper map page and the compact LCD map so both plot
+        exactly the same data. Returns (track, nets, here) with here=None when
+        there is no fix; every point is a (lat, lon) pair.
+        """
+        track, nets, here = [], [], None
+        try:
+            from webapp_modern import _get_wardriving_engine
+            engine = _get_wardriving_engine()
+            session = getattr(engine, 'session', None)
+            wd = wd if wd is not None else (self._get_wardriving_data() or {})
+            gps = (wd or {}).get('gps') or {}
+            if gps.get('has_fix'):
+                lat, lon = gps.get('latitude'), gps.get('longitude')
+                if lat is not None and lon is not None:
+                    here = (lat, lon)
+            if session is not None:
+                track = [p for p in (session.get_gps_track() or [])
+                         if isinstance(p, (list, tuple)) and p[0] is not None and p[1] is not None]
+                for n in session.get_networks(limit=2000):
+                    lat = n.get('best_lat') if n.get('best_lat') else n.get('latitude')
+                    lon = n.get('best_lon') if n.get('best_lon') else n.get('longitude')
+                    if lat and lon and not (lat == 0 and lon == 0):
+                        nets.append((lat, lon))
+        except Exception:
+            pass
+        return track, nets, here
 
     def _render_wardriving_page(self, image, draw):
         """Render a wardriving status page for EPD e-paper displays."""
@@ -2498,25 +2784,7 @@ class Display:
         right = w - int(3 * sx)
 
         # Pull track + located networks straight from the live session.
-        track, nets, here = [], [], None
-        try:
-            from webapp_modern import _get_wardriving_engine
-            engine = _get_wardriving_engine()
-            session = getattr(engine, 'session', None)
-            wd = self._get_wardriving_data() or {}
-            gps = wd.get('gps') or {}
-            if gps.get('has_fix'):
-                here = (gps.get('latitude'), gps.get('longitude'))
-            if session is not None:
-                track = [p for p in (session.get_gps_track() or [])
-                         if isinstance(p, (list, tuple)) and p[0] is not None and p[1] is not None]
-                for n in session.get_networks(limit=2000):
-                    lat = n.get('best_lat') if n.get('best_lat') else n.get('latitude')
-                    lon = n.get('best_lon') if n.get('best_lon') else n.get('longitude')
-                    if lat and lon and not (lat == 0 and lon == 0):
-                        nets.append((lat, lon))
-        except Exception:
-            pass
+        track, nets, here = self._wardrive_map_points()
 
         pts = list(track) + nets + ([here] if here and here[0] is not None else [])
         if not pts:
