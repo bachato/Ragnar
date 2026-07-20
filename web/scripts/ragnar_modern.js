@@ -22737,6 +22737,321 @@ function updateWardrivingUI(status) {
 
     // Serial ESP32 config card
     updateSerialStatus(status);
+
+    // Collapsed diagnostics panel at the bottom of the tab
+    renderWardrivingDiagnostics(status);
+}
+
+// --- Wardriving diagnostics panel -----------------------------------------
+// Everything /api/wardriving/status exposes, grouped, collapsed by default.
+// Mirrors the panel on the phone-access AP page (web/wardrive_mobile.html) and
+// adds the antenna Coverage group, which only the full dashboard has room for.
+// GPS leads: SNR max and satellites used-vs-in-view are what separate a
+// weak-signal problem from a receiver that keeps restarting when it can see
+// satellites but never fixes.
+let _wdDiagLastStatus = null;
+let _wdDiagBound = false;
+// Deep payload from /api/wardriving/diagnostics (radios, power, GPS detail,
+// errors). Fetched only while the panel is open — it walks sysfs and shells out
+// to vcgencmd, so it must not ride the 3 s status poll.
+let _wdDiagExtra = null;
+let _wdDiagExtraAt = 0;
+let _wdDiagExtraBusy = false;
+const _WD_DIAG_EXTRA_TTL = 8000;
+
+function _wdFetchDiagExtra(force) {
+    const panel = document.getElementById('wd-diag');
+    if (!panel || !panel.open || _wdDiagExtraBusy) return;
+    if (!force && Date.now() - _wdDiagExtraAt < _WD_DIAG_EXTRA_TTL) return;
+    _wdDiagExtraBusy = true;
+    fetch('/api/wardriving/diagnostics', { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+            if (d && !d.error) {
+                _wdDiagExtra = d;
+                _wdDiagExtraAt = Date.now();
+                if (_wdDiagLastStatus) renderWardrivingDiagnostics(_wdDiagLastStatus);
+            }
+        })
+        .catch(() => { /* panel degrades to the status-only groups */ })
+        .finally(() => { _wdDiagExtraBusy = false; });
+}
+
+function _wdHas(v) { return v !== undefined && v !== null && v !== ''; }
+
+function _wdAge(ts) {
+    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return null;
+    const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    return `${Math.floor(s / 3600)}h${Math.floor(s / 60) % 60}m ago`;
+}
+
+// True when an epoch-seconds timestamp is older than `maxAge` seconds.
+function _wdStale(ts, maxAge) {
+    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return false;
+    return (Date.now() / 1000 - ts) > maxAge;
+}
+
+function _wdDur(sec) {
+    if (typeof sec !== 'number' || !isFinite(sec) || sec < 0) return null;
+    const t = Math.round(sec), h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60;
+    return h ? `${h}h ${m}m` : `${m}m ${t % 60}s`;
+}
+
+// One titled group of key/value rows. Rows with no value are dropped, and a
+// group with nothing left to show is skipped entirely.
+function _wdDiagGroup(title, rows) {
+    const kept = rows.filter(r => _wdHas(r[1]));
+    if (!kept.length) return '';
+    const body = kept.map(([k, v, tone]) => {
+        const cls = tone === 'warn' ? 'text-red-400'
+                  : tone === 'good' ? 'text-emerald-400' : 'text-gray-200';
+        return `<div class="flex items-baseline gap-3 py-0.5">
+            <span class="text-gray-500 whitespace-nowrap">${escapeHtml(String(k))}</span>
+            <span class="${cls} ml-auto text-right font-mono break-all">${escapeHtml(String(v))}</span>
+        </div>`;
+    }).join('');
+    return `<div class="min-w-0">
+        <h4 class="text-xs uppercase tracking-wide text-gray-500 font-semibold mb-2 pb-1 border-b border-slate-700">${escapeHtml(title)}</h4>
+        <div class="text-xs">${body}</div>
+    </div>`;
+}
+
+function renderWardrivingDiagnostics(status) {
+    const panel = document.getElementById('wd-diag');
+    const body = document.getElementById('wd-diag-body');
+    if (!panel || !body) return;
+
+    _wdDiagLastStatus = status || {};
+    const st = _wdDiagLastStatus;
+    const gps = st.gps || {};
+    const stats = st.stats || {};
+
+    // Headline stays readable while collapsed so a glance often suffices.
+    const note = document.getElementById('wd-diag-note');
+    if (note) {
+        let hint = gps.has_fix ? 'GPS fix' : (gps.connected ? 'GPS searching' : 'no GPS');
+        if (st.error || gps.error) hint += ' · error';
+        note.textContent = hint;
+    }
+
+    // Re-render on expand instead of keeping the DOM warm while hidden.
+    if (!_wdDiagBound) {
+        _wdDiagBound = true;
+        panel.addEventListener('toggle', () => {
+            if (!panel.open) return;
+            _wdFetchDiagExtra(true);
+            if (_wdDiagLastStatus) renderWardrivingDiagnostics(_wdDiagLastStatus);
+        });
+    }
+    if (!panel.open) return;
+    _wdFetchDiagExtra(false);   // refresh the deep payload while open
+
+    const sats = (_wdHas(gps.satellites) || _wdHas(gps.satellites_in_view))
+        ? `${gps.satellites || 0} used / ${gps.satellites_in_view || 0} in view` : null;
+
+    const groups = [];
+
+    groups.push(_wdDiagGroup('GPS', [
+        ['Fix', gps.has_fix ? 'yes' : 'no', gps.has_fix ? 'good' : 'warn'],
+        ['Fix quality', gps.fix_quality],
+        ['Satellites', sats],
+        ['SNR max', _wdHas(gps.snr_max) ? `${gps.snr_max} dB` : null],
+        ['HDOP', gps.hdop],
+        ['Latitude', _wdHas(gps.latitude) ? Number(gps.latitude).toFixed(6) : null],
+        ['Longitude', _wdHas(gps.longitude) ? Number(gps.longitude).toFixed(6) : null],
+        ['Altitude', _wdHas(gps.altitude) ? `${Number(gps.altitude).toFixed(1)} m` : null],
+        ['Speed', _wdHas(gps.speed_kmh) ? formatWardrivingSpeed(gps.speed_kmh) : null],
+        ['Course', _wdHas(gps.course) ? `${Number(gps.course).toFixed(0)}°` : null],
+        ['Connected', gps.connected ? 'yes' : 'no'],
+        ['Source', gps.source],
+        ['Port', gps.port],
+        ['Last update', _wdAge(gps.last_update)],
+        // last_sentence is a TIMESTAMP of the last NMEA sentence, not its text
+        // — rendering it raw printed a bare epoch float on the device. Flag it
+        // red once it goes stale: a feed that stopped looks exactly like a weak
+        // one in the numbers above, which just sit at their last value.
+        ['Last NMEA', _wdAge(gps.last_sentence),
+            _wdStale(gps.last_sentence, 30) ? 'warn' : null],
+        ['Time to first fix', _wdHas(gps.ttff_seconds) ? `${gps.ttff_seconds}s` : null],
+        ['Searching for', _wdHas(gps.searching_seconds)
+            ? `${_wdDur(gps.searching_seconds)} (no fix yet)` : null,
+            gps.searching_seconds > 120 ? 'warn' : null],
+        ['GPS error', gps.error, 'warn']
+    ]));
+
+    // Per-constellation GSV breakdown + serial plumbing, from the deeper
+    // /api/wardriving/diagnostics payload.
+    const ex = _wdDiagExtra || {};
+    const exGps = ex.gps || {};
+    if ((exGps.constellations || []).length) {
+        groups.push(_wdDiagGroup('GPS constellations',
+            exGps.constellations.map(c => [
+                c.constellation,
+                `${c.in_view} in view` + (_wdHas(c.snr_max) ? ` · SNR ${c.snr_max} dB` : '')
+            ])));
+    }
+
+    const strongest = stats.strongest || null;
+    groups.push(_wdDiagGroup('Session', [
+        ['Session', st.session_id],
+        ['Duration', _wdDur(stats.duration_seconds)],
+        ['Networks', stats.total_networks],
+        ['Open / WEP / WPA', _wdHas(stats.total_networks)
+            ? `${stats.open_networks || 0} / ${stats.wep_networks || 0} / ${stats.wpa_networks || 0}` : null],
+        ['2.4 / 5 / 6 GHz', _wdHas(stats.total_networks)
+            ? `${stats.band_2_4ghz || 0} / ${stats.band_5ghz || 0} / ${stats.band_6ghz || 0}` : null],
+        ['Bluetooth', stats.bluetooth_devices],
+        ['Cell towers', stats.cell_towers],
+        ['Cameras', stats.cameras],
+        ['GPS trackpoints', stats.gps_trackpoints],
+        ['Strongest', strongest ? `${strongest.ssid || strongest.bssid || '?'}` +
+            (_wdHas(strongest.best_rssi) ? ` (${strongest.best_rssi} dBm)` : '') : null],
+        ['Database', stats.db_path]
+    ]));
+
+    const scanRows = [
+        ['Running', st.running ? 'yes' : 'no', st.running ? 'good' : 'warn'],
+        ['Band mode', st.band_mode],
+        ['Scans completed', st.scans_completed],
+        ['Networks last scan', st.networks_this_scan],
+        ['Last scan', _wdAge(st.last_scan_time),
+            (st.running && _wdStale(st.last_scan_time, 60)) ? 'warn' : null],
+        ['Interfaces', (st.interfaces || []).join(', ')],
+        ['Engine error', st.error, 'warn']
+    ];
+    (st.interface_details || []).forEach(d => {
+        const bits = [];
+        if (_wdHas(d.networks)) bits.push(`${d.networks} nets`);
+        if (d.driver) bits.push(d.driver);
+        if (d.bands) bits.push([].concat(d.bands).join('/'));
+        if (d.is_usb) bits.push('USB');
+        if (d.manufacturer) bits.push(d.manufacturer);
+        scanRows.push([`  ${d.name}`, bits.join(' · ')]);
+    });
+    groups.push(_wdDiagGroup('Scanning', scanRows));
+
+    // Antenna coverage — which adapter is actually pulling its weight.
+    const cov = st.coverage || {};
+    const perIface = cov.per_interface || {};
+    const covRows = [['Seen by 2+ adapters', cov.overlap]];
+    Object.keys(perIface).forEach(name => {
+        const c = perIface[name] || {};
+        const bits = [];
+        if (_wdHas(c.unique)) bits.push(`${c.unique} uniq`);
+        if (_wdHas(c.only_here)) bits.push(`${c.only_here} only here`);
+        if (_wdHas(c.best_rssi_median)) bits.push(`med ${Number(c.best_rssi_median).toFixed(0)} dBm`);
+        covRows.push([`  ${name}`, bits.join(' · ')]);
+    });
+    groups.push(_wdDiagGroup('Coverage', covRows));
+
+    const comps = st.companions || [];
+    const compRows = [['Companions', comps.length || null]];
+    comps.forEach(c => {
+        const bits = [c.connected ? 'up' : 'down'];
+        if (_wdHas(c.networks)) bits.push(`${c.networks} nets`);
+        if (_wdHas(c.networks_24) || _wdHas(c.networks_5)) {
+            bits.push(`${c.networks_24 || 0}/${c.networks_5 || 0} 2.4/5`);
+        }
+        if (c.esp_mode) bits.push(c.esp_mode);
+        if (_wdHas(c.esp_ble_count)) bits.push(`${c.esp_ble_count} BLE`);
+        if (c.mesh_node_count) bits.push(`${c.mesh_node_count} nodes`);
+        if (c.coordinator_board) bits.push(c.coordinator_board);
+        if (c.coordinator_fw) bits.push(`fw ${c.coordinator_fw}`);
+        compRows.push([`  ${c.name || c.port || 'companion'}`, bits.join(' · ')]);
+        (c.esp_alerts || []).slice(-3).forEach((a, i) => {
+            compRows.push([`    alert ${i + 1}`,
+                typeof a === 'string' ? a : JSON.stringify(a), 'warn']);
+        });
+    });
+    groups.push(_wdDiagGroup('Companions', compRows));
+
+    // Radios — every wireless interface present, and when one is NOT scanning,
+    // the reason. This is what turns "only wlan0 is listed" from a mystery into
+    // a statement (rfkill-blocked / held as uplink / lent to the AP / unclaimed).
+    const radios = ex.radios || [];
+    if (radios.length) {
+        const rows = [];
+        radios.forEach(r => {
+            const bits = [];
+            if (r.driver) bits.push(r.driver);
+            if (r.mode) bits.push(r.mode);
+            if (r.operstate) bits.push(r.operstate);
+            if (r.usb && r.usb.max_power_ma) bits.push(`${r.usb.max_power_ma} mA`);
+            if (r.usb && (r.usb.product || r.usb.manufacturer)) {
+                bits.push(r.usb.product || r.usb.manufacturer);
+            }
+            rows.push([r.name, (r.scanning ? 'scanning' : 'idle') +
+                (bits.length ? ' · ' + bits.join(' · ') : ''),
+                r.scanning ? 'good' : 'warn']);
+            if (r.excluded_reason) rows.push([`  why not`, r.excluded_reason, 'warn']);
+        });
+        groups.push(_wdDiagGroup('Radios', rows));
+    }
+
+    // Power — declared USB draw per device plus Pi supply health. bMaxPower is
+    // the descriptor's declared draw, not a measurement; no Pi meters per-port
+    // current. It is still the figure the host budgets against.
+    const pw = ex.power || {};
+    if (Object.keys(pw).length) {
+        const rows = [];
+        if (pw.model) rows.push(['Board', pw.model]);
+        (pw.usb_devices || []).forEach(d => {
+            const label = d.product || d.manufacturer || d.usb_id || d.id;
+            const bits = [];
+            if (_wdHas(d.max_power_ma)) bits.push(`${d.max_power_ma} mA`);
+            if (d.interfaces && d.interfaces.length) bits.push(d.interfaces.join(', '));
+            if (d.speed_mbps) bits.push(`${d.speed_mbps} Mb/s`);
+            rows.push([`  ${label}`, bits.join(' · ')]);
+        });
+        if (_wdHas(pw.usb_declared_ma)) {
+            rows.push(['USB declared total', `${pw.usb_declared_ma} mA` +
+                (pw.usb_count ? ` (${pw.usb_count} devices)` : ''),
+                pw.usb_declared_ma > 600 ? 'warn' : null]);
+        }
+        if (pw.usb_max_current_enabled === false) {
+            rows.push(['usb_max_current_enable', 'not set', 'warn']);
+        } else if (pw.usb_max_current_enabled === true) {
+            rows.push(['usb_max_current_enable', 'set', 'good']);
+        }
+        const thr = pw.throttled;
+        if (thr) {
+            rows.push(['Supply', thr.healthy ? 'healthy' : 'see flags below',
+                thr.healthy ? 'good' : 'warn']);
+            if ((thr.now || []).length) rows.push(['  Right now', thr.now.join(', '), 'warn']);
+            if ((thr.occurred || []).length) rows.push(['  Since boot', thr.occurred.join(', '), 'warn']);
+            rows.push(['  throttled flags', thr.raw]);
+        }
+        if (_wdHas(pw.core_volts)) rows.push(['Core voltage', `${pw.core_volts} V`]);
+        if (_wdHas(pw.temp_c)) rows.push(['Temperature', `${pw.temp_c} °C`]);
+        if (pw.pmic && _wdHas(pw.pmic.total_watts)) {
+            rows.push(['Board power (PMIC)', `${pw.pmic.total_watts} W`]);
+        }
+        groups.push(_wdDiagGroup('Power', rows));
+    }
+
+    // Errors — everything currently complaining, in one place.
+    const errs = ex.errors || [];
+    if (errs.length) {
+        groups.push(_wdDiagGroup('Errors',
+            errs.map(e => [e.source, e.message, 'warn'])));
+    }
+
+    groups.push(_wdDiagGroup('Device', [
+        ['Device name', st.device_name],
+        ['Bluetooth seen', st.bluetooth_count],
+        ['Cells seen', st.cell_count],
+        ['GPS backfill', _wdHas(st.allow_backfill) ? (st.allow_backfill ? 'allowed' : 'off') : null]
+    ]));
+
+    const html = groups.filter(Boolean).join('');
+    body.innerHTML = html
+        // gap-6 (not gap-x-8/gap-y-5): web/css/tailwind.css is a prebuilt,
+        // purged bundle and there is no local Tailwind CLI to rebuild it, so
+        // every class here must already exist in that file.
+        ? `<div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">${html}</div>`
+        : '<p class="text-gray-500 text-sm">No diagnostics available yet.</p>';
 }
 
 // Render one status bar per connected USB companion. The backend exposes a

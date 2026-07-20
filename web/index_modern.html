@@ -5467,9 +5467,23 @@
                         <p class="text-gray-500 text-sm">No previous sessions.</p>
                     </div>
                 </div>
+
+                <!-- Diagnostics — collapsed by default. Mirrors the panel on the
+                     phone-access AP page (web/wardrive_mobile.html); a native
+                     <details> so the toggle survives a script error, which is
+                     exactly when this panel gets opened. -->
+                <details id="wd-diag" class="mt-8 bg-slate-800/40 border border-slate-700 rounded-lg overflow-hidden">
+                    <summary class="px-4 py-3 cursor-pointer select-none flex items-center gap-3 hover:bg-slate-700/30 transition-colors">
+                        <h3 class="text-md font-semibold text-gray-300">Diagnostics</h3>
+                        <span id="wd-diag-note" class="text-xs text-gray-500 ml-auto"></span>
+                    </summary>
+                    <div id="wd-diag-body" class="px-4 pb-4">
+                        <p class="text-gray-500 text-sm">Waiting for status…</p>
+                    </div>
+                </details>
             </div>
         </div>
-        
+
         <!-- Config Tab -->
         <div id="config-tab" class="tab-content hidden">
             <div class="glass rounded-xl p-6">
@@ -6697,7 +6711,7 @@
     </div>
 
     <!-- JavaScript -->
-    <script src="/web/scripts/ragnar_modern.js?v=20260720-wardriving-speed-unit-card"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260720-wardriving-diag-stale"></script>
 
 </body>
 </html>

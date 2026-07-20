@@ -125,14 +125,21 @@ def check_authentication():
     # Wardriving phone-access AP (KEY1): let AP clients view the minimal live
     # page and its READ-ONLY data without login — same spirit as the captive
     # portal. Scoped to GET on the status/track/networks endpoints so a phone
-    # on the AP can watch but cannot stop wardriving, wipe data, etc.
+    # on the AP can watch but cannot wipe data, change settings, etc.
+    # Two writes are allowed, both being buttons on that page and both only
+    # reachable while the wardriving AP is up: stopping the session and
+    # restarting the Ragnar service (the field "it's wedged" recovery).
     if getattr(shared_data, 'wardrive_ap_active', False) and is_ap_client_request():
         readonly_api = (
             '/api/wardriving/status', '/api/wardriving/track',
             '/api/wardriving/networks', '/api/wardriving/gps',
             '/api/wardriving/bluetooth', '/api/wardriving/cells',
+            '/api/wardriving/diagnostics',
         )
+        write_api = ('/api/wardriving/stop', '/api/system/restart-service')
         if path in ('/', '/wardrive') or (request.method == 'GET' and path in readonly_api):
+            return
+        if request.method == 'POST' and path in write_api:
             return
 
     # Kiosk loopback bypass: any request originating from the Pi itself
@@ -8822,12 +8829,56 @@ def wardriving_start():
         logger.error(f"Wardriving start error: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/wardriving/diagnostics')
+def wardriving_diagnostics():
+    """Deep diagnostics for the Diagnostics panel.
+
+    Separate from /api/wardriving/status because the panel only fetches this
+    while it is expanded — the 3 s status poll stays cheap, and the sysfs walk
+    plus vcgencmd shell-outs here only run when somebody is actually looking.
+    """
+    try:
+        import wardrive_diagnostics
+        engine = _get_wardriving_engine()
+        return jsonify(wardrive_diagnostics.collect(engine, shared_data))
+    except Exception as e:
+        logger.error(f"Wardriving diagnostics error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/wardriving/stop', methods=['POST'])
 def wardriving_stop():
-    """Stop the current wardriving session."""
+    """Stop the current wardriving session.
+
+    If the phone-access AP is up (the field 'Exit Wardriving' button on the
+    minimal mobile page hits this), also tear the AP down so the device returns
+    to normal Ragnar operation. The teardown is deferred to a background thread
+    so this HTTP response reaches the AP client *before* the AP radio drops —
+    otherwise the client's connection dies mid-response and it never learns the
+    stop succeeded.
+    """
     try:
         engine = _get_wardriving_engine()
         result = engine.stop()
+
+        ap_teardown = False
+        if getattr(shared_data, 'wardrive_ap_active', False):
+            ragnar_instance = getattr(shared_data, 'ragnar_instance', None)
+            wifi_mgr = getattr(ragnar_instance, 'wifi_manager', None) if ragnar_instance else None
+            if wifi_mgr is not None:
+                ap_teardown = True
+
+                def _deferred_ap_teardown():
+                    try:
+                        time.sleep(1.5)
+                        wifi_mgr.stop_wardrive_ap()
+                    except Exception as exc:
+                        logger.error(f"Wardrive AP teardown after stop failed: {exc}")
+
+                threading.Thread(target=_deferred_ap_teardown, daemon=True).start()
+
+        if isinstance(result, dict):
+            result['ap_teardown'] = ap_teardown
         return jsonify(result)
     except Exception as e:
         logger.error(f"Wardriving stop error: {e}")

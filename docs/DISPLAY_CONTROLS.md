@@ -51,6 +51,47 @@ In Default and Wardriving layers the keys act **on press**.
 > pushes a band into the thousands (or higher) still fits its column instead of
 > overlapping the neighbouring band. All three share one size so the row stays
 > visually even.
+>
+> That page is the first of **five** wardriving screens on the LCD HAT — see
+> [Wardriving mode](#wardriving-mode-engine-running-1) below for the joystick
+> carousel and its key map.
+
+> **Exit Wardriving from the phone page:** the minimal wardriving page (join the
+> KEY1 AP, open `http://192.168.4.1:8000/`) has an **Exit Wardriving** button at
+> the bottom. It stops the current session and then tears down the phone-access
+> AP so the device returns to normal Ragnar operation. Because dropping the AP
+> disconnects the phone, the button confirms first and, once the stop is issued,
+> tells you to reconnect to your normal Wi-Fi to reach Ragnar web.
+>
+> The page also has a **Restart Ragnar Service** button — the field recovery
+> when the UI or a scan thread wedges. The AP is run by hostapd/dnsmasq rather
+> than the Ragnar service, so the phone stays connected across the restart; the
+> page polls until the service answers again and then resumes live updates.
+> These two buttons are the *only* write actions an un-authenticated AP client
+> is allowed — everything else on that page is read-only.
+>
+> Below them sits a **Diagnostics** panel, collapsed by default (a native
+> `<details>`, so the toggle works even if a script errors — this is the panel
+> you read when something is already wrong). Its summary always shows a live
+> hint (`GPS fix` / `GPS searching` / `no GPS`, plus `· error`), and expanding it
+> lists everything `/api/wardriving/status` exposes, grouped as **GPS ·
+> Session · Scanning · Companions · Device**. GPS comes first and includes
+> **SNR max** and **satellites used / in view** — the two numbers that separate
+> a weak-signal problem from a receiver that keeps restarting when it sees
+> satellites but never fixes. Fields with no value are omitted rather than shown
+> blank, and the panel skips its DOM work entirely while collapsed. The same
+> panel is on the main dashboard's **Wardriving** tab (which adds an antenna
+> **Coverage** group) — see
+> [Diagnostics Panel (UI)](wardriving.md#diagnostics-panel-ui).
+>
+> **The AP does not carry your phone's internet.** Ragnar never routes for AP
+> clients (no NAT, no `ip_forward`, and while wardriving the radio is usually
+> borrowed so there's no uplink at all), so the wardriving AP hands out an
+> address and deliberately nothing else — no gateway, no DNS, no captive-portal
+> DNS hijack. Your phone keeps its own default route and stays on **cellular**
+> for internet while 192.168.4.1 remains directly reachable. Expect iOS/Android
+> to label the network "No Internet" — that is the intended state. The separate
+> Wi-Fi-**setup** AP is unaffected and still runs its captive portal.
 
 ### Network Diagnostic mode
 
@@ -84,6 +125,43 @@ GPIO pins (BCM), fixed by the HAT: `KEY1=21`, `KEY2=20`, `KEY3=16`; joystick
 > field‑tester switch instead — it flips Network Diagnostic Mode on and off.
 > Autoscroll pauses automatically during Network Diagnostic mode and wardriving,
 > and any manual joystick page-nav switches it off.
+
+### Wardriving mode (engine running)
+
+While the wardriving engine runs **and the display is on the main page**, the
+joystick pages a carousel of **five wardriving screens** and the three keys
+become wardriving actions:
+
+| Input | Action |
+|-------|--------|
+| **Joystick ↑ / ←** | Previous wardriving screen |
+| **Joystick ↓ / →** | Next wardriving screen |
+| **Joystick press** | Jump back to the **STATS** screen |
+| **KEY1** | **Return to the Ragnar view** — leave the wardriving screens (wardriving keeps running) |
+| **KEY2** | **Reconnect** to a known Wi‑Fi (wardriving keeps running) |
+| **KEY3** | **Start / stop** the phone-access AP |
+
+The screens, in carousel order (the footer shows the key hints and an `n/5`
+counter):
+
+| # | Screen | Shows |
+|---|--------|-------|
+| 1 | **STATS** | 2.4 / 5 / 6 GHz counts as big numbers, GPS, speed, companion |
+| 2 | **MAP** | Live GPS breadcrumb + located networks, auto-scaled, current fix ringed |
+| 3 | **GPS** | Lat / lon / altitude, satellites used-in-view, HDOP, speed, course |
+| 4 | **SESSION** | Session duration, total networks, open, WEP, Bluetooth, cells, trackpoints |
+| 5 | **VIKING** | The Ragnar viking filling the panel — the "still alive?" glance screen |
+
+> **KEY1 does not stop wardriving** — it only steps the display off the main
+> page, which is where the wardriving render overrides the dashboard. The
+> engine, GPS and companions keep running; joystick back round to the main page
+> to return to the wardriving screens. (To actually stop a session, use the web
+> UI or the **Exit Wardriving** button on the phone-access AP page.)
+>
+> This layer replaces the default one only while wardriving is live, so KEY1's
+> Network Diagnostic toggle and KEY3's next-page/restart pair come back as soon
+> as you leave the wardriving screens. The 2.7" e‑paper HAT is unaffected — it
+> keeps its 4‑key map and its KEY3 stats/map toggle.
 
 ### Network Diagnostic mode
 
