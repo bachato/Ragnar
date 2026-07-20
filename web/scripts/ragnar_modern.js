@@ -22787,6 +22787,12 @@ function _wdAge(ts) {
     return `${Math.floor(s / 3600)}h${Math.floor(s / 60) % 60}m ago`;
 }
 
+// True when an epoch-seconds timestamp is older than `maxAge` seconds.
+function _wdStale(ts, maxAge) {
+    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return false;
+    return (Date.now() / 1000 - ts) > maxAge;
+}
+
 function _wdDur(sec) {
     if (typeof sec !== 'number' || !isFinite(sec) || sec < 0) return null;
     const t = Math.round(sec), h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60;
@@ -22863,8 +22869,11 @@ function renderWardrivingDiagnostics(status) {
         ['Port', gps.port],
         ['Last update', _wdAge(gps.last_update)],
         // last_sentence is a TIMESTAMP of the last NMEA sentence, not its text
-        // — rendering it raw printed a bare epoch float on the device.
-        ['Last NMEA', _wdAge(gps.last_sentence)],
+        // — rendering it raw printed a bare epoch float on the device. Flag it
+        // red once it goes stale: a feed that stopped looks exactly like a weak
+        // one in the numbers above, which just sit at their last value.
+        ['Last NMEA', _wdAge(gps.last_sentence),
+            _wdStale(gps.last_sentence, 30) ? 'warn' : null],
         ['Time to first fix', _wdHas(gps.ttff_seconds) ? `${gps.ttff_seconds}s` : null],
         ['Searching for', _wdHas(gps.searching_seconds)
             ? `${_wdDur(gps.searching_seconds)} (no fix yet)` : null,
@@ -22907,7 +22916,8 @@ function renderWardrivingDiagnostics(status) {
         ['Band mode', st.band_mode],
         ['Scans completed', st.scans_completed],
         ['Networks last scan', st.networks_this_scan],
-        ['Last scan', _wdAge(st.last_scan_time)],
+        ['Last scan', _wdAge(st.last_scan_time),
+            (st.running && _wdStale(st.last_scan_time, 60)) ? 'warn' : null],
         ['Interfaces', (st.interfaces || []).join(', ')],
         ['Engine error', st.error, 'warn']
     ];

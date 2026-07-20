@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 _CACHE = {'ts': 0.0, 'data': None}
 _CACHE_TTL = 5.0
 
+# A live receiver emits NMEA every second or so, and the scan loop turns over
+# every few seconds. These thresholds are deliberately generous — they should
+# only fire on a genuine stall, never on a slow cycle.
+GPS_STALE_S = 30
+SCAN_STALE_S = 60
+
 # vcgencmd get_throttled bit meanings. Low nibble = happening now, bits 16-19 =
 # has happened since boot. The "occurred" bits are the ones that catch a
 # brownout that already passed — exactly the case where a GPS cold start dies
@@ -111,10 +117,18 @@ def _usb_devices():
         }
         # Which kernel interfaces does this USB device provide? That is what
         # turns "500mA device" into "wlan1 draws 500mA".
-        for net in glob.glob(f'{path}/*/net/*'):
-            dev['interfaces'].append(os.path.basename(net))
-        for tty in glob.glob(f'{path}/*/tty/*') + glob.glob(f'{path}/*/*/tty/*'):
-            dev['interfaces'].append(os.path.basename(tty))
+        #
+        # Scope this to the device's OWN interface directories ("<dev>:<cfg>.<n>").
+        # In sysfs a hub's downstream devices are nested underneath it, so a
+        # loose "{path}/*/*/tty/*" walks into them and credits the hub with its
+        # children's ports — a bus-powered hub showed up owning the GPS's
+        # ttyACM0. Child devices are enumerated separately in their own right.
+        for iface_dir in glob.glob(f'{path}/{base}:*'):
+            for node in (glob.glob(f'{iface_dir}/net/*')
+                         + glob.glob(f'{iface_dir}/tty/*')
+                         # usb-serial bridges nest one deeper: :1.0/ttyUSB0/tty/ttyUSB0
+                         + glob.glob(f'{iface_dir}/*/tty/*')):
+                dev['interfaces'].append(os.path.basename(node))
         dev['interfaces'] = sorted(set(dev['interfaces']))
         out.append(dev)
     return out
@@ -199,19 +213,21 @@ def power():
             info['temp_c'] = float(m.group(1))
 
     # Pi 5 caps *total* USB peripheral current at 600mA unless it detects a 5A
-    # PD supply or this flag is set. Worth surfacing next to the declared draw,
-    # because that is the ceiling the sum above is measured against.
-    for cfg in ('/boot/firmware/config.txt', '/boot/config.txt'):
-        txt = _read(cfg)
-        if txt is None:
-            continue
-        for line in txt.splitlines():
-            line = line.strip()
-            if line.startswith('usb_max_current_enable'):
-                info['usb_max_current_enabled'] = line.split('=')[-1].strip() in ('1', 'true')
-        if info['usb_max_current_enabled'] is None:
-            info['usb_max_current_enabled'] = False
-        break
+    # PD supply or this flag is set. Only meaningful on Pi 5 — reporting "not
+    # set" on a Zero 2 W or Pi 4 reads as a problem when the setting does not
+    # apply to that board at all, so leave it None (the UI then omits the row).
+    if (info['model'] or '').startswith('Raspberry Pi 5'):
+        for cfg in ('/boot/firmware/config.txt', '/boot/config.txt'):
+            txt = _read(cfg)
+            if txt is None:
+                continue
+            enabled = False
+            for line in txt.splitlines():
+                line = line.strip()
+                if line.startswith('usb_max_current_enable'):
+                    enabled = line.split('=')[-1].strip() in ('1', 'true')
+            info['usb_max_current_enabled'] = enabled
+            break
     return info
 
 
@@ -390,6 +406,37 @@ def errors(engine, shared_data=None):
     if not (getattr(engine, 'interfaces', None) or []):
         add('radios', 'No WiFi interface is scanning — see the Radios group '
                       'for why each radio was excluded.')
+
+    # --- Staleness -------------------------------------------------------
+    # A feed that has simply STOPPED looks identical to a weak one in the
+    # summary numbers: the last-known satellite count and SNR just sit there.
+    # Call it out explicitly, and when both feeds die together, say so — that
+    # pattern points at the shared USB bus (a hub dropping, a bus reset) rather
+    # than at reception or at either device individually.
+    now = time.time()
+    gps_stale = scan_stale = None
+
+    if gps is not None and getattr(gps, 'connected', False):
+        last = getattr(gps, 'last_sentence', 0) or 0
+        if last and now - last > GPS_STALE_S:
+            gps_stale = now - last
+            add('gps', f'No NMEA sentence for {int(gps_stale)}s although the '
+                       f'receiver still reports connected — the port is open '
+                       f'but nothing is arriving.')
+
+    if getattr(engine, '_running', False):
+        last = getattr(engine, 'last_scan_time', 0) or 0
+        if last and now - last > SCAN_STALE_S:
+            scan_stale = now - last
+            add('engine', f'No scan completed for {int(scan_stale)}s although '
+                          f'the engine reports running — the scan loop is '
+                          f'stalled or its radios stopped responding.')
+
+    if gps_stale and scan_stale and abs(gps_stale - scan_stale) < 60:
+        add('usb', 'GPS and WiFi scanning went quiet within a minute of each '
+                   'other. Both hang off USB, so a bus/hub glitch or a power '
+                   'dip on the USB rail fits better than an RF or per-device '
+                   'fault. Check dmesg for USB resets/disconnects.')
     for c in (getattr(engine, '_companions', None) or {}).values():
         try:
             if not c.connected:

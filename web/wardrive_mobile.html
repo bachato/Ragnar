@@ -286,6 +286,11 @@
     return h ? (h + 'h ' + m + 'm') : (m + 'm ' + (t % 60) + 's');
   }
   function has(v) { return v !== undefined && v !== null && v !== ''; }
+  // True when an epoch-seconds timestamp is older than maxAge seconds.
+  function stale(ts, maxAge) {
+    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return false;
+    return (Date.now() / 1000 - ts) > maxAge;
+  }
 
   function section(title, rows) {
     var any = rows.some(function (r) { return has(r[1]); });
@@ -337,7 +342,8 @@
       ['Last update', fmtAge(gps.last_update)],
       // last_sentence is a TIMESTAMP of the last NMEA sentence, not its text —
       // rendering it raw printed a bare epoch float on the device.
-      ['Last NMEA', fmtAge(gps.last_sentence)],
+      ['Last NMEA', fmtAge(gps.last_sentence),
+        stale(gps.last_sentence, 30) ? 'warn' : null],
       ['Time to first fix', has(gps.ttff_seconds) ? gps.ttff_seconds + 's' : null],
       ['Searching for', has(gps.searching_seconds)
         ? fmtDur(gps.searching_seconds) + ' (no fix)' : null,
@@ -379,7 +385,8 @@
       ['Band mode', st.band_mode],
       ['Scans completed', st.scans_completed],
       ['Networks last scan', st.networks_this_scan],
-      ['Last scan', fmtAge(st.last_scan_time)],
+      ['Last scan', fmtAge(st.last_scan_time),
+        (st.running && stale(st.last_scan_time, 60)) ? 'warn' : null],
       ['Interfaces', (st.interfaces || []).join(', ')],
       ['Engine error', st.error, 'warn']
     ];
