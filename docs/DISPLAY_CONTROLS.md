@@ -56,6 +56,15 @@ In Default and Wardriving layers the keys act **on press**.
 > [Wardriving mode](#wardriving-mode-engine-running-1) below for the joystick
 > carousel and its key map.
 
+> **Exit Wardriving from the phone page:** the minimal wardriving page (join the
+> KEY1 AP, open `http://192.168.4.1:8000/`) has an **Exit Wardriving** button at
+> the bottom. It stops the current session and then tears down the phone-access
+> AP so the device returns to normal Ragnar operation. Because dropping the AP
+> disconnects the phone, the button confirms first and, once the stop is issued,
+> tells you to reconnect to your normal Wi-Fi to reach Ragnar web. (It is the
+> only write action an un-authenticated AP client is allowed — everything else
+> on that page is read-only.)
+
 ### Network Diagnostic mode
 
 Each key gains a **short** and a **long** (hold ~0.6 s) press — see the full
