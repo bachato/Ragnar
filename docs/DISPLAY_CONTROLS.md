@@ -70,6 +70,17 @@ In Default and Wardriving layers the keys act **on press**.
 > These two buttons are the *only* write actions an un-authenticated AP client
 > is allowed — everything else on that page is read-only.
 >
+> Below them sits a **Diagnostics** panel, collapsed by default (a native
+> `<details>`, so the toggle works even if a script errors — this is the panel
+> you read when something is already wrong). Its summary always shows a live
+> hint (`GPS fix` / `GPS searching` / `no GPS`, plus `· error`), and expanding it
+> lists everything `/api/wardriving/status` exposes, grouped as **GPS ·
+> Session · Scanning · Companions · Device**. GPS comes first and includes
+> **SNR max** and **satellites used / in view** — the two numbers that separate
+> a weak-signal problem from a receiver that keeps restarting when it sees
+> satellites but never fixes. Fields with no value are omitted rather than shown
+> blank, and the panel skips its DOM work entirely while collapsed.
+>
 > **The AP does not carry your phone's internet.** Ragnar never routes for AP
 > clients (no NAT, no `ip_forward`, and while wardriving the radio is usually
 > borrowed so there's no uplink at all), so the wardriving AP hands out an
