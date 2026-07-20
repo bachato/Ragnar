@@ -22751,6 +22751,31 @@ function updateWardrivingUI(status) {
 // satellites but never fixes.
 let _wdDiagLastStatus = null;
 let _wdDiagBound = false;
+// Deep payload from /api/wardriving/diagnostics (radios, power, GPS detail,
+// errors). Fetched only while the panel is open — it walks sysfs and shells out
+// to vcgencmd, so it must not ride the 3 s status poll.
+let _wdDiagExtra = null;
+let _wdDiagExtraAt = 0;
+let _wdDiagExtraBusy = false;
+const _WD_DIAG_EXTRA_TTL = 8000;
+
+function _wdFetchDiagExtra(force) {
+    const panel = document.getElementById('wd-diag');
+    if (!panel || !panel.open || _wdDiagExtraBusy) return;
+    if (!force && Date.now() - _wdDiagExtraAt < _WD_DIAG_EXTRA_TTL) return;
+    _wdDiagExtraBusy = true;
+    fetch('/api/wardriving/diagnostics', { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+            if (d && !d.error) {
+                _wdDiagExtra = d;
+                _wdDiagExtraAt = Date.now();
+                if (_wdDiagLastStatus) renderWardrivingDiagnostics(_wdDiagLastStatus);
+            }
+        })
+        .catch(() => { /* panel degrades to the status-only groups */ })
+        .finally(() => { _wdDiagExtraBusy = false; });
+}
 
 function _wdHas(v) { return v !== undefined && v !== null && v !== ''; }
 
@@ -22809,10 +22834,13 @@ function renderWardrivingDiagnostics(status) {
     if (!_wdDiagBound) {
         _wdDiagBound = true;
         panel.addEventListener('toggle', () => {
-            if (panel.open && _wdDiagLastStatus) renderWardrivingDiagnostics(_wdDiagLastStatus);
+            if (!panel.open) return;
+            _wdFetchDiagExtra(true);
+            if (_wdDiagLastStatus) renderWardrivingDiagnostics(_wdDiagLastStatus);
         });
     }
     if (!panel.open) return;
+    _wdFetchDiagExtra(false);   // refresh the deep payload while open
 
     const sats = (_wdHas(gps.satellites) || _wdHas(gps.satellites_in_view))
         ? `${gps.satellites || 0} used / ${gps.satellites_in_view || 0} in view` : null;
@@ -22834,9 +22862,27 @@ function renderWardrivingDiagnostics(status) {
         ['Source', gps.source],
         ['Port', gps.port],
         ['Last update', _wdAge(gps.last_update)],
-        ['Last sentence', gps.last_sentence],
+        // last_sentence is a TIMESTAMP of the last NMEA sentence, not its text
+        // — rendering it raw printed a bare epoch float on the device.
+        ['Last NMEA', _wdAge(gps.last_sentence)],
+        ['Time to first fix', _wdHas(gps.ttff_seconds) ? `${gps.ttff_seconds}s` : null],
+        ['Searching for', _wdHas(gps.searching_seconds)
+            ? `${_wdDur(gps.searching_seconds)} (no fix yet)` : null,
+            gps.searching_seconds > 120 ? 'warn' : null],
         ['GPS error', gps.error, 'warn']
     ]));
+
+    // Per-constellation GSV breakdown + serial plumbing, from the deeper
+    // /api/wardriving/diagnostics payload.
+    const ex = _wdDiagExtra || {};
+    const exGps = ex.gps || {};
+    if ((exGps.constellations || []).length) {
+        groups.push(_wdDiagGroup('GPS constellations',
+            exGps.constellations.map(c => [
+                c.constellation,
+                `${c.in_view} in view` + (_wdHas(c.snr_max) ? ` · SNR ${c.snr_max} dB` : '')
+            ])));
+    }
 
     const strongest = stats.strongest || null;
     groups.push(_wdDiagGroup('Session', [
@@ -22910,6 +22956,77 @@ function renderWardrivingDiagnostics(status) {
         });
     });
     groups.push(_wdDiagGroup('Companions', compRows));
+
+    // Radios — every wireless interface present, and when one is NOT scanning,
+    // the reason. This is what turns "only wlan0 is listed" from a mystery into
+    // a statement (rfkill-blocked / held as uplink / lent to the AP / unclaimed).
+    const radios = ex.radios || [];
+    if (radios.length) {
+        const rows = [];
+        radios.forEach(r => {
+            const bits = [];
+            if (r.driver) bits.push(r.driver);
+            if (r.mode) bits.push(r.mode);
+            if (r.operstate) bits.push(r.operstate);
+            if (r.usb && r.usb.max_power_ma) bits.push(`${r.usb.max_power_ma} mA`);
+            if (r.usb && (r.usb.product || r.usb.manufacturer)) {
+                bits.push(r.usb.product || r.usb.manufacturer);
+            }
+            rows.push([r.name, (r.scanning ? 'scanning' : 'idle') +
+                (bits.length ? ' · ' + bits.join(' · ') : ''),
+                r.scanning ? 'good' : 'warn']);
+            if (r.excluded_reason) rows.push([`  why not`, r.excluded_reason, 'warn']);
+        });
+        groups.push(_wdDiagGroup('Radios', rows));
+    }
+
+    // Power — declared USB draw per device plus Pi supply health. bMaxPower is
+    // the descriptor's declared draw, not a measurement; no Pi meters per-port
+    // current. It is still the figure the host budgets against.
+    const pw = ex.power || {};
+    if (Object.keys(pw).length) {
+        const rows = [];
+        if (pw.model) rows.push(['Board', pw.model]);
+        (pw.usb_devices || []).forEach(d => {
+            const label = d.product || d.manufacturer || d.usb_id || d.id;
+            const bits = [];
+            if (_wdHas(d.max_power_ma)) bits.push(`${d.max_power_ma} mA`);
+            if (d.interfaces && d.interfaces.length) bits.push(d.interfaces.join(', '));
+            if (d.speed_mbps) bits.push(`${d.speed_mbps} Mb/s`);
+            rows.push([`  ${label}`, bits.join(' · ')]);
+        });
+        if (_wdHas(pw.usb_declared_ma)) {
+            rows.push(['USB declared total', `${pw.usb_declared_ma} mA` +
+                (pw.usb_count ? ` (${pw.usb_count} devices)` : ''),
+                pw.usb_declared_ma > 600 ? 'warn' : null]);
+        }
+        if (pw.usb_max_current_enabled === false) {
+            rows.push(['usb_max_current_enable', 'not set', 'warn']);
+        } else if (pw.usb_max_current_enabled === true) {
+            rows.push(['usb_max_current_enable', 'set', 'good']);
+        }
+        const thr = pw.throttled;
+        if (thr) {
+            rows.push(['Supply', thr.healthy ? 'healthy' : 'see flags below',
+                thr.healthy ? 'good' : 'warn']);
+            if ((thr.now || []).length) rows.push(['  Right now', thr.now.join(', '), 'warn']);
+            if ((thr.occurred || []).length) rows.push(['  Since boot', thr.occurred.join(', '), 'warn']);
+            rows.push(['  throttled flags', thr.raw]);
+        }
+        if (_wdHas(pw.core_volts)) rows.push(['Core voltage', `${pw.core_volts} V`]);
+        if (_wdHas(pw.temp_c)) rows.push(['Temperature', `${pw.temp_c} °C`]);
+        if (pw.pmic && _wdHas(pw.pmic.total_watts)) {
+            rows.push(['Board power (PMIC)', `${pw.pmic.total_watts} W`]);
+        }
+        groups.push(_wdDiagGroup('Power', rows));
+    }
+
+    // Errors — everything currently complaining, in one place.
+    const errs = ex.errors || [];
+    if (errs.length) {
+        groups.push(_wdDiagGroup('Errors',
+            errs.map(e => [e.source, e.message, 'warn'])));
+    }
 
     groups.push(_wdDiagGroup('Device', [
         ['Device name', st.device_name],

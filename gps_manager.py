@@ -289,6 +289,13 @@ class GPSManager:
         self.last_update = 0
         self.last_sentence = 0
         self._gsv_by_talker = {}
+        # Time-to-first-fix bookkeeping. A cold start has to demodulate the
+        # ephemeris (~30 s of uninterrupted reception), so a receiver that keeps
+        # browning out or is being desensed shows satellites in view while TTFF
+        # never completes. Recording when the reader started and when the first
+        # fix landed makes that visible instead of inferred.
+        self.start_time = 0
+        self.first_fix_time = 0
         self.connected = False
         self.error = None
         # Tracks whether the current position came from an external source
@@ -301,6 +308,12 @@ class GPSManager:
         """Start GPS reading thread."""
         if self._running:
             return
+
+        # Clock TTFF from the moment the reader is asked to run, not from the
+        # first sentence — the gap before data arrives is part of the problem
+        # when a receiver is struggling.
+        self.start_time = time.time()
+        self.first_fix_time = 0
 
         if not self.port:
             self.port = detect_gps_device(exclude_ports=self._exclude_ports)
@@ -410,7 +423,19 @@ class GPSManager:
         # Consider fix stale after 10 seconds without update
         if self.last_update and (time.time() - self.last_update) > 10:
             return False
+        # Stamp TTFF here rather than in each of the GGA / RMC / gpsd paths:
+        # this method is the one definition of "we actually have a fix", so
+        # every producer would otherwise need the same guard duplicated.
+        if not self.first_fix_time:
+            self.first_fix_time = time.time()
         return True
+
+    @property
+    def ttff_seconds(self):
+        """Seconds from reader start to first fix, or None if still searching."""
+        if not self.start_time or not self.first_fix_time:
+            return None
+        return round(self.first_fix_time - self.start_time, 1)
 
     def get_position(self):
         """Return current position dict (or None if no fix)."""
@@ -448,6 +473,11 @@ class GPSManager:
                 'satellites_in_view': self.satellites_in_view,
                 'snr_max': self.snr_max,
                 'hdop': self.hdop,
+                # TTFF once fixed; until then, how long we have been searching.
+                'ttff_seconds': self.ttff_seconds,
+                'searching_seconds': (round(time.time() - self.start_time, 1)
+                                      if (self.start_time and not self.first_fix_time)
+                                      else None),
                 'latitude': self.latitude,
                 'longitude': self.longitude,
                 'altitude': self.altitude,

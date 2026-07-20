@@ -134,6 +134,7 @@ def check_authentication():
             '/api/wardriving/status', '/api/wardriving/track',
             '/api/wardriving/networks', '/api/wardriving/gps',
             '/api/wardriving/bluetooth', '/api/wardriving/cells',
+            '/api/wardriving/diagnostics',
         )
         write_api = ('/api/wardriving/stop', '/api/system/restart-service')
         if path in ('/', '/wardrive') or (request.method == 'GET' and path in readonly_api):
@@ -8827,6 +8828,23 @@ def wardriving_start():
     except Exception as e:
         logger.error(f"Wardriving start error: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/wardriving/diagnostics')
+def wardriving_diagnostics():
+    """Deep diagnostics for the Diagnostics panel.
+
+    Separate from /api/wardriving/status because the panel only fetches this
+    while it is expanded — the 3 s status poll stays cheap, and the sysfs walk
+    plus vcgencmd shell-outs here only run when somebody is actually looking.
+    """
+    try:
+        import wardrive_diagnostics
+        engine = _get_wardriving_engine()
+        return jsonify(wardrive_diagnostics.collect(engine, shared_data))
+    except Exception as e:
+        logger.error(f"Wardriving diagnostics error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/wardriving/stop', methods=['POST'])
 def wardriving_stop():

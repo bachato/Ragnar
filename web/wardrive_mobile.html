@@ -251,6 +251,27 @@
   var diagEl = document.getElementById('diag');
   var diagBody = document.getElementById('diag-body');
   var lastStatus = null;
+  // Deep payload (radios, power, GPS constellations, errors) from
+  // /api/wardriving/diagnostics. Fetched only while the panel is open — it
+  // walks sysfs and shells out to vcgencmd, so it must not ride the 3s poll.
+  var diagExtra = null;
+  var diagExtraAt = 0;
+  var diagExtraBusy = false;
+
+  function fetchDiagExtra(force) {
+    if (!diagEl.open || diagExtraBusy) return;
+    if (!force && Date.now() - diagExtraAt < 8000) return;
+    diagExtraBusy = true;
+    getJSON('/api/wardriving/diagnostics').then(function (d) {
+      if (d && !d.error) {
+        diagExtra = d;
+        diagExtraAt = Date.now();
+        if (lastStatus) renderDiag(lastStatus);
+      }
+    }).catch(function () {
+      // panel degrades to the status-only groups
+    }).then(function () { diagExtraBusy = false; });
+  }
 
   function fmtAge(ts) {
     if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return null;
@@ -291,6 +312,7 @@
     if (st.error || gps.error) note += ' · error';
     txt('diag-note', note);
     if (!diagEl.open) return;   // don't rebuild the DOM while collapsed
+    fetchDiagExtra(false);      // refresh the deep payload while open
 
     diagBody.textContent = '';
 
@@ -313,9 +335,24 @@
       ['Source', gps.source],
       ['Port', gps.port],
       ['Last update', fmtAge(gps.last_update)],
-      ['Last sentence', gps.last_sentence],
+      // last_sentence is a TIMESTAMP of the last NMEA sentence, not its text —
+      // rendering it raw printed a bare epoch float on the device.
+      ['Last NMEA', fmtAge(gps.last_sentence)],
+      ['Time to first fix', has(gps.ttff_seconds) ? gps.ttff_seconds + 's' : null],
+      ['Searching for', has(gps.searching_seconds)
+        ? fmtDur(gps.searching_seconds) + ' (no fix)' : null,
+        gps.searching_seconds > 120 ? 'warn' : null],
       ['GPS error', gps.error, 'warn']
     ]);
+
+    var ex = diagExtra || {};
+    var exGps = ex.gps || {};
+    if ((exGps.constellations || []).length) {
+      section('GPS constellations', exGps.constellations.map(function (c) {
+        return [c.constellation, c.in_view + ' in view' +
+                (has(c.snr_max) ? ' · SNR ' + c.snr_max + ' dB' : '')];
+      }));
+    }
 
     var strongest = stats.strongest || null;
     section('Session', [
@@ -378,6 +415,69 @@
     });
     section('Companions', compRows);
 
+    // Radios — and, when one is not scanning, why. Answers "only wlan0 is
+    // listed" without needing a shell on the device.
+    var radios = ex.radios || [];
+    if (radios.length) {
+      var rrows = [];
+      radios.forEach(function (r) {
+        var bits = [];
+        if (r.driver) bits.push(r.driver);
+        if (r.mode) bits.push(r.mode);
+        if (r.usb && r.usb.max_power_ma) bits.push(r.usb.max_power_ma + ' mA');
+        if (r.usb && (r.usb.product || r.usb.manufacturer)) {
+          bits.push(r.usb.product || r.usb.manufacturer);
+        }
+        rrows.push([r.name, (r.scanning ? 'scanning' : 'idle') +
+                    (bits.length ? ' · ' + bits.join(' · ') : ''),
+                    r.scanning ? 'good' : 'warn']);
+        if (r.excluded_reason) rrows.push(['  why not', r.excluded_reason, 'warn']);
+      });
+      section('Radios', rrows);
+    }
+
+    // Power — declared USB draw per device (bMaxPower from the descriptor, not
+    // a measurement) plus supply health.
+    var pw = ex.power || {};
+    if (Object.keys(pw).length) {
+      var prows = [];
+      if (pw.model) prows.push(['Board', pw.model]);
+      (pw.usb_devices || []).forEach(function (d) {
+        var bits = [];
+        if (has(d.max_power_ma)) bits.push(d.max_power_ma + ' mA');
+        if (d.interfaces && d.interfaces.length) bits.push(d.interfaces.join(', '));
+        prows.push(['  ' + (d.product || d.manufacturer || d.usb_id || d.id),
+                    bits.join(' · ')]);
+      });
+      if (has(pw.usb_declared_ma)) {
+        prows.push(['USB total', pw.usb_declared_ma + ' mA',
+                    pw.usb_declared_ma > 600 ? 'warn' : null]);
+      }
+      if (pw.usb_max_current_enabled === false) {
+        prows.push(['usb_max_current', 'not set', 'warn']);
+      }
+      var thr = pw.throttled;
+      if (thr) {
+        prows.push(['Supply', thr.healthy ? 'healthy' : 'see below',
+                    thr.healthy ? 'good' : 'warn']);
+        if ((thr.now || []).length) prows.push(['  Right now', thr.now.join(', '), 'warn']);
+        if ((thr.occurred || []).length) prows.push(['  Since boot', thr.occurred.join(', '), 'warn']);
+      }
+      if (has(pw.core_volts)) prows.push(['Core voltage', pw.core_volts + ' V']);
+      if (has(pw.temp_c)) prows.push(['Temperature', pw.temp_c + ' °C']);
+      if (pw.pmic && has(pw.pmic.total_watts)) {
+        prows.push(['Board power', pw.pmic.total_watts + ' W']);
+      }
+      section('Power', prows);
+    }
+
+    var errs = ex.errors || [];
+    if (errs.length) {
+      section('Errors', errs.map(function (e) {
+        return [e.source, e.message, 'warn'];
+      }));
+    }
+
     section('Device', [
       ['Device name', st.device_name],
       ['Bluetooth seen', st.bluetooth_count],
@@ -392,7 +492,9 @@
 
   // Expanding while collapsed skips DOM work, so render on open too.
   diagEl.addEventListener('toggle', function () {
-    if (diagEl.open && lastStatus) renderDiag(lastStatus);
+    if (!diagEl.open) return;
+    fetchDiagExtra(true);
+    if (lastStatus) renderDiag(lastStatus);
   });
 
   // Exit Wardriving: stop the session and drop the field AP, then head back to
