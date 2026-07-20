@@ -344,6 +344,39 @@ Shows the most actionable signals at a glance:
 - **Sats line** — `Sats: used/in-view · SNR N dB · HDOP H`. HDOP is hidden while it's still the pre-fix 99.99 placeholder.
 - **Speed line** — velocity in the configured unit. Set **Config → Wardriving → Speed Unit** (`wardriving_speed_unit`, `kmh` or `mph`) to choose km/h or mph. This is display-only and applies everywhere speed is shown — GPS card, live map marker, kiosk readout, and the hardware display. Recorded data (`speed_kmh`) is always stored in km/h regardless of the setting.
 
+### Diagnostics Panel (UI)
+
+At the bottom of the **Wardriving** tab (and of the phone-access AP page,
+`web/wardrive_mobile.html`) sits a **Diagnostics** panel, collapsed by default.
+It is a native `<details>` element, so the toggle keeps working even if a script
+errors — which is precisely when the panel gets opened.
+
+Its summary always shows a live hint (`GPS fix` / `GPS searching` / `no GPS`,
+with `· error` appended when the engine or GPS reports one), so a glance is
+often enough without expanding. Expanded, it lists everything the
+[Status Object](#status-object) exposes, grouped:
+
+| Group | Contents |
+|-------|----------|
+| **GPS** | fix + quality, satellites used/in-view, SNR max, HDOP, lat/lon/altitude, speed, course, source, port, last update, last raw NMEA sentence, error |
+| **Session** | id, duration, network totals, open/WEP/WPA, per-band, Bluetooth, cell towers, cameras, trackpoints, strongest AP, DB path |
+| **Scanning** | running, band mode, scans completed, networks last scan, last scan age, interfaces, plus per-adapter driver / bands / USB / manufacturer / network count |
+| **Coverage** | BSSIDs seen by 2+ adapters, and per adapter its unique count, *only-here* count and median best RSSI — the antenna-comparison view (dashboard only) |
+| **Companions** | per-device up/down, network counts, 2.4/5 split, ESP mode, BLE count, mesh nodes, coordinator board/firmware, recent alerts |
+| **Device** | device name, Bluetooth/cell totals, GPS-backfill setting |
+
+Fields with no value are omitted rather than rendered blank, and the panel skips
+its DOM work entirely while collapsed (re-rendering from the last status when
+expanded), so the polling loop costs nothing extra when it is closed.
+
+> **Diagnosing "sees satellites but never gets a fix":** open **GPS** and read
+> **SNR max** together with **Satellites** (`used / in view`). A cold start must
+> demodulate the ephemeris — roughly 30 s of continuous reception at ≥30 dB-Hz —
+> while an already-established fix tracks down to ~20 dB-Hz. So a receiver
+> showing satellites in view with `0 used` and a low SNR is signal-limited
+> (antenna placement or RF interference from a nearby adapter), whereas
+> comparable SNR with the fix repeatedly resetting points at power instead.
+
 ### Network Position Preservation
 
 `upsert_network` uses `COALESCE(?, col)` for `latitude`, `longitude`, `altitude`, `best_lat`, `best_lon`, `speed_kmh`, and `hdop` on both the stronger-RSSI and weaker-RSSI update paths. Concretely: an existing row's GPS columns are **never** overwritten with NULL. A re-scan with a stronger signal but no current GPS fix keeps the previously-recorded position instead of erasing it.

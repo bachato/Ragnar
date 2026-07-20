@@ -79,7 +79,10 @@ In Default and Wardriving layers the keys act **on press**.
 > **SNR max** and **satellites used / in view** — the two numbers that separate
 > a weak-signal problem from a receiver that keeps restarting when it sees
 > satellites but never fixes. Fields with no value are omitted rather than shown
-> blank, and the panel skips its DOM work entirely while collapsed.
+> blank, and the panel skips its DOM work entirely while collapsed. The same
+> panel is on the main dashboard's **Wardriving** tab (which adds an antenna
+> **Coverage** group) — see
+> [Diagnostics Panel (UI)](wardriving.md#diagnostics-panel-ui).
 >
 > **The AP does not carry your phone's internet.** Ragnar never routes for AP
 > clients (no NAT, no `ip_forward`, and while wardriving the radio is usually

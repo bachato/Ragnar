@@ -22737,6 +22737,194 @@ function updateWardrivingUI(status) {
 
     // Serial ESP32 config card
     updateSerialStatus(status);
+
+    // Collapsed diagnostics panel at the bottom of the tab
+    renderWardrivingDiagnostics(status);
+}
+
+// --- Wardriving diagnostics panel -----------------------------------------
+// Everything /api/wardriving/status exposes, grouped, collapsed by default.
+// Mirrors the panel on the phone-access AP page (web/wardrive_mobile.html) and
+// adds the antenna Coverage group, which only the full dashboard has room for.
+// GPS leads: SNR max and satellites used-vs-in-view are what separate a
+// weak-signal problem from a receiver that keeps restarting when it can see
+// satellites but never fixes.
+let _wdDiagLastStatus = null;
+let _wdDiagBound = false;
+
+function _wdHas(v) { return v !== undefined && v !== null && v !== ''; }
+
+function _wdAge(ts) {
+    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return null;
+    const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    return `${Math.floor(s / 3600)}h${Math.floor(s / 60) % 60}m ago`;
+}
+
+function _wdDur(sec) {
+    if (typeof sec !== 'number' || !isFinite(sec) || sec < 0) return null;
+    const t = Math.round(sec), h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60;
+    return h ? `${h}h ${m}m` : `${m}m ${t % 60}s`;
+}
+
+// One titled group of key/value rows. Rows with no value are dropped, and a
+// group with nothing left to show is skipped entirely.
+function _wdDiagGroup(title, rows) {
+    const kept = rows.filter(r => _wdHas(r[1]));
+    if (!kept.length) return '';
+    const body = kept.map(([k, v, tone]) => {
+        const cls = tone === 'warn' ? 'text-red-400'
+                  : tone === 'good' ? 'text-emerald-400' : 'text-gray-200';
+        return `<div class="flex items-baseline gap-3 py-0.5">
+            <span class="text-gray-500 whitespace-nowrap">${escapeHtml(String(k))}</span>
+            <span class="${cls} ml-auto text-right font-mono break-all">${escapeHtml(String(v))}</span>
+        </div>`;
+    }).join('');
+    return `<div class="min-w-0">
+        <h4 class="text-xs uppercase tracking-wide text-gray-500 font-semibold mb-2 pb-1 border-b border-slate-700">${escapeHtml(title)}</h4>
+        <div class="text-xs">${body}</div>
+    </div>`;
+}
+
+function renderWardrivingDiagnostics(status) {
+    const panel = document.getElementById('wd-diag');
+    const body = document.getElementById('wd-diag-body');
+    if (!panel || !body) return;
+
+    _wdDiagLastStatus = status || {};
+    const st = _wdDiagLastStatus;
+    const gps = st.gps || {};
+    const stats = st.stats || {};
+
+    // Headline stays readable while collapsed so a glance often suffices.
+    const note = document.getElementById('wd-diag-note');
+    if (note) {
+        let hint = gps.has_fix ? 'GPS fix' : (gps.connected ? 'GPS searching' : 'no GPS');
+        if (st.error || gps.error) hint += ' · error';
+        note.textContent = hint;
+    }
+
+    // Re-render on expand instead of keeping the DOM warm while hidden.
+    if (!_wdDiagBound) {
+        _wdDiagBound = true;
+        panel.addEventListener('toggle', () => {
+            if (panel.open && _wdDiagLastStatus) renderWardrivingDiagnostics(_wdDiagLastStatus);
+        });
+    }
+    if (!panel.open) return;
+
+    const sats = (_wdHas(gps.satellites) || _wdHas(gps.satellites_in_view))
+        ? `${gps.satellites || 0} used / ${gps.satellites_in_view || 0} in view` : null;
+
+    const groups = [];
+
+    groups.push(_wdDiagGroup('GPS', [
+        ['Fix', gps.has_fix ? 'yes' : 'no', gps.has_fix ? 'good' : 'warn'],
+        ['Fix quality', gps.fix_quality],
+        ['Satellites', sats],
+        ['SNR max', _wdHas(gps.snr_max) ? `${gps.snr_max} dB` : null],
+        ['HDOP', gps.hdop],
+        ['Latitude', _wdHas(gps.latitude) ? Number(gps.latitude).toFixed(6) : null],
+        ['Longitude', _wdHas(gps.longitude) ? Number(gps.longitude).toFixed(6) : null],
+        ['Altitude', _wdHas(gps.altitude) ? `${Number(gps.altitude).toFixed(1)} m` : null],
+        ['Speed', _wdHas(gps.speed_kmh) ? formatWardrivingSpeed(gps.speed_kmh) : null],
+        ['Course', _wdHas(gps.course) ? `${Number(gps.course).toFixed(0)}°` : null],
+        ['Connected', gps.connected ? 'yes' : 'no'],
+        ['Source', gps.source],
+        ['Port', gps.port],
+        ['Last update', _wdAge(gps.last_update)],
+        ['Last sentence', gps.last_sentence],
+        ['GPS error', gps.error, 'warn']
+    ]));
+
+    const strongest = stats.strongest || null;
+    groups.push(_wdDiagGroup('Session', [
+        ['Session', st.session_id],
+        ['Duration', _wdDur(stats.duration_seconds)],
+        ['Networks', stats.total_networks],
+        ['Open / WEP / WPA', _wdHas(stats.total_networks)
+            ? `${stats.open_networks || 0} / ${stats.wep_networks || 0} / ${stats.wpa_networks || 0}` : null],
+        ['2.4 / 5 / 6 GHz', _wdHas(stats.total_networks)
+            ? `${stats.band_2_4ghz || 0} / ${stats.band_5ghz || 0} / ${stats.band_6ghz || 0}` : null],
+        ['Bluetooth', stats.bluetooth_devices],
+        ['Cell towers', stats.cell_towers],
+        ['Cameras', stats.cameras],
+        ['GPS trackpoints', stats.gps_trackpoints],
+        ['Strongest', strongest ? `${strongest.ssid || strongest.bssid || '?'}` +
+            (_wdHas(strongest.best_rssi) ? ` (${strongest.best_rssi} dBm)` : '') : null],
+        ['Database', stats.db_path]
+    ]));
+
+    const scanRows = [
+        ['Running', st.running ? 'yes' : 'no', st.running ? 'good' : 'warn'],
+        ['Band mode', st.band_mode],
+        ['Scans completed', st.scans_completed],
+        ['Networks last scan', st.networks_this_scan],
+        ['Last scan', _wdAge(st.last_scan_time)],
+        ['Interfaces', (st.interfaces || []).join(', ')],
+        ['Engine error', st.error, 'warn']
+    ];
+    (st.interface_details || []).forEach(d => {
+        const bits = [];
+        if (_wdHas(d.networks)) bits.push(`${d.networks} nets`);
+        if (d.driver) bits.push(d.driver);
+        if (d.bands) bits.push([].concat(d.bands).join('/'));
+        if (d.is_usb) bits.push('USB');
+        if (d.manufacturer) bits.push(d.manufacturer);
+        scanRows.push([`  ${d.name}`, bits.join(' · ')]);
+    });
+    groups.push(_wdDiagGroup('Scanning', scanRows));
+
+    // Antenna coverage — which adapter is actually pulling its weight.
+    const cov = st.coverage || {};
+    const perIface = cov.per_interface || {};
+    const covRows = [['Seen by 2+ adapters', cov.overlap]];
+    Object.keys(perIface).forEach(name => {
+        const c = perIface[name] || {};
+        const bits = [];
+        if (_wdHas(c.unique)) bits.push(`${c.unique} uniq`);
+        if (_wdHas(c.only_here)) bits.push(`${c.only_here} only here`);
+        if (_wdHas(c.best_rssi_median)) bits.push(`med ${Number(c.best_rssi_median).toFixed(0)} dBm`);
+        covRows.push([`  ${name}`, bits.join(' · ')]);
+    });
+    groups.push(_wdDiagGroup('Coverage', covRows));
+
+    const comps = st.companions || [];
+    const compRows = [['Companions', comps.length || null]];
+    comps.forEach(c => {
+        const bits = [c.connected ? 'up' : 'down'];
+        if (_wdHas(c.networks)) bits.push(`${c.networks} nets`);
+        if (_wdHas(c.networks_24) || _wdHas(c.networks_5)) {
+            bits.push(`${c.networks_24 || 0}/${c.networks_5 || 0} 2.4/5`);
+        }
+        if (c.esp_mode) bits.push(c.esp_mode);
+        if (_wdHas(c.esp_ble_count)) bits.push(`${c.esp_ble_count} BLE`);
+        if (c.mesh_node_count) bits.push(`${c.mesh_node_count} nodes`);
+        if (c.coordinator_board) bits.push(c.coordinator_board);
+        if (c.coordinator_fw) bits.push(`fw ${c.coordinator_fw}`);
+        compRows.push([`  ${c.name || c.port || 'companion'}`, bits.join(' · ')]);
+        (c.esp_alerts || []).slice(-3).forEach((a, i) => {
+            compRows.push([`    alert ${i + 1}`,
+                typeof a === 'string' ? a : JSON.stringify(a), 'warn']);
+        });
+    });
+    groups.push(_wdDiagGroup('Companions', compRows));
+
+    groups.push(_wdDiagGroup('Device', [
+        ['Device name', st.device_name],
+        ['Bluetooth seen', st.bluetooth_count],
+        ['Cells seen', st.cell_count],
+        ['GPS backfill', _wdHas(st.allow_backfill) ? (st.allow_backfill ? 'allowed' : 'off') : null]
+    ]));
+
+    const html = groups.filter(Boolean).join('');
+    body.innerHTML = html
+        // gap-6 (not gap-x-8/gap-y-5): web/css/tailwind.css is a prebuilt,
+        // purged bundle and there is no local Tailwind CLI to rebuild it, so
+        // every class here must already exist in that file.
+        ? `<div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">${html}</div>`
+        : '<p class="text-gray-500 text-sm">No diagnostics available yet.</p>';
 }
 
 // Render one status bar per connected USB companion. The backend exposes a
