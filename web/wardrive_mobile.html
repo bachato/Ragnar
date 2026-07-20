@@ -31,12 +31,15 @@
   .legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
   .foot { text-align:center; color:var(--mut); font-size:11px; margin-top:14px; }
   .stale { opacity:.5; }
-  .exit-wrap { margin-top:18px; }
-  .exit-btn { width:100%; padding:14px 16px; border-radius:12px; border:1px solid #7f1d1d;
-              background:#3b1414; color:#fca5a5; font-size:15px; font-weight:600;
-              letter-spacing:.3px; cursor:pointer; -webkit-appearance:none; appearance:none; }
+  .actions { margin-top:18px; display:grid; gap:10px; }
+  .act-btn { width:100%; padding:14px 16px; border-radius:12px; font-size:15px;
+             font-weight:600; letter-spacing:.3px; cursor:pointer;
+             -webkit-appearance:none; appearance:none; }
+  .act-btn:disabled { opacity:.6; cursor:default; }
+  .exit-btn { border:1px solid #7f1d1d; background:#3b1414; color:#fca5a5; }
   .exit-btn:active { background:#4c1a1a; }
-  .exit-btn:disabled { opacity:.6; cursor:default; }
+  .restart-btn { border:1px solid #78350f; background:#3a2410; color:#fcd34d; }
+  .restart-btn:active { background:#4a2f14; }
   .overlay { position:fixed; inset:0; background:rgba(6,9,20,.92); display:none;
              align-items:center; justify-content:center; padding:24px; z-index:50; }
   .overlay.show { display:flex; }
@@ -70,8 +73,9 @@
     </div>
   </div>
 
-  <div class="exit-wrap">
-    <button type="button" id="exit-btn" class="exit-btn">Exit Wardriving</button>
+  <div class="actions">
+    <button type="button" id="restart-btn" class="act-btn restart-btn">Restart Ragnar Service</button>
+    <button type="button" id="exit-btn" class="act-btn exit-btn">Exit Wardriving</button>
   </div>
 
   <div class="foot" id="foot">Connecting…</div>
@@ -245,6 +249,41 @@
       });
   }
   document.getElementById('exit-btn').addEventListener('click', exitWardriving);
+
+  // Restart the Ragnar service — the field recovery when the UI or a scan
+  // thread has wedged. The AP itself is run by hostapd/dnsmasq, not the Ragnar
+  // service, so the phone stays connected across the restart; we just poll the
+  // status endpoint until it answers again and then resume the live refresh.
+  function restartService() {
+    if (stopping) return;
+    if (!window.confirm('Restart the Ragnar service? Wardriving will stop and the page will reconnect.')) return;
+    var btn = document.getElementById('restart-btn');
+    btn.disabled = true;
+    btn.textContent = 'Restarting…';
+    showOverlay('Restarting Ragnar…', 'The service is coming back up. This page reconnects on its own.');
+    fetch('/api/system/restart-service', { method: 'POST', cache: 'no-store' })
+      .catch(function () { /* the service may drop the connection as it goes down */ })
+      .then(function () { setTimeout(waitForService, 4000); });
+  }
+
+  function waitForService(attempt) {
+    attempt = attempt || 0;
+    getJSON('/api/wardriving/status').then(function () {
+      document.getElementById('exit-overlay').classList.remove('show');
+      var btn = document.getElementById('restart-btn');
+      btn.disabled = false;
+      btn.textContent = 'Restart Ragnar Service';
+      refresh();
+    }).catch(function () {
+      if (attempt > 40) {   // ~2 min
+        showOverlay('Still restarting',
+          'Ragnar has not come back yet. Reload this page, or power-cycle the device.');
+        return;
+      }
+      setTimeout(function () { waitForService(attempt + 1); }, 3000);
+    });
+  }
+  document.getElementById('restart-btn').addEventListener('click', restartService);
 
   refresh();
   setInterval(refresh, 3000);

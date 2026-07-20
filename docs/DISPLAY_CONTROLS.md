@@ -57,9 +57,23 @@ In Default and Wardriving layers the keys act **on press**.
 > the bottom. It stops the current session and then tears down the phone-access
 > AP so the device returns to normal Ragnar operation. Because dropping the AP
 > disconnects the phone, the button confirms first and, once the stop is issued,
-> tells you to reconnect to your normal Wi-Fi to reach Ragnar web. (It is the
-> only write action an un-authenticated AP client is allowed — everything else
-> on that page is read-only.)
+> tells you to reconnect to your normal Wi-Fi to reach Ragnar web.
+>
+> The page also has a **Restart Ragnar Service** button — the field recovery
+> when the UI or a scan thread wedges. The AP is run by hostapd/dnsmasq rather
+> than the Ragnar service, so the phone stays connected across the restart; the
+> page polls until the service answers again and then resumes live updates.
+> These two buttons are the *only* write actions an un-authenticated AP client
+> is allowed — everything else on that page is read-only.
+>
+> **The AP does not carry your phone's internet.** Ragnar never routes for AP
+> clients (no NAT, no `ip_forward`, and while wardriving the radio is usually
+> borrowed so there's no uplink at all), so the wardriving AP hands out an
+> address and deliberately nothing else — no gateway, no DNS, no captive-portal
+> DNS hijack. Your phone keeps its own default route and stays on **cellular**
+> for internet while 192.168.4.1 remains directly reachable. Expect iOS/Android
+> to label the network "No Internet" — that is the intended state. The separate
+> Wi-Fi-**setup** AP is unaffected and still runs its captive portal.
 
 ### Network Diagnostic mode
 
