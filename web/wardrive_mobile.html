@@ -31,6 +31,18 @@
   .legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
   .foot { text-align:center; color:var(--mut); font-size:11px; margin-top:14px; }
   .stale { opacity:.5; }
+  .exit-wrap { margin-top:18px; }
+  .exit-btn { width:100%; padding:14px 16px; border-radius:12px; border:1px solid #7f1d1d;
+              background:#3b1414; color:#fca5a5; font-size:15px; font-weight:600;
+              letter-spacing:.3px; cursor:pointer; -webkit-appearance:none; appearance:none; }
+  .exit-btn:active { background:#4c1a1a; }
+  .exit-btn:disabled { opacity:.6; cursor:default; }
+  .overlay { position:fixed; inset:0; background:rgba(6,9,20,.92); display:none;
+             align-items:center; justify-content:center; padding:24px; z-index:50; }
+  .overlay.show { display:flex; }
+  .overlay .msg { max-width:360px; text-align:center; }
+  .overlay .msg h2 { font-size:18px; margin:0 0 10px; }
+  .overlay .msg p { color:var(--mut); font-size:13px; line-height:1.5; margin:0; }
 </style>
 </head>
 <body>
@@ -58,8 +70,19 @@
     </div>
   </div>
 
+  <div class="exit-wrap">
+    <button type="button" id="exit-btn" class="exit-btn">Exit Wardriving</button>
+  </div>
+
   <div class="foot" id="foot">Connecting…</div>
 </main>
+
+<div class="overlay" id="exit-overlay">
+  <div class="msg">
+    <h2 id="exit-title">Stopping wardriving…</h2>
+    <p id="exit-note">Ending the session and shutting down the Ragnar access point.</p>
+  </div>
+</div>
 
 <script>
 (function () {
@@ -182,6 +205,46 @@
       txt('foot', 'Reconnecting…');
     });
   }
+
+  // Exit Wardriving: stop the session and drop the field AP, then head back to
+  // Ragnar web. The AP teardown is deferred server-side (~1.5s) so this request
+  // completes first; after that the AP radio goes down and this phone loses the
+  // Ragnar network, so we give clear on-screen guidance rather than assume the
+  // redirect will load.
+  var stopping = false;
+  function showOverlay(title, note) {
+    txt('exit-title', title);
+    txt('exit-note', note);
+    document.getElementById('exit-overlay').classList.add('show');
+  }
+  function exitWardriving() {
+    if (stopping) return;
+    if (!window.confirm('Stop wardriving and shut down the Ragnar access point?')) return;
+    stopping = true;
+    var btn = document.getElementById('exit-btn');
+    btn.disabled = true;
+    btn.textContent = 'Stopping…';
+    showOverlay('Stopping wardriving…', 'Ending the session and shutting down the Ragnar access point.');
+    fetch('/api/wardriving/stop', { method: 'POST', cache: 'no-store' })
+      .then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (res) {
+        if (res && res.ap_teardown) {
+          showOverlay('Wardriving stopped',
+            'The Ragnar access point is shutting down. Reconnect your phone to its normal Wi-Fi to reach Ragnar web.');
+        } else {
+          showOverlay('Wardriving stopped', 'Returning to Ragnar web…');
+        }
+        setTimeout(function () { window.location.href = '/'; }, 2500);
+      })
+      .catch(function () {
+        // The AP may have dropped before the response arrived — that still means
+        // the stop was issued. Guide the user rather than showing a raw error.
+        showOverlay('Wardriving stopping',
+          'If this page does not return, reconnect your phone to its normal Wi-Fi to reach Ragnar web.');
+        setTimeout(function () { window.location.href = '/'; }, 3000);
+      });
+  }
+  document.getElementById('exit-btn').addEventListener('click', exitWardriving);
 
   refresh();
   setInterval(refresh, 3000);
