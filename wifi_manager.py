@@ -2307,8 +2307,13 @@ class WiFiManager:
             # Fallback to regular AP mode if endless loop not active
             return self.start_ap_mode()
     
-    def start_ap_mode(self):
-        """Start Access Point mode"""
+    def start_ap_mode(self, captive=True):
+        """Start Access Point mode.
+
+        captive=False starts an accessory AP that advertises no gateway and no
+        DNS, so a phone joining it keeps using cellular for internet (see
+        _dnsmasq_config_no_internet). Used by the wardriving phone-access AP.
+        """
         if self.ap_mode_active:
             self.logger.info("AP mode already active")
             self.ap_logger.info("AP mode start requested but already active")
@@ -2343,7 +2348,7 @@ class WiFiManager:
             
             # Create dnsmasq configuration
             self.ap_logger.info("Creating dnsmasq configuration...")
-            if not self._create_dnsmasq_config(dns_enabled=True):
+            if not self._create_dnsmasq_config(dns_enabled=True, captive=captive):
                 self.ap_logger.error("Failed to create dnsmasq configuration")
                 return False
             
@@ -2497,7 +2502,10 @@ class WiFiManager:
         self._wardrive_ap_prev_interface = self.ap_interface
         self.ap_interface = iface
         self.logger.info(f"Wardrive AP: starting on {iface} (SSID={self.ap_ssid})")
-        if self.start_ap_mode():
+        # captive=False: this AP is a viewer for the wardriving page, not an
+        # internet path. Advertising no gateway/DNS keeps the phone's cellular
+        # data working while it's joined (see _dnsmasq_config_no_internet).
+        if self.start_ap_mode(captive=False):
             self.shared_data.wardrive_ap_active = True
             self.shared_data.wardrive_ap_url = f"{self.ap_ip}:8000"
             self.shared_data.wardrive_ap_iface = iface
@@ -2567,12 +2575,59 @@ rsn_pairwise=CCMP
             self.ap_logger.error(f"Error creating hostapd config: {e}")
             return False
     
-    def _create_dnsmasq_config(self, dns_enabled=True):
-        """Create dnsmasq configuration file"""
+    def _dnsmasq_config_no_internet(self):
+        """dnsmasq profile for an accessory AP that must NOT become the client's
+        internet path — used by the wardriving phone-access AP.
+
+        Ragnar never routes for AP clients (there is no NAT, no ip_forward, and
+        while wardriving the radio is usually borrowed so there's no uplink at
+        all). Handing out a default route and a DNS server anyway is what made
+        phones blackhole: iOS would put its default route on Wi-Fi, send every
+        request at 192.168.4.1, get nothing back, and show "No Internet".
+
+        So we hand out an address and deliberately nothing else:
+          * `dhcp-option=3` with an empty value suppresses the router option, so
+            the client installs only the on-link 192.168.4.0/24 route. The
+            wardriving page stays reachable; everything else stays on cellular.
+          * `dhcp-option=6` empty likewise suppresses DNS, leaving the phone's
+            own (cellular) resolvers in place.
+          * `port=0` turns the DNS server off entirely — no wildcard hijack, so
+            iOS's captive-portal probe simply fails on this interface and the
+            network is marked "no internet" instead of trapping traffic.
+        """
+        return f"""# Interface configuration
+interface={self.ap_interface}
+# DHCP range
+dhcp-range=192.168.4.2,192.168.4.20,255.255.255.0,24h
+# DHCP authoritative
+dhcp-authoritative
+# Bind to specific interface only
+bind-interfaces
+# Log DHCP activity
+log-dhcp
+# No gateway: empty option 3 suppresses the router option so clients keep
+# their existing default route (cellular on a phone) for internet.
+dhcp-option=3
+# No DNS: empty option 6 leaves the client's own resolvers in place.
+dhcp-option=6
+# DNS server off entirely - no captive-portal hijack on this AP.
+port=0
+"""
+
+    def _create_dnsmasq_config(self, dns_enabled=True, captive=True):
+        """Create dnsmasq configuration file.
+
+        captive=True  — the Wi-Fi-setup AP: hand out ourselves as gateway+DNS and
+                        hijack every domain so the captive portal pops up.
+        captive=False — an accessory AP (wardriving): hand out an address and
+                        nothing else. See _create_dnsmasq_config_no_internet.
+        """
         try:
             self.ap_logger.debug("Creating dnsmasq configuration file...")
-            
-            if dns_enabled:
+
+            if not captive:
+                config_content = self._dnsmasq_config_no_internet()
+            elif dns_enabled:
                 # Full configuration with DNS for captive portal
                 config_content = f"""# Interface configuration
 interface={self.ap_interface}
@@ -2628,8 +2683,11 @@ port=0
             
             with open('/tmp/ragnar/dnsmasq.conf', 'w') as f:
                 f.write(config_content)
-            
-            config_type = "with captive portal DNS" if dns_enabled else "DHCP-only (no DNS conflicts)"
+
+            if not captive:
+                config_type = "accessory AP (no gateway/DNS — clients keep their own internet)"
+            else:
+                config_type = "with captive portal DNS" if dns_enabled else "DHCP-only (no DNS conflicts)"
             self.logger.info(f"Created dnsmasq configuration {config_type}")
             self.ap_logger.info(f"Created dnsmasq configuration at /tmp/ragnar/dnsmasq.conf ({config_type})")
             self.ap_logger.debug(f"Dnsmasq config content:\n{config_content}")

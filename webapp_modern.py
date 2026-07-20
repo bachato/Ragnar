@@ -126,17 +126,19 @@ def check_authentication():
     # page and its READ-ONLY data without login — same spirit as the captive
     # portal. Scoped to GET on the status/track/networks endpoints so a phone
     # on the AP can watch but cannot wipe data, change settings, etc.
-    # The one write allowed is POST /api/wardriving/stop — the "Exit Wardriving"
-    # button on the mobile page, which ends the session and drops this AP.
+    # Two writes are allowed, both being buttons on that page and both only
+    # reachable while the wardriving AP is up: stopping the session and
+    # restarting the Ragnar service (the field "it's wedged" recovery).
     if getattr(shared_data, 'wardrive_ap_active', False) and is_ap_client_request():
         readonly_api = (
             '/api/wardriving/status', '/api/wardriving/track',
             '/api/wardriving/networks', '/api/wardriving/gps',
             '/api/wardriving/bluetooth', '/api/wardriving/cells',
         )
+        write_api = ('/api/wardriving/stop', '/api/system/restart-service')
         if path in ('/', '/wardrive') or (request.method == 'GET' and path in readonly_api):
             return
-        if request.method == 'POST' and path == '/api/wardriving/stop':
+        if request.method == 'POST' and path in write_api:
             return
 
     # Kiosk loopback bypass: any request originating from the Pi itself
