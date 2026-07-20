@@ -356,9 +356,21 @@ with `· error` appended when the engine or GPS reports one), so a glance is
 often enough without expanding. Expanded, it lists everything the
 [Status Object](#status-object) exposes, grouped:
 
+The **GPS**, **Session**, **Scanning**, **Coverage**, **Companions** and
+**Device** groups come from the status object the panel already polls. The
+**GPS constellations**, **Radios**, **Power** and **Errors** groups come from a
+second endpoint, `GET /api/wardriving/diagnostics`, which the panel fetches
+**only while it is expanded** (and at most every 8 s; the backend caches 5 s).
+That walk touches sysfs and shells out to `vcgencmd`, so it deliberately does
+not ride the 3-second status poll.
+
 | Group | Contents |
 |-------|----------|
-| **GPS** | fix + quality, satellites used/in-view, SNR max, HDOP, lat/lon/altitude, speed, course, source, port, last update, last raw NMEA sentence, error |
+| **GPS** | fix + quality, satellites used/in-view, SNR max, HDOP, lat/lon/altitude, speed, course, source, port, age of last update and last NMEA sentence, time-to-first-fix (or how long it has been searching), error |
+| **GPS constellations** | per-constellation satellites in view and peak SNR (GPS / GLONASS / Galileo / BeiDou / QZSS / NavIC) |
+| **Radios** | every wireless interface present, whether it is scanning, its driver / mode / link state, the USB adapter behind it — and **when it is not scanning, the reason** |
+| **Power** | per-USB-device declared draw and which interface it backs, summed USB budget, `usb_max_current_enable`, supply throttle/under-voltage flags (now and since boot), core voltage, temperature, and Pi 5 PMIC board power |
+| **Errors** | everything currently complaining — engine, GPS, radios, companions and supply — gathered into one list |
 | **Session** | id, duration, network totals, open/WEP/WPA, per-band, Bluetooth, cell towers, cameras, trackpoints, strongest AP, DB path |
 | **Scanning** | running, band mode, scans completed, networks last scan, last scan age, interfaces, plus per-adapter driver / bands / USB / manufacturer / network count |
 | **Coverage** | BSSIDs seen by 2+ adapters, and per adapter its unique count, *only-here* count and median best RSSI — the antenna-comparison view (dashboard only) |
@@ -370,12 +382,25 @@ its DOM work entirely while collapsed (re-rendering from the last status when
 expanded), so the polling loop costs nothing extra when it is closed.
 
 > **Diagnosing "sees satellites but never gets a fix":** open **GPS** and read
-> **SNR max** together with **Satellites** (`used / in view`). A cold start must
-> demodulate the ephemeris — roughly 30 s of continuous reception at ≥30 dB-Hz —
-> while an already-established fix tracks down to ~20 dB-Hz. So a receiver
-> showing satellites in view with `0 used` and a low SNR is signal-limited
-> (antenna placement or RF interference from a nearby adapter), whereas
-> comparable SNR with the fix repeatedly resetting points at power instead.
+> **SNR max** together with **Satellites** (`used / in view`) and **Searching
+> for**. A cold start must demodulate the ephemeris — roughly 30 s of continuous
+> reception at ≥30 dB-Hz — while an already-established fix tracks down to
+> ~20 dB-Hz. So a receiver showing satellites in view with `0 used` and a low
+> SNR is signal-limited (antenna placement, or RF desense from an adapter sat
+> next to the puck), whereas comparable SNR with the fix repeatedly resetting
+> points at power instead. **Power** settles that second half: compare the
+> summed USB draw against what the board allows, and check whether
+> `under-voltage` appears under *Right now* or *Since boot* — the "since boot"
+> flags are what catch a brownout that has already passed.
+
+> **Diagnosing "only wlan0 is scanning":** open **Radios**. Every wireless
+> interface the kernel knows about is listed, and any radio that is not in the
+> scan set carries a *why not* line — `rfkill-blocked` (with the unblock
+> command), `held as the uplink / management radio` (wardriving never claims the
+> interface carrying Ragnar's own connectivity — see `_management_ifaces`), `in
+> AP mode (lent to the phone-access AP)`, a monitor child, or simply *present
+> but not claimed*. A radio that does not appear at all was never enumerated by
+> the kernel, which points at the adapter, cable or power rather than at Ragnar.
 
 ### Network Position Preservation
 
@@ -417,6 +442,7 @@ Falls back to linear when either endpoint speed is NULL or both are zero. The ch
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/wardriving/status` | Full status incl. GPS, serial, counters |
+| GET | `/api/wardriving/diagnostics` | Deep diagnostics: radios + exclusion reasons, USB power budget, supply health, GPS constellations, errors ([panel](#diagnostics-panel-ui)) |
 | POST | `/api/wardriving/start` | Start wardriving session |
 | POST | `/api/wardriving/stop` | Stop session |
 | GET | `/api/wardriving/networks` | List captured WiFi networks |
