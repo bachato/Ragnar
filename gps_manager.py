@@ -682,8 +682,17 @@ class GPSManager:
                 self.fix_quality = 0
             self.last_sentence = now
 
+    # gpsd gnssid -> NMEA talker code, so the gpsd path keys its per-constellation
+    # bookkeeping the same way the direct-NMEA GSV path does (see _parse_nmea).
+    _GNSS_TALKER = {0: 'GP', 1: 'SB', 2: 'GA', 3: 'GB', 5: 'GQ', 6: 'GL', 7: 'GI'}
+
     def _parse_sky(self, obj):
-        """Parse a gpsd SKY object for satellite count and HDOP."""
+        """Parse a gpsd SKY object: satellite count, HDOP, and — the part that
+        used to be missing — the per-constellation breakdown and per-satellite
+        sky view. gpsd's SKY carries az/el/ss/gnssid per satellite, the same
+        information the NMEA GSV sentences give, so the constellations card and
+        the sky-view plot work on gpsd too, not just direct-serial NMEA."""
+        now = time.time()
         with self._lock:
             sats = obj.get('satellites') or []
             used = sum(1 for s in sats if s.get('used', False))
@@ -694,7 +703,38 @@ class GPSManager:
             hdop = obj.get('hdop')
             if hdop is not None:
                 self.hdop = hdop
-            self.last_sentence = time.time()
+
+            # Group gpsd's flat satellite list by constellation. gpsd sends the
+            # full in-view list every SKY, so a straight replace per talker (not
+            # a merge) is correct.
+            by_talker = {}
+            for s in sats:
+                gid = s.get('gnssid')
+                talker = self._GNSS_TALKER.get(gid, 'GN') if gid is not None else 'GN'
+                ss, az, el = s.get('ss'), s.get('az'), s.get('el')
+                svid = s.get('svid')
+                try:
+                    prn = int(svid if svid is not None else s.get('PRN'))
+                except (TypeError, ValueError):
+                    prn = None
+                rec = by_talker.setdefault(talker, {'sats': [], 'snr': None})
+                rec['sats'].append({
+                    'prn': prn,
+                    'elev': int(el) if isinstance(el, (int, float)) else None,
+                    'az': int(az) if isinstance(az, (int, float)) else None,
+                    'snr': int(ss) if isinstance(ss, (int, float)) else None,
+                })
+                if isinstance(ss, (int, float)):
+                    rec['snr'] = ss if rec['snr'] is None else max(rec['snr'], ss)
+            for talker, rec in by_talker.items():
+                self._gsv_by_talker[talker] = (len(rec['sats']), rec['snr'], now)
+                self._sats_by_talker[talker] = (rec['sats'], now)
+            # Same 30 s pruning as the NMEA path (ts is the last tuple element).
+            for d in (self._gsv_by_talker, self._sats_by_talker):
+                for t in [t for t, v in d.items() if now - v[-1] > 30]:
+                    del d[t]
+
+            self.last_sentence = now
 
     def _read_loop(self):
         """Background thread: read NMEA sentences and parse position."""

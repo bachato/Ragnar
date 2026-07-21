@@ -130,8 +130,13 @@ still before the fix completes. u-blox 7 pucks lose their almanac every power
 cycle, so this cold-start window is expected on that hardware, not a bug.
 
 **gpsd vs direct NMEA.** When a `gpsd` instance owns the receiver, Ragnar reads
-its JSON stream (`TPV`/`SKY`) instead of raw NMEA. The satellite counts, used
-count and SNR come from gpsd `SKY` reports along that path.
+its JSON stream (`TPV`/`SKY`) instead of raw NMEA. gpsd `SKY` reports carry the
+same per-satellite azimuth/elevation/SNR (and a `gnssid` per satellite) that
+NMEA `GSV` does, so the counts, the **per-constellation breakdown** and the
+**sky view** are all derived from `SKY` on this path — mapped by `gnssid` to the
+same talker codes the GSV path uses. If gpsd reports a position but zero
+satellites, it usually needs `GPSD_OPTIONS="-n"` (poll before a client
+connects) or the receiver isn't feeding per-satellite detail to gpsd.
 
 ### Fullscreen sky view (stars behind the satellites)
 
