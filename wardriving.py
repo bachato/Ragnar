@@ -1688,6 +1688,39 @@ class WardrivingEngine:
         except Exception as e:
             logger.debug(f"HAT button reclaim skipped: {e}")
 
+    @staticmethod
+    def _iface_is_usb(iface):
+        """True if this radio is a USB dongle (as opposed to a built-in radio)."""
+        try:
+            return 'usb' in os.path.realpath(
+                f'/sys/class/net/{iface}/device').lower()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _iface_supports_ap(iface):
+        """True if the radio behind iface advertises AP mode (iw phy info).
+
+        Built-in Pi radios do; a number of USB dongles (several Alfa cards
+        among them) do NOT, and hostapd started on one that doesn't just fails.
+        Fails open (True) when the mode list can't be read, so an unknown radio
+        is never wrongly excluded.
+        """
+        try:
+            phy = os.path.basename(
+                os.path.realpath(f'/sys/class/net/{iface}/phy80211'))
+            r = subprocess.run(['iw', 'phy', phy, 'info'],
+                               capture_output=True, text=True, timeout=6)
+            if r.returncode != 0:
+                return True
+            block = re.search(r"Supported interface modes:(.*?)(?:\n\s*\n|\Z)",
+                              r.stdout, re.S)
+            if not block:
+                return True
+            return bool(re.search(r"\*\s*AP\b", block.group(1)))
+        except Exception:
+            return True
+
     def lend_interface_for_ap(self, prefer=None):
         """Remove one scanning interface so the KEY1 AP can own it.
 
@@ -1697,12 +1730,30 @@ class WardrivingEngine:
         it. Returns the lent interface name, or None if nothing is available.
         The scan loop re-reads self.interfaces each cycle, so swapping the list
         reference is picked up safely on the next scan.
+
+        Choosing which radio to lend matters once there's more than one: the
+        phone AP needs an **AP-capable** radio, and the Pi's built-in radio is
+        the reliable one for that. A premium USB scanner (e.g. an Alfa) is both
+        the better antenna to keep scanning AND, on many cards, unable to run
+        hostapd at all — so lending it (the old ifaces[-1] default) started the
+        AP on a radio that couldn't be an AP and it silently failed, which is
+        exactly the "works without the Alfa, dead with it" symptom. Preference:
+        an explicit `prefer`, then a built-in AP-capable radio, then any
+        AP-capable radio, then the last interface.
         """
         with self._iface_swap_lock:
             ifaces = list(self.interfaces)
             if not ifaces:
                 return None
-            iface = prefer if (prefer in ifaces) else ifaces[-1]
+            if prefer in ifaces:
+                iface = prefer
+            else:
+                ap_capable = [n for n in ifaces if self._iface_supports_ap(n)]
+                if ap_capable:
+                    non_usb = [n for n in ap_capable if not self._iface_is_usb(n)]
+                    iface = (non_usb or ap_capable)[0]
+                else:
+                    iface = ifaces[-1]
             ifaces.remove(iface)
             self.interfaces = ifaces
             self._iface_prepared.discard(iface)
