@@ -658,6 +658,19 @@ freshly-plugged USB dongle commonly comes up **soft-blocked**: it appears in
 `/sys/class/net` and in the adapter list but scans zero networks. Ragnar logs a
 warning naming any blocked radio; clear it with `sudo rfkill unblock all`.
 
+**Hot-plug is live — no restart needed.** The scan set is reconciled with the
+radios actually present every ~12 s, so an adapter plugged in *after* wardriving
+started (e.g. booting without the Alfa, then connecting it) joins the sweep on
+its own, and a yanked one drops out. The scan-set change is logged:
+
+```
+Wardriving: scan set changed (added=['wlan1'], removed=—); now scanning ['wlan0', 'wlan1']
+```
+
+The rescan deliberately leaves alone the radio currently hosting the phone-access
+AP and any radio in AP/monitor mode (e.g. WiFi Defense), and re-checks a
+soft-blocked adapter on the next pass once you `rfkill unblock` it.
+
 ### "Adding a second dongle crashes the whole box"
 
 Two distinct causes, and they look identical from the outside.
