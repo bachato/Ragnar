@@ -451,6 +451,30 @@ def errors(engine, shared_data=None):
                        f'receiver still reports connected — the port is open '
                        f'but nothing is arriving.')
 
+    # Tracking satellites but still no fix after a long search. The receiver
+    # SEES satellites (carrier lock) but can't decode a position, which means
+    # the signal is too weak to demodulate the 50 bps nav message — an antenna
+    # placement / sky-view problem (a GPS puck sat right next to the Pi or a USB
+    # hub gets desensed), or a cold start on a u-blox with no battery-backed
+    # almanac. It is NOT a Ragnar fault, so say so explicitly — otherwise a live
+    # feed with a healthy supply and N satellites "in view" looks like a bug.
+    if gps is not None:
+        try:
+            s = gps.get_status()
+            searching = s.get('searching_seconds') or 0
+            in_view = s.get('satellites_in_view') or 0
+            if not s.get('has_fix') and searching > 180 and in_view >= 4:
+                add('gps',
+                    f'Tracking {in_view} satellites for {int(searching)}s but no '
+                    f'fix: the receiver sees satellites but the signal is too weak '
+                    f'to decode a position. This is antenna placement / sky view '
+                    f'(a GPS puck next to the Pi or a USB hub gets desensed) or a '
+                    f'cold start on a receiver with no battery-backed almanac — '
+                    f'not a Ragnar fault. Move the antenna to open sky, away from '
+                    f'the Pi and USB.', 'warn')
+        except Exception as e:
+            logger.debug(f"no-fix hint failed: {e}")
+
     if getattr(engine, '_running', False):
         last = getattr(engine, 'last_scan_time', 0) or 0
         if last and now - last > SCAN_STALE_S:
