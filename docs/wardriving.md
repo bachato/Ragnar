@@ -313,7 +313,7 @@ Re-run `sudo scripts/setup_gpsd.sh` manually after swapping to a different GPS r
 
 - **Permissive talker IDs.** The GGA/RMC/GSV regexes accept any two-letter talker prefix (GP, GN, GL, GA, GB, GI, GQ, …) so multi-GNSS modules are covered.
 - **Optional time field.** Pre-fix receivers emit GGA/RMC with empty time and position. The parser accepts these so `last_update` and satellite counters move as soon as any NMEA is received — not only after first fix.
-- **GSV parsing.** Per-constellation `$xxGSV` sentences are aggregated; the API exposes `satellites_in_view` (sum across all reporting constellations) and `snr_max` (highest reported SNR in dB-Hz). Entries that haven't been heard from in 30 s are pruned so a constellation that stops reporting doesn't inflate the total.
+- **GSV parsing.** Per-constellation `$xxGSV` sentences are aggregated; the API exposes `satellites_in_view` (sum across all reporting constellations) and `snr_max` (highest reported SNR in dB-Hz). The multi-message GSV sweep is also stitched back into a **per-satellite list** (PRN, elevation, azimuth, SNR) per constellation, which the diagnostics endpoint surfaces as `gps.sky` for the sky-view plot; the NMEA 4.10+ trailing signal-ID field is ignored. Entries that haven't been heard from in 30 s are pruned so a constellation that stops reporting doesn't inflate the total.
 - **Liveness signal.** `last_sentence` updates on any recognized NMEA line (including GSV / GSA / VTG / GLL / TXT and pre-fix GGA/RMC). `last_update` continues to mean "last positional/fix update". Together they distinguish "GPS is alive but has no fix yet" from "GPS isn't transmitting at all".
 
 ### Status Fields (`/api/wardriving/gps`)
@@ -358,9 +358,10 @@ often enough without expanding. Expanded, it lists everything the
 
 The **GPS**, **Session**, **Scanning**, **Coverage**, **Companions** and
 **Device** groups come from the status object the panel already polls. The
-**GPS constellations**, **Radios**, **Power** and **Errors** groups come from a
-second endpoint, `GET /api/wardriving/diagnostics`, which the panel fetches
-**only while it is expanded** (and at most every 8 s; the backend caches 5 s).
+**GPS constellations**, **GPS sky view**, **Radios**, **Power** and **Errors**
+groups come from a second endpoint, `GET /api/wardriving/diagnostics`, which the
+panel fetches **only while it is expanded** (and at most every 8 s; the backend
+caches 5 s).
 That walk touches sysfs and shells out to `vcgencmd`, so it deliberately does
 not ride the 3-second status poll.
 
@@ -368,6 +369,7 @@ not ride the 3-second status poll.
 |-------|----------|
 | **GPS** | fix + quality, satellites used/in-view, SNR max, HDOP, lat/lon/altitude, speed, course, source, port, age of last update and last NMEA sentence, time-to-first-fix (or how long it has been searching), error |
 | **GPS constellations** | per-constellation satellites in view and peak SNR (GPS / GLONASS / Galileo / BeiDou / QZSS / NavIC) |
+| **GPS sky view** | polar plot of every satellite by azimuth/elevation, coloured per constellation — North up, zenith at centre, horizon at the rim. Fill opacity tracks SNR (untracked satellites render hollow); hover a dot for PRN / elevation / azimuth / SNR. This is the graphical half of the same GSV data u-center draws |
 | **Radios** | every wireless interface present, whether it is scanning, its driver / mode / link state, the USB adapter behind it — and **when it is not scanning, the reason** |
 | **Power** | per-USB-device declared draw and which interface it backs, summed USB budget, `usb_max_current_enable`, supply throttle/under-voltage flags (now and since boot), core voltage, temperature, and Pi 5 PMIC board power |
 | **Errors** | everything currently complaining — engine, GPS, radios, companions, supply and **stalled feeds** — gathered into one list |

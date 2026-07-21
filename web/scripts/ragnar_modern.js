@@ -22801,6 +22801,63 @@ function _wdDur(sec) {
 
 // One titled group of key/value rows. Rows with no value are dropped, and a
 // group with nothing left to show is skipped entirely.
+// Polar sky plot of satellites by azimuth/elevation, coloured per
+// constellation — the graphical half of the GSV data u-center draws. North is
+// up, zenith at the centre, horizon at the outer ring. Fill opacity tracks SNR
+// so a weak-but-tracked satellite reads as faint; an untracked one (no SNR)
+// shows as a hollow ring. Colours are inline (SVG attrs / style), not Tailwind
+// classes, so the purged tailwind.css bundle needs no rebuild.
+const _WD_SKY_COLORS = {
+    GPS: '#34d399', GLONASS: '#f87171', Galileo: '#60a5fa',
+    BeiDou: '#fbbf24', QZSS: '#a78bfa', NavIC: '#f472b6', combined: '#94a3b8'
+};
+
+function _wdSkyPlot(sky) {
+    const pts = (sky || []).filter(s => _wdHas(s.az) && _wdHas(s.elev));
+    if (!pts.length) return '';
+    const S = 220, c = S / 2, R = c - 16;   // leave a margin for cardinal labels
+    // Elevation rings at 0°, 30°, 60° (radius = (90 - elev) / 90).
+    const rings = [1, 2 / 3, 1 / 3].map(f =>
+        `<circle cx="${c}" cy="${c}" r="${(R * f).toFixed(1)}" fill="none" stroke="#334155" stroke-width="1"/>`
+    ).join('');
+    const card = [['N', 0], ['E', 90], ['S', 180], ['W', 270]].map(([lab, az]) => {
+        const a = az * Math.PI / 180;
+        const lx = c + (R + 9) * Math.sin(a), ly = c - (R + 9) * Math.cos(a);
+        return `<text x="${lx.toFixed(1)}" y="${(ly + 3).toFixed(1)}" fill="#64748b" font-size="10" text-anchor="middle">${lab}</text>`;
+    }).join('');
+    const dots = pts.map(s => {
+        const elev = Math.max(0, Math.min(90, s.elev));
+        const r = R * (90 - elev) / 90;
+        const a = s.az * Math.PI / 180;
+        const x = c + r * Math.sin(a), y = c - r * Math.cos(a);
+        const col = _WD_SKY_COLORS[s.constellation] || '#94a3b8';
+        const hasSnr = _wdHas(s.snr) && s.snr > 0;
+        const op = hasSnr ? (0.3 + 0.7 * Math.min(1, s.snr / 50)) : 0.35;
+        const fill = hasSnr ? col : 'none';
+        const tip = `${s.constellation} PRN ${s.prn} · el ${s.elev}° az ${s.az}°`
+            + (hasSnr ? ` · SNR ${s.snr} dB` : ' · untracked');
+        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.2" fill="${fill}" stroke="${col}" stroke-width="1" opacity="${op.toFixed(2)}"><title>${escapeHtml(tip)}</title></circle>`;
+    }).join('');
+    const svg = `<svg viewBox="0 0 ${S} ${S}" class="w-full" style="max-width:240px" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="${c}" cy="${c}" r="${R}" fill="#0f172a"/>
+        ${rings}
+        <line x1="${c}" y1="${c - R}" x2="${c}" y2="${c + R}" stroke="#334155" stroke-width="1"/>
+        <line x1="${c - R}" y1="${c}" x2="${c + R}" y2="${c}" stroke="#334155" stroke-width="1"/>
+        ${card}${dots}
+    </svg>`;
+    const present = [...new Set(pts.map(s => s.constellation))];
+    const legend = present.map(name => {
+        const col = _WD_SKY_COLORS[name] || '#94a3b8';
+        return `<span class="inline-flex items-center gap-1 mr-2"><span style="width:8px;height:8px;border-radius:9999px;background:${col};display:inline-block"></span>${escapeHtml(name)}</span>`;
+    }).join('');
+    return `<div class="min-w-0">
+        <h4 class="text-xs uppercase tracking-wide text-gray-500 font-semibold mb-2 pb-1 border-b border-slate-700">GPS sky view</h4>
+        <div class="flex flex-col items-center">${svg}
+            <div class="text-[10px] text-gray-400 mt-1 flex flex-wrap justify-center">${legend}</div>
+        </div>
+    </div>`;
+}
+
 function _wdDiagGroup(title, rows) {
     const kept = rows.filter(r => _wdHas(r[1]));
     if (!kept.length) return '';
@@ -22891,6 +22948,10 @@ function renderWardrivingDiagnostics(status) {
                 c.constellation,
                 `${c.in_view} in view` + (_wdHas(c.snr_max) ? ` · SNR ${c.snr_max} dB` : '')
             ])));
+    }
+    if ((exGps.sky || []).length) {
+        const skyHtml = _wdSkyPlot(exGps.sky);
+        if (skyHtml) groups.push(skyHtml);
     }
 
     const strongest = stats.strongest || null;

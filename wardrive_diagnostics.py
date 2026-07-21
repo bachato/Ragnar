@@ -378,6 +378,33 @@ def gps_extra(engine):
         logger.debug(f"GSV breakdown failed: {e}")
         info['constellations'] = []
 
+    # Per-satellite sky view (azimuth/elevation/SNR) for a polar plot — the
+    # graphical half of the same GSV data u-center draws. Only satellites with
+    # both azimuth and elevation are plottable.
+    try:
+        now = time.time()
+        sky = []
+        for talker, val in (getattr(gps, '_sats_by_talker', None) or {}).items():
+            sats, ts = val
+            if ts and now - ts > 30:
+                continue
+            cons = talkers.get(talker, talker)
+            for s in sats:
+                if s.get('az') is None or s.get('elev') is None:
+                    continue
+                sky.append({
+                    'constellation': cons,
+                    'talker': talker,
+                    'prn': s.get('prn'),
+                    'az': s.get('az'),
+                    'elev': s.get('elev'),
+                    'snr': s.get('snr'),
+                })
+        info['sky'] = sky
+    except Exception as e:
+        logger.debug(f"sky view failed: {e}")
+        info['sky'] = []
+
     # Serial/gpsd plumbing worth seeing when nothing is arriving at all.
     info['port'] = getattr(gps, 'port', None)
     info['use_gpsd'] = bool(getattr(gps, '_use_gpsd', False))
