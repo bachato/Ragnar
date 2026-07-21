@@ -1612,7 +1612,9 @@ class WardrivingEngine:
         # Treat "auto" or empty string as None to trigger auto-detection
         if gps_port and gps_port.lower() == 'auto':
             gps_port = None
-        self._gps = GPSManager(port=gps_port, exclude_ports=esp_exclude)
+        self._gps = GPSManager(
+            port=gps_port, exclude_ports=esp_exclude,
+            state_file=os.path.join(self.data_dir, 'last_gps.json'))
         gps_ok = self._gps.start()
         if not gps_ok:
             logger.warning(f"GPS not available: {self._gps.error}. Wardriving without GPS.")

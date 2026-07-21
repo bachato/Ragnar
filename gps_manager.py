@@ -264,7 +264,8 @@ def detect_gps_device(exclude_ports=None):
 class GPSManager:
     """Manages a GPS source (gpsd socket or direct NMEA serial), providing real-time position data."""
 
-    def __init__(self, port=None, baudrate=9600, exclude_ports=None):
+    def __init__(self, port=None, baudrate=9600, exclude_ports=None,
+                 state_file=None):
         self.port = port
         self.baudrate = baudrate
         self._exclude_ports = set(exclude_ports or [])
@@ -294,6 +295,16 @@ class GPSManager:
         # (each sentence carries ≤4 satellites) back into one sweep.
         self._sats_by_talker = {}
         self._gsv_accum = {}
+        # Last-known position — the most recent confirmed fix, kept in memory and
+        # mirrored to disk so it survives reboots. Lets the sky view place stars
+        # from roughly the right spot before this boot's receiver gets its own
+        # fix (a u-blox cold start can take minutes). A later real fix always
+        # wins; this is only ever a starting point.
+        self.state_file = state_file
+        self.last_known = None            # {'lat','lon','alt','t'} or None
+        self._last_persist = 0.0
+        if state_file:
+            self._load_last_known()
         # Time-to-first-fix bookkeeping. A cold start has to demodulate the
         # ephemeris (~30 s of uninterrupted reception), so a receiver that keeps
         # browning out or is being desensed shows satellites in view while TTFF
@@ -459,6 +470,40 @@ class GPSManager:
                 'timestamp': self.last_update
             }
 
+    def _load_last_known(self):
+        """Load the persisted last-known position at startup (best-effort)."""
+        try:
+            with open(self.state_file) as f:
+                d = json.load(f)
+            self.last_known = {
+                'lat': float(d['lat']), 'lon': float(d['lon']),
+                'alt': d.get('alt'), 't': d.get('t'),
+            }
+            logger.info("GPS last-known position loaded: "
+                        f"{self.last_known['lat']:.4f}, {self.last_known['lon']:.4f}")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"last-known GPS load failed: {e}")
+
+    def _record_position(self, now):
+        """Update (and throttle-persist) last-known position. Call under _lock
+        at each confirmed-fix point, with self.latitude/longitude already set."""
+        if self.latitude is None or self.longitude is None:
+            return
+        self.last_known = {'lat': self.latitude, 'lon': self.longitude,
+                           'alt': self.altitude, 't': now}
+        if self.state_file and (now - self._last_persist) > 60:
+            self._last_persist = now
+            try:
+                os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+                tmp = self.state_file + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(self.last_known, f)
+                os.replace(tmp, self.state_file)   # atomic
+            except Exception as e:
+                logger.debug(f"last-known GPS persist failed: {e}")
+
     def get_status(self):
         """Return full GPS status dict."""
         with self._lock:
@@ -490,6 +535,7 @@ class GPSManager:
                 'course': self.course,
                 'last_update': self.last_update,
                 'last_sentence': self.last_sentence,
+                'last_known': self.last_known,
                 'error': self.error
             }
 
@@ -551,6 +597,7 @@ class GPSManager:
             if self.fix_quality <= 0:
                 self.fix_quality = 1
             self.last_update = now
+            self._record_position(now)
             self.last_sentence = now
             self.connected = True
             self.error = None
@@ -629,6 +676,7 @@ class GPSManager:
                 self.fix_quality = 2 if status == 2 else 1
                 self.hdop = obj.get('hdop') or self.hdop
                 self.last_update = now
+                self._record_position(now)
                 self._external_source = None
             else:
                 self.fix_quality = 0
@@ -817,6 +865,7 @@ class GPSManager:
                 except (ValueError, TypeError):
                     pass
                 self.last_update = now
+                self._record_position(now)
                 self.last_sentence = now
                 self._external_source = None
             return
@@ -852,6 +901,7 @@ class GPSManager:
                     except (ValueError, TypeError):
                         pass
                     self.last_update = now
+                    self._record_position(now)
                     self.last_sentence = now
                     self._external_source = None
             else:

@@ -22867,10 +22867,7 @@ function _wdSkyPlot(sky) {
 function wdOpenSkyView() {
     if (!window.RagnarSkyView) return;
     const gps = (_wdDiagExtra && _wdDiagExtra.gps) || {};
-    const status = gps.status || {};
-    const lat = status.latitude, lon = status.longitude;
-    const hasFix = !!status.has_fix && typeof lat === 'number' && typeof lon === 'number';
-    window.RagnarSkyView.open({ sky: gps.sky || [], lat, lon, hasFix });
+    window.RagnarSkyView.open({ sky: gps.sky || [], status: gps.status || {} });
 }
 window.wdOpenSkyView = wdOpenSkyView;
 

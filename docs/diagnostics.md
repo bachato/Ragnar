@@ -148,9 +148,16 @@ so you can see the sky the receiver is looking at.
   the device clock using standard sidereal-time math, so stars and satellites
   share one true-north frame. Star size scales with brightness; the brightest
   named stars are labelled.
-- **Stars render only with a live GPS fix** — without lat/lon we cannot place
-  them. No fix ⇒ the overlay shows satellites only, with a note. (Satellites,
-  which carry their own az/el, always render.)
+- **Stars need a position, and fall back to last-known.** A live fix is used
+  when present; otherwise the server's **persisted last-known position** places
+  the stars (with a "last-known — no live fix yet" note), so the starfield is
+  roughly right the moment you open the view, even straight after a reboot
+  before this boot's receiver has locked. The last-known fix is written to
+  `data/last_gps.json` (throttled, atomic) and reloaded at startup — see
+  [`GPSManager`](../gps_manager.py) (`_record_position` / `_load_last_known`,
+  exposed as `gps.status.last_known`). Only with neither a fix nor any
+  last-known does the overlay show satellites alone. (Satellites carry their own
+  az/el and always render.)
 - **Tap/click** a satellite for its constellation / PRN / elevation / azimuth /
   SNR, or a star for its name, constellation, magnitude and elevation/azimuth.
 - It polls this same endpoint every ~2.5 s, so satellites move live and the

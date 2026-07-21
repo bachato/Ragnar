@@ -78,13 +78,36 @@
   let overlay = null, svg = null, infoCard = null, subtitleEl = null, noteEl = null;
   let catalog = null, catalogLoading = null;
   let timer = null, onEsc = null, resizeH = null;
-  let lastData = { sky: [], lat: null, lon: null, hasFix: false };
+  // mode: 'live' (this boot's fix) | 'last' (persisted last-known) | 'none'
+  let lastData = { sky: [], lat: null, lon: null, mode: 'none', t: null };
   // Screen-space projected objects for click hit-testing.
   let projected = [];
 
   function esc(s) {
     return String(s).replace(/[<>&"]/g, c =>
       ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+  }
+
+  // Resolve the sky origin: a live fix wins; else the server's persisted
+  // last-known position (survives reboots); else nothing.
+  function positionFromStatus(status) {
+    status = status || {};
+    const lat = status.latitude, lon = status.longitude;
+    if (status.has_fix && typeof lat === 'number' && typeof lon === 'number')
+      return { lat, lon, mode: 'live', t: null };
+    const lk = status.last_known;
+    if (lk && typeof lk.lat === 'number' && typeof lk.lon === 'number')
+      return { lat: lk.lat, lon: lk.lon, mode: 'last', t: lk.t };
+    return { lat: null, lon: null, mode: 'none', t: null };
+  }
+
+  function agoText(epochSec) {
+    if (!epochSec) return '';
+    const s = Math.max(0, Date.now() / 1000 - epochSec);
+    if (s < 90) return 'moments ago';
+    if (s < 5400) return Math.round(s / 60) + ' min ago';
+    if (s < 172800) return Math.round(s / 3600) + ' h ago';
+    return Math.round(s / 86400) + ' days ago';
   }
 
   function loadCatalog() {
@@ -113,9 +136,10 @@
       <stop offset="100%" stop-color="#03060f"/></radialGradient></defs>`);
     parts.push(`<circle cx="${c}" cy="${c}" r="${R}" fill="url(#skgrad)"/>`);
 
-    // Stars (only with a fix).
-    const { lat, lon, hasFix } = lastData;
-    if (hasFix && catalog && Array.isArray(catalog.stars)) {
+    // Stars — drawn whenever we have any position (live fix or last-known).
+    const { lat, lon, mode } = lastData;
+    const hasPos = lat != null && lon != null;
+    if (hasPos && catalog && Array.isArray(catalog.stars)) {
       const cols = catalog.colors || [];
       const rScale = R / 260;
       for (const st of catalog.stars) {
@@ -172,16 +196,26 @@
     // Subtitle + note.
     if (subtitleEl) {
       const t = date.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-      const pos = hasFix ? `${lat.toFixed(4)}, ${lon.toFixed(4)}` : 'no fix';
+      const pos = hasPos
+        ? `${lat.toFixed(4)}, ${lon.toFixed(4)}${mode === 'last' ? ' (last-known)' : ''}`
+        : 'no position';
       const nsat = (lastData.sky || []).length;
       subtitleEl.textContent = `${pos}  ·  ${nsat} satellite${nsat === 1 ? '' : 's'}  ·  ${t}`;
     }
     if (noteEl) {
-      const showNote = !hasFix;
-      noteEl.style.display = showNote ? '' : 'none';
-      if (showNote) noteEl.textContent = catalog
-        ? 'Stars need a live GPS fix — showing satellites only.'
-        : 'Star catalog unavailable — showing satellites only.';
+      if (mode === 'live') {
+        noteEl.style.display = 'none';
+      } else if (mode === 'last') {
+        noteEl.style.display = '';
+        const age = agoText(lastData.t);
+        noteEl.textContent = 'Stars placed from last-known position'
+          + (age ? ' (' + age + ')' : '') + ' — no live fix yet.';
+      } else {
+        noteEl.style.display = '';
+        noteEl.textContent = catalog
+          ? 'Stars need a GPS position — no fix and no last-known yet.'
+          : 'Star catalog unavailable — showing satellites only.';
+      }
     }
   }
 
@@ -242,10 +276,8 @@
       .then(d => {
         if (!d || !overlay) return;
         const gps = d.gps || {};
-        const status = gps.status || {};
-        const lat = status.latitude, lon = status.longitude;
-        const hasFix = !!status.has_fix && typeof lat === 'number' && typeof lon === 'number';
-        lastData = { sky: gps.sky || [], lat, lon, hasFix };
+        const p = positionFromStatus(gps.status);
+        lastData = { sky: gps.sky || [], lat: p.lat, lon: p.lon, mode: p.mode, t: p.t };
         render();
       })
       .catch(() => {});
@@ -255,13 +287,9 @@
   function open(initial) {
     if (overlay) return;
     // Seed from whatever the caller already has so the first frame isn't blank.
-    if (initial && Array.isArray(initial.sky)) {
-      lastData = {
-        sky: initial.sky,
-        lat: typeof initial.lat === 'number' ? initial.lat : null,
-        lon: typeof initial.lon === 'number' ? initial.lon : null,
-        hasFix: !!initial.hasFix
-      };
+    if (initial && (initial.sky || initial.status)) {
+      const p = positionFromStatus(initial.status);
+      lastData = { sky: initial.sky || [], lat: p.lat, lon: p.lon, mode: p.mode, t: p.t };
     }
 
     overlay = document.createElement('div');
