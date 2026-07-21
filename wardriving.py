@@ -1392,6 +1392,10 @@ class WardrivingEngine:
         self._iface_prepared = set()  # interfaces successfully brought up at least once
         self._iface_last_error = {}  # most informative scan-failure reason per interface
         self._iface_freq_cache = {}  # cached supported-frequency list per interface
+        # WiFi-adapter hot-plug: re-detect the scan set periodically so an Alfa
+        # plugged in after wardriving started is picked up without a restart.
+        self._last_iface_rescan = 0.0
+        self._iface_rescan_interval = 12  # seconds between scan-set re-detections
         # Band-splitting: when multiple adapters are present, pin each one to a
         # subset of bands so adapters don't redundantly sweep the same channels.
         # 'redundant' (default) = every adapter sweeps every band it supports.
@@ -1720,6 +1724,60 @@ class WardrivingEngine:
             return bool(re.search(r"\*\s*AP\b", block.group(1)))
         except Exception:
             return True
+
+    @staticmethod
+    def _iface_mode(iface):
+        """Current 802.11 mode (managed/AP/monitor/…) via `iw dev info`, or None."""
+        try:
+            r = subprocess.run(['iw', 'dev', iface, 'info'],
+                               capture_output=True, text=True, timeout=4)
+            m = re.search(r'^\s*type\s+(\S+)', r.stdout, re.M)
+            return m.group(1) if m else None
+        except Exception:
+            return None
+
+    def _refresh_interfaces(self):
+        """Reconcile the scan set with the radios actually present, so a WiFi
+        adapter hot-plugged after start() is picked up (and a yanked one dropped)
+        without a service restart.
+
+        Skips the radio currently hosting the phone AP and anything in AP/monitor
+        mode (e.g. WiFi Defense), and leaves rfkill-blocked adapters for a later
+        pass. Runs on the scan-loop cadence (see _iface_rescan_interval)."""
+        try:
+            present = set(self._detect_wifi_interfaces(quiet=True))
+        except Exception as e:
+            logger.debug(f"Wardriving: hot-plug re-detect failed: {e}")
+            return
+        ap_iface = getattr(self.shared_data, 'wardrive_ap_iface', '') or ''
+        with self._iface_swap_lock:
+            current = list(self.interfaces)
+            current_set = set(current)
+            gone = [n for n in current if n not in present]
+            added = []
+            for n in present:
+                if n in current_set or n == ap_iface:
+                    continue
+                if self._iface_rfkill_blocked(n):
+                    continue                       # retried once unblocked
+                if self._iface_mode(n) in ('AP', 'monitor'):
+                    continue                       # owned by the AP / WIDS
+                try:
+                    self._prepare_interface(n)
+                    added.append(n)
+                except Exception as e:
+                    logger.warning(f"Wardriving: hot-plug prepare {n} failed: {e}")
+            if not added and not gone:
+                return
+            self.interfaces = [n for n in current if n not in gone] + added
+            for n in gone:
+                self._iface_prepared.discard(n)
+                self._iface_freq_cache.pop(n, None)
+            self._iface_freq_cache.clear()          # re-derive band assignments
+            self._compute_band_assignments()
+            logger.info(
+                f"Wardriving: scan set changed (added={added or '—'}, "
+                f"removed={gone or '—'}); now scanning {self.interfaces or ['(none)']}")
 
     def lend_interface_for_ap(self, prefer=None):
         """Remove one scanning interface so the KEY1 AP can own it.
@@ -2483,7 +2541,7 @@ class WardrivingEngine:
         logger.info(f"Wardriving data wiped: {deleted} files deleted")
         return {'success': True, 'deleted': deleted}
 
-    def _detect_wifi_interfaces(self):
+    def _detect_wifi_interfaces(self, quiet=False):
         """Detect all available WiFi interfaces (including external USB adapters).
 
         Enumerated from BOTH nmcli and sysfs and then UNIONed — never
@@ -2526,15 +2584,18 @@ class WardrivingEngine:
                             if not n.endswith('mon') and not n.startswith('mon'))
 
         blocked = [n for n in interfaces if self._iface_rfkill_blocked(n)]
-        if blocked:
+        if blocked and not quiet:
             # A soft-blocked dongle is present in sysfs but cannot scan; say so
             # explicitly because the symptom (adapter listed, zero networks) is
             # otherwise indistinguishable from a driver problem.
             logger.warning(
                 f"Wardriving: {', '.join(blocked)} is rfkill-blocked and will not "
                 f"scan until unblocked — run 'sudo rfkill unblock all'")
-        logger.info(f"Wardriving detected {len(interfaces)} WiFi interface(s): "
-                    f"{', '.join(interfaces) or '(none)'}")
+        # quiet=True on the periodic hot-plug rescan, so it doesn't log this
+        # every cycle — only the genuine start-up detection is announced.
+        (logger.debug if quiet else logger.info)(
+            f"Wardriving detected {len(interfaces)} WiFi interface(s): "
+            f"{', '.join(interfaces) or '(none)'}")
         return interfaces
 
     @staticmethod
@@ -2563,6 +2624,11 @@ class WardrivingEngine:
 
         while self._running:
             scan_start = time.time()
+
+            # Pick up a hot-plugged (or removed) WiFi adapter without a restart.
+            if scan_start - self._last_iface_rescan >= self._iface_rescan_interval:
+                self._last_iface_rescan = scan_start
+                self._refresh_interfaces()
 
             try:
                 # Get GPS position
