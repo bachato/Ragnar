@@ -2482,9 +2482,12 @@ class WiFiManager:
 
         # 1) Prefer a genuine spare (multi-adapter rigs).
         iface = self._find_wardrive_ap_interface()
-        # 2) Otherwise borrow one from wardriving's scan set.
+        # 2) Otherwise borrow one from wardriving's scan set — preferring the
+        # built-in radio (the designed AP interface), so a premium USB scanner
+        # like an Alfa keeps scanning and the AP lands on a radio that can
+        # actually run hostapd.
         if iface is None and engine is not None:
-            iface = engine.lend_interface_for_ap()
+            iface = engine.lend_interface_for_ap(prefer=self.default_wifi_interface)
             self._wardrive_ap_lent_iface = iface
         # 3) Last resort.
         if iface is None:
