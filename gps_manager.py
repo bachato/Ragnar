@@ -289,6 +289,11 @@ class GPSManager:
         self.last_update = 0
         self.last_sentence = 0
         self._gsv_by_talker = {}
+        # Per-satellite sky view (prn/elev/az/snr) keyed by talker, plus the
+        # in-flight accumulator that stitches the multi-message GSV sequence
+        # (each sentence carries ≤4 satellites) back into one sweep.
+        self._sats_by_talker = {}
+        self._gsv_accum = {}
         # Time-to-first-fix bookkeeping. A cold start has to demodulate the
         # ephemeris (~30 s of uninterrupted reception), so a receiver that keeps
         # browning out or is being desensed shows satellites in view while TTFF
@@ -859,19 +864,46 @@ class GPSManager:
             try:
                 talker = m.group('talker')
                 in_view = int(m.group('in_view'))
+                total_msgs = int(m.group('total_msgs'))
+                msg_num = int(m.group('msg_num'))
                 fields = m.group('body').split(',')
                 snr_max = None
-                for i in range(3, len(fields), 4):
-                    raw = fields[i].strip()
-                    if not raw:
+                # The body is repeating quads: prn, elev, az, snr. NMEA 4.10+
+                # appends a trailing signalID field, so iterate complete quads
+                # only (range stops before an odd tail).
+                msg_sats = []
+                for i in range(0, len(fields) - 3, 4):
+                    prn = fields[i].strip()
+                    elev = fields[i + 1].strip()
+                    az = fields[i + 2].strip()
+                    raw = fields[i + 3].strip()
+                    try:
+                        snr = int(raw) if raw else None
+                    except ValueError:
+                        snr = None
+                    if snr is not None and (snr_max is None or snr > snr_max):
+                        snr_max = snr
+                    if not prn:
                         continue
                     try:
-                        snr = int(raw)
+                        msg_sats.append({
+                            'prn': int(prn),
+                            'elev': int(elev) if elev else None,
+                            'az': int(az) if az else None,
+                            'snr': snr,
+                        })
                     except ValueError:
                         continue
-                    if snr_max is None or snr > snr_max:
-                        snr_max = snr
                 with self._lock:
+                    # Reset the accumulator on the first message of a sweep and
+                    # commit the whole list on the last, so the sky view never
+                    # shows a half-populated constellation mid-sequence.
+                    if msg_num <= 1:
+                        self._gsv_accum[talker] = []
+                    self._gsv_accum.setdefault(talker, []).extend(msg_sats)
+                    if msg_num >= total_msgs:
+                        self._sats_by_talker[talker] = (self._gsv_accum.pop(talker, []), now)
+
                     prev = self._gsv_by_talker.get(talker, (0, None, 0))
                     merged_snr = snr_max
                     if merged_snr is None:
@@ -882,6 +914,9 @@ class GPSManager:
                     stale = [t for t, v in self._gsv_by_talker.items() if now - v[2] > 30]
                     for t in stale:
                         del self._gsv_by_talker[t]
+                    for t in [t for t, v in self._sats_by_talker.items()
+                              if now - v[1] > 30]:
+                        del self._sats_by_talker[t]
                     self.satellites_in_view = sum(v[0] for v in self._gsv_by_talker.values())
                     snrs = [v[1] for v in self._gsv_by_talker.values() if v[1] is not None]
                     self.snr_max = max(snrs) if snrs else None

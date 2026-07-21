@@ -309,6 +309,71 @@
     diagBody.appendChild(dl);
   }
 
+  // Polar sky plot: satellites by azimuth/elevation, coloured per
+  // constellation (North up, zenith centre, horizon at the rim). Fill opacity
+  // tracks SNR; untracked satellites (no SNR) render hollow. Styles are inline
+  // so this needs nothing from the page stylesheet.
+  var SKY_COLORS = { GPS: '#34d399', GLONASS: '#f87171', Galileo: '#60a5fa',
+    BeiDou: '#fbbf24', QZSS: '#a78bfa', NavIC: '#f472b6', combined: '#94a3b8' };
+
+  function skyEsc(v) {
+    return String(v).replace(/[<>&"]/g, function (ch) {
+      return { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[ch];
+    });
+  }
+
+  function skyPlot(sky) {
+    var pts = (sky || []).filter(function (s) { return has(s.az) && has(s.elev); });
+    if (!pts.length) return;
+    var S = 220, c = S / 2, R = c - 16;
+    var svg = '<circle cx="' + c + '" cy="' + c + '" r="' + R + '" fill="#0f172a"/>';
+    [1, 2 / 3, 1 / 3].forEach(function (f) {
+      svg += '<circle cx="' + c + '" cy="' + c + '" r="' + (R * f).toFixed(1) +
+             '" fill="none" stroke="#334155" stroke-width="1"/>';
+    });
+    svg += '<line x1="' + c + '" y1="' + (c - R) + '" x2="' + c + '" y2="' + (c + R) + '" stroke="#334155" stroke-width="1"/>';
+    svg += '<line x1="' + (c - R) + '" y1="' + c + '" x2="' + (c + R) + '" y2="' + c + '" stroke="#334155" stroke-width="1"/>';
+    [['N', 0], ['E', 90], ['S', 180], ['W', 270]].forEach(function (p) {
+      var a = p[1] * Math.PI / 180;
+      var lx = c + (R + 9) * Math.sin(a), ly = c - (R + 9) * Math.cos(a);
+      svg += '<text x="' + lx.toFixed(1) + '" y="' + (ly + 3).toFixed(1) +
+             '" fill="#64748b" font-size="10" text-anchor="middle">' + p[0] + '</text>';
+    });
+    pts.forEach(function (s) {
+      var elev = Math.max(0, Math.min(90, s.elev));
+      var r = R * (90 - elev) / 90, a = s.az * Math.PI / 180;
+      var x = c + r * Math.sin(a), y = c - r * Math.cos(a);
+      var col = SKY_COLORS[s.constellation] || '#94a3b8';
+      var hasSnr = has(s.snr) && s.snr > 0;
+      var op = hasSnr ? (0.3 + 0.7 * Math.min(1, s.snr / 50)) : 0.35;
+      var tip = s.constellation + ' PRN ' + s.prn + ' · el ' + s.elev + '° az ' +
+                s.az + '°' + (hasSnr ? ' · SNR ' + s.snr + ' dB' : ' · untracked');
+      svg += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) +
+             '" r="3.2" fill="' + (hasSnr ? col : 'none') + '" stroke="' + col +
+             '" stroke-width="1" opacity="' + op.toFixed(2) + '"><title>' +
+             skyEsc(tip) + '</title></circle>';
+    });
+    var h = document.createElement('h3'); h.textContent = 'GPS sky view';
+    diagBody.appendChild(h);
+    var wrap = document.createElement('div');
+    wrap.innerHTML = '<svg viewBox="0 0 ' + S + ' ' + S +
+      '" style="width:100%;max-width:240px;display:block;margin:0 auto" ' +
+      'xmlns="http://www.w3.org/2000/svg">' + svg + '</svg>';
+    var present = [];
+    pts.forEach(function (s) {
+      if (present.indexOf(s.constellation) < 0) present.push(s.constellation);
+    });
+    var leg = document.createElement('div');
+    leg.style.cssText = 'font-size:10px;color:#9ca3af;display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:4px';
+    leg.innerHTML = present.map(function (name) {
+      var col = SKY_COLORS[name] || '#94a3b8';
+      return '<span><i style="display:inline-block;width:8px;height:8px;border-radius:9999px;background:' +
+             col + ';margin-right:4px;vertical-align:middle"></i>' + skyEsc(name) + '</span>';
+    }).join('');
+    wrap.appendChild(leg);
+    diagBody.appendChild(wrap);
+  }
+
   function renderDiag(st) {
     var gps = st.gps || {}, stats = st.stats || {};
     // Headline stays visible while collapsed so a glance is often enough.
@@ -359,6 +424,7 @@
                 (has(c.snr_max) ? ' · SNR ' + c.snr_max + ' dB' : '')];
       }));
     }
+    skyPlot(exGps.sky);
 
     var strongest = stats.strongest || null;
     section('Session', [
