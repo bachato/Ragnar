@@ -504,6 +504,36 @@ class GPSManager:
             except Exception as e:
                 logger.debug(f"last-known GPS persist failed: {e}")
 
+    # Talker code -> human constellation name, for the sky view. Shared by the
+    # gpsd (SKY) and serial (GSV) paths, both of which key by these codes.
+    _TALKER_NAMES = {
+        'GP': 'GPS', 'GL': 'GLONASS', 'GA': 'Galileo', 'GB': 'BeiDou',
+        'BD': 'BeiDou', 'GQ': 'QZSS', 'GI': 'NavIC', 'GN': 'combined',
+    }
+
+    def get_sky_view(self):
+        """Per-satellite sky list (constellation / prn / az / elev / snr) for the
+        sky-view plot, from the live GSV/SKY bookkeeping. Only satellites with
+        both azimuth and elevation (the plottable ones); stale talkers (>30 s)
+        are skipped. Cheap enough to poll at ~1 Hz for a live view."""
+        now = time.time()
+        with self._lock:
+            items = [(t, s, ts) for t, (s, ts) in self._sats_by_talker.items()]
+        out = []
+        for talker, sats, ts in items:
+            if ts and now - ts > 30:
+                continue
+            cons = self._TALKER_NAMES.get(talker, talker)
+            for s in sats:
+                if s.get('az') is None or s.get('elev') is None:
+                    continue
+                out.append({
+                    'constellation': cons, 'talker': talker,
+                    'prn': s.get('prn'), 'az': s.get('az'),
+                    'elev': s.get('elev'), 'snr': s.get('snr'),
+                })
+        return out
+
     def get_status(self):
         """Return full GPS status dict."""
         with self._lock:

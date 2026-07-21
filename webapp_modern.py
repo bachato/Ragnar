@@ -8963,7 +8963,12 @@ def wardriving_gps():
     try:
         engine = _get_wardriving_engine()
         if engine._gps:
-            return jsonify(engine._gps.get_status())
+            status = engine._gps.get_status()
+            # Include the per-satellite sky list so the live fullscreen sky view
+            # can poll this cheap, uncached endpoint instead of the heavy,
+            # 5 s-cached /diagnostics one.
+            status['sky'] = engine._gps.get_sky_view()
+            return jsonify(status)
         return jsonify({'connected': False, 'error': 'GPS not initialized'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

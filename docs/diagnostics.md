@@ -165,8 +165,10 @@ so you can see the sky the receiver is looking at.
   az/el and always render.)
 - **Tap/click** a satellite for its constellation / PRN / elevation / azimuth /
   SNR, or a star for its name, constellation, magnitude and elevation/azimuth.
-- It polls this same endpoint every ~2.5 s, so satellites move live and the
-  starfield drifts with sidereal time.
+- It polls the lightweight, uncached `GET /api/wardriving/gps` (which now carries
+  the `sky` list alongside the GPS status) at ~1 Hz — not the heavy, 5 s-cached
+  `/diagnostics` endpoint — so satellites update live and the starfield drifts
+  with sidereal time.
 
 No external libraries or CDN — pure SVG + vanilla JS; the RA/Dec→alt/az
 transform is self-tested against Polaris (altitude ≈ latitude, azimuth ≈ 0°).

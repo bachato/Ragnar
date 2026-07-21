@@ -22,7 +22,7 @@
 
   const D2R = Math.PI / 180, R2D = 180 / Math.PI;
   const CATALOG_URL = '/web/vendor/star_catalog.json';
-  const REFRESH_MS = 2500;
+  const REFRESH_MS = 1000;
 
   // Constellation colours mirror the small diagnostics plot.
   const SAT_COLORS = {
@@ -271,13 +271,16 @@
   }
 
   function refresh() {
-    fetch('/api/wardriving/diagnostics')
+    // The lightweight, uncached GPS endpoint (status + sky) — polled at 1 Hz so
+    // the view is actually live, unlike the heavy 5 s-cached /diagnostics one.
+    // Its body IS the status object (has_fix/lat/lon/last_known at top level),
+    // with a `sky` array alongside.
+    fetch('/api/wardriving/gps', { cache: 'no-store' })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (!d || !overlay) return;
-        const gps = d.gps || {};
-        const p = positionFromStatus(gps.status);
-        lastData = { sky: gps.sky || [], lat: p.lat, lon: p.lon, mode: p.mode, t: p.t };
+        const p = positionFromStatus(d);
+        lastData = { sky: d.sky || [], lat: p.lat, lon: p.lon, mode: p.mode, t: p.t };
         render();
       })
       .catch(() => {});
