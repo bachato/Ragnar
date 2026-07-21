@@ -118,6 +118,7 @@
   </div>
 </div>
 
+<script src="/web/scripts/skyview.js?v=20260721-skyview-stars"></script>
 <script>
 (function () {
   "use strict";
@@ -322,6 +323,15 @@
     });
   }
 
+  function openSkyFullscreen() {
+    if (!window.RagnarSkyView) return;
+    var gps = (diagExtra && diagExtra.gps) || {};
+    var status = gps.status || {};
+    var lat = status.latitude, lon = status.longitude;
+    var hasFix = !!status.has_fix && typeof lat === 'number' && typeof lon === 'number';
+    window.RagnarSkyView.open({ sky: gps.sky || [], lat: lat, lon: lon, hasFix: hasFix });
+  }
+
   function skyPlot(sky) {
     var pts = (sky || []).filter(function (s) { return has(s.az) && has(s.elev); });
     if (!pts.length) return;
@@ -353,7 +363,15 @@
              '" stroke-width="1" opacity="' + op.toFixed(2) + '"><title>' +
              skyEsc(tip) + '</title></circle>';
     });
-    var h = document.createElement('h3'); h.textContent = 'GPS sky view';
+    var h = document.createElement('h3');
+    h.textContent = 'GPS sky view';
+    if (window.RagnarSkyView) {
+      var fs = document.createElement('button');
+      fs.textContent = '⛶ Fullscreen';
+      fs.style.cssText = 'float:right;background:none;border:none;color:var(--accent);font-size:12px;cursor:pointer;padding:0';
+      fs.onclick = openSkyFullscreen;
+      h.appendChild(fs);
+    }
     diagBody.appendChild(h);
     var wrap = document.createElement('div');
     wrap.innerHTML = '<svg viewBox="0 0 ' + S + ' ' + S +
