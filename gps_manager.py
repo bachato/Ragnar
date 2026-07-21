@@ -694,15 +694,26 @@ class GPSManager:
         the sky-view plot work on gpsd too, not just direct-serial NMEA."""
         now = time.time()
         with self._lock:
+            hdop = obj.get('hdop')
+            if hdop is not None:
+                self.hdop = hdop
+            self.last_sentence = now
+
+            # gpsd interleaves DOP-only SKY reports (no `satellites` array) with
+            # full ones. Those must NOT zero the counts/constellations — an empty
+            # SKY arriving right after a full one was blanking "satellites in
+            # view" while the fix and the constellation card stayed populated.
+            # Only a SKY that actually carries satellites updates this bookkeeping
+            # (mirrors the NMEA path, where non-GSV sentences never zero it).
             sats = obj.get('satellites') or []
+            if not sats:
+                return
+
             used = sum(1 for s in sats if s.get('used', False))
             self.satellites = used
             self.satellites_in_view = len(sats)
             snrs = [s.get('ss') for s in sats if isinstance(s.get('ss'), (int, float))]
             self.snr_max = max(snrs) if snrs else None
-            hdop = obj.get('hdop')
-            if hdop is not None:
-                self.hdop = hdop
 
             # Group gpsd's flat satellite list by constellation. gpsd sends the
             # full in-view list every SKY, so a straight replace per talker (not
@@ -733,8 +744,6 @@ class GPSManager:
             for d in (self._gsv_by_talker, self._sats_by_talker):
                 for t in [t for t, v in d.items() if now - v[-1] > 30]:
                     del d[t]
-
-            self.last_sentence = now
 
     def _read_loop(self):
         """Background thread: read NMEA sentences and parse position."""
