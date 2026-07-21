@@ -22851,12 +22851,25 @@ function _wdSkyPlot(sky) {
         return `<span class="inline-flex items-center gap-1 mr-2"><span style="width:8px;height:8px;border-radius:9999px;background:${col};display:inline-block"></span>${escapeHtml(name)}</span>`;
     }).join('');
     return `<div class="min-w-0">
-        <h4 class="text-xs uppercase tracking-wide text-gray-500 font-semibold mb-2 pb-1 border-b border-slate-700">GPS sky view</h4>
+        <h4 class="text-xs uppercase tracking-wide text-gray-500 font-semibold mb-2 pb-1 border-b border-slate-700 flex items-center justify-between">
+            <span>GPS sky view</span>
+            <button onclick="wdOpenSkyView()" title="Fullscreen sky view with stars"
+                class="normal-case tracking-normal text-[11px] font-normal text-sky-400 hover:text-sky-300">⛶ Fullscreen</button>
+        </h4>
         <div class="flex flex-col items-center">${svg}
             <div class="text-[10px] text-gray-400 mt-1 flex flex-wrap justify-center">${legend}</div>
         </div>
     </div>`;
 }
+
+// Open the fullscreen sky view (stars + satellites), seeded from the deep
+// diagnostics payload the panel already holds so the first frame isn't blank.
+function wdOpenSkyView() {
+    if (!window.RagnarSkyView) return;
+    const gps = (_wdDiagExtra && _wdDiagExtra.gps) || {};
+    window.RagnarSkyView.open({ sky: gps.sky || [], status: gps.status || {} });
+}
+window.wdOpenSkyView = wdOpenSkyView;
 
 function _wdDiagGroup(title, rows) {
     const kept = rows.filter(r => _wdHas(r[1]));

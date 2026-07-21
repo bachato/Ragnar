@@ -43,7 +43,7 @@ groups come from this endpoint.
 |-------|----------|
 | **GPS** | fix + quality, satellites used/in-view, SNR max, HDOP, lat/lon/altitude, speed, course, source, port, age of last update and last NMEA sentence, time-to-first-fix (or how long it has been searching), error |
 | **GPS constellations** | per-constellation satellites in view and peak SNR (GPS / GLONASS / Galileo / BeiDou / QZSS / NavIC) |
-| **GPS sky view** | polar plot of every satellite by azimuth/elevation, coloured per constellation — North up, zenith at centre, horizon at the rim. Fill opacity tracks SNR (untracked satellites render hollow); hover a dot for PRN / elevation / azimuth / SNR. The graphical half of the same GSV data u-center draws |
+| **GPS sky view** | polar plot of every satellite by azimuth/elevation, coloured per constellation — North up, zenith at centre, horizon at the rim. Fill opacity tracks SNR (untracked satellites render hollow); hover a dot for PRN / elevation / azimuth / SNR. The graphical half of the same GSV data u-center draws. A **⛶ Fullscreen** button opens an immersive view with a real **starfield** behind the satellites (see below) |
 | **Radios** | every wireless interface present, whether it is scanning, its driver / mode / link state, the USB adapter behind it — and **when it is not scanning, the reason** |
 | **Power** | per-USB-device declared draw and which interface it backs, summed USB budget, `usb_max_current_enable`, supply throttle/under-voltage flags (now and since boot), core voltage, temperature, and Pi 5 PMIC board power |
 | **Errors** | everything currently complaining — engine, GPS, radios, companions, supply and **stalled feeds** — gathered into one list |
@@ -130,8 +130,46 @@ still before the fix completes. u-blox 7 pucks lose their almanac every power
 cycle, so this cold-start window is expected on that hardware, not a bug.
 
 **gpsd vs direct NMEA.** When a `gpsd` instance owns the receiver, Ragnar reads
-its JSON stream (`TPV`/`SKY`) instead of raw NMEA. The satellite counts, used
-count and SNR come from gpsd `SKY` reports along that path.
+its JSON stream (`TPV`/`SKY`) instead of raw NMEA. gpsd `SKY` reports carry the
+same per-satellite azimuth/elevation/SNR (and a `gnssid` per satellite) that
+NMEA `GSV` does, so the counts, the **per-constellation breakdown** and the
+**sky view** are all derived from `SKY` on this path — mapped by `gnssid` to the
+same talker codes the GSV path uses. If gpsd reports a position but zero
+satellites, it usually needs `GPSD_OPTIONS="-n"` (poll before a client
+connects) or the receiver isn't feeding per-satellite detail to gpsd.
+
+### Fullscreen sky view (stars behind the satellites)
+
+The **⛶ Fullscreen** button on the sky view opens
+[`web/scripts/skyview.js`](../web/scripts/skyview.js) — a full-window overlay
+(Esc or ✕ to close) that draws a **real starfield** behind the live satellites,
+so you can see the sky the receiver is looking at.
+
+- **Stars** come from a bundled bright-star catalog
+  ([`web/vendor/star_catalog.json`](../web/vendor/star_catalog.json) — 1,627
+  stars to magnitude 5, RA/Dec J2000, colour-bucketed by B–V; derived from the
+  d3-celestial / HYG–Hipparcos data, BSD-2-Clause). Each star's RA/Dec is
+  projected to the observer's local **altitude/azimuth** from the GPS fix and
+  the device clock using standard sidereal-time math, so stars and satellites
+  share one true-north frame. Star size scales with brightness; the brightest
+  named stars are labelled.
+- **Stars need a position, and fall back to last-known.** A live fix is used
+  when present; otherwise the server's **persisted last-known position** places
+  the stars (with a "last-known — no live fix yet" note), so the starfield is
+  roughly right the moment you open the view, even straight after a reboot
+  before this boot's receiver has locked. The last-known fix is written to
+  `data/last_gps.json` (throttled, atomic) and reloaded at startup — see
+  [`GPSManager`](../gps_manager.py) (`_record_position` / `_load_last_known`,
+  exposed as `gps.status.last_known`). Only with neither a fix nor any
+  last-known does the overlay show satellites alone. (Satellites carry their own
+  az/el and always render.)
+- **Tap/click** a satellite for its constellation / PRN / elevation / azimuth /
+  SNR, or a star for its name, constellation, magnitude and elevation/azimuth.
+- It polls this same endpoint every ~2.5 s, so satellites move live and the
+  starfield drifts with sidereal time.
+
+No external libraries or CDN — pure SVG + vanilla JS; the RA/Dec→alt/az
+transform is self-tested against Polaris (altitude ≈ latitude, azimuth ≈ 0°).
 
 ---
 
