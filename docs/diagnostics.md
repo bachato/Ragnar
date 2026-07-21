@@ -100,6 +100,13 @@ and adds the two failure modes the summary numbers hide:
   so this is called out explicitly.
 - **Stalled scan** — the engine reports `running`, but no scan completed for
   **> 60 s** (`SCAN_STALE_S`).
+- **Tracking but no fix** — the receiver is **searching > 3 min** with **≥ 4
+  satellites in view** and still no fix. Satellites "in view" only means carrier
+  lock; a fix also needs the 50 bps navigation message demodulated, which fails
+  when the signal is too weak. This is antenna placement / sky view (a GPS puck
+  next to the Pi or a USB hub gets desensed) or a cold start on a receiver with
+  no battery-backed almanac — **not a Ragnar fault**, so the panel says so
+  instead of leaving a healthy-looking feed with N satellites looking like a bug.
 - **Shared-USB correlation** — if **both** feeds go quiet within a minute of
   each other, that points at the shared USB bus (a hub dropping, a bus/power
   dip) rather than at reception or either device individually. The hint says so
