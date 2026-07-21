@@ -346,6 +346,10 @@ Shows the most actionable signals at a glance:
 
 ### Diagnostics Panel (UI)
 
+> Full reference: **[Diagnostics Panel Guide](diagnostics.md)** — the endpoint,
+> every group, the Radios exclusion reasons, the Power/throttle fields, and the
+> feed-stall correlation logic.
+
 At the bottom of the **Wardriving** tab (and of the phone-access AP page,
 `web/wardrive_mobile.html`) sits a **Diagnostics** panel, collapsed by default.
 It is a native `<details>` element, so the toggle keeps working even if a script
