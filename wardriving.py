@@ -136,6 +136,7 @@ class _CompanionState:
         # Per-connection scan state
         self.current_esp_mode: str = 'wifi'
         self.esp_ble_count: int = 0
+        self.esp_zigbee_count: int = 0
         self.esp_alerts: list = []
         self.esp_alert_buffer: dict = {}
         self.esp_airtag_buffer = None
@@ -194,6 +195,7 @@ class _CompanionState:
             'coordinator_nodes': self.active_coordinator_nodes(),
             'esp_mode':          self.current_esp_mode,
             'esp_ble_count':     self.esp_ble_count,
+            'esp_zigbee_count':  self.esp_zigbee_count,
             'esp_alerts':        self.esp_alerts[-5:],
         }
 
@@ -364,6 +366,35 @@ class WardrivingSession:
             """)
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cell ON cell_towers(cell_id)
+            """)
+            # Zigbee / IEEE 802.15.4 devices seen by a companion with a
+            # 2.4 GHz 802.15.4 radio (e.g. HuginnESP on an ESP32-C5). Keyed by
+            # the device identity: its 64-bit extended address (EUI-64) when the
+            # frame carries one, otherwise "<panid>:<short>" as a fallback.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS zigbee_devices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    addr TEXT NOT NULL,
+                    panid TEXT DEFAULT '',
+                    short_addr TEXT DEFAULT '',
+                    device_type TEXT DEFAULT '',
+                    rssi INTEGER DEFAULT -100,
+                    best_rssi INTEGER DEFAULT -100,
+                    lqi INTEGER DEFAULT 0,
+                    channel INTEGER DEFAULT 0,
+                    latitude REAL,
+                    longitude REAL,
+                    altitude REAL,
+                    best_lat REAL,
+                    best_lon REAL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    scan_count INTEGER DEFAULT 1,
+                    gps_backfilled INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_zigbee_addr ON zigbee_devices(addr)
             """)
             # Migrate older networks / cell_towers tables that predate the
             # GPS-backfill flag. Table names here are hardcoded literals, so
@@ -688,6 +719,61 @@ class WardrivingSession:
             except Exception as e:
                 logger.debug(f"Cell upsert error: {e}")
 
+    def upsert_zigbee(self, addr, panid, short_addr, device_type,
+                      rssi, lqi, channel, lat, lon, alt):
+        """Insert or update a discovered Zigbee / 802.15.4 device.
+
+        `addr` is the stable identity (EUI-64 or "<panid>:<short>"). Best
+        position is tracked at the strongest RSSI sighting, mirroring how
+        Bluetooth devices are recorded so map exports stay consistent.
+        """
+        if not addr:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    existing = conn.execute(
+                        "SELECT scan_count, best_rssi FROM zigbee_devices WHERE addr = ?",
+                        (addr,)
+                    ).fetchone()
+                    if existing:
+                        count = (existing[0] or 0) + 1
+                        old_best = existing[1] if existing[1] is not None else -100
+                        new_best = rssi if rssi > old_best else old_best
+                        best_lat_val = lat if (rssi > old_best and lat) else None
+                        best_lon_val = lon if (rssi > old_best and lon) else None
+                        conn.execute("""
+                            UPDATE zigbee_devices SET
+                                panid = COALESCE(NULLIF(?, ''), panid),
+                                short_addr = COALESCE(NULLIF(?, ''), short_addr),
+                                device_type = COALESCE(NULLIF(?, ''), device_type),
+                                rssi = ?, lqi = ?,
+                                channel = CASE WHEN ? > 0 THEN ? ELSE channel END,
+                                best_rssi = ?,
+                                best_lat = COALESCE(?, best_lat),
+                                best_lon = COALESCE(?, best_lon),
+                                latitude = COALESCE(?, latitude),
+                                longitude = COALESCE(?, longitude),
+                                altitude = COALESCE(?, altitude),
+                                last_seen = ?, scan_count = ?
+                            WHERE addr = ?
+                        """, (panid, short_addr, device_type,
+                              rssi, lqi, channel, channel,
+                              new_best, best_lat_val, best_lon_val,
+                              lat, lon, alt, now, count, addr))
+                    else:
+                        conn.execute("""
+                            INSERT INTO zigbee_devices
+                                (addr, panid, short_addr, device_type, rssi, best_rssi,
+                                 lqi, channel, latitude, longitude, altitude,
+                                 best_lat, best_lon, first_seen, last_seen, scan_count)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """, (addr, panid, short_addr, device_type, rssi, rssi,
+                              lqi, channel, lat, lon, alt, lat, lon, now, now))
+            except Exception as e:
+                logger.debug(f"Zigbee upsert error: {e}")
+
     def get_stats(self):
         """Return session statistics (cached for 5 s to reduce SQLite load)."""
         now = time.time()
@@ -721,15 +807,20 @@ class WardrivingSession:
                     strongest = conn.execute("SELECT bssid, ssid, best_rssi FROM networks ORDER BY best_rssi DESC LIMIT 1").fetchone()
                     trackpoints = conn.execute("SELECT COUNT(*) FROM gps_track").fetchone()[0]
 
-                    # Bluetooth and cell counts (tables may not exist in old DBs)
+                    # Bluetooth, cell and Zigbee counts (tables may not exist in old DBs)
                     bt_count = 0
                     cell_count = 0
+                    zigbee_count = 0
                     try:
                         bt_count = conn.execute("SELECT COUNT(*) FROM bluetooth_devices").fetchone()[0]
                     except Exception:
                         pass
                     try:
                         cell_count = conn.execute("SELECT COUNT(*) FROM cell_towers").fetchone()[0]
+                    except Exception:
+                        pass
+                    try:
+                        zigbee_count = conn.execute("SELECT COUNT(*) FROM zigbee_devices").fetchone()[0]
                     except Exception:
                         pass
 
@@ -745,6 +836,7 @@ class WardrivingSession:
                         'band_6ghz': band_6,
                         'bluetooth_devices': bt_count,
                         'cell_towers': cell_count,
+                        'zigbee_devices': zigbee_count,
                         'cameras': camera_count,
                         'gps_trackpoints': trackpoints,
                         'strongest': dict(strongest) if strongest else None,
@@ -862,6 +954,19 @@ class WardrivingSession:
                     conn.row_factory = sqlite3.Row
                     rows = conn.execute(
                         "SELECT * FROM cell_towers ORDER BY signal_dbm DESC"
+                    ).fetchall()
+                    return [dict(r) for r in rows]
+            except Exception:
+                return []
+
+    def get_zigbee_devices(self):
+        """Get all discovered Zigbee / 802.15.4 devices."""
+        with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT * FROM zigbee_devices ORDER BY rssi DESC"
                     ).fetchall()
                     return [dict(r) for r in rows]
             except Exception:
@@ -1411,6 +1516,7 @@ class WardrivingEngine:
         self._last_gps_track = 0
         self.bt_count = 0
         self.cell_count = 0
+        self.zigbee_count = 0
         self.device_name = ''
         # Multi-companion support: one _CompanionState per USB-serial port.
         # Keyed by port path (e.g. '/dev/ttyACM0').
@@ -1480,6 +1586,10 @@ class WardrivingEngine:
     @property
     def _esp_ble_count(self) -> int:
         return sum(c.esp_ble_count for c in self._companions.values())
+
+    @property
+    def _esp_zigbee_count(self) -> int:
+        return sum(c.esp_zigbee_count for c in self._companions.values())
 
     @property
     def _esp_alerts(self) -> list:
@@ -1630,6 +1740,7 @@ class WardrivingEngine:
         self.scans_completed = 0
         self.bt_count = 0
         self.cell_count = 0
+        self.zigbee_count = 0
 
         # Save device name and session info
         if self.device_name:
@@ -2408,6 +2519,7 @@ class WardrivingEngine:
             'gps': gps_status,
             'bluetooth_count': self.bt_count,
             'cell_count': self.cell_count,
+            'zigbee_count': self.zigbee_count,
             'device_name': self.device_name,
             # Backward-compat single-companion fields (aggregated)
             'serial_connected': self.serial_connected,
@@ -2421,6 +2533,7 @@ class WardrivingEngine:
             'coordinator_nodes': self._active_coordinator_nodes(),
             'esp_mode':      self._current_esp_mode,
             'esp_ble_count': self._esp_ble_count,
+            'esp_zigbee_count': self._esp_zigbee_count,
             'esp_alerts':    self._esp_alerts[-5:],
             'band_mode': self.band_mode,
             # Multi-companion list: full per-device status for the UI
@@ -2485,6 +2598,17 @@ class WardrivingEngine:
                             "WHERE device_type IN ('BLE','Flipper','AirTag','Skimmer')"
                         ).fetchone()
                         result['esp_ble_count'] = row[0] if row else 0
+                    except Exception:
+                        pass
+                    # Unique Zigbee / 802.15.4 devices seen via a companion radio.
+                    # DB-backed so the status bar reflects unique devices, not
+                    # the running stream line count.
+                    try:
+                        row = conn.execute(
+                            "SELECT COUNT(*) FROM zigbee_devices"
+                        ).fetchone()
+                        result['esp_zigbee_count'] = row[0] if row else 0
+                        result['zigbee_count'] = result['esp_zigbee_count']
                     except Exception:
                         pass
             except Exception:
@@ -4108,6 +4232,58 @@ class WardrivingEngine:
                             'last_update': time.time(),
                         }
                         companion.mesh_node_count = len(companion.coordinator_nodes)
+                    return
+
+                # Zigbee / IEEE 802.15.4 rows from a companion with an
+                # 802.15.4 radio (HuginnESP on ESP32-C5). Handled before the
+                # 48-bit-MAC guard below because a Zigbee device is identified
+                # by its EUI-64 / PAN-ID + short address, not a Wi-Fi BSSID.
+                if data.get('type', '').upper() in ('ZIGBEE', 'ZB', '802.15.4', 'IEEE802154'):
+                    companion.current_esp_mode = 'zigbee'
+                    addr = str(data.get('addr') or data.get('eui')
+                               or data.get('ext') or data.get('mac') or ''
+                               ).upper().replace(':', '')
+                    panid = str(data.get('panid') or data.get('pan') or '').upper()
+                    short = str(data.get('short') or data.get('nwk') or '').upper()
+                    if not addr:
+                        # No extended address in the frame — fall back to the
+                        # PAN + short address (or just the PAN) as identity.
+                        if panid and short:
+                            addr = f"{panid}:{short}"
+                        elif panid:
+                            addr = panid
+                    if not addr:
+                        return
+                    try:
+                        z_rssi = int(data.get('rssi', data.get('signal', -80)))
+                    except (ValueError, TypeError):
+                        z_rssi = -80
+                    try:
+                        z_lqi = int(data.get('lqi', 0) or 0)
+                    except (ValueError, TypeError):
+                        z_lqi = 0
+                    try:
+                        z_channel = int(data.get('channel', data.get('ch', 0)) or 0)
+                    except (ValueError, TypeError):
+                        z_channel = 0
+                    z_dtype = str(data.get('ftype') or data.get('dev')
+                                  or data.get('name') or '')
+                    z_lat, z_lon, z_alt, z_from = self._resolve_coords(
+                        data.get('lat', data.get('latitude')),
+                        data.get('lon', data.get('longitude')),
+                        data.get('alt', data.get('altitude')),
+                        gps_lat, gps_lon, gps_alt,
+                    )
+                    self.session.upsert_zigbee(
+                        addr, panid, short, z_dtype,
+                        z_rssi, z_lqi, z_channel, z_lat, z_lon, z_alt
+                    )
+                    companion.esp_zigbee_count += 1
+                    if z_from and self._gps is not None:
+                        self._gps.update_external_fix(
+                            z_lat, z_lon, z_alt,
+                            source=companion.name or 'companion'
+                        )
                     return
 
                 mac = data.get('mac', data.get('bssid', '')).upper()
