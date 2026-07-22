@@ -386,6 +386,7 @@ class WardrivingSession:
                     panid TEXT DEFAULT '',
                     short_addr TEXT DEFAULT '',
                     device_type TEXT DEFAULT '',
+                    proto TEXT DEFAULT 'zigbee',
                     rssi INTEGER DEFAULT -100,
                     best_rssi INTEGER DEFAULT -100,
                     lqi INTEGER DEFAULT 0,
@@ -414,6 +415,14 @@ class WardrivingSession:
                         conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN gps_backfilled INTEGER DEFAULT 0")
                 except Exception:
                     pass
+            # Add the 802.15.4 protocol column (zigbee/thread/802.15.4) to
+            # zigbee_devices tables created before Thread classification existed.
+            try:
+                zcols = {r[1] for r in conn.execute("PRAGMA table_info(zigbee_devices)").fetchall()}
+                if zcols and 'proto' not in zcols:
+                    conn.execute("ALTER TABLE zigbee_devices ADD COLUMN proto TEXT DEFAULT 'zigbee'")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS gps_track (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -728,15 +737,21 @@ class WardrivingSession:
                 logger.debug(f"Cell upsert error: {e}")
 
     def upsert_zigbee(self, addr, panid, short_addr, device_type,
-                      rssi, lqi, channel, lat, lon, alt):
-        """Insert or update a discovered Zigbee / 802.15.4 device.
+                      rssi, lqi, channel, lat, lon, alt, proto='zigbee'):
+        """Insert or update a discovered 802.15.4 device (Zigbee / Thread).
 
         `addr` is the stable identity (EUI-64 or "<panid>:<short>"). Best
         position is tracked at the strongest RSSI sighting, mirroring how
         Bluetooth devices are recorded so map exports stay consistent.
+
+        `proto` is the classified network layer ('zigbee' / 'thread' /
+        '802.15.4'). It's only upgraded to a *specific* protocol on re-sightings
+        so a later opaque (encrypted) frame can't downgrade a device that a
+        beacon already identified.
         """
         if not addr:
             return
+        proto = (proto or 'zigbee').lower()
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             try:
@@ -756,6 +771,7 @@ class WardrivingSession:
                                 panid = COALESCE(NULLIF(?, ''), panid),
                                 short_addr = COALESCE(NULLIF(?, ''), short_addr),
                                 device_type = COALESCE(NULLIF(?, ''), device_type),
+                                proto = CASE WHEN ? IN ('zigbee','thread') THEN ? ELSE proto END,
                                 rssi = ?, lqi = ?,
                                 channel = CASE WHEN ? > 0 THEN ? ELSE channel END,
                                 best_rssi = ?,
@@ -766,18 +782,18 @@ class WardrivingSession:
                                 altitude = COALESCE(?, altitude),
                                 last_seen = ?, scan_count = ?
                             WHERE addr = ?
-                        """, (panid, short_addr, device_type,
+                        """, (panid, short_addr, device_type, proto, proto,
                               rssi, lqi, channel, channel,
                               new_best, best_lat_val, best_lon_val,
                               lat, lon, alt, now, count, addr))
                     else:
                         conn.execute("""
                             INSERT INTO zigbee_devices
-                                (addr, panid, short_addr, device_type, rssi, best_rssi,
+                                (addr, panid, short_addr, device_type, proto, rssi, best_rssi,
                                  lqi, channel, latitude, longitude, altitude,
                                  best_lat, best_lon, first_seen, last_seen, scan_count)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                        """, (addr, panid, short_addr, device_type, rssi, rssi,
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """, (addr, panid, short_addr, device_type, proto, rssi, rssi,
                               lqi, channel, lat, lon, alt, lat, lon, now, now))
             except Exception as e:
                 logger.debug(f"Zigbee upsert error: {e}")
@@ -4310,6 +4326,10 @@ class WardrivingEngine:
                         z_channel = 0
                     z_dtype = str(data.get('ftype') or data.get('dev')
                                   or data.get('name') or '')
+                    # Network layer riding on 802.15.4, classified by the
+                    # companion: 'zigbee' / 'thread' / '802.15.4'. Older firmware
+                    # omits it, so default to 'zigbee' for back-compat.
+                    z_proto = str(data.get('proto') or 'zigbee').lower()
                     z_lat, z_lon, z_alt, z_from = self._resolve_coords(
                         data.get('lat', data.get('latitude')),
                         data.get('lon', data.get('longitude')),
@@ -4318,7 +4338,8 @@ class WardrivingEngine:
                     )
                     self.session.upsert_zigbee(
                         addr, panid, short, z_dtype,
-                        z_rssi, z_lqi, z_channel, z_lat, z_lon, z_alt
+                        z_rssi, z_lqi, z_channel, z_lat, z_lon, z_alt,
+                        proto=z_proto
                     )
                     companion.esp_zigbee_count += 1
                     if z_from and self._gps is not None:

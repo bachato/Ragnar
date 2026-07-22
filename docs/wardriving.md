@@ -204,12 +204,17 @@ over-report. The companion status bar shows `2.4G` / `5G` alongside the total
 {"type":"BLE","mac":"AA:BB:CC:DD:EE:FF","name":"DeviceName","rssi":-60}
 ```
 
-#### Zigbee / 802.15.4 Devices (JSON, one line per sighting)
+#### Thread / Zigbee (802.15.4) Devices (JSON, one line per sighting)
 
-Emitted by HuginnESP builds with an IEEE 802.15.4 radio (ESP32-C5). Ragnar
-stores these in a dedicated `zigbee_devices` table and counts them separately
-from BLE — the live status bar and displays show a `Zigbee` total alongside
-`BT` and `Cell`, and `/api/wardriving/zigbee` returns the full list.
+Emitted by HuginnESP builds with an IEEE 802.15.4 radio (ESP32-C5). Zigbee and
+Thread share the same 802.15.4 radio and channels (11–26), so the companion
+sniffs both and tags each sighting with a `proto` field — `zigbee`, `thread`, or
+`802.15.4` (unknown). **Matter-over-Thread** is ordinary Thread traffic at the
+radio layer, so it reports as `thread`. Ragnar stores these in a dedicated
+`zigbee_devices` table (with the `proto` column) and counts them separately from
+BLE — the live status bar and displays show a **Thread / Zigbee** total
+alongside `BT` and `Cell`, the "Thread / Zigbee" table view lists them with a
+Proto column, and `/api/wardriving/zigbee` returns the full list.
 
 > **WiGLE export is opt-in.** WiGLE has no standard 802.15.4 record type, so
 > Zigbee devices are **excluded from WiGLE CSV export by default**. Enable
@@ -218,7 +223,7 @@ from BLE — the live status bar and displays show a `Zigbee` total alongside
 > not for submitting to WiGLE. Applies to both manual export and Auto Export on Stop.
 
 ```json
-{"type":"ZIGBEE","panid":"0x1A2B","addr":"AABBCCDDEEFF0011","short":"0x1234","channel":15,"rssi":-70,"lqi":180,"ftype":"beacon"}
+{"type":"ZIGBEE","panid":"0x1A2B","addr":"AABBCCDDEEFF0011","short":"0x1234","channel":15,"rssi":-70,"lqi":180,"ftype":"beacon","proto":"thread"}
 ```
 
 Each device is identified by its 64-bit extended address (`addr` / EUI-64) when

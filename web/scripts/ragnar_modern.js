@@ -22985,7 +22985,7 @@ function renderWardrivingDiagnostics(status) {
             ? `${stats.band_2_4ghz || 0} / ${stats.band_5ghz || 0} / ${stats.band_6ghz || 0}` : null],
         ['Bluetooth', stats.bluetooth_devices],
         ['Cell towers', stats.cell_towers],
-        ['Zigbee devices', stats.zigbee_devices],
+        ['Thread / Zigbee', stats.zigbee_devices],
         ['Cameras', stats.cameras],
         ['GPS trackpoints', stats.gps_trackpoints],
         ['Strongest', strongest ? `${strongest.ssid || strongest.bssid || '?'}` +
@@ -24072,7 +24072,7 @@ const _WD_HEADERS = {
     bluetooth: '<tr><th class="px-3 py-2">Name</th><th class="px-3 py-2">MAC</th><th class="px-3 py-2">Type</th><th class="px-3 py-2">RSSI</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">First Seen</th><th class="px-3 py-2">Seen</th></tr>',
     cell: '<tr><th class="px-3 py-2">Provider</th><th class="px-3 py-2">Tech</th><th class="px-3 py-2">Cell ID</th><th class="px-3 py-2">MCC/MNC</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2">Band</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
     cameras: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
-    zigbee: '<tr><th class="px-3 py-2">Address</th><th class="px-3 py-2">PAN ID</th><th class="px-3 py-2">Short</th><th class="px-3 py-2">Type</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">LQI</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>'
+    zigbee: '<tr><th class="px-3 py-2">Address</th><th class="px-3 py-2">Proto</th><th class="px-3 py-2">PAN ID</th><th class="px-3 py-2">Short</th><th class="px-3 py-2">Type</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">LQI</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>'
 };
 
 function _setWdTableHeaders(type) {
@@ -24184,7 +24184,7 @@ async function _loadWardrivingZigbee() {
         const sig = _wdSig('zigbee', devices, d => (d.scan_count || 0) + (d.rssi || 0));
         if (!_wdShouldRender('zigbee', sig)) return;
         if (devices.length === 0) {
-            _wdSetTbodyHTML(tbody, '<tr><td colspan="9" class="text-center text-gray-500 py-8">No Zigbee / 802.15.4 devices found yet. Needs a companion with an 802.15.4 radio (ESP32-C5/C6).</td></tr>');
+            _wdSetTbodyHTML(tbody, '<tr><td colspan="10" class="text-center text-gray-500 py-8">No Thread / Zigbee (802.15.4) devices found yet. Needs a companion with an 802.15.4 radio (ESP32-C5/C6).</td></tr>');
             return;
         }
         const html = devices.map(d => {
@@ -24196,8 +24196,12 @@ async function _loadWardrivingZigbee() {
                 : '<span class="text-gray-600">—</span>';
             const rssi = (d.best_rssi != null ? d.best_rssi : d.rssi);
             const sigColor = rssi > -50 ? 'text-emerald-400' : rssi > -70 ? 'text-yellow-400' : 'text-red-400';
+            const proto = (d.proto || 'zigbee').toLowerCase();
+            const protoLabel = proto === 'thread' ? 'Thread' : proto === 'zigbee' ? 'Zigbee' : '802.15.4';
+            const protoColor = proto === 'thread' ? 'text-purple-400' : proto === 'zigbee' ? 'text-teal-400' : 'text-gray-400';
             return `<tr class="hover:bg-slate-800/50">
                 <td class="px-3 py-1.5 font-mono text-xs text-teal-400" data-label="Address">${escapeHtml(d.addr || '-')}</td>
+                <td class="px-3 py-1.5 text-xs font-semibold ${protoColor}" data-label="Proto">${protoLabel}</td>
                 <td class="px-3 py-1.5 font-mono text-xs text-gray-400" data-label="PAN ID">${escapeHtml(d.panid || '-')}</td>
                 <td class="px-3 py-1.5 font-mono text-xs text-gray-400" data-label="Short">${escapeHtml(d.short_addr || '-')}</td>
                 <td class="px-3 py-1.5 text-xs text-orange-400" data-label="Type">${escapeHtml(d.device_type || '-')}</td>
