@@ -23175,6 +23175,8 @@ function _companionBarHtml(c, single, status) {
     const name     = c.name || 'Companion';
     const isPiglet = name === 'Piglet' || name === 'Piglet Coordinator';
     const isCoord  = name === 'Piglet Coordinator';
+    const isHuginn = name === 'Huginn';
+    const isZigbeeRole = isHuginn && c.role === 'zigbee';
     const dotColor = c.connected ? 'bg-green-500' : 'bg-gray-500';
 
     const chips = [];
@@ -23200,14 +23202,20 @@ function _companionBarHtml(c, single, status) {
                 <span class="text-xs text-gray-400">WiFi:</span>
                 <span class="text-xs font-bold text-emerald-400">${status.serial_seen_unique || 0}</span>`);
         }
+    } else if (c.connected && isZigbeeRole) {
+        // Dedicated Zigbee/Thread node — WiFi/BLE are parked, so show only the
+        // 802.15.4 tally (matches what this node actually captures).
+        chips.push(`${sep}
+            <span class="text-xs text-gray-400">Zigbee / Thread:</span>
+            <span class="text-xs font-bold text-teal-400">${c.esp_zigbee_count || 0}</span>`);
     } else if (c.connected) {
         chips.push(`${sep}
             <span class="text-xs text-gray-400">WiFi:</span>
             <span class="text-xs font-bold text-emerald-400">${c.networks || 0}</span>`);
-        // Per-band breakdown for dual-band companions. Only rendered once a
-        // 5 GHz network has actually been seen, so a 2.4-only board (plain
-        // ESP32-S3) keeps the compact single-total bar it had before.
-        if ((c.networks_5 || 0) > 0) {
+        // Per-band breakdown. Dual-band boards (Huginn on a C5) always show the
+        // 2.4/5 split so the two bands are legible; a 2.4-only board (ESP32-S3)
+        // only gets the split once a 5 GHz network has actually been seen.
+        if (isHuginn || (c.networks_5 || 0) > 0) {
             chips.push(`<span class="text-xs text-cyan-400">${c.networks_24 || 0}</span>
                 <span class="text-xs text-gray-500">2.4G</span>
                 <span class="text-xs text-purple-400">${c.networks_5 || 0}</span>
@@ -23215,16 +23223,15 @@ function _companionBarHtml(c, single, status) {
         }
     }
 
-    // BLE — hidden for Piglet / Coordinator (WiFi-only firmware).
-    if (c.connected && !isPiglet) {
+    // BLE — hidden for Piglet / Coordinator (WiFi-only) and for a Zigbee node.
+    if (c.connected && !isPiglet && !isZigbeeRole) {
         chips.push(`<span class="text-xs text-gray-400">BLE:</span>
             <span class="text-xs font-bold text-blue-400">${c.esp_ble_count || 0}</span>`);
     }
 
-    // Zigbee / 802.15.4 — only for companions with an 802.15.4 radio (ESP32-C5/
-    // C6). Shown once the board has reported any Zigbee device, so WiFi/BLE-only
-    // boards don't carry a permanent "Zig: 0" chip.
-    if (c.connected && c.esp_zigbee_count) {
+    // Zigbee chip for a normal companion that happens to report 802.15.4 (the
+    // dedicated Zigbee node already shows its tally above).
+    if (c.connected && !isZigbeeRole && c.esp_zigbee_count) {
         chips.push(`<span class="text-xs text-gray-400">Zig:</span>
             <span class="text-xs font-bold text-teal-400">${c.esp_zigbee_count}</span>`);
     }
