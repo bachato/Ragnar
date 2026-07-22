@@ -434,6 +434,7 @@ install_dependencies() {
         "libopenblas-dev"
         "bluez"
         "bluez-tools"
+        "python3-dbus"
         "bridge-utils"
         "python3-pil"
         "libjpeg-dev"

@@ -274,6 +274,42 @@ survey.
 
 ---
 
+## Bluetooth / BLE overlay (2.4 GHz)
+
+Tick **📶 Bluetooth** in the toolbar to overlay nearby **Bluetooth Classic
+(BR/EDR)** and **Bluetooth Low Energy** activity onto the 2.4 GHz segment of the
+spectrum — the two radios share the ISM band, so BT/BLE is a real, often
+invisible, source of 2.4 GHz Wi-Fi interference.
+
+**What it draws:**
+
+- **BLE advertising markers** — the three fixed advertising channels **37 / 38 /
+  39** at **2402 / 2426 / 2480 MHz**, placed (by design) in the gaps around Wi-Fi
+  1/6/11. Marker opacity scales with how many advertisers are heard.
+- **A band-wide "BT hopping" strip** — BLE data (37 channels) and Classic BT (79
+  channels) frequency-hop across the whole band, drawn as a hatched activity
+  strip whose height scales with device count, proximity and Classic presence.
+- **A device table** — every in-range device with **RSSI**, kind (BLE / Classic /
+  dual-mode), **vendor** (IEEE OUI for public addresses, Bluetooth SIG company
+  ID for randomised ones), and decoded **class-of-device** (Audio/Video, Phone,
+  Wearable, …). Randomised (LE-privacy) addresses are tagged `rnd`.
+- **Per-channel BT pressure chips** — an estimated low/moderate/high interference
+  level for Wi-Fi channels 1/6/11/13.
+
+**It is a device-activity estimate, not a measured RF sweep.** We ask the
+Bluetooth controller (via BlueZ) which devices it can hear and model where their
+energy lands — a true per-Hz energy sweep of BT hopping needs an SDR. Capture is
+**receive-only**: device *discovery* only, never pairing or connecting.
+
+**Hardware / capture.** Discovery runs over BlueZ's D-Bus API (`python3-dbus`),
+falling back to `bluetoothctl` text mode if unavailable. Any BlueZ controller
+works — the Pi's **onboard** radio or the tri-band **Alfa's built-in BT 5.2**.
+When the Alfa combo dongle is plugged in its controller enumerates on **USB**
+while the onboard radio is **UART**, so the scanner prefers the USB controller
+(same adapter as the Wi-Fi capture). On a combo chip the Wi-Fi and BT radios
+time-share the RF front-end, so the overlay is best-effort and duty-cycled —
+running BT discovery and Wi-Fi monitor capture flat-out can cost frames on both.
+
 ## Hardware
 
 Tuned for the **Alfa AWUS036AXM** (MediaTek MT7921AU, `mt7921u` driver — a
@@ -301,13 +337,26 @@ All endpoints are passive and read-only except the heatmap store.
 | `GET/POST /api/net/wifi/surveys` | list / save / load / delete named surveys |
 | `GET/POST /api/net/wifi/history` | get AP history DB / reset it |
 | `GET /api/net/wifi/selftest` | parser + analyzer self-test |
+| `GET /api/net/bt/controllers` | Bluetooth controllers (USB-first: Alfa before onboard) |
+| `GET /api/net/bt/scan?controller=&duration=` | BT/BLE discovery + 2.4 GHz interference model |
+| `GET /api/net/bt/selftest` | Bluetooth parser + model self-test |
 
 ```bash
 python3 wifi_analyzer.py interfaces
 python3 wifi_analyzer.py scan --interface wlan0 --band all
 python3 wifi_analyzer.py radius --interface wlan0 --bssid aa:bb:cc:dd:ee:ff
 python3 wifi_analyzer.py selftest
+
+# Bluetooth / BLE 2.4 GHz overlay (bt_scanner.py)
+python3 bt_scanner.py controllers
+python3 bt_scanner.py scan --duration 12
+python3 bt_scanner.py selftest
 ```
+
+The Bluetooth scanner ships its own offline self-test — **28 checks** covering
+the D-Bus/`bluetoothctl` parsers, class-of-device decode, public-vs-random
+address handling, OUI/company-ID vendor attribution, device classification
+(BLE/Classic/dual), controller enumeration, and the 2.4 GHz interference model.
 
 The self-test (`selftest`) drives the beacon parser (2.4/5/6 GHz, HT/VHT/HE
 widths, a Wi-Fi 7 / 802.11be AP with EHT IEs and 320 MHz width, BSS-Load,

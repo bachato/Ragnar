@@ -38,6 +38,7 @@ import path_asymmetry
 import tls_watch
 import wifi_analyzer
 import wifi_defense
+import bt_scanner
 from ldap_watch import do_ldap_watch
 from tls_watch import do_tls_watch
 
@@ -14935,6 +14936,33 @@ def register_network_diagnostics(app, logger=None):
             _log("net/wifi/history reset")
             return jsonify(wifi_analyzer.db_reset())
         return jsonify({"aps": wifi_analyzer.db_get()})
+
+    # ------------------------------------------------------------------
+    # Bluetooth / BLE 2.4 GHz overlay (bt_scanner.py) — device-discovery
+    # companion to the Wi-Fi analyzer. Receive-only: discovery, never pairs
+    # or connects. Maps BT/BLE energy onto the same 2.4 GHz band.
+    # ------------------------------------------------------------------
+    @app.route('/api/net/bt/controllers', methods=['GET'])
+    def net_bt_controllers():
+        _log("net/bt/controllers")
+        return jsonify({"controllers": bt_scanner.list_controllers()})
+
+    @app.route('/api/net/bt/scan', methods=['GET'])
+    def net_bt_scan():
+        ctrl = (request.args.get('controller') or '').strip() or None
+        if ctrl is not None and not bt_scanner._valid_controller(ctrl):
+            return _bad('Invalid controller')
+        try:
+            dur = int(request.args.get('duration', bt_scanner._DEFAULT_DURATION))
+        except (TypeError, ValueError):
+            return _bad('Invalid duration')
+        _log(f"net/bt/scan controller={ctrl} {dur}s")
+        return jsonify(bt_scanner.do_scan(controller=ctrl, duration=dur))
+
+    @app.route('/api/net/bt/selftest', methods=['GET'])
+    def net_bt_selftest():
+        _log("net/bt/selftest")
+        return jsonify(bt_scanner.selftest())
 
     # ------------------------------------------------------------------
     # WiFi Defense — 802.11 frame monitor / WIDS (wifi_defense.py).

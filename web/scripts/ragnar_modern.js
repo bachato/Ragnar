@@ -1283,7 +1283,7 @@ function showNetworkSubtab(name) {
 // WiFi Spectrum Analyzer (Network > WiFi Analyzer sub-tab)
 // Passive tri-band survey. Backend: /api/net/wifi/* (wifi_analyzer.py)
 // ============================================================================
-const _wifiState = { iface: '', band: 'all', view: 'bar', data: null, selected: null, auto: null, inited: false };
+const _wifiState = { iface: '', band: 'all', view: 'bar', data: null, selected: null, auto: null, inited: false, bt: null, btOn: false, btBusy: false };
 
 const _WIFI_BAND_COLOR = { '2.4': '#f59e0b', '5': '#38bdf8', '6': '#a78bfa' };
 
@@ -1338,6 +1338,15 @@ function wifiInit() {
             if (_wifiState.auto) { clearInterval(_wifiState.auto); _wifiState.auto = null; }
             if (e.target.checked) _wifiState.auto = setInterval(wifiScan, 8000);
         });
+        // Bluetooth overlay toggle
+        const btChk = document.getElementById('wifi-bt');
+        if (btChk) btChk.addEventListener('change', (e) => {
+            _wifiState.btOn = e.target.checked;
+            const panel = document.getElementById('wifi-bt-panel');
+            if (panel) panel.classList.toggle('hidden', !_wifiState.btOn);
+            if (_wifiState.btOn) wifiBtScan();
+            else { if (_wifiState.data) _wifiDrawSpectrum(); }
+        });
         ['wifi-tx', 'wifi-ple'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.addEventListener('change', () => { if (_wifiState.selected) wifiSelectAp(_wifiState.selected); });
@@ -1379,6 +1388,65 @@ function wifiScan() {
             st.textContent = `${d.ap_count} AP(s) · ${new Date(d.timestamp * 1000).toLocaleTimeString()}`;
             wifiRender();
         }).catch(e => { if (btn) btn.disabled = false; st.textContent = 'Scan failed'; });
+}
+
+// ---- Bluetooth / BLE 2.4 GHz overlay ---------------------------------------
+const _BT_KIND = { le: { c: '#38bdf8', t: 'BLE' }, classic: { c: '#818cf8', t: 'Classic' },
+    dual: { c: '#a78bfa', t: 'Dual' } };
+const _BT_PRESSURE_COLOR = { low: '#64748b', moderate: '#f59e0b', high: '#ef4444' };
+
+function wifiBtScan() {
+    if (_wifiState.btBusy) return;
+    _wifiState.btBusy = true;
+    const st = document.getElementById('wifi-bt-status');
+    if (st) st.textContent = 'Discovering (receive-only)…';
+    fetch('/api/net/bt/scan?duration=12')
+        .then(r => r.json()).then(d => {
+            _wifiState.btBusy = false;
+            if (d.error) { if (st) st.textContent = '⚠ ' + d.error; _wifiState.bt = null; return; }
+            _wifiState.bt = d;
+            const i = d.interference || {};
+            if (st) st.textContent = `${d.device_count} BT/BLE · ${d.controller || '?'}` +
+                (d.capture === 'bluetoothctl' ? ' (fallback)' : '');
+            _wifiBtRender();
+            if (_wifiState.data) _wifiDrawSpectrum();
+        }).catch(() => { _wifiState.btBusy = false; if (st) st.textContent = 'BT scan failed'; });
+}
+
+function _wifiBtRender() {
+    const d = _wifiState.bt; if (!d) return;
+    const i = d.interference || {};
+    const sum = document.getElementById('wifi-bt-summary');
+    if (sum) sum.textContent = `${i.le_count || 0} BLE · ${i.classic_count || 0} Classic · ${i.strong_count || 0} close`;
+    const note = document.getElementById('wifi-bt-note');
+    if (note) note.textContent = (i.note || '') + '  ' + (d.coexistence_note || '');
+    // Per-Wi-Fi-channel BT pressure chips
+    const pr = document.getElementById('wifi-bt-pressure');
+    if (pr) pr.innerHTML = (i.wifi_channels || []).map(c => {
+        const col = _BT_PRESSURE_COLOR[c.level] || '#64748b';
+        return `<span class="px-1.5 py-0.5 rounded" style="background:${col}22;color:${col};border:1px solid ${col}55" title="Estimated BT pressure on Wi-Fi ch ${c.wifi_channel}">ch${c.wifi_channel}: ${c.level}</span>`;
+    }).join('');
+    // Device table (strongest first, already sorted server-side)
+    const tb = document.getElementById('wifi-bt-tbody');
+    if (!tb) return;
+    if (!d.devices.length) {
+        tb.innerHTML = '<tr><td colspan="5" class="py-3 text-gray-500">No Bluetooth devices in range.</td></tr>';
+        return;
+    }
+    tb.innerHTML = d.devices.map(v => {
+        const k = _BT_KIND[v.kind] || { c: '#94a3b8', t: v.kind || '?' };
+        const name = v.name || '<span class="text-gray-600">(no name)</span>';
+        const cls = v.major_class ? v.major_class + (v.services && v.services.length ? ` · ${v.services.join(', ')}` : '') : '—';
+        const rssi = (v.rssi == null) ? '—' : `${v.rssi}`;
+        const rcol = (v.rssi == null) ? '#64748b' : _wifiSignalColor(v.rssi);
+        return `<tr class="border-b border-slate-800/60">
+            <td class="py-1 pr-3">${name}<div class="text-[10px] text-gray-600 font-mono">${v.mac}</div></td>
+            <td class="py-1 pr-3"><span style="color:${k.c}">${k.t}</span>${v.randomized ? ' <span class="text-[9px] text-gray-500">rnd</span>' : ''}</td>
+            <td class="py-1 pr-3">${v.vendor || '—'}</td>
+            <td class="py-1 pr-3">${cls}</td>
+            <td class="py-1 pr-3 text-right font-mono" style="color:${rcol}">${rssi}</td>
+        </tr>`;
+    }).join('');
 }
 
 function _wifiGenBadge(std) {
@@ -1756,6 +1824,54 @@ function _wifiDrawSpectrum() {
         const label = a.ssid || 'hidden';
         ctx.fillStyle = sel ? '#fff' : '#cbd5e1'; ctx.font = (sel ? 'bold ' : '') + '10px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText(label.length > 14 ? label.slice(0, 13) + '…' : label, xC, y - 4);
+    });
+    // Bluetooth / BLE overlay on the 2.4 GHz segment (device-activity estimate)
+    if (_wifiState.btOn && _wifiState.bt && ranges['2.4']) {
+        _wifiDrawBtOverlay(ctx, ranges['2.4'], xFor, { padT, padB, H, plotH });
+    }
+}
+
+// Draw the BLE advertising-channel markers (37/38/39) and a band-wide
+// "BT hopping activity" strip onto the 2.4 GHz segment of the spectrum. This is
+// a device-activity overlay, not measured RF — labelled as such in the panel.
+function _wifiDrawBtOverlay(ctx, r24, xFor, g) {
+    const i = (_wifiState.bt.interference) || {};
+    const baseY = g.H - g.padB;
+    // 1) Band-wide hopping activity strip: height scales with hopping_pressure.
+    const hp = Math.max(0, Math.min(100, i.hopping_pressure || 0));
+    if (hp > 0) {
+        const stripH = 6 + (hp / 100) * 26;
+        const x0 = r24.x0, x1 = r24.x1;
+        const grad = ctx.createLinearGradient(0, baseY - stripH, 0, baseY);
+        grad.addColorStop(0, 'rgba(56,189,248,0.05)');
+        grad.addColorStop(1, 'rgba(56,189,248,0.28)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(x0, baseY - stripH, x1 - x0, stripH);
+        // Diagonal hatch so it reads as "hopping", distinct from a solid AP bar.
+        ctx.save();
+        ctx.beginPath(); ctx.rect(x0, baseY - stripH, x1 - x0, stripH); ctx.clip();
+        ctx.strokeStyle = 'rgba(56,189,248,0.25)'; ctx.lineWidth = 1;
+        for (let x = x0 - stripH; x < x1; x += 7) {
+            ctx.beginPath(); ctx.moveTo(x, baseY); ctx.lineTo(x + stripH, baseY - stripH); ctx.stroke();
+        }
+        ctx.restore();
+        ctx.fillStyle = '#38bdf8'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText('BT hopping', x0 + 3, baseY - stripH - 3);
+    }
+    // 2) BLE advertising-channel markers at 2402/2426/2480 MHz. Convert each
+    // frequency to the analyzer's fractional 2.4 GHz channel, clamped to the
+    // segment so the edge channels (37/39) still show a labelled tick.
+    (i.adv_markers || []).forEach(m => {
+        const chFrac = (m.freq_mhz - 2407) / 5;
+        let x = xFor('2.4', chFrac);
+        x = Math.max(r24.x0 + 2, Math.min(r24.x1 - 2, x));
+        const intensity = Math.max(0, Math.min(100, m.intensity || 0));
+        const alpha = 0.25 + (intensity / 100) * 0.5;
+        ctx.strokeStyle = `rgba(129,140,248,${alpha})`; ctx.lineWidth = 2; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(x, g.padT + 4); ctx.lineTo(x, baseY); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#c7d2fe'; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('BLE ' + m.adv_channel, x, g.padT + 2);
     });
 }
 
