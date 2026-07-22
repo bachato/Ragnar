@@ -22722,6 +22722,9 @@ function updateWardrivingUI(status) {
     updateElement('wd-bt-count', String(stats.bluetooth_devices || status.bluetooth_count || 0));
     updateElement('wd-cell-count', String(stats.cell_towers || status.cell_count || 0));
     updateElement('wd-camera-count', String(stats.cameras || 0));
+    // Zigbee / 802.15.4 — unique devices in the DB, falling back to the live
+    // session count from companions before the first DB stats roll-up.
+    updateElement('wd-zigbee-count', String(stats.zigbee_devices || status.zigbee_count || 0));
 
     // Interfaces
     const ifInfo = document.getElementById('wd-interfaces-info');
@@ -22978,6 +22981,7 @@ function renderWardrivingDiagnostics(status) {
             ? `${stats.band_2_4ghz || 0} / ${stats.band_5ghz || 0} / ${stats.band_6ghz || 0}` : null],
         ['Bluetooth', stats.bluetooth_devices],
         ['Cell towers', stats.cell_towers],
+        ['Zigbee devices', stats.zigbee_devices],
         ['Cameras', stats.cameras],
         ['GPS trackpoints', stats.gps_trackpoints],
         ['Strongest', strongest ? `${strongest.ssid || strongest.bssid || '?'}` +
@@ -23030,6 +23034,7 @@ function renderWardrivingDiagnostics(status) {
         }
         if (c.esp_mode) bits.push(c.esp_mode);
         if (_wdHas(c.esp_ble_count)) bits.push(`${c.esp_ble_count} BLE`);
+        if (c.esp_zigbee_count) bits.push(`${c.esp_zigbee_count} Zig`);
         if (c.mesh_node_count) bits.push(`${c.mesh_node_count} nodes`);
         if (c.coordinator_board) bits.push(c.coordinator_board);
         if (c.coordinator_fw) bits.push(`fw ${c.coordinator_fw}`);
@@ -23210,6 +23215,14 @@ function _companionBarHtml(c, single, status) {
     if (c.connected && !isPiglet) {
         chips.push(`<span class="text-xs text-gray-400">BLE:</span>
             <span class="text-xs font-bold text-blue-400">${c.esp_ble_count || 0}</span>`);
+    }
+
+    // Zigbee / 802.15.4 — only for companions with an 802.15.4 radio (ESP32-C5/
+    // C6). Shown once the board has reported any Zigbee device, so WiFi/BLE-only
+    // boards don't carry a permanent "Zig: 0" chip.
+    if (c.connected && c.esp_zigbee_count) {
+        chips.push(`<span class="text-xs text-gray-400">Zig:</span>
+            <span class="text-xs font-bold text-teal-400">${c.esp_zigbee_count}</span>`);
     }
 
     // Unique — session aggregate, only meaningful for a lone companion.
@@ -24007,6 +24020,7 @@ function loadWardrivingTableByType() {
     else if (type === 'bluetooth') _loadWardrivingBluetooth();
     else if (type === 'cell') _loadWardrivingCellTable();
     else if (type === 'cameras') _loadWardrivingCameras();
+    else if (type === 'zigbee') _loadWardrivingZigbee();
 }
 
 // Per-table render signature. We avoid re-rendering identical data on every
@@ -24053,7 +24067,8 @@ const _WD_HEADERS = {
     wifi: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">📷</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
     bluetooth: '<tr><th class="px-3 py-2">Name</th><th class="px-3 py-2">MAC</th><th class="px-3 py-2">Type</th><th class="px-3 py-2">RSSI</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">First Seen</th><th class="px-3 py-2">Seen</th></tr>',
     cell: '<tr><th class="px-3 py-2">Provider</th><th class="px-3 py-2">Tech</th><th class="px-3 py-2">Cell ID</th><th class="px-3 py-2">MCC/MNC</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2">Band</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
-    cameras: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>'
+    cameras: '<tr><th class="px-3 py-2">SSID</th><th class="px-3 py-2">BSSID</th><th class="px-3 py-2">Security</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Band</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>',
+    zigbee: '<tr><th class="px-3 py-2">Address</th><th class="px-3 py-2">PAN ID</th><th class="px-3 py-2">Short</th><th class="px-3 py-2">Type</th><th class="px-3 py-2">Ch</th><th class="px-3 py-2">Signal</th><th class="px-3 py-2 text-center">LQI</th><th class="px-3 py-2 text-center">GPS</th><th class="px-3 py-2">Seen</th></tr>'
 };
 
 function _setWdTableHeaders(type) {
@@ -24150,6 +24165,52 @@ async function _loadWardrivingBluetooth() {
         updateElement('wd-total', String(data.total || devices.length));
     } catch (e) {
         console.error('[Wardriving] BT table error:', e);
+    }
+}
+
+async function _loadWardrivingZigbee() {
+    _setWdTableHeaders('zigbee');
+    const tbody = document.getElementById('wd-network-table');
+    if (!tbody) return;
+    try {
+        const sid = _wdSelectedSessionId ? `?session_id=${encodeURIComponent(_wdSelectedSessionId)}` : '';
+        const res = await fetch(`/api/wardriving/zigbee${sid}`);
+        const data = await res.json();
+        const devices = data.devices || [];
+        const sig = _wdSig('zigbee', devices, d => (d.scan_count || 0) + (d.rssi || 0));
+        if (!_wdShouldRender('zigbee', sig)) return;
+        if (devices.length === 0) {
+            _wdSetTbodyHTML(tbody, '<tr><td colspan="9" class="text-center text-gray-500 py-8">No Zigbee / 802.15.4 devices found yet. Needs a companion with an 802.15.4 radio (ESP32-C5/C6).</td></tr>');
+            return;
+        }
+        const html = devices.map(d => {
+            const lat = d.latitude != null ? d.latitude : d.best_lat;
+            const lon = d.longitude != null ? d.longitude : d.best_lon;
+            const hasGps = lat != null && lon != null;
+            const gpsIcon = hasGps
+                ? `<span title="${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}" class="text-emerald-400 cursor-help">📍</span>`
+                : '<span class="text-gray-600">—</span>';
+            const rssi = (d.best_rssi != null ? d.best_rssi : d.rssi);
+            const sigColor = rssi > -50 ? 'text-emerald-400' : rssi > -70 ? 'text-yellow-400' : 'text-red-400';
+            return `<tr class="hover:bg-slate-800/50">
+                <td class="px-3 py-1.5 font-mono text-xs text-teal-400" data-label="Address">${escapeHtml(d.addr || '-')}</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400" data-label="PAN ID">${escapeHtml(d.panid || '-')}</td>
+                <td class="px-3 py-1.5 font-mono text-xs text-gray-400" data-label="Short">${escapeHtml(d.short_addr || '-')}</td>
+                <td class="px-3 py-1.5 text-xs text-orange-400" data-label="Type">${escapeHtml(d.device_type || '-')}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400" data-label="Ch">${d.channel || '-'}</td>
+                <td class="px-3 py-1.5 text-xs ${sigColor}" data-label="Signal">${rssi != null ? rssi + ' dBm' : '-'}</td>
+                <td class="px-3 py-1.5 text-xs text-center text-gray-400" data-label="LQI">${d.lqi != null ? d.lqi : '-'}</td>
+                <td class="px-3 py-1.5 text-xs text-center" data-label="GPS">${gpsIcon}</td>
+                <td class="px-3 py-1.5 text-xs text-gray-400" data-label="Seen">${d.scan_count || 1}x</td>
+            </tr>`;
+        }).join('');
+        _wdSetTbodyHTML(tbody, html);
+        const info = document.getElementById('wd-table-info');
+        if (info) info.classList.remove('hidden');
+        updateElement('wd-showing', String(devices.length));
+        updateElement('wd-total', String(data.total || devices.length));
+    } catch (e) {
+        console.error('[Wardriving] Zigbee table error:', e);
     }
 }
 
