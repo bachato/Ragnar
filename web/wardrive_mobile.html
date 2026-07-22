@@ -86,6 +86,7 @@
     <div class="stat"><div class="v" id="s-24">–</div><div class="l">2.4 GHz</div></div>
     <div class="stat"><div class="v" id="s-5">–</div><div class="l">5 GHz</div></div>
     <div class="stat"><div class="v" id="s-6">–</div><div class="l">6 GHz</div></div>
+    <div class="stat"><div class="v" id="s-zig">–</div><div class="l">Zigbee</div></div>
   </div>
 
   <div class="mapwrap">
@@ -210,6 +211,7 @@
       txt('s-24', stats.band_2_4ghz || 0);
       txt('s-5', stats.band_5ghz || 0);
       txt('s-6', stats.band_6ghz || 0);
+      txt('s-zig', stats.zigbee_devices != null ? stats.zigbee_devices : (st.zigbee_count || 0));
 
       var g = document.getElementById('gps');
       var here = null;
@@ -454,6 +456,7 @@
         : null],
       ['Bluetooth', stats.bluetooth_devices],
       ['Cell towers', stats.cell_towers],
+      ['Zigbee devices', stats.zigbee_devices],
       ['Cameras', stats.cameras],
       ['GPS trackpoints', stats.gps_trackpoints],
       ['Strongest', strongest ? ((strongest.ssid || strongest.bssid || '?') +
@@ -492,6 +495,7 @@
       }
       if (c.esp_mode) bits.push(c.esp_mode);
       if (has(c.esp_ble_count)) bits.push(c.esp_ble_count + ' BLE');
+      if (has(c.esp_zigbee_count) && c.esp_zigbee_count) bits.push(c.esp_zigbee_count + ' Zig');
       if (has(c.mesh_node_count) && c.mesh_node_count) bits.push(c.mesh_node_count + ' nodes');
       if (c.coordinator_board) bits.push(c.coordinator_board);
       if (c.coordinator_fw) bits.push('fw ' + c.coordinator_fw);

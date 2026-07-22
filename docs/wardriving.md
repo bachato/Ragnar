@@ -411,10 +411,10 @@ not ride the 3-second status poll.
 > off USB, so a bus/hub glitch or a dip on the USB rail fits better than an RF
 > or per-device fault — check `dmesg` for USB resets. That correlation is
 > invisible if you only read the satellite counts.
-| **Session** | id, duration, network totals, open/WEP/WPA, per-band, Bluetooth, cell towers, cameras, trackpoints, strongest AP, DB path |
+| **Session** | id, duration, network totals, open/WEP/WPA, per-band, Bluetooth, cell towers, Zigbee devices, cameras, trackpoints, strongest AP, DB path |
 | **Scanning** | running, band mode, scans completed, networks last scan, last scan age, interfaces, plus per-adapter driver / bands / USB / manufacturer / network count |
 | **Coverage** | BSSIDs seen by 2+ adapters, and per adapter its unique count, *only-here* count and median best RSSI — the antenna-comparison view (dashboard only) |
-| **Companions** | per-device up/down, network counts, 2.4/5 split, ESP mode, BLE count, mesh nodes, coordinator board/firmware, recent alerts |
+| **Companions** | per-device up/down, network counts, 2.4/5 split, ESP mode, BLE count, Zigbee count (802.15.4 boards), mesh nodes, coordinator board/firmware, recent alerts |
 | **Device** | device name, Bluetooth/cell totals, GPS-backfill setting |
 
 Fields with no value are omitted rather than rendered blank, and the panel skips
