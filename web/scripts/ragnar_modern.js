@@ -23144,7 +23144,7 @@ function renderWardrivingDiagnostics(status) {
 const _ESP_MODE_LABELS = {
     wifi: 'WiFi', 'ble-flipper': '🐬 Flipper', 'ble-airtag': '🏷️ AirTag',
     'ble-skimmer': '💳 Skimmer', pineap: '🍍 PineAP', ble: 'BLE',
-    stations: 'Stations', wardrive: '🏎️ Wardrive (fast)'
+    stations: 'Stations', wardrive: '🏎️ Wardrive (fast)', zigbee: '🐝 Zigbee / Thread'
 };
 
 function _renderCompanionBars(status) {
@@ -23253,13 +23253,40 @@ function _companionBarHtml(c, single, status) {
         ? ''
         : '<span class="text-xs text-gray-400">Ragnar looking for Huginn or Piglet...</span>';
 
+    // Role selector (Huginn only). One C5 can't do WiFi + 802.15.4 at once, so a
+    // dedicated second Huginn can be flipped to Zigbee/Thread-only here.
+    let roleHtml = '';
+    if (c.connected && name === 'Huginn') {
+        const role = c.role === 'zigbee' ? 'zigbee' : 'wardrive';
+        roleHtml = `<span class="ml-auto flex items-center gap-1">
+            <span class="text-xs text-gray-500">Role:</span>
+            <select onchange="setCompanionRole('${escapeHtml(c.port)}', this.value)"
+                title="What this Huginn does. One ESP32-C5 shares a single 2.4 GHz radio, so it can wardrive WiFi+BLE OR sniff Zigbee/Thread — not both. Use a second Huginn for Zigbee."
+                class="text-xs bg-slate-900 border border-slate-600 rounded px-1 py-0.5 text-gray-200 focus:border-teal-500 focus:outline-none">
+                <option value="wardrive" ${role === 'wardrive' ? 'selected' : ''}>WiFi + BLE</option>
+                <option value="zigbee" ${role === 'zigbee' ? 'selected' : ''}>Zigbee / Thread only</option>
+            </select>
+        </span>`;
+    }
+
     return `<div class="bg-slate-800/40 border border-slate-700 rounded-lg px-4 py-2 flex items-center gap-3 flex-wrap">
             <span class="text-xs font-bold text-purple-400">${escapeHtml(name)}</span>
             ${statusText}
             <span class="w-2 h-2 rounded-full ${dotColor} animate-pulse"></span>
             ${chips.join('\n')}
             ${alertHtml}
+            ${roleHtml}
         </div>${_coordNodesHtml(c)}`;
+}
+
+// Flip a Huginn companion between WiFi+BLE wardriving and Zigbee/Thread-only.
+// Applied live server-side (the listener re-sends the mode command).
+async function setCompanionRole(port, role) {
+    try {
+        await postAPI('/api/wardriving/companion_role', { port, role });
+    } catch (e) {
+        console.error('[Wardriving] set companion role failed:', e);
+    }
 }
 
 // Per-node breakdown for a Piglet Coordinator / Core, rendered beneath its bar.

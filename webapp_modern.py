@@ -9076,6 +9076,38 @@ def wardriving_huginn_config():
         logger.error(f"Wardriving huginn_config error: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/wardriving/companion_role', methods=['GET', 'POST'])
+def wardriving_companion_role():
+    """Get or set a Huginn companion's role, keyed by serial port.
+
+    'wardrive' (default) = WiFi + BLE wardriving.
+    'zigbee'             = 802.15.4 (Zigbee/Thread) only — for a dedicated
+                           second Huginn, since one C5 can't do WiFi + 802.15.4
+                           at once (shared 2.4 GHz radio). The change is applied
+                           live (the listener re-sends the mode command).
+    """
+    try:
+        roles = dict(shared_data.config.get('wardriving_companion_roles', {}) or {})
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            port = str(data.get('port', '')).strip()
+            role = str(data.get('role', 'wardrive')).strip().lower()
+            if not port:
+                return jsonify({'error': 'port required'}), 400
+            if role not in ('wardrive', 'zigbee'):
+                return jsonify({'error': "role must be 'wardrive' or 'zigbee'"}), 400
+            if role == 'wardrive':
+                roles.pop(port, None)          # default — don't persist noise
+            else:
+                roles[port] = 'zigbee'
+            shared_data.config['wardriving_companion_roles'] = roles
+            shared_data.save_config()
+            return jsonify({'success': True, 'port': port, 'role': role, 'roles': roles})
+        return jsonify({'roles': roles})
+    except Exception as e:
+        logger.error(f"Wardriving companion_role error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/wardriving/track')
 def wardriving_track():
     """Get GPS track for current session (for map display)."""
