@@ -135,6 +135,14 @@ class _CompanionState:
         self.huginn_handshake_pushed: bool = False
         # Per-connection scan state
         self.current_esp_mode: str = 'wifi'
+        # True while the companion is in HuginnESP's wardrive loop. In that mode
+        # the device rotates through WiFi -> BLE -> Zigbee phases on one shared
+        # radio, so the per-line `current_esp_mode` (set from the last data line)
+        # is a misleading "current activity" — WiFi is de-duplicated on-device so
+        # it goes quiet after the first cycle while BLE keeps re-emitting, which
+        # pins the label to 'ble-all'. When wardriving we report 'wardrive'
+        # instead; the per-radio WiFi/BLE/Zigbee counts show what's captured.
+        self.in_wardrive: bool = False
         self.esp_ble_count: int = 0
         self.esp_zigbee_count: int = 0
         self.esp_alerts: list = []
@@ -193,7 +201,7 @@ class _CompanionState:
             'coordinator_board': self.coordinator_board,
             'coordinator_fw':    self.coordinator_fw,
             'coordinator_nodes': self.active_coordinator_nodes(),
-            'esp_mode':          self.current_esp_mode,
+            'esp_mode':          'wardrive' if self.in_wardrive else self.current_esp_mode,
             'esp_ble_count':     self.esp_ble_count,
             'esp_zigbee_count':  self.esp_zigbee_count,
             'esp_alerts':        self.esp_alerts[-5:],
@@ -1611,7 +1619,7 @@ class WardrivingEngine:
     def _current_esp_mode(self) -> str:
         for c in self._companions.values():
             if c.connected and c.current_esp_mode:
-                return c.current_esp_mode
+                return 'wardrive' if c.in_wardrive else c.current_esp_mode
         return 'wifi'
 
     @property
@@ -3990,6 +3998,7 @@ class WardrivingEngine:
             self._drain_huginn_queue(ser, companion)
             ser.reset_input_buffer()
             ser.write(b"wardrive\r\n")
+            companion.in_wardrive = True
             logger.info(f"HuginnESP {companion.port}: entered fast wardrive mode")
         except Exception as e:
             logger.warning(f"Failed to start Huginn wardrive mode on {companion.port}: {e}")
@@ -4020,6 +4029,8 @@ class WardrivingEngine:
                 companion
             )
             companion.serial_entry_buffer = {}
+
+        companion.in_wardrive = False
 
         try:
             ser.write(b"stop\r\n")
