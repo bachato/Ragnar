@@ -211,6 +211,12 @@ stores these in a dedicated `zigbee_devices` table and counts them separately
 from BLE — the live status bar and displays show a `Zigbee` total alongside
 `BT` and `Cell`, and `/api/wardriving/zigbee` returns the full list.
 
+> **WiGLE export is opt-in.** WiGLE has no standard 802.15.4 record type, so
+> Zigbee devices are **excluded from WiGLE CSV export by default**. Enable
+> **Config → Wardriving → Include Zigbee in WiGLE CSV** (`wardriving_wigle_include_zigbee`)
+> to append them with a `ZIGBEE` type token — intended for your own tooling,
+> not for submitting to WiGLE. Applies to both manual export and Auto Export on Stop.
+
 ```json
 {"type":"ZIGBEE","panid":"0x1A2B","addr":"AABBCCDDEEFF0011","short":"0x1234","channel":15,"rssi":-70,"lqi":180,"ftype":"beacon"}
 ```

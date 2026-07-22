@@ -859,6 +859,7 @@ class SharedData:
             "wardriving_gps_baudrate": 9600,
             "wardriving_interfaces": [],
             "wardriving_auto_export": True,
+            "wardriving_wigle_include_zigbee": False,
             "wardriving_device_name": "",
             "wardriving_speed_unit": "kmh",
             "wardriving_on_boot": False,

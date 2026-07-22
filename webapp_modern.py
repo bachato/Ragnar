@@ -8948,7 +8948,8 @@ def wardriving_export(session_id):
             )
         else:
             device_name = engine.device_name or shared_data.config.get('wardriving_device_name', 'Ragnar')
-            content = session.export_wigle_csv(device_name=device_name)
+            include_zigbee = bool(shared_data.config.get('wardriving_wigle_include_zigbee', False))
+            content = session.export_wigle_csv(device_name=device_name, include_zigbee=include_zigbee)
             return app.response_class(
                 content, mimetype='text/csv',
                 headers={'Content-Disposition': f'attachment; filename=ragnar_wardriving_{session_id}.csv'}

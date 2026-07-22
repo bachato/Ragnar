@@ -1118,12 +1118,17 @@ class WardrivingSession:
                 logger.error(f"GPS backfill error: {e}")
         return result
 
-    def export_wigle_csv(self, device_name='Ragnar'):
+    def export_wigle_csv(self, device_name='Ragnar', include_zigbee=False):
         """Export session to WiGLE CSV format string including WiFi, BT, and cell.
 
         Rows whose position was estimated via backfill_gps_from_track
         (gps_backfilled = 1) are excluded — they are interpolated coordinates,
-        not real observations, and must not be submitted to WiGLE."""
+        not real observations, and must not be submitted to WiGLE.
+
+        Zigbee / 802.15.4 devices are excluded by default: WiGLE has no
+        standard 802.15.4 record type, so those rows are only useful for the
+        user's own tooling. Set `include_zigbee=True` (opt-in from the config
+        tab) to append them with a `ZIGBEE` type token."""
         lines = []
         dn = device_name or 'Ragnar'
         lines.append(f'WigleWifi-1.4,appRelease=Ragnar,model=RaspberryPi,release=1.0,device={dn},display=EPD,board=RPi,brand=Ragnar')
@@ -1199,6 +1204,32 @@ class WardrivingSession:
                             ]))
                     except Exception:
                         pass
+                    # Zigbee / 802.15.4 devices — opt-in only (see docstring).
+                    if include_zigbee:
+                        try:
+                            zb_rows = conn.execute(
+                                "SELECT * FROM zigbee_devices WHERE COALESCE(gps_backfilled, 0) = 0 "
+                                "ORDER BY first_seen"
+                            ).fetchall()
+                            for row in zb_rows:
+                                r = dict(row)
+                                zlat = r.get('best_lat') if r.get('best_lat') is not None else r.get('latitude')
+                                zlon = r.get('best_lon') if r.get('best_lon') is not None else r.get('longitude')
+                                lines.append(','.join([
+                                    r.get('addr', ''),
+                                    (r.get('panid', '') or '').replace(',', '\\,'),
+                                    '[ZIGBEE]',
+                                    r.get('first_seen', ''),
+                                    str(r.get('channel', 0)),
+                                    str(r.get('best_rssi', -100)),
+                                    str(zlat if zlat is not None else ''),
+                                    str(zlon if zlon is not None else ''),
+                                    str(r.get('altitude', '') or ''),
+                                    '',
+                                    'ZIGBEE'
+                                ]))
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.error(f"WiGLE export error: {e}")
 
