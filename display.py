@@ -2478,6 +2478,7 @@ class Display:
             ("WEP", st.get('wep_networks', 0)),
             ("BT", st.get('bluetooth_devices', 0)),
             ("Cell", st.get('cell_towers', 0)),
+            ("Zig", st.get('zigbee_devices', 0)),
             ("Track", st.get('gps_trackpoints', 0)),
         ]
         self._wd_compact_rows(draw, rows, int(15 * sy), footer_y)
@@ -2719,6 +2720,8 @@ class Display:
         ]
         if st.get('cell_towers', 0) > 0:
             stats_bottom.append(("Cell", str(st.get('cell_towers', 0))))
+        if st.get('zigbee_devices', 0) > 0:
+            stats_bottom.append(("Zigbee", str(st.get('zigbee_devices', 0))))
         if st.get('cameras', 0) > 0:
             stats_bottom.append(("Cameras", str(st.get('cameras', 0))))
         stats_bottom.append(("GPS", gps_str))
@@ -2750,6 +2753,9 @@ class Display:
                 ble = c.get('esp_ble_count', 0)
                 if ble > 0:
                     stats_bottom.append(("  BLE", str(ble)))
+                zig = c.get('esp_zigbee_count', 0)
+                if zig > 0:
+                    stats_bottom.append(("  Zigbee", str(zig)))
         else:
             stats_bottom.append(("Companion", "None"))
 
@@ -3200,7 +3206,11 @@ class Display:
             bt_n = st.get('bluetooth_devices', 0)
             cell_n = st.get('cell_towers', 0)
             cam_n = st.get('cameras', 0)
-            draw.text((30, y), f"BT:{bt_n} Cell:{cell_n} Cam:{cam_n}", font=font_side, fill=C_AMBER)
+            zig_n = st.get('zigbee_devices', 0)
+            bt_line = f"BT:{bt_n} Cell:{cell_n} Cam:{cam_n}"
+            if zig_n:
+                bt_line += f" Zig:{zig_n}"
+            draw.text((30, y), bt_line, font=font_side, fill=C_AMBER)
             y += line_h
             scans = wd.get('scans_completed', 0) if wd else 0
             draw.text((30, y), f"Scans: {scans}", font=font_side, fill=C_GRAY)
@@ -3685,6 +3695,7 @@ class Display:
             wpa_n = st.get('wpa_networks', 0)
             bt_n = st.get('bluetooth_devices', 0)
             cell_n = st.get('cell_towers', 0)
+            zig_n = st.get('zigbee_devices', 0)
             scans = wd.get('scans_completed', 0) if wd else 0
 
             if gps.get('has_fix'):
@@ -3715,7 +3726,8 @@ class Display:
 
             # Body
             draw.text((0, 15), f"Net:{total} Open:{open_n} WPA:{wpa_n}", font=font_body, fill=255)
-            draw.text((0, 26), f"BT:{bt_n} Cell:{cell_n} Scans:{scans}", font=font_body, fill=255)
+            _zig = f" Zig:{zig_n}" if zig_n else ""
+            draw.text((0, 26), f"BT:{bt_n} Cell:{cell_n}{_zig} Scans:{scans}", font=font_body, fill=255)
             draw.text((0, 37), gps_str[:22], font=font_body, fill=255)
 
             return img

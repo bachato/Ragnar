@@ -9156,6 +9156,25 @@ def wardriving_cells():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/wardriving/zigbee')
+def wardriving_zigbee():
+    """Get discovered Zigbee / 802.15.4 devices."""
+    try:
+        engine = _get_wardriving_engine()
+        session_id = request.args.get('session_id')
+        if session_id and (not engine.session or engine.session.session_id != session_id):
+            from wardriving import WardrivingSession
+            session = WardrivingSession(engine.data_dir, session_id=session_id)
+        elif engine.session:
+            session = engine.session
+        else:
+            return jsonify({'devices': [], 'total': 0})
+        devices = session.get_zigbee_devices()
+        return jsonify({'devices': devices, 'total': len(devices)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/wardriving/backfill_gps', methods=['POST'])
 def wardriving_backfill_gps():
     """Backfill missing GPS positions on networks / BT / cell rows from the

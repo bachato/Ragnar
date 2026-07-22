@@ -2,14 +2,14 @@
 
 ## Overview
 
-Ragnar's wardriving engine collects WiFi networks, BLE devices, cell towers, and GPS positions while driving. Data is stored in SQLite per session and can be exported to WiGLE CSV or KML.
+Ragnar's wardriving engine collects WiFi networks, BLE devices, Zigbee / 802.15.4 devices, cell towers, and GPS positions while driving. Data is stored in SQLite per session and can be exported to WiGLE CSV or KML.
 
 Ragnar supports **five operating modes**, in any combination — all five can run at the same time and merge into one session DB:
 
 | # | Mode | Hardware | What it adds |
 |---|------|----------|--------------|
 | 1 | **Standalone wardriver** | Raspberry Pi (or PC) with its built-in Wi-Fi and/or one or more USB Wi-Fi adapters | WiFi scanning via `iw`, multi-adapter antenna coverage |
-| 2 | **+ HuginnESP (USB)** | ESP32-S3-Touch-LCD-4B running [HuginnESP](https://github.com/PierreGode/HuginnESP) | Real-time WiFi + BLE + AirTag/Flipper/skimmer/pineapple detection |
+| 2 | **+ HuginnESP (USB)** | ESP32-S3-Touch-LCD-4B or ESP32-C5 running [HuginnESP](https://github.com/PierreGode/HuginnESP) | Real-time WiFi + BLE + AirTag/Flipper/skimmer/pineapple detection (+ Zigbee/802.15.4 on ESP32-C5) |
 | 3 | **+ Piglet (USB)** | Any [Piglet](https://github.com/Hamspiced/piglet) board (XIAO ESP32-S3/C5/C6, LilyGo T-Dongle C5) Works only with my fork till tested and aprooved by [Hamspiced](https://github.com/Hamspiced/), flash [here](https://pierregode.github.io/piglet/) | Live WiGLE-CSV stream over serial |
 | 4 | **+ Piglet Coordinator (USB)** | Dedicated [Coordinator](https://pierregode.github.io/Ragnar/) firmware on a Waveshare ESP32-C5 *or* ESP32-S3-Touch-LCD-4B | Receives records from a fleet of Piglet mesh nodes over ESP-Now and forwards them to Ragnar live |
 | 5 | **+ Piglet Core (USB)** | A regular Piglet board running mesh `core` mode, tethered to Ragnar | Same idea as #4 but on a standard Piglet — the Core scans locally *and* aggregates its mesh nodes, streaming the combined feed to Ragnar |
@@ -203,6 +203,24 @@ over-report. The companion status bar shows `2.4G` / `5G` alongside the total
 ```json
 {"type":"BLE","mac":"AA:BB:CC:DD:EE:FF","name":"DeviceName","rssi":-60}
 ```
+
+#### Zigbee / 802.15.4 Devices (JSON, one line per sighting)
+
+Emitted by HuginnESP builds with an IEEE 802.15.4 radio (ESP32-C5). Ragnar
+stores these in a dedicated `zigbee_devices` table and counts them separately
+from BLE — the live status bar and displays show a `Zigbee` total alongside
+`BT` and `Cell`, and `/api/wardriving/zigbee` returns the full list.
+
+```json
+{"type":"ZIGBEE","panid":"0x1A2B","addr":"AABBCCDDEEFF0011","short":"0x1234","channel":15,"rssi":-70,"lqi":180,"ftype":"beacon"}
+```
+
+Each device is identified by its 64-bit extended address (`addr` / EUI-64) when
+the frame carries one; otherwise Ragnar falls back to `"<panid>:<short>"` as the
+identity so a device is still counted once. `lqi` (link quality) and the
+802.15.4 `channel` (11–26) are retained; `ftype` (e.g. `beacon` / `data` /
+`cmd`) is stored as the device type. GPS is stamped from Ragnar's fix when the
+frame has none, exactly like WiFi/BLE rows.
 
 #### AirTag (multi-line, FILTERED + ALL mode)
 ```
