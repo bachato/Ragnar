@@ -216,6 +216,17 @@ BLE — the live status bar and displays show a **Thread / Zigbee** total
 alongside `BT` and `Cell`, the "Thread / Zigbee" table view lists them with a
 Proto column, and `/api/wardriving/zigbee` returns the full list.
 
+> **One C5 can't do WiFi *and* Zigbee at once.** WiFi, BLE and 802.15.4 share a
+> single 2.4 GHz radio on the ESP32-C5 — once 802.15.4 starts receiving, the WiFi
+> scan can't reclaim the radio, so the wardrive cycle is WiFi + BLE only. To
+> capture Zigbee/Thread **simultaneously**, add a **second Huginn** and give it
+> the Zigbee role: on the wardrive dashboard, each Huginn companion bar has a
+> **Role** selector — set the dedicated node to **"Zigbee / Thread only"** and
+> Ragnar sends it the `zigbee` command (parks WiFi/BLE, continuous 802.15.4
+> sniff) while the other keeps wardriving WiFi. The role is stored per serial
+> port (`wardriving_companion_roles`), applied live, and exposed at
+> `GET/POST /api/wardriving/companion_role`.
+
 > **WiGLE export is opt-in.** WiGLE has no standard 802.15.4 record type, so
 > Zigbee devices are **excluded from WiGLE CSV export by default**. Enable
 > **Config → Wardriving → Include Zigbee in WiGLE CSV** (`wardriving_wigle_include_zigbee`)

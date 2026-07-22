@@ -2591,8 +2591,13 @@ class WardrivingEngine:
             'esp_zigbee_count': self._esp_zigbee_count,
             'esp_alerts':    self._esp_alerts[-5:],
             'band_mode': self.band_mode,
-            # Multi-companion list: full per-device status for the UI
-            'companions': [c.as_dict() for c in self._companions.values()],
+            # Multi-companion list: full per-device status for the UI. Each gets
+            # its configured role ('wardrive' | 'zigbee') so the UI can show and
+            # toggle which Huginn is the dedicated Zigbee/Thread node.
+            'companions': [
+                {**c.as_dict(), 'role': self._companion_role(c)}
+                for c in self._companions.values()
+            ],
         }
         # Interface details (cached 30s — sysfs/udev calls are slow)
         now_if = time.time()
@@ -4008,19 +4013,41 @@ class WardrivingEngine:
         companion.connected = False
         logger.info(f"Serial listener stopped for {companion.port}")
 
+    def _companion_role(self, companion: '_CompanionState') -> str:
+        """Role for a Huginn companion, keyed by serial port.
+
+        'wardrive' (default) = WiFi + BLE wardriving.
+        'zigbee'             = 802.15.4 (Zigbee/Thread) only. On the C5 the one
+                               2.4 GHz radio can't do WiFi and 802.15.4 at once,
+                               so a dedicated second Huginn is put in this role to
+                               sniff Zigbee while the first does WiFi.
+        """
+        roles = self.shared_data.config.get('wardriving_companion_roles', {}) or {}
+        return 'zigbee' if roles.get(companion.port) == 'zigbee' else 'wardrive'
+
+    @staticmethod
+    def _role_command(role: str):
+        # (serial command, esp_mode label, is_wardrive)
+        if role == 'zigbee':
+            return (b"zigbee\r\n", 'zigbee', False)
+        return (b"wardrive\r\n", 'wardrive', True)
+
     def _run_huginn_wardrive_loop(self, ser, companion: '_CompanionState'):
-        companion.current_esp_mode = 'wardrive'
+        active_role = self._companion_role(companion)
+        cmd, mode, in_wd = self._role_command(active_role)
+        companion.current_esp_mode = mode
         try:
             self._drain_huginn_queue(ser, companion)
             ser.reset_input_buffer()
-            ser.write(b"wardrive\r\n")
-            companion.in_wardrive = True
-            logger.info(f"HuginnESP {companion.port}: entered fast wardrive mode")
+            ser.write(cmd)
+            companion.in_wardrive = in_wd
+            logger.info(f"HuginnESP {companion.port}: entered {mode} mode")
         except Exception as e:
-            logger.warning(f"Failed to start Huginn wardrive mode on {companion.port}: {e}")
+            logger.warning(f"Failed to start Huginn {mode} mode on {companion.port}: {e}")
             return
 
         last_config_drain = time.time()
+        last_role_check = time.time()
         while self._running and companion.port in self._companions:
             try:
                 raw = ser.readline()
@@ -4032,8 +4059,23 @@ class WardrivingEngine:
                 if now - last_config_drain > 5:
                     self._drain_huginn_queue(ser, companion)
                     last_config_drain = now
+                # Live role switch (from the Ragnar UI) without a replug.
+                if now - last_role_check > 3:
+                    last_role_check = now
+                    new_role = self._companion_role(companion)
+                    if new_role != active_role:
+                        active_role = new_role
+                        cmd, mode, in_wd = self._role_command(active_role)
+                        try:
+                            ser.reset_input_buffer()
+                            ser.write(cmd)
+                            companion.current_esp_mode = mode
+                            companion.in_wardrive = in_wd
+                            logger.info(f"HuginnESP {companion.port}: switched to {mode} mode")
+                        except Exception as e:
+                            logger.warning(f"Role switch failed on {companion.port}: {e}")
             except Exception as e:
-                logger.debug(f"Serial read error (wardrive) on {companion.port}: {e}")
+                logger.debug(f"Serial read error (huginn) on {companion.port}: {e}")
                 break
 
         if companion.serial_entry_buffer.get('bssid'):
