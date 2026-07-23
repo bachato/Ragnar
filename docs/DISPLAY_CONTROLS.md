@@ -167,7 +167,7 @@ counter):
 ### Network Diagnostic mode
 
 Navigated as **cards**: `LINK · IP · SWITCH · DHCP · WIFI · SIGNAL · SPECTRUM ·
-IFACE`.
+IFACE · BT · ZIGBEE`.
 
 | Input | Action |
 |-------|--------|
@@ -194,6 +194,24 @@ adapter present** (so a tri-band dongle like the **Alfa AWUS036AXM** is used for
 name in the header — a band reads *"not supported"* when the chosen radio can't
 reach it. See the full
 [field‑test pad](nettools.md#field-test-pad-144-lcd-hat--joystick) table.
+
+The **BT** and **ZIGBEE** cards cover the other two occupants of 2.4 GHz, so the
+band's whole story is on the panel next to SPECTRUM. Both are **one-shot**: the
+centre press runs a scan (~8 s) and the card then shows that result until you
+scan again — unlike the Wi-Fi cards nothing polls in the background, because BT
+discovery and an 802.15.4 sniff each cost radio time and the auto-cycle would
+otherwise re-trigger them every few seconds. Each card shows the device count,
+an **Age** so a stale scan doesn't read as live, and the strongest few
+neighbours as signal bars:
+
+| Card | Needs | Shows |
+|------|-------|-------|
+| **BT** | a BlueZ controller (`rfkill unblock bluetooth`) | Devices, LE/Classic split, close-by count, adapter, and the Wi-Fi channel under the most BT pressure; then the loudest devices by name/vendor + RSSI |
+| **ZIGBEE** | a **HuginnESP** companion with an 802.15.4 radio (ESP32-C5/C6/H2) | Devices, distinct channels, close-by count, busiest channel; then the loudest devices as `c<channel> <addr>` + RSSI |
+
+When the hardware isn't there the card says why in short (`no adapter`,
+`no Huginn`, `no 15.4 rx`, `port busy`) and the press retries. These two cards
+are LCD-HAT only — the 2.7" e‑paper HAT still cycles just LINK/IP/SWITCH.
 
 The **IFACE** card picks which NIC the egress tests (**Speedtest**, **Ping GW**,
 **Ping WAN**) originate from: ↑/↓ highlights **Auto** or an interface, the
