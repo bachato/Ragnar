@@ -2120,6 +2120,8 @@
                         <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none"><input type="checkbox" id="wifi-auto" class="accent-Ragnar-600"> Auto-refresh (8s)</label>
                         <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none" title="Overlay Bluetooth / BLE device activity on the 2.4 GHz band (device-discovery estimate, not measured RF)"><input type="checkbox" id="wifi-bt" class="accent-sky-500"> <span class="text-sky-400">📶 Bluetooth</span></label>
                         <span id="wifi-bt-status" class="text-xs text-sky-500/70"></span>
+                        <label id="wifi-zb-label" class="flex items-center gap-2 text-xs opacity-40 cursor-not-allowed select-none" title="Connect a HuginnESP (ESP32-C5) companion to sniff Zigbee / 802.15.4"><input type="checkbox" id="wifi-zb" disabled class="accent-amber-500"> <span class="text-amber-400">🐝 Zigbee</span></label>
+                        <span id="wifi-zb-status" class="text-xs text-amber-500/70"></span>
                         <span id="wifi-status" class="text-xs text-gray-500 ml-auto"></span>
                     </div>
                 </div>
@@ -2154,6 +2156,28 @@
                                 </tr>
                             </thead>
                             <tbody id="wifi-bt-tbody" class="text-gray-300"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Zigbee / 802.15.4 overlay (hidden until toggled) -->
+                <div id="wifi-zb-panel" class="hidden glass rounded-xl p-4 mb-4">
+                    <div class="flex flex-wrap items-center gap-3 mb-3">
+                        <h3 class="text-sm font-semibold text-amber-300">🐝 Zigbee / 802.15.4 on 2.4 GHz</h3>
+                        <span id="wifi-zb-summary" class="text-xs text-gray-400"></span>
+                        <span id="wifi-zb-pressure" class="flex flex-wrap gap-2 text-xs ml-auto"></span>
+                    </div>
+                    <p class="text-[11px] text-gray-500 mb-3" id="wifi-zb-note"></p>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-xs">
+                            <thead class="text-gray-500 border-b border-slate-700">
+                                <tr class="text-left">
+                                    <th class="py-1 pr-3">Device</th><th class="py-1 pr-3">Proto</th>
+                                    <th class="py-1 pr-3">Ch</th><th class="py-1 pr-3">PAN ID</th>
+                                    <th class="py-1 pr-3">Vendor</th><th class="py-1 pr-3 text-right">RSSI</th>
+                                </tr>
+                            </thead>
+                            <tbody id="wifi-zb-tbody" class="text-gray-300"></tbody>
                         </table>
                     </div>
                 </div>
@@ -6744,7 +6768,7 @@
 
     <!-- JavaScript -->
     <script src="/web/scripts/skyview.js?v=20260721-skyview-live"></script>
-    <script src="/web/scripts/ragnar_modern.js?v=20260723-wf-btn"></script>
+    <script src="/web/scripts/ragnar_modern.js?v=20260723-zigbee"></script>
 
 </body>
 </html>

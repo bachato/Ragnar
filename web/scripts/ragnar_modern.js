@@ -1284,6 +1284,7 @@ function showNetworkSubtab(name) {
 // Passive tri-band survey. Backend: /api/net/wifi/* (wifi_analyzer.py)
 // ============================================================================
 const _wifiState = { iface: '', band: 'all', view: 'bar', data: null, selected: null, auto: null, inited: false, bt: null, btOn: false, btBusy: false, btSelected: null,
+    zb: null, zbOn: false, zbBusy: false, zbSelected: null, zbAvailable: false,
     sdr: { available: false, running: false, band: '2.4', bandMhz: null, floor: -120, seq: 0, rows: [], maxhold: null, poll: null, statusPoll: null, error: null } };
 
 const _WIFI_BAND_COLOR = { '2.4': '#f59e0b', '5': '#38bdf8', '6': '#a78bfa' };
@@ -1361,6 +1362,16 @@ function wifiInit() {
             if (_wifiState.btOn) wifiBtScan();
             else { if (_wifiState.data) _wifiDrawSpectrum(); }
         });
+        // Zigbee overlay toggle (gated on a Huginn companion being present)
+        const zbChk = document.getElementById('wifi-zb');
+        if (zbChk) zbChk.addEventListener('change', (e) => {
+            if (zbChk.disabled) { e.target.checked = false; return; }
+            _wifiState.zbOn = e.target.checked;
+            const panel = document.getElementById('wifi-zb-panel');
+            if (panel) panel.classList.toggle('hidden', !_wifiState.zbOn);
+            if (_wifiState.zbOn) wifiZbScan();
+            else { if (_wifiState.data) _wifiDrawSpectrum(); }
+        });
         ['wifi-tx', 'wifi-ple'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.addEventListener('change', () => { if (_wifiState.selected) wifiSelectAp(_wifiState.selected); });
@@ -1371,8 +1382,9 @@ function wifiInit() {
     wifiHeatmapLoad();
     _wifiFillIfaces();
     _wifiSdrCheck();
+    _wifiZbCheck();
     if (!_wifiState.sdr.statusPoll)
-        _wifiState.sdr.statusPoll = setInterval(_wifiSdrCheck, 15000);
+        _wifiState.sdr.statusPoll = setInterval(() => { _wifiSdrCheck(); _wifiZbCheck(); }, 15000);
     window.addEventListener('beforeunload', () => { if (_wifiState.sdr.running) _wifiSdrStop(); });
 }
 
@@ -1476,6 +1488,84 @@ function _wifiBtRender() {
 function wifiBtSelect(mac) {
     _wifiState.btSelected = (_wifiState.btSelected === mac) ? null : mac;
     _wifiBtRender();
+    if (_wifiState.data) _wifiDrawSpectrum();
+}
+
+// ---- Zigbee / 802.15.4 overlay (via an on-demand Huginn sniff) -------------
+// The Zigbee toggle stays greyed until a HuginnESP companion is on USB.
+function _wifiZbCheck() {
+    fetch('/api/net/zigbee/status').then(r => r.json()).then(st => {
+        const ok = !!(st && st.available);
+        _wifiState.zbAvailable = ok;
+        const chk = document.getElementById('wifi-zb'), lab = document.getElementById('wifi-zb-label');
+        if (chk) chk.disabled = !ok;
+        if (lab) {
+            lab.classList.toggle('opacity-40', !ok);
+            lab.classList.toggle('cursor-not-allowed', !ok);
+            lab.classList.toggle('cursor-pointer', ok);
+            lab.classList.toggle('text-gray-400', ok);
+            lab.title = ok ? 'Sniff Zigbee / 802.15.4 with the connected HuginnESP'
+                : (st && st.error ? st.error : 'Connect a HuginnESP (ESP32-C5) companion to sniff Zigbee');
+        }
+    }).catch(() => {});
+}
+
+function wifiZbScan() {
+    if (_wifiState.zbBusy) return;
+    _wifiState.zbBusy = true;
+    const st = document.getElementById('wifi-zb-status');
+    if (st) st.textContent = 'Sniffing 802.15.4 (ch 11–26)…';
+    fetch('/api/net/zigbee/scan?duration=8').then(r => r.json()).then(d => {
+        _wifiState.zbBusy = false;
+        if (d.error) { if (st) st.textContent = '⚠ ' + d.error; _wifiState.zb = null; if (_wifiState.data) _wifiDrawSpectrum(); return; }
+        _wifiState.zb = d;
+        if (_wifiState.zbSelected && !(d.devices || []).some(v => (v.addr || v.short_addr) === _wifiState.zbSelected))
+            _wifiState.zbSelected = null;
+        const i = d.interference || {};
+        if (st) st.textContent = `${d.device_count} device(s) · ${i.channel_count || 0} ch` + (d.warning ? ' ⚠' : '');
+        _wifiZbRender();
+        if (_wifiState.data) _wifiDrawSpectrum();
+    }).catch(() => { _wifiState.zbBusy = false; if (st) st.textContent = 'Zigbee scan failed'; });
+}
+
+function _wifiZbRender() {
+    const d = _wifiState.zb; if (!d) return;
+    const i = d.interference || {};
+    const sum = document.getElementById('wifi-zb-summary');
+    if (sum) sum.textContent = `${i.device_count || 0} device(s) · ${i.channel_count || 0} channel(s) · ${i.strong_count || 0} close`;
+    const note = document.getElementById('wifi-zb-note');
+    if (note) note.textContent = (i.note || '') + '  ' + (d.companion_note || '');
+    const pr = document.getElementById('wifi-zb-pressure');
+    if (pr) pr.innerHTML = (i.wifi_channels || []).map(c => {
+        const col = _BT_PRESSURE_COLOR[c.level] || '#64748b';
+        return `<span class="px-1.5 py-0.5 rounded" style="background:${col}22;color:${col};border:1px solid ${col}55" title="Estimated Zigbee pressure on Wi-Fi ch ${c.wifi_channel}">ch${c.wifi_channel}: ${c.level}</span>`;
+    }).join('');
+    const tb = document.getElementById('wifi-zb-tbody');
+    if (!tb) return;
+    if (!d.devices.length) {
+        tb.innerHTML = '<tr><td colspan="6" class="py-3 text-gray-500">No Zigbee / 802.15.4 devices heard this sweep.</td></tr>';
+        return;
+    }
+    tb.innerHTML = d.devices.map(v => {
+        const id = v.addr || v.short_addr;
+        const sel = _wifiState.zbSelected === id;
+        const rssi = (v.rssi == null) ? '—' : `${v.rssi}`;
+        const rcol = (v.rssi == null) ? '#64748b' : _wifiSignalColor(v.rssi);
+        const pcol = v.proto === 'Thread' ? '#f472b6' : v.proto === 'Zigbee' ? '#fbbf24' : '#94a3b8';
+        return `<tr class="border-b border-slate-800/60 cursor-pointer hover:bg-slate-800/40${sel ? ' bg-amber-500/15' : ''}" onclick="wifiZbSelect('${id}')" title="Click to highlight on the spectrum">
+            <td class="py-1 pr-3">${sel ? '<span class="text-amber-400">▸</span> ' : ''}<span class="font-mono text-[10px]">${id}</span></td>
+            <td class="py-1 pr-3"><span style="color:${pcol}">${v.proto}</span></td>
+            <td class="py-1 pr-3">${v.channel != null ? v.channel : '—'}</td>
+            <td class="py-1 pr-3 font-mono text-[10px]">${v.panid || '—'}</td>
+            <td class="py-1 pr-3">${v.vendor || '—'}</td>
+            <td class="py-1 pr-3 text-right font-mono" style="color:${rcol}">${rssi}</td>
+        </tr>`;
+    }).join('');
+}
+
+function wifiZbSelect(id) {
+    _wifiState.zbSelected = (_wifiState.zbSelected === id) ? null : id;
+    _wifiZbRender();
     if (_wifiState.data) _wifiDrawSpectrum();
 }
 
@@ -2033,6 +2123,53 @@ function _wifiDrawSpectrum() {
     // Bluetooth / BLE overlay on the 2.4 GHz segment (device-activity estimate)
     if (_wifiState.btOn && _wifiState.bt && ranges['2.4']) {
         _wifiDrawBtOverlay(ctx, ranges['2.4'], xFor, { padT, padB, H, plotH, yFor });
+    }
+    // Zigbee / 802.15.4 overlay on the 2.4 GHz segment (device-activity estimate)
+    if (_wifiState.zbOn && _wifiState.zb && ranges['2.4']) {
+        _wifiDrawZbOverlay(ctx, ranges['2.4'], xFor, { padT, padB, H, plotH, yFor });
+    }
+}
+
+// Draw Zigbee channel markers (11–26) on the 2.4 GHz segment: a labelled tick
+// per occupied channel, intensity by activity, plus a selected-device RSSI line.
+function _wifiDrawZbOverlay(ctx, r24, xFor, g) {
+    const i = (_wifiState.zb.interference) || {};
+    const baseY = g.H - g.padB;
+    const zbX = (freqMhz) => {
+        const chFrac = (freqMhz - 2407) / 5;
+        return Math.max(r24.x0 + 2, Math.min(r24.x1 - 2, xFor('2.4', chFrac)));
+    };
+    const sel = _wifiState.zbSelected
+        ? (_wifiState.zb.devices || []).find(v => (v.addr || v.short_addr) === _wifiState.zbSelected)
+        : null;
+    const dim = sel ? 0.35 : 1.0;
+    // Per-channel markers (amber), height scaled by intensity.
+    (i.markers || []).forEach(m => {
+        if (!m.freq_mhz) return;
+        const x = zbX(m.freq_mhz);
+        const intensity = Math.max(0, Math.min(100, m.intensity || 0));
+        const h = (g.plotH || (baseY - g.padT)) * (0.15 + 0.35 * intensity / 100);
+        const yTop = baseY - h;
+        ctx.strokeStyle = `rgba(251,191,36,${(0.35 + intensity / 100 * 0.5) * dim})`;
+        ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x, yTop); ctx.lineTo(x, baseY); ctx.stroke();
+        ctx.fillStyle = `rgba(253,230,138,${dim})`; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('Z' + m.channel, x, yTop - 3);
+        if (m.count > 1) ctx.fillText('×' + m.count, x, yTop + 9);
+    });
+    // Selected device: RSSI level line + emphasised marker on its channel.
+    if (sel && sel.rssi != null && sel.freq_mhz) {
+        const yR = g.yFor(sel.rssi);
+        const col = _wifiSignalColor(sel.rssi);
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(r24.x0, yR); ctx.lineTo(r24.x1, yR); ctx.stroke(); ctx.setLineDash([]);
+        const x = zbX(sel.freq_mhz);
+        ctx.strokeStyle = col; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.moveTo(x, yR); ctx.lineTo(x, baseY); ctx.stroke();
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, yR, 4, 0, 2 * Math.PI); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+        const nm = sel.vendor || sel.addr || sel.short_addr;
+        ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText(`${(nm || '').slice(0, 20)}  ${sel.proto} ch${sel.channel}  ${sel.rssi} dBm`, r24.x0 + 3, yR - 5);
     }
 }
 
