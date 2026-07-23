@@ -314,6 +314,36 @@ while the onboard radio is **UART**, so the scanner prefers the USB controller
 time-share the RF front-end, so the overlay is best-effort and duty-cycled —
 running BT discovery and Wi-Fi monitor capture flat-out can cost frames on both.
 
+## True-RF Waterfall (HackRF SDR)
+
+The Bar and Dome views draw the *beacon* picture (what APs announce). The
+**📈 Waterfall** view is different: it measures the **actual radio energy on the
+air** with a Software Defined Radio — so it sees what nothing else here can:
+microwave ovens, drones, analog cameras, jammers, the true noise floor, and
+Wi-Fi/BT energy as *measured* rather than modelled.
+
+**The button stays greyed out until Ragnar actually detects a HackRF.** The UI
+polls `/api/net/sdr/status` and only un-greys 📈 Waterfall when the `hackrf`
+tools are installed **and** a board answers; otherwise the tooltip tells you
+what's missing. Bar/Dome keep working with no SDR at all.
+
+**What it shows** — a live **spectrum line** with **max-hold** on top, above a
+scrolling **time × frequency × power waterfall**, with your Wi-Fi channel ticks
+(and BT advertising markers in 2.4 GHz) overlaid on the measured energy. Change
+the band selector to retune the sweep (2.4 / 5 GHz).
+
+**How it works** — `sdr_spectrum.py` runs `hackrf_sweep -f LO:HI`, parses its
+power-per-bin CSV, assembles each sweep into a fixed-width frame plus a
+cumulative max-hold, and streams frames to the browser. **Receive-only** — an
+SDR sweep never transmits.
+
+**Hardware.** Needs a **HackRF One** (1 MHz–6 GHz — covers 2.4 *and* 5 GHz).
+The cheap RTL-SDR only reaches ~1.7 GHz and **cannot** see these bands. Install
+the tools with `apt install hackrf` (done by `install_ragnar.sh` / ensured by
+`update_ragnar.sh`). The HackRF draws real USB current — a **powered USB hub** is
+recommended on the Pi. Wi-Fi 6 GHz is within HackRF's range but its band edges
+vary by region, so only 2.4/5 ship as presets.
+
 ## Hardware
 
 Tuned for the **Alfa AWUS036AXM** (MediaTek MT7921AU, `mt7921u` driver — a
@@ -344,6 +374,11 @@ All endpoints are passive and read-only except the heatmap store.
 | `GET /api/net/bt/controllers` | Bluetooth controllers (USB-first: Alfa before onboard) |
 | `GET /api/net/bt/scan?controller=&duration=` | BT/BLE discovery + 2.4 GHz interference model |
 | `GET /api/net/bt/selftest` | Bluetooth parser + model self-test |
+| `GET /api/net/sdr/status` | HackRF detection (gates the Waterfall button) + capture state |
+| `POST /api/net/sdr/start` `{band}` | start the HackRF sweep (2.4/5) |
+| `POST /api/net/sdr/stop` | stop the sweep |
+| `GET /api/net/sdr/frames?since=` | new waterfall frames + max-hold since a seq |
+| `GET /api/net/sdr/selftest` | sweep parser + frame-assembly self-test |
 
 ```bash
 python3 wifi_analyzer.py interfaces
@@ -355,6 +390,11 @@ python3 wifi_analyzer.py selftest
 python3 bt_scanner.py controllers
 python3 bt_scanner.py scan --duration 12
 python3 bt_scanner.py selftest
+
+# True-RF waterfall (sdr_spectrum.py — needs a HackRF)
+python3 sdr_spectrum.py detect
+python3 sdr_spectrum.py sweep --band 2.4 --frames 5
+python3 sdr_spectrum.py selftest
 ```
 
 The Bluetooth scanner ships its own offline self-test — **28 checks** covering

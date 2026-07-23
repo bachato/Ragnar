@@ -39,6 +39,7 @@ import tls_watch
 import wifi_analyzer
 import wifi_defense
 import bt_scanner
+import sdr_spectrum
 from ldap_watch import do_ldap_watch
 from tls_watch import do_tls_watch
 
@@ -14963,6 +14964,45 @@ def register_network_diagnostics(app, logger=None):
     def net_bt_selftest():
         _log("net/bt/selftest")
         return jsonify(bt_scanner.selftest())
+
+    # ------------------------------------------------------------------
+    # True-RF spectrum / waterfall via a HackRF SDR (sdr_spectrum.py).
+    # Measures actual on-air energy (any protocol). Receive-only. The UI
+    # gates the Waterfall view on /status.available (device present).
+    # ------------------------------------------------------------------
+    @app.route('/api/net/sdr/status', methods=['GET'])
+    def net_sdr_status():
+        _log("net/sdr/status")
+        return jsonify(sdr_spectrum.status())
+
+    @app.route('/api/net/sdr/start', methods=['POST'])
+    def net_sdr_start():
+        data = request.get_json(silent=True) or {}
+        band = (data.get('band') or '2.4').strip()
+        if band not in sdr_spectrum.BANDS:
+            return _bad('Invalid band')
+        lna = data.get('lna')
+        vga = data.get('vga')
+        _log(f"net/sdr/start band={band}")
+        return jsonify(sdr_spectrum.start(band=band, lna=lna, vga=vga))
+
+    @app.route('/api/net/sdr/stop', methods=['POST'])
+    def net_sdr_stop():
+        _log("net/sdr/stop")
+        return jsonify(sdr_spectrum.stop())
+
+    @app.route('/api/net/sdr/frames', methods=['GET'])
+    def net_sdr_frames():
+        try:
+            since = int(request.args.get('since', 0))
+        except (TypeError, ValueError):
+            return _bad('Invalid since')
+        return jsonify(sdr_spectrum.get_frames(since=since))
+
+    @app.route('/api/net/sdr/selftest', methods=['GET'])
+    def net_sdr_selftest():
+        _log("net/sdr/selftest")
+        return jsonify(sdr_spectrum.selftest())
 
     # ------------------------------------------------------------------
     # WiFi Defense — 802.11 frame monitor / WIDS (wifi_defense.py).

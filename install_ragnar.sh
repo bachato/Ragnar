@@ -435,6 +435,7 @@ install_dependencies() {
         "bluez"
         "bluez-tools"
         "python3-dbus"
+        "hackrf"
         "bridge-utils"
         "python3-pil"
         "libjpeg-dev"
