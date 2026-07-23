@@ -117,10 +117,11 @@ NETDIAG_CYCLE_SECONDS = 5
 
 # Wardriving screens on the 1.44" ST7735S LCD HAT (128x128), paged with the
 # joystick while wardriving runs. Mirrored by lcdhat_input.WARDRIVE_PAGE_COUNT.
-#   0=STATS  1=MAP  2=GPS  3=SESSION  4=VIKING
+#   0=STATS  1=MAP  2=GPS  3=SKY  4=SESSION  5=VIKING
 # The 2.7" e-paper HAT is unaffected — it keeps its KEY3 stats/map toggle.
-WARDRIVE_PAGE_COUNT = 5
-WD_PAGE_STATS, WD_PAGE_MAP, WD_PAGE_GPS, WD_PAGE_SESSION, WD_PAGE_VIKING = range(5)
+WARDRIVE_PAGE_COUNT = 6
+(WD_PAGE_STATS, WD_PAGE_MAP, WD_PAGE_GPS, WD_PAGE_SKY,
+ WD_PAGE_SESSION, WD_PAGE_VIKING) = range(6)
 
 class Display:
     def __init__(self, shared_data):
@@ -2214,6 +2215,8 @@ class Display:
             self._render_wd_compact_map(image, draw, wd)
         elif page == WD_PAGE_GPS:
             self._render_wd_compact_gps(image, draw, wd)
+        elif page == WD_PAGE_SKY:
+            self._render_wd_compact_sky(image, draw, wd)
         elif page == WD_PAGE_SESSION:
             self._render_wd_compact_session(image, draw, wd)
         elif page == WD_PAGE_VIKING:
@@ -2451,6 +2454,85 @@ class Display:
             rows.append(("Crs", f"{course:.0f}"))
 
         self._wd_compact_rows(draw, rows, int(15 * sy), footer_y)
+
+    def _wd_sky_data(self):
+        """Per-satellite sky list (constellation/az/elev/snr) from the live GPS,
+        for the compact SKY screen. Pulled straight off the running engine's
+        GPSManager (the same get_sky_view() the web sky view polls) since the
+        wardriving status dict doesn't carry the per-satellite detail. Returns
+        [] when GPS isn't running or nothing is being tracked."""
+        try:
+            from webapp_modern import _get_wardriving_engine
+            engine = _get_wardriving_engine()
+            if engine and getattr(engine, '_gps', None) and engine._running:
+                return engine._gps.get_sky_view() or []
+        except Exception:
+            pass
+        return []
+
+    def _render_wd_compact_sky(self, image, draw, wd):
+        """Compact GPS sky view — a polar plot of the satellites in view, the
+        graphical twin of the web sky view. North is up, the outer circle is the
+        horizon (elevation 0°) and the centre is the zenith (90°); each satellite
+        sits at its azimuth/elevation. Dots are filled for a strong signal and
+        hollow for a weak one, so a glance shows both geometry and fix quality."""
+        sx = getattr(self, 'render_sx', self.scale_factor_x)
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        w = getattr(self, 'render_w', self.shared_data.width)
+        font = self.shared_data.font_arial9
+        footer_y = self._draw_wd_compact_chrome(draw, title="SKY")
+        if self._wd_compact_not_running(draw, wd):
+            return
+
+        top = int(15 * sy)
+        bottom = footer_y - int(2 * sy)
+        cx = w / 2.0
+        cy = (top + bottom) / 2.0
+        radius = min(w / 2.0, (bottom - top) / 2.0) - int(9 * sx)
+
+        # Horizon + a mid ring at elevation 45°, then the N/E/S/W crosshairs so
+        # the azimuth of each satellite is readable.
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=0)
+        mid = radius / 2.0
+        draw.ellipse((cx - mid, cy - mid, cx + mid, cy + mid), outline=0)
+        draw.line((cx, cy - radius, cx, cy + radius), fill=0)
+        draw.line((cx - radius, cy, cx + radius, cy), fill=0)
+
+        for lbl, dx, dy in (("N", 0, -1), ("S", 0, 1), ("E", 1, 0), ("W", -1, 0)):
+            lw = font.getlength(lbl)
+            lx = cx + dx * (radius + int(6 * sx)) - lw / 2.0
+            ly = cy + dy * (radius + int(6 * sy)) - int(5 * sy)
+            draw.text((lx, ly), lbl, font=font, fill=0)
+
+        sats = self._wd_sky_data()
+        if not sats:
+            gps = (wd.get('gps') or {})
+            msg = "Searching..." if gps.get('connected') else "No GPS"
+            draw.text(((w - font.getlength(msg)) / 2, cy - int(4 * sy)),
+                      msg, font=font, fill=0)
+            return
+
+        plotted = 0
+        for s in sats:
+            az, elev = s.get('az'), s.get('elev')
+            if not isinstance(az, (int, float)) or not isinstance(elev, (int, float)):
+                continue
+            elev = max(0.0, min(90.0, float(elev)))
+            r = radius * (90.0 - elev) / 90.0
+            a = math.radians(float(az))
+            x = cx + r * math.sin(a)
+            y = cy - r * math.cos(a)
+            snr = s.get('snr')
+            strong = isinstance(snr, (int, float)) and snr >= 25
+            dot = int(2 * sx)
+            if strong:
+                draw.ellipse((x - dot, y - dot, x + dot, y + dot), fill=0)
+            else:
+                draw.ellipse((x - dot, y - dot, x + dot, y + dot), outline=0)
+            plotted += 1
+
+        cnt = f"{plotted} sat"
+        draw.text((int(3 * sx), top), cnt, font=font, fill=0)
 
     def _render_wd_compact_session(self, image, draw, wd):
         """Compact session totals — the running tally the stats page's band

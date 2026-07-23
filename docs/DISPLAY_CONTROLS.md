@@ -141,7 +141,7 @@ become wardriving actions:
 | **KEY2** | **Reconnect** to a known Wi‑Fi (wardriving keeps running) |
 | **KEY3** | **Start / stop** the phone-access AP |
 
-The screens, in carousel order (the footer shows the key hints and an `n/5`
+The screens, in carousel order (the footer shows the key hints and an `n/6`
 counter):
 
 | # | Screen | Shows |
@@ -149,8 +149,9 @@ counter):
 | 1 | **STATS** | 2.4 / 5 / 6 GHz counts as big numbers, GPS, speed, companion |
 | 2 | **MAP** | Live GPS breadcrumb + located networks, auto-scaled, current fix ringed |
 | 3 | **GPS** | Lat / lon / altitude, satellites used-in-view, HDOP, speed, course |
-| 4 | **SESSION** | Session duration, total networks, open, WEP, Bluetooth, cells, trackpoints |
-| 5 | **VIKING** | The Ragnar viking filling the panel — the "still alive?" glance screen |
+| 4 | **SKY** | Polar sky view — satellites plotted by azimuth/elevation (North up, horizon = outer ring, zenith = centre); filled dot = strong signal, hollow = weak |
+| 5 | **SESSION** | Session duration, total networks, open, WEP, Bluetooth, cells, trackpoints |
+| 6 | **VIKING** | The Ragnar viking filling the panel — the "still alive?" glance screen |
 
 > **KEY1 does not stop wardriving** — it only steps the display off the main
 > page, which is where the wardriving render overrides the dashboard. The
