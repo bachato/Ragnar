@@ -5557,6 +5557,18 @@ def update_config():
         # Save configuration
         shared_data.save_config()
 
+        # On-Screen Network Diagnostic mode and wardriving both own the e-Paper
+        # panel + HAT keys and can't coexist (the diagnostic layer wins the
+        # display render race). Turning diagnostic mode ON stops any live
+        # wardriving session so the panel isn't left in a half-and-half state.
+        if data.get('network_diagnostic_mode') is True:
+            try:
+                if _wardriving_engine is not None and getattr(_wardriving_engine, '_running', False):
+                    logger.info("Stopping wardriving: On-Screen Network Diagnostic mode enabled (mutually exclusive).")
+                    _wardriving_engine.stop()
+            except Exception as e:
+                logger.warning(f"Could not stop wardriving when enabling diagnostic mode: {e}")
+
         # Auto-install pyserial when wardriving is enabled
         if data.get('wardriving_enabled') is True:
             try:
@@ -8778,6 +8790,29 @@ def _get_wardriving_engine():
         _wardriving_engine = WardrivingEngine(shared_data)
     return _wardriving_engine
 
+def _disable_netdiag_for_wardriving(reason):
+    """Turn On-Screen Network Diagnostic mode off (persisting + notifying the UI).
+
+    Wardriving and diagnostic mode both take over the e-Paper panel and the HAT
+    keys, and the diagnostic layer wins the display render race, so they can't be
+    on at the same time. Called whenever wardriving takes the screen. No-op if
+    diagnostic mode is already off. Returns True if it flipped the flag.
+    """
+    if not shared_data.config.get('network_diagnostic_mode', False):
+        return False
+    logger.info(f"Disabling On-Screen Network Diagnostic mode: {reason}.")
+    shared_data.config['network_diagnostic_mode'] = False
+    setattr(shared_data, 'network_diagnostic_mode', False)
+    try:
+        shared_data.save_config()
+    except Exception as e:
+        logger.warning(f"Could not persist network_diagnostic_mode off: {e}")
+    try:
+        socketio.emit('config_updated', shared_data.config)
+    except Exception:
+        pass
+    return True
+
 @app.route('/api/wardriving/status')
 def wardriving_status():
     """Get wardriving engine status."""
@@ -8818,6 +8853,11 @@ def wardriving_start():
     try:
         if not shared_data.config.get('wardriving_enabled', False):
             return jsonify({'error': 'Wardriving not enabled in config'}), 400
+        # Wardriving and On-Screen Network Diagnostic mode are mutually exclusive:
+        # both own the e-Paper panel + HAT keys and the diagnostic layer wins the
+        # render race (display.py), which would strand the screen on the netdiag
+        # field-test view. Starting wardriving turns diagnostic mode off.
+        _disable_netdiag_for_wardriving('wardriving session started')
         data = request.get_json(silent=True) or {}
         interfaces = data.get('interfaces')  # optional list
         gps_port = data.get('gps_port')      # optional
