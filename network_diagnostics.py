@@ -40,6 +40,7 @@ import wifi_analyzer
 import wifi_defense
 import bt_scanner
 import sdr_spectrum
+import zigbee_scan
 from ldap_watch import do_ldap_watch
 from tls_watch import do_tls_watch
 
@@ -15003,6 +15004,33 @@ def register_network_diagnostics(app, logger=None):
     def net_sdr_selftest():
         _log("net/sdr/selftest")
         return jsonify(sdr_spectrum.selftest())
+
+    # ------------------------------------------------------------------
+    # Zigbee / 802.15.4 overlay via an on-demand HuginnESP sniff
+    # (zigbee_scan.py + zigbee_overlay.py). Receive-only. The UI gates the
+    # Zigbee toggle on /status.available (a Huginn companion is present).
+    # ------------------------------------------------------------------
+    @app.route('/api/net/zigbee/status', methods=['GET'])
+    def net_zigbee_status():
+        _log("net/zigbee/status")
+        return jsonify(zigbee_scan.detect())
+
+    @app.route('/api/net/zigbee/scan', methods=['GET'])
+    def net_zigbee_scan():
+        port = (request.args.get('port') or '').strip() or None
+        if port is not None and not zigbee_scan._valid_port(port):
+            return _bad('Invalid port')
+        try:
+            dur = int(request.args.get('duration', zigbee_scan._DEFAULT_DURATION))
+        except (TypeError, ValueError):
+            return _bad('Invalid duration')
+        _log(f"net/zigbee/scan port={port} {dur}s")
+        return jsonify(zigbee_scan.scan(port=port, duration=dur))
+
+    @app.route('/api/net/zigbee/selftest', methods=['GET'])
+    def net_zigbee_selftest():
+        _log("net/zigbee/selftest")
+        return jsonify(zigbee_scan.selftest())
 
     # ------------------------------------------------------------------
     # WiFi Defense — 802.11 frame monitor / WIDS (wifi_defense.py).

@@ -314,6 +314,31 @@ while the onboard radio is **UART**, so the scanner prefers the USB controller
 time-share the RF front-end, so the overlay is best-effort and duty-cycled —
 running BT discovery and Wi-Fi monitor capture flat-out can cost frames on both.
 
+## Zigbee / 802.15.4 overlay (via Huginn)
+
+Tick **🐝 Zigbee** to overlay nearby **Zigbee / Thread / 802.15.4** activity onto
+the 2.4 GHz spectrum — another real Wi-Fi interference source (smart-home hubs,
+bulbs, sensors, locks) that shares the band.
+
+The Pi has no 802.15.4 radio, so this uses a **HuginnESP companion**
+(ESP32-C5/C6/H2) on demand — **no wardriving needed**. On toggle, Ragnar opens
+the Huginn's USB-serial port, sends the `zigbee` command, reads the streamed
+`{"type":"ZIGBEE",…}` device lines for ~8 s while Huginn hops **channels 11–26**,
+then sends `stop`. **The toggle stays greyed out until a Huginn is detected on
+USB** (`/api/net/zigbee/status`).
+
+**What it draws** — a labelled marker per occupied Zigbee channel (Z11–Z26 at
+2405–2480 MHz; 15/20/25/26 fall in the Wi-Fi 1/6/11 gaps), scaled by how many
+devices and how strong; a **device table** (address, proto, channel, PAN ID,
+vendor from the EUI-64 OUI, RSSI) — **click a row to highlight it** on the
+spectrum like a Wi-Fi AP; and an estimated **per-Wi-Fi-channel Zigbee pressure**.
+
+**Caveats.** Huginn is a packet sniffer, so this is device-activity, not a
+per-channel energy sweep. One ESP32-C5 can't do Wi-Fi and 802.15.4 at once, so
+the scan briefly switches the Huginn into zigbee mode (a board without an
+802.15.4 radio answers with a "not compiled in" notice). If wardriving is
+running it owns the serial port — stop it first to sniff on demand. Receive-only.
+
 ## True-RF Waterfall (HackRF SDR)
 
 The Bar and Dome views draw the *beacon* picture (what APs announce). The
@@ -379,6 +404,9 @@ All endpoints are passive and read-only except the heatmap store.
 | `POST /api/net/sdr/stop` | stop the sweep |
 | `GET /api/net/sdr/frames?since=` | new waterfall frames + max-hold since a seq |
 | `GET /api/net/sdr/selftest` | sweep parser + frame-assembly self-test |
+| `GET /api/net/zigbee/status` | HuginnESP detection (gates the Zigbee toggle) |
+| `GET /api/net/zigbee/scan?duration=&port=` | on-demand Huginn 802.15.4 sniff → channel markers + devices |
+| `GET /api/net/zigbee/selftest` | Zigbee line-parser + overlay-model self-test |
 
 ```bash
 python3 wifi_analyzer.py interfaces
@@ -395,6 +423,11 @@ python3 bt_scanner.py selftest
 python3 sdr_spectrum.py detect
 python3 sdr_spectrum.py sweep --band 2.4 --frames 5
 python3 sdr_spectrum.py selftest
+
+# Zigbee / 802.15.4 overlay (needs a HuginnESP companion)
+python3 zigbee_scan.py detect
+python3 zigbee_scan.py scan --duration 8
+python3 zigbee_scan.py selftest      # + zigbee_overlay.py selftest
 ```
 
 The Bluetooth scanner ships its own offline self-test — **28 checks** covering
