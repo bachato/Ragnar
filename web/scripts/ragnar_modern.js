@@ -1283,7 +1283,7 @@ function showNetworkSubtab(name) {
 // WiFi Spectrum Analyzer (Network > WiFi Analyzer sub-tab)
 // Passive tri-band survey. Backend: /api/net/wifi/* (wifi_analyzer.py)
 // ============================================================================
-const _wifiState = { iface: '', band: 'all', view: 'bar', data: null, selected: null, auto: null, inited: false, bt: null, btOn: false, btBusy: false };
+const _wifiState = { iface: '', band: 'all', view: 'bar', data: null, selected: null, auto: null, inited: false, bt: null, btOn: false, btBusy: false, btSelected: null };
 
 const _WIFI_BAND_COLOR = { '2.4': '#f59e0b', '5': '#38bdf8', '6': '#a78bfa' };
 
@@ -1405,6 +1405,9 @@ function wifiBtScan() {
             _wifiState.btBusy = false;
             if (d.error) { if (st) st.textContent = '⚠ ' + d.error; _wifiState.bt = null; return; }
             _wifiState.bt = d;
+            // Drop a selection that dropped out of range this scan.
+            if (_wifiState.btSelected && !(d.devices || []).some(v => v.mac === _wifiState.btSelected))
+                _wifiState.btSelected = null;
             const i = d.interference || {};
             if (st) st.textContent = `${d.device_count} BT/BLE · ${d.controller || '?'}` +
                 (d.capture === 'bluetoothctl' ? ' (fallback)' : '');
@@ -1439,14 +1442,23 @@ function _wifiBtRender() {
         const cls = v.major_class ? v.major_class + (v.services && v.services.length ? ` · ${v.services.join(', ')}` : '') : '—';
         const rssi = (v.rssi == null) ? '—' : `${v.rssi}`;
         const rcol = (v.rssi == null) ? '#64748b' : _wifiSignalColor(v.rssi);
-        return `<tr class="border-b border-slate-800/60">
-            <td class="py-1 pr-3">${name}<div class="text-[10px] text-gray-600 font-mono">${v.mac}</div></td>
+        const sel = _wifiState.btSelected === v.mac;
+        return `<tr class="border-b border-slate-800/60 cursor-pointer hover:bg-slate-800/40${sel ? ' bg-sky-500/15' : ''}" onclick="wifiBtSelect('${v.mac}')" title="Click to highlight this device on the spectrum">
+            <td class="py-1 pr-3">${sel ? '<span class="text-sky-400">▸</span> ' : ''}${name}<div class="text-[10px] text-gray-600 font-mono">${v.mac}</div></td>
             <td class="py-1 pr-3"><span style="color:${k.c}">${k.t}</span>${v.randomized ? ' <span class="text-[9px] text-gray-500">rnd</span>' : ''}</td>
             <td class="py-1 pr-3">${v.vendor || '—'}</td>
             <td class="py-1 pr-3">${cls}</td>
             <td class="py-1 pr-3 text-right font-mono" style="color:${rcol}">${rssi}</td>
         </tr>`;
     }).join('');
+}
+
+// Click a BT device row → highlight it on the 2.4 GHz spectrum (toggle off if
+// the same row is clicked again). Mirrors the Wi-Fi AP select behaviour.
+function wifiBtSelect(mac) {
+    _wifiState.btSelected = (_wifiState.btSelected === mac) ? null : mac;
+    _wifiBtRender();
+    if (_wifiState.data) _wifiDrawSpectrum();
 }
 
 function _wifiGenBadge(std) {
@@ -1827,7 +1839,7 @@ function _wifiDrawSpectrum() {
     });
     // Bluetooth / BLE overlay on the 2.4 GHz segment (device-activity estimate)
     if (_wifiState.btOn && _wifiState.bt && ranges['2.4']) {
-        _wifiDrawBtOverlay(ctx, ranges['2.4'], xFor, { padT, padB, H, plotH });
+        _wifiDrawBtOverlay(ctx, ranges['2.4'], xFor, { padT, padB, H, plotH, yFor });
     }
 }
 
@@ -1858,21 +1870,62 @@ function _wifiDrawBtOverlay(ctx, r24, xFor, g) {
         ctx.fillStyle = '#38bdf8'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
         ctx.fillText('BT hopping', x0 + 3, baseY - stripH - 3);
     }
-    // 2) BLE advertising-channel markers at 2402/2426/2480 MHz. Convert each
-    // frequency to the analyzer's fractional 2.4 GHz channel, clamped to the
-    // segment so the edge channels (37/39) still show a labelled tick.
+    // The x-position of a BLE advertising channel on the 2.4 GHz segment.
+    const advX = (freqMhz) => {
+        const chFrac = (freqMhz - 2407) / 5;
+        return Math.max(r24.x0 + 2, Math.min(r24.x1 - 2, xFor('2.4', chFrac)));
+    };
+    // A device is selected → fade the ambient markers so the selection pops.
+    const sel = _wifiState.btSelected
+        ? (_wifiState.bt.devices || []).find(v => v.mac === _wifiState.btSelected)
+        : null;
+    const dim = sel ? 0.35 : 1.0;
+    // 2) BLE advertising-channel markers at 2402/2426/2480 MHz.
     (i.adv_markers || []).forEach(m => {
-        const chFrac = (m.freq_mhz - 2407) / 5;
-        let x = xFor('2.4', chFrac);
-        x = Math.max(r24.x0 + 2, Math.min(r24.x1 - 2, x));
+        const x = advX(m.freq_mhz);
         const intensity = Math.max(0, Math.min(100, m.intensity || 0));
-        const alpha = 0.25 + (intensity / 100) * 0.5;
+        const alpha = (0.25 + (intensity / 100) * 0.5) * dim;
         ctx.strokeStyle = `rgba(129,140,248,${alpha})`; ctx.lineWidth = 2; ctx.setLineDash([3, 3]);
         ctx.beginPath(); ctx.moveTo(x, g.padT + 4); ctx.lineTo(x, baseY); ctx.stroke();
         ctx.setLineDash([]);
-        ctx.fillStyle = '#c7d2fe'; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillStyle = `rgba(199,210,254,${dim})`; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText('BLE ' + m.adv_channel, x, g.padT + 2);
     });
+    // 3) Selected device: draw its RSSI level as a horizontal line across the
+    // 2.4 GHz segment (its signal vs the Wi-Fi APs), and mark where its energy
+    // lands — the three advertising channels for BLE, band-wide for Classic.
+    if (sel && sel.rssi != null) {
+        const yR = g.yFor(sel.rssi);
+        const col = _wifiSignalColor(sel.rssi);
+        // Horizontal RSSI line
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(r24.x0, yR); ctx.lineTo(r24.x1, yR); ctx.stroke();
+        ctx.setLineDash([]);
+        const isLE = sel.kind === 'le' || sel.kind === 'dual';
+        if (isLE) {
+            // Emphasise the advertising channels this device beacons on.
+            (i.adv_markers || []).forEach(m => {
+                const x = advX(m.freq_mhz);
+                ctx.strokeStyle = col; ctx.lineWidth = 2.5;
+                ctx.beginPath(); ctx.moveTo(x, yR); ctx.lineTo(x, baseY); ctx.stroke();
+                ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, yR, 4, 0, 2 * Math.PI); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+            });
+        } else {
+            // Classic BT hops the whole band — shade the segment at its level.
+            ctx.fillStyle = col + '18';
+            ctx.fillRect(r24.x0, yR, r24.x1 - r24.x0, baseY - yR);
+        }
+        // Label the selection at the left edge of the band.
+        const nm = sel.name || sel.vendor || sel.mac;
+        const tag = `${nm.length > 18 ? nm.slice(0, 17) + '…' : nm}  ${sel.rssi} dBm  ${isLE ? '(BLE adv)' : '(Classic · hops band)'}`;
+        ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText(tag, r24.x0 + 3, yR - 5);
+    } else if (sel) {
+        // Selected but no RSSI heard this scan.
+        ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText(`${sel.name || sel.mac} — RSSI not heard this scan`, r24.x0 + 3, g.padT + 14);
+    }
 }
 
 // ---- WiFi Defense → Analyzer pivot -----------------------------------------

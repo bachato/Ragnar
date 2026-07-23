@@ -292,7 +292,11 @@ invisible, source of 2.4 GHz Wi-Fi interference.
 - **A device table** — every in-range device with **RSSI**, kind (BLE / Classic /
   dual-mode), **vendor** (IEEE OUI for public addresses, Bluetooth SIG company
   ID for randomised ones), and decoded **class-of-device** (Audio/Video, Phone,
-  Wearable, …). Randomised (LE-privacy) addresses are tagged `rnd`.
+  Wearable, …). Randomised (LE-privacy) addresses are tagged `rnd`. **Click any
+  row to highlight that device on the spectrum** (like selecting a Wi-Fi AP): its
+  RSSI is drawn as a level line across the 2.4 GHz band, with its energy marked
+  on the three BLE advertising channels (BLE) or shaded band-wide (Classic, which
+  hops). Click again to clear.
 - **Per-channel BT pressure chips** — an estimated low/moderate/high interference
   level for Wi-Fi channels 1/6/11/13.
 
