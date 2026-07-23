@@ -1283,7 +1283,8 @@ function showNetworkSubtab(name) {
 // WiFi Spectrum Analyzer (Network > WiFi Analyzer sub-tab)
 // Passive tri-band survey. Backend: /api/net/wifi/* (wifi_analyzer.py)
 // ============================================================================
-const _wifiState = { iface: '', band: 'all', view: 'bar', data: null, selected: null, auto: null, inited: false };
+const _wifiState = { iface: '', band: 'all', view: 'bar', data: null, selected: null, auto: null, inited: false, bt: null, btOn: false, btBusy: false, btSelected: null,
+    sdr: { available: false, running: false, band: '2.4', bandMhz: null, floor: -120, seq: 0, rows: [], maxhold: null, poll: null, statusPoll: null, error: null } };
 
 const _WIFI_BAND_COLOR = { '2.4': '#f59e0b', '5': '#38bdf8', '6': '#a78bfa' };
 
@@ -1317,26 +1318,48 @@ function wifiInit() {
                     b.classList.toggle('bg-Ragnar-600', on); b.classList.toggle('text-white', on);
                     b.classList.toggle('text-slate-300', !on);
                 });
-                wifiScan();
+                // In the live waterfall, a band change retunes the HackRF sweep;
+                // otherwise it re-runs the passive Wi-Fi scan.
+                if (_wifiState.view === 'waterfall') { _wifiSdrStop(); _wifiSdrStart(); }
+                else wifiScan();
             });
         });
         // View toggle
         const setView = (v) => {
+            const prev = _wifiState.view;
             _wifiState.view = v;
-            const bar = document.getElementById('wifi-view-bar'), dome = document.getElementById('wifi-view-dome');
-            [['bar', bar], ['dome', dome]].forEach(([name, el]) => {
+            const bar = document.getElementById('wifi-view-bar'), dome = document.getElementById('wifi-view-dome'),
+                wf = document.getElementById('wifi-view-wf');
+            [['bar', bar], ['dome', dome], ['waterfall', wf]].forEach(([name, el]) => {
+                if (!el) return;
                 const on = name === v;
                 el.classList.toggle('bg-Ragnar-600', on); el.classList.toggle('text-white', on);
-                el.classList.toggle('text-slate-300', !on);
+                el.classList.toggle('text-slate-300', !on && !el.disabled);
             });
-            if (_wifiState.data) _wifiDrawSpectrum();
+            // Enter/leave the live SDR waterfall (a separate capture pipeline).
+            if (v === 'waterfall' && prev !== 'waterfall') _wifiSdrStart();
+            else if (v !== 'waterfall' && prev === 'waterfall') _wifiSdrStop();
+            if (v === 'waterfall') _wifiDrawWaterfall();
+            else if (_wifiState.data) _wifiDrawSpectrum();
         };
+        _wifiState._setView = setView;
         document.getElementById('wifi-view-bar').addEventListener('click', () => setView('bar'));
         document.getElementById('wifi-view-dome').addEventListener('click', () => setView('dome'));
+        const wfBtn = document.getElementById('wifi-view-wf');
+        if (wfBtn) wfBtn.addEventListener('click', () => { if (!wfBtn.disabled) setView('waterfall'); });
         // Auto-refresh
         document.getElementById('wifi-auto').addEventListener('change', (e) => {
             if (_wifiState.auto) { clearInterval(_wifiState.auto); _wifiState.auto = null; }
             if (e.target.checked) _wifiState.auto = setInterval(wifiScan, 8000);
+        });
+        // Bluetooth overlay toggle
+        const btChk = document.getElementById('wifi-bt');
+        if (btChk) btChk.addEventListener('change', (e) => {
+            _wifiState.btOn = e.target.checked;
+            const panel = document.getElementById('wifi-bt-panel');
+            if (panel) panel.classList.toggle('hidden', !_wifiState.btOn);
+            if (_wifiState.btOn) wifiBtScan();
+            else { if (_wifiState.data) _wifiDrawSpectrum(); }
         });
         ['wifi-tx', 'wifi-ple'].forEach(id => {
             const el = document.getElementById(id);
@@ -1347,6 +1370,10 @@ function wifiInit() {
     wifiHeatmapInit();
     wifiHeatmapLoad();
     _wifiFillIfaces();
+    _wifiSdrCheck();
+    if (!_wifiState.sdr.statusPoll)
+        _wifiState.sdr.statusPoll = setInterval(_wifiSdrCheck, 15000);
+    window.addEventListener('beforeunload', () => { if (_wifiState.sdr.running) _wifiSdrStop(); });
 }
 
 function _wifiFillIfaces() {
@@ -1379,6 +1406,252 @@ function wifiScan() {
             st.textContent = `${d.ap_count} AP(s) · ${new Date(d.timestamp * 1000).toLocaleTimeString()}`;
             wifiRender();
         }).catch(e => { if (btn) btn.disabled = false; st.textContent = 'Scan failed'; });
+}
+
+// ---- Bluetooth / BLE 2.4 GHz overlay ---------------------------------------
+const _BT_KIND = { le: { c: '#38bdf8', t: 'BLE' }, classic: { c: '#818cf8', t: 'Classic' },
+    dual: { c: '#a78bfa', t: 'Dual' } };
+const _BT_PRESSURE_COLOR = { low: '#64748b', moderate: '#f59e0b', high: '#ef4444' };
+
+function wifiBtScan() {
+    if (_wifiState.btBusy) return;
+    _wifiState.btBusy = true;
+    const st = document.getElementById('wifi-bt-status');
+    if (st) st.textContent = 'Discovering (receive-only)…';
+    fetch('/api/net/bt/scan?duration=12')
+        .then(r => r.json()).then(d => {
+            _wifiState.btBusy = false;
+            if (d.error) { if (st) st.textContent = '⚠ ' + d.error; _wifiState.bt = null; return; }
+            _wifiState.bt = d;
+            // Drop a selection that dropped out of range this scan.
+            if (_wifiState.btSelected && !(d.devices || []).some(v => v.mac === _wifiState.btSelected))
+                _wifiState.btSelected = null;
+            const i = d.interference || {};
+            if (st) st.textContent = `${d.device_count} BT/BLE · ${d.controller || '?'}` +
+                (d.capture === 'bluetoothctl' ? ' (fallback)' : '');
+            _wifiBtRender();
+            if (_wifiState.data) _wifiDrawSpectrum();
+        }).catch(() => { _wifiState.btBusy = false; if (st) st.textContent = 'BT scan failed'; });
+}
+
+function _wifiBtRender() {
+    const d = _wifiState.bt; if (!d) return;
+    const i = d.interference || {};
+    const sum = document.getElementById('wifi-bt-summary');
+    if (sum) sum.textContent = `${i.le_count || 0} BLE · ${i.classic_count || 0} Classic · ${i.strong_count || 0} close`;
+    const note = document.getElementById('wifi-bt-note');
+    if (note) note.textContent = (i.note || '') + '  ' + (d.coexistence_note || '');
+    // Per-Wi-Fi-channel BT pressure chips
+    const pr = document.getElementById('wifi-bt-pressure');
+    if (pr) pr.innerHTML = (i.wifi_channels || []).map(c => {
+        const col = _BT_PRESSURE_COLOR[c.level] || '#64748b';
+        return `<span class="px-1.5 py-0.5 rounded" style="background:${col}22;color:${col};border:1px solid ${col}55" title="Estimated BT pressure on Wi-Fi ch ${c.wifi_channel}">ch${c.wifi_channel}: ${c.level}</span>`;
+    }).join('');
+    // Device table (strongest first, already sorted server-side)
+    const tb = document.getElementById('wifi-bt-tbody');
+    if (!tb) return;
+    if (!d.devices.length) {
+        tb.innerHTML = '<tr><td colspan="5" class="py-3 text-gray-500">No Bluetooth devices in range.</td></tr>';
+        return;
+    }
+    tb.innerHTML = d.devices.map(v => {
+        const k = _BT_KIND[v.kind] || { c: '#94a3b8', t: v.kind || '?' };
+        const name = v.name || '<span class="text-gray-600">(no name)</span>';
+        const cls = v.major_class ? v.major_class + (v.services && v.services.length ? ` · ${v.services.join(', ')}` : '') : '—';
+        const rssi = (v.rssi == null) ? '—' : `${v.rssi}`;
+        const rcol = (v.rssi == null) ? '#64748b' : _wifiSignalColor(v.rssi);
+        const sel = _wifiState.btSelected === v.mac;
+        return `<tr class="border-b border-slate-800/60 cursor-pointer hover:bg-slate-800/40${sel ? ' bg-sky-500/15' : ''}" onclick="wifiBtSelect('${v.mac}')" title="Click to highlight this device on the spectrum">
+            <td class="py-1 pr-3">${sel ? '<span class="text-sky-400">▸</span> ' : ''}${name}<div class="text-[10px] text-gray-600 font-mono">${v.mac}</div></td>
+            <td class="py-1 pr-3"><span style="color:${k.c}">${k.t}</span>${v.randomized ? ' <span class="text-[9px] text-gray-500">rnd</span>' : ''}</td>
+            <td class="py-1 pr-3">${v.vendor || '—'}</td>
+            <td class="py-1 pr-3">${cls}</td>
+            <td class="py-1 pr-3 text-right font-mono" style="color:${rcol}">${rssi}</td>
+        </tr>`;
+    }).join('');
+}
+
+// Click a BT device row → highlight it on the 2.4 GHz spectrum (toggle off if
+// the same row is clicked again). Mirrors the Wi-Fi AP select behaviour.
+function wifiBtSelect(mac) {
+    _wifiState.btSelected = (_wifiState.btSelected === mac) ? null : mac;
+    _wifiBtRender();
+    if (_wifiState.data) _wifiDrawSpectrum();
+}
+
+// ---- True-RF waterfall (HackRF SDR) ----------------------------------------
+// The Waterfall button stays greyed out until the backend actually sees a
+// HackRF; this polls detection and enables/labels the button accordingly.
+function _wifiSdrCheck() {
+    fetch('/api/net/sdr/status').then(r => r.json()).then(st => {
+        const det = (st && st.detect) || {};
+        _wifiState.sdr.available = !!det.available;
+        const btn = document.getElementById('wifi-view-wf');
+        if (!btn) return;
+        btn.disabled = !det.available;
+        const off = !det.available;
+        // Disabled = clearly greyed + transparent (no hover tooltip on touch).
+        btn.classList.toggle('cursor-not-allowed', off);
+        btn.classList.toggle('opacity-40', off);
+        btn.classList.toggle('text-slate-500', off);
+        if (off) { btn.classList.remove('hover:bg-slate-700', 'text-slate-300'); }
+        else if (_wifiState.view !== 'waterfall') { btn.classList.add('hover:bg-slate-700', 'text-slate-300'); }
+        btn.title = det.available
+            ? `HackRF ready${det.board ? ' (' + det.board + ')' : ''} — true-RF waterfall`
+            : (det.error || 'Connect a HackRF SDR to enable true-RF waterfall');
+    }).catch(() => {});
+}
+
+function _wifiSdrStart() {
+    const s = _wifiState.sdr;
+    if (!s.available) { _wifiDrawWaterfall(); return; }
+    s.rows = []; s.seq = 0; s.maxhold = null; s.error = null;
+    // Match the SDR band to the analyzer's band selector where it's a real RF
+    // band (2.4/5); 'all'/'6' fall back to 2.4.
+    s.band = (_wifiState.band === '5') ? '5' : '2.4';
+    fetch('/api/net/sdr/start', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ band: s.band }) })
+        .then(r => r.json()).then(res => {
+            if (res && res.error) { s.error = res.error; _wifiDrawWaterfall(); return; }
+            if (s.poll) clearInterval(s.poll);
+            s.running = true;
+            s.poll = setInterval(_wifiSdrPoll, 400);
+        }).catch(() => { s.error = 'Failed to start SDR'; _wifiDrawWaterfall(); });
+}
+
+function _wifiSdrStop() {
+    const s = _wifiState.sdr;
+    if (s.poll) { clearInterval(s.poll); s.poll = null; }
+    s.running = false;
+    fetch('/api/net/sdr/stop', { method: 'POST' }).catch(() => {});
+}
+
+function _wifiSdrPoll() {
+    const s = _wifiState.sdr;
+    fetch('/api/net/sdr/frames?since=' + s.seq).then(r => r.json()).then(d => {
+        if (d.error) s.error = d.error;
+        if (d.band_mhz) s.bandMhz = d.band_mhz;
+        if (typeof d.floor_dbm === 'number') s.floor = d.floor_dbm;
+        if (d.max_hold) s.maxhold = d.max_hold;
+        (d.frames || []).forEach(f => { s.seq = f.seq; s.rows.unshift(f.power); });
+        if (s.rows.length > 260) s.rows.length = 260;
+        if (_wifiState.view === 'waterfall') _wifiDrawWaterfall();
+    }).catch(() => {});
+}
+
+// Power (dBm) → waterfall colour: dark → blue → cyan → green → yellow → red.
+function _wifiSdrColor(dbm, floor) {
+    const top = -20, lo = (typeof floor === 'number' ? floor : -110);
+    let t = (dbm - lo) / (top - lo);
+    t = Math.max(0, Math.min(1, t));
+    const stops = [[8, 12, 30], [30, 60, 170], [30, 190, 200], [40, 200, 70], [235, 220, 40], [235, 60, 40]];
+    const seg = t * (stops.length - 1), i = Math.floor(seg), f = seg - i;
+    const a = stops[i], b = stops[Math.min(stops.length - 1, i + 1)];
+    return `rgb(${Math.round(a[0] + (b[0] - a[0]) * f)},${Math.round(a[1] + (b[1] - a[1]) * f)},${Math.round(a[2] + (b[2] - a[2]) * f)})`;
+}
+
+// The live-RF view: a spectrum line (current + max-hold) above a scrolling
+// time × frequency × power waterfall, with Wi-Fi channel + BT markers overlaid.
+function _wifiDrawWaterfall() {
+    const canvas = document.getElementById('wifi-spectrum'); if (!canvas) return;
+    const s = _wifiState.sdr;
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = 360;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const padL = 44, padR = 12, padT = 14, padB = 26;
+    const plotW = W - padL - padR;
+    const specH = 96, gap = 8;                      // top spectrum-line panel
+    const wfTop = padT + specH + gap, wfH = H - padB - wfTop;
+    const lo = s.bandMhz ? s.bandMhz[0] : (s.band === '5' ? 5150 : 2400);
+    const hi = s.bandMhz ? s.bandMhz[1] : (s.band === '5' ? 5895 : 2500);
+
+    // Not ready / not running → explain why (keeps the blind path honest).
+    if (!s.available || s.error || !s.rows.length) {
+        ctx.fillStyle = '#0b1220'; ctx.fillRect(padL, wfTop, plotW, wfH);
+        ctx.fillStyle = '#64748b'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+        const msg = !s.available ? '📡 Connect a HackRF SDR to see the true-RF waterfall'
+            : s.error ? ('⚠ ' + s.error)
+            : 'Starting HackRF sweep…';
+        ctx.fillText(msg, W / 2, wfTop + wfH / 2);
+        if (!s.available) {
+            ctx.font = '11px sans-serif'; ctx.fillStyle = '#475569';
+            ctx.fillText('Bar / Dome work from the passive Wi-Fi scan and need no SDR.', W / 2, wfTop + wfH / 2 + 20);
+        }
+        return;
+    }
+
+    const nb = s.rows[0].length;
+    const xForBin = (bi) => padL + (bi + 0.5) / nb * plotW;
+    const xForFreq = (mhz) => padL + (mhz - lo) / (hi - lo) * plotW;
+
+    // --- Waterfall: newest row at the top, scrolling down ---
+    const rowH = Math.max(1, wfH / Math.min(s.rows.length, Math.floor(wfH)));
+    const colW = plotW / nb;
+    for (let r = 0; r < s.rows.length; r++) {
+        const y = wfTop + r * rowH;
+        if (y > wfTop + wfH) break;
+        const row = s.rows[r];
+        for (let bi = 0; bi < nb; bi++) {
+            ctx.fillStyle = _wifiSdrColor(row[bi], s.floor);
+            ctx.fillRect(padL + bi * colW, y, Math.ceil(colW), Math.ceil(rowH));
+        }
+    }
+
+    // --- Spectrum line panel: current frame + max-hold ---
+    ctx.fillStyle = '#0b1220'; ctx.fillRect(padL, padT, plotW, specH);
+    const sTop = -20, sBot = s.floor;
+    const yFor = (db) => padT + (sTop - Math.max(sBot, Math.min(sTop, db))) / (sTop - sBot) * specH;
+    // dB gridlines
+    ctx.strokeStyle = '#1e293b'; ctx.fillStyle = '#475569'; ctx.font = '9px sans-serif'; ctx.textAlign = 'right';
+    for (let v = sTop; v >= sBot; v -= 20) {
+        const y = yFor(v); ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+        ctx.fillText(v + '', padL - 3, y + 3);
+    }
+    const drawTrace = (arr, stroke, wdt) => {
+        ctx.strokeStyle = stroke; ctx.lineWidth = wdt; ctx.beginPath();
+        for (let bi = 0; bi < arr.length; bi++) {
+            const x = xForBin(bi), y = yFor(arr[bi]);
+            bi ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        }
+        ctx.stroke();
+    };
+    if (s.maxhold) drawTrace(s.maxhold, 'rgba(148,163,184,0.7)', 1);   // max-hold
+    drawTrace(s.rows[0], '#22d3ee', 1.5);                             // live
+
+    // --- Frequency axis + Wi-Fi channel & BT marker overlays ---
+    ctx.strokeStyle = '#334155'; ctx.beginPath(); ctx.moveTo(padL, wfTop - 2); ctx.lineTo(W - padR, wfTop - 2); ctx.stroke();
+    ctx.textAlign = 'center';
+    const wifiCh = (s.band === '5')
+        ? { 36: 5180, 40: 5200, 44: 5220, 48: 5240, 52: 5260, 100: 5500, 149: 5745, 157: 5785 }
+        : { 1: 2412, 6: 2437, 11: 2462 };
+    Object.entries(wifiCh).forEach(([ch, mhz]) => {
+        if (mhz < lo || mhz > hi) return;
+        const x = xForFreq(mhz);
+        ctx.strokeStyle = 'rgba(52,211,153,0.25)'; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
+        ctx.beginPath(); ctx.moveTo(x, wfTop); ctx.lineTo(x, wfTop + wfH); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = '#34d399'; ctx.font = '9px sans-serif'; ctx.fillText('ch' + ch, x, wfTop - 4);
+    });
+    // BT advertising markers, only meaningful in 2.4 and when the overlay is on.
+    if (_wifiState.btOn && _wifiState.bt && s.band === '2.4') {
+        [2402, 2426, 2480].forEach((mhz, i) => {
+            const x = xForFreq(mhz);
+            ctx.strokeStyle = 'rgba(129,140,248,0.5)'; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(x, wfTop); ctx.lineTo(x, wfTop + wfH); ctx.stroke(); ctx.setLineDash([]);
+            ctx.fillStyle = '#c7d2fe'; ctx.font = 'bold 8px sans-serif'; ctx.fillText('BLE ' + [37, 38, 39][i], x, wfTop + wfH + 9);
+        });
+    }
+    // Frequency ticks (GHz) along the very bottom
+    ctx.fillStyle = '#64748b'; ctx.font = '9px sans-serif';
+    const nTicks = 5;
+    for (let t = 0; t <= nTicks; t++) {
+        const mhz = lo + (hi - lo) * t / nTicks;
+        ctx.fillText((mhz / 1000).toFixed(3), padL + plotW * t / nTicks, H - 6);
+    }
+    // Live badge
+    ctx.fillStyle = '#22d3ee'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText(`● LIVE RF · ${s.band} GHz · HackRF`, padL + 2, padT + 10);
 }
 
 function _wifiGenBadge(std) {
@@ -1757,6 +2030,95 @@ function _wifiDrawSpectrum() {
         ctx.fillStyle = sel ? '#fff' : '#cbd5e1'; ctx.font = (sel ? 'bold ' : '') + '10px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText(label.length > 14 ? label.slice(0, 13) + '…' : label, xC, y - 4);
     });
+    // Bluetooth / BLE overlay on the 2.4 GHz segment (device-activity estimate)
+    if (_wifiState.btOn && _wifiState.bt && ranges['2.4']) {
+        _wifiDrawBtOverlay(ctx, ranges['2.4'], xFor, { padT, padB, H, plotH, yFor });
+    }
+}
+
+// Draw the BLE advertising-channel markers (37/38/39) and a band-wide
+// "BT hopping activity" strip onto the 2.4 GHz segment of the spectrum. This is
+// a device-activity overlay, not measured RF — labelled as such in the panel.
+function _wifiDrawBtOverlay(ctx, r24, xFor, g) {
+    const i = (_wifiState.bt.interference) || {};
+    const baseY = g.H - g.padB;
+    // 1) Band-wide hopping activity strip: height scales with hopping_pressure.
+    const hp = Math.max(0, Math.min(100, i.hopping_pressure || 0));
+    if (hp > 0) {
+        const stripH = 6 + (hp / 100) * 26;
+        const x0 = r24.x0, x1 = r24.x1;
+        const grad = ctx.createLinearGradient(0, baseY - stripH, 0, baseY);
+        grad.addColorStop(0, 'rgba(56,189,248,0.05)');
+        grad.addColorStop(1, 'rgba(56,189,248,0.28)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(x0, baseY - stripH, x1 - x0, stripH);
+        // Diagonal hatch so it reads as "hopping", distinct from a solid AP bar.
+        ctx.save();
+        ctx.beginPath(); ctx.rect(x0, baseY - stripH, x1 - x0, stripH); ctx.clip();
+        ctx.strokeStyle = 'rgba(56,189,248,0.25)'; ctx.lineWidth = 1;
+        for (let x = x0 - stripH; x < x1; x += 7) {
+            ctx.beginPath(); ctx.moveTo(x, baseY); ctx.lineTo(x + stripH, baseY - stripH); ctx.stroke();
+        }
+        ctx.restore();
+        ctx.fillStyle = '#38bdf8'; ctx.font = '9px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText('BT hopping', x0 + 3, baseY - stripH - 3);
+    }
+    // The x-position of a BLE advertising channel on the 2.4 GHz segment.
+    const advX = (freqMhz) => {
+        const chFrac = (freqMhz - 2407) / 5;
+        return Math.max(r24.x0 + 2, Math.min(r24.x1 - 2, xFor('2.4', chFrac)));
+    };
+    // A device is selected → fade the ambient markers so the selection pops.
+    const sel = _wifiState.btSelected
+        ? (_wifiState.bt.devices || []).find(v => v.mac === _wifiState.btSelected)
+        : null;
+    const dim = sel ? 0.35 : 1.0;
+    // 2) BLE advertising-channel markers at 2402/2426/2480 MHz.
+    (i.adv_markers || []).forEach(m => {
+        const x = advX(m.freq_mhz);
+        const intensity = Math.max(0, Math.min(100, m.intensity || 0));
+        const alpha = (0.25 + (intensity / 100) * 0.5) * dim;
+        ctx.strokeStyle = `rgba(129,140,248,${alpha})`; ctx.lineWidth = 2; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(x, g.padT + 4); ctx.lineTo(x, baseY); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = `rgba(199,210,254,${dim})`; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('BLE ' + m.adv_channel, x, g.padT + 2);
+    });
+    // 3) Selected device: draw its RSSI level as a horizontal line across the
+    // 2.4 GHz segment (its signal vs the Wi-Fi APs), and mark where its energy
+    // lands — the three advertising channels for BLE, band-wide for Classic.
+    if (sel && sel.rssi != null) {
+        const yR = g.yFor(sel.rssi);
+        const col = _wifiSignalColor(sel.rssi);
+        // Horizontal RSSI line
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(r24.x0, yR); ctx.lineTo(r24.x1, yR); ctx.stroke();
+        ctx.setLineDash([]);
+        const isLE = sel.kind === 'le' || sel.kind === 'dual';
+        if (isLE) {
+            // Emphasise the advertising channels this device beacons on.
+            (i.adv_markers || []).forEach(m => {
+                const x = advX(m.freq_mhz);
+                ctx.strokeStyle = col; ctx.lineWidth = 2.5;
+                ctx.beginPath(); ctx.moveTo(x, yR); ctx.lineTo(x, baseY); ctx.stroke();
+                ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, yR, 4, 0, 2 * Math.PI); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+            });
+        } else {
+            // Classic BT hops the whole band — shade the segment at its level.
+            ctx.fillStyle = col + '18';
+            ctx.fillRect(r24.x0, yR, r24.x1 - r24.x0, baseY - yR);
+        }
+        // Label the selection at the left edge of the band.
+        const nm = sel.name || sel.vendor || sel.mac;
+        const tag = `${nm.length > 18 ? nm.slice(0, 17) + '…' : nm}  ${sel.rssi} dBm  ${isLE ? '(BLE adv)' : '(Classic · hops band)'}`;
+        ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText(tag, r24.x0 + 3, yR - 5);
+    } else if (sel) {
+        // Selected but no RSSI heard this scan.
+        ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText(`${sel.name || sel.mac} — RSSI not heard this scan`, r24.x0 + 3, g.padT + 14);
+    }
 }
 
 // ---- WiFi Defense → Analyzer pivot -----------------------------------------

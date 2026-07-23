@@ -274,6 +274,76 @@ survey.
 
 ---
 
+## Bluetooth / BLE overlay (2.4 GHz)
+
+Tick **📶 Bluetooth** in the toolbar to overlay nearby **Bluetooth Classic
+(BR/EDR)** and **Bluetooth Low Energy** activity onto the 2.4 GHz segment of the
+spectrum — the two radios share the ISM band, so BT/BLE is a real, often
+invisible, source of 2.4 GHz Wi-Fi interference.
+
+**What it draws:**
+
+- **BLE advertising markers** — the three fixed advertising channels **37 / 38 /
+  39** at **2402 / 2426 / 2480 MHz**, placed (by design) in the gaps around Wi-Fi
+  1/6/11. Marker opacity scales with how many advertisers are heard.
+- **A band-wide "BT hopping" strip** — BLE data (37 channels) and Classic BT (79
+  channels) frequency-hop across the whole band, drawn as a hatched activity
+  strip whose height scales with device count, proximity and Classic presence.
+- **A device table** — every in-range device with **RSSI**, kind (BLE / Classic /
+  dual-mode), **vendor** (IEEE OUI for public addresses, Bluetooth SIG company
+  ID for randomised ones), and decoded **class-of-device** (Audio/Video, Phone,
+  Wearable, …). Randomised (LE-privacy) addresses are tagged `rnd`. **Click any
+  row to highlight that device on the spectrum** (like selecting a Wi-Fi AP): its
+  RSSI is drawn as a level line across the 2.4 GHz band, with its energy marked
+  on the three BLE advertising channels (BLE) or shaded band-wide (Classic, which
+  hops). Click again to clear.
+- **Per-channel BT pressure chips** — an estimated low/moderate/high interference
+  level for Wi-Fi channels 1/6/11/13.
+
+**It is a device-activity estimate, not a measured RF sweep.** We ask the
+Bluetooth controller (via BlueZ) which devices it can hear and model where their
+energy lands — a true per-Hz energy sweep of BT hopping needs an SDR. Capture is
+**receive-only**: device *discovery* only, never pairing or connecting.
+
+**Hardware / capture.** Discovery runs over BlueZ's D-Bus API (`python3-dbus`),
+falling back to `bluetoothctl` text mode if unavailable. Any BlueZ controller
+works — the Pi's **onboard** radio or the tri-band **Alfa's built-in BT 5.2**.
+When the Alfa combo dongle is plugged in its controller enumerates on **USB**
+while the onboard radio is **UART**, so the scanner prefers the USB controller
+(same adapter as the Wi-Fi capture). On a combo chip the Wi-Fi and BT radios
+time-share the RF front-end, so the overlay is best-effort and duty-cycled —
+running BT discovery and Wi-Fi monitor capture flat-out can cost frames on both.
+
+## True-RF Waterfall (HackRF SDR)
+
+The Bar and Dome views draw the *beacon* picture (what APs announce). The
+**📈 Waterfall** view is different: it measures the **actual radio energy on the
+air** with a Software Defined Radio — so it sees what nothing else here can:
+microwave ovens, drones, analog cameras, jammers, the true noise floor, and
+Wi-Fi/BT energy as *measured* rather than modelled.
+
+**The button stays greyed out until Ragnar actually detects a HackRF.** The UI
+polls `/api/net/sdr/status` and only un-greys 📈 Waterfall when the `hackrf`
+tools are installed **and** a board answers; otherwise the tooltip tells you
+what's missing. Bar/Dome keep working with no SDR at all.
+
+**What it shows** — a live **spectrum line** with **max-hold** on top, above a
+scrolling **time × frequency × power waterfall**, with your Wi-Fi channel ticks
+(and BT advertising markers in 2.4 GHz) overlaid on the measured energy. Change
+the band selector to retune the sweep (2.4 / 5 GHz).
+
+**How it works** — `sdr_spectrum.py` runs `hackrf_sweep -f LO:HI`, parses its
+power-per-bin CSV, assembles each sweep into a fixed-width frame plus a
+cumulative max-hold, and streams frames to the browser. **Receive-only** — an
+SDR sweep never transmits.
+
+**Hardware.** Needs a **HackRF One** (1 MHz–6 GHz — covers 2.4 *and* 5 GHz).
+The cheap RTL-SDR only reaches ~1.7 GHz and **cannot** see these bands. Install
+the tools with `apt install hackrf` (done by `install_ragnar.sh` / ensured by
+`update_ragnar.sh`). The HackRF draws real USB current — a **powered USB hub** is
+recommended on the Pi. Wi-Fi 6 GHz is within HackRF's range but its band edges
+vary by region, so only 2.4/5 ship as presets.
+
 ## Hardware
 
 Tuned for the **Alfa AWUS036AXM** (MediaTek MT7921AU, `mt7921u` driver — a
@@ -301,13 +371,36 @@ All endpoints are passive and read-only except the heatmap store.
 | `GET/POST /api/net/wifi/surveys` | list / save / load / delete named surveys |
 | `GET/POST /api/net/wifi/history` | get AP history DB / reset it |
 | `GET /api/net/wifi/selftest` | parser + analyzer self-test |
+| `GET /api/net/bt/controllers` | Bluetooth controllers (USB-first: Alfa before onboard) |
+| `GET /api/net/bt/scan?controller=&duration=` | BT/BLE discovery + 2.4 GHz interference model |
+| `GET /api/net/bt/selftest` | Bluetooth parser + model self-test |
+| `GET /api/net/sdr/status` | HackRF detection (gates the Waterfall button) + capture state |
+| `POST /api/net/sdr/start` `{band}` | start the HackRF sweep (2.4/5) |
+| `POST /api/net/sdr/stop` | stop the sweep |
+| `GET /api/net/sdr/frames?since=` | new waterfall frames + max-hold since a seq |
+| `GET /api/net/sdr/selftest` | sweep parser + frame-assembly self-test |
 
 ```bash
 python3 wifi_analyzer.py interfaces
 python3 wifi_analyzer.py scan --interface wlan0 --band all
 python3 wifi_analyzer.py radius --interface wlan0 --bssid aa:bb:cc:dd:ee:ff
 python3 wifi_analyzer.py selftest
+
+# Bluetooth / BLE 2.4 GHz overlay (bt_scanner.py)
+python3 bt_scanner.py controllers
+python3 bt_scanner.py scan --duration 12
+python3 bt_scanner.py selftest
+
+# True-RF waterfall (sdr_spectrum.py — needs a HackRF)
+python3 sdr_spectrum.py detect
+python3 sdr_spectrum.py sweep --band 2.4 --frames 5
+python3 sdr_spectrum.py selftest
 ```
+
+The Bluetooth scanner ships its own offline self-test — **28 checks** covering
+the D-Bus/`bluetoothctl` parsers, class-of-device decode, public-vs-random
+address handling, OUI/company-ID vendor attribution, device classification
+(BLE/Classic/dual), controller enumeration, and the 2.4 GHz interference model.
 
 The self-test (`selftest`) drives the beacon parser (2.4/5/6 GHz, HT/VHT/HE
 widths, a Wi-Fi 7 / 802.11be AP with EHT IEs and 320 MHz width, BSS-Load,

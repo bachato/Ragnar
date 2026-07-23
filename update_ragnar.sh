@@ -120,6 +120,26 @@ if ! pip3 install --break-system-packages --upgrade -r requirements.txt; then
     done < requirements.txt
 fi
 
+echo -e "${BLUE}Step 5.2: Ensuring Bluetooth overlay dependencies...${NC}"
+# The WiFi-analyzer Bluetooth/BLE 2.4 GHz overlay (bt_scanner.py) talks to BlueZ
+# over D-Bus via python3-dbus, and needs bluez/bluetoothctl. These ship in the
+# installer; ensure them here too so update-only boxes get the overlay. Guarded
+# and idempotent — only apt-installs a package that is actually missing.
+for _btpkg in python3-dbus bluez; do
+    if ! dpkg -s "$_btpkg" >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$_btpkg" >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓${NC} Installed $_btpkg (Bluetooth overlay)" \
+            || echo -e "  ${YELLOW}⚠${NC} Could not install $_btpkg — the overlay falls back to bluetoothctl text mode"
+    fi
+done
+# HackRF tools for the true-RF Waterfall view (sdr_spectrum.py). Optional — the
+# Waterfall button stays greyed out until both the tools and a board are present.
+if ! dpkg -s hackrf >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends hackrf >/dev/null 2>&1 \
+        && echo -e "  ${GREEN}✓${NC} Installed hackrf (true-RF Waterfall)" \
+        || echo -e "  ${YELLOW}⚠${NC} Could not install hackrf — Waterfall stays disabled until installed"
+fi
+
 echo -e "${BLUE}Step 5.5: Restoring local runtime data...${NC}"
 for file in "${PRESERVE_FILES[@]}"; do
     backup_file="$BACKUP_DIR/$(basename $file)"

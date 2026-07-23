@@ -38,6 +38,8 @@ import path_asymmetry
 import tls_watch
 import wifi_analyzer
 import wifi_defense
+import bt_scanner
+import sdr_spectrum
 from ldap_watch import do_ldap_watch
 from tls_watch import do_tls_watch
 
@@ -14935,6 +14937,72 @@ def register_network_diagnostics(app, logger=None):
             _log("net/wifi/history reset")
             return jsonify(wifi_analyzer.db_reset())
         return jsonify({"aps": wifi_analyzer.db_get()})
+
+    # ------------------------------------------------------------------
+    # Bluetooth / BLE 2.4 GHz overlay (bt_scanner.py) — device-discovery
+    # companion to the Wi-Fi analyzer. Receive-only: discovery, never pairs
+    # or connects. Maps BT/BLE energy onto the same 2.4 GHz band.
+    # ------------------------------------------------------------------
+    @app.route('/api/net/bt/controllers', methods=['GET'])
+    def net_bt_controllers():
+        _log("net/bt/controllers")
+        return jsonify({"controllers": bt_scanner.list_controllers()})
+
+    @app.route('/api/net/bt/scan', methods=['GET'])
+    def net_bt_scan():
+        ctrl = (request.args.get('controller') or '').strip() or None
+        if ctrl is not None and not bt_scanner._valid_controller(ctrl):
+            return _bad('Invalid controller')
+        try:
+            dur = int(request.args.get('duration', bt_scanner._DEFAULT_DURATION))
+        except (TypeError, ValueError):
+            return _bad('Invalid duration')
+        _log(f"net/bt/scan controller={ctrl} {dur}s")
+        return jsonify(bt_scanner.do_scan(controller=ctrl, duration=dur))
+
+    @app.route('/api/net/bt/selftest', methods=['GET'])
+    def net_bt_selftest():
+        _log("net/bt/selftest")
+        return jsonify(bt_scanner.selftest())
+
+    # ------------------------------------------------------------------
+    # True-RF spectrum / waterfall via a HackRF SDR (sdr_spectrum.py).
+    # Measures actual on-air energy (any protocol). Receive-only. The UI
+    # gates the Waterfall view on /status.available (device present).
+    # ------------------------------------------------------------------
+    @app.route('/api/net/sdr/status', methods=['GET'])
+    def net_sdr_status():
+        _log("net/sdr/status")
+        return jsonify(sdr_spectrum.status())
+
+    @app.route('/api/net/sdr/start', methods=['POST'])
+    def net_sdr_start():
+        data = request.get_json(silent=True) or {}
+        band = (data.get('band') or '2.4').strip()
+        if band not in sdr_spectrum.BANDS:
+            return _bad('Invalid band')
+        lna = data.get('lna')
+        vga = data.get('vga')
+        _log(f"net/sdr/start band={band}")
+        return jsonify(sdr_spectrum.start(band=band, lna=lna, vga=vga))
+
+    @app.route('/api/net/sdr/stop', methods=['POST'])
+    def net_sdr_stop():
+        _log("net/sdr/stop")
+        return jsonify(sdr_spectrum.stop())
+
+    @app.route('/api/net/sdr/frames', methods=['GET'])
+    def net_sdr_frames():
+        try:
+            since = int(request.args.get('since', 0))
+        except (TypeError, ValueError):
+            return _bad('Invalid since')
+        return jsonify(sdr_spectrum.get_frames(since=since))
+
+    @app.route('/api/net/sdr/selftest', methods=['GET'])
+    def net_sdr_selftest():
+        _log("net/sdr/selftest")
+        return jsonify(sdr_spectrum.selftest())
 
     # ------------------------------------------------------------------
     # WiFi Defense — 802.11 frame monitor / WIDS (wifi_defense.py).
