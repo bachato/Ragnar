@@ -168,6 +168,27 @@ The display auto-cycles six pages every **5 seconds**:
    a device-bound probe), so a plugged-in cable is what gets tested instead of
    whatever holds the default route. The selection resets to Auto each time the
    mode is switched on. *(LCD HAT only.)*
+9. **BT** — an on-demand **Bluetooth/BLE discovery sweep** (the same BlueZ
+   scanner behind the analyzer's [Bluetooth overlay](wifi-analyzer.md)), so the
+   card answers "what else is in 2.4 GHz?" next to SPECTRUM. Shows the device
+   count, the **LE/Classic** split, how many are close, the adapter, and the
+   **Wi-Fi channel carrying the most BT pressure**, then the loudest devices by
+   name/vendor with RSSI bars. Needs a controller that is present and unblocked
+   (`rfkill unblock bluetooth`), else the card reads *no adapter*.
+   *(LCD HAT only.)*
+10. **ZIGBEE** — an on-demand **802.15.4 sniff** via a **HuginnESP** companion
+    (the same capture behind the [Zigbee overlay](wifi-analyzer.md)). Shows the
+    device count, how many distinct channels are in use, how many are close, the
+    busiest channel, then the loudest devices as `c<channel> <addr>` with RSSI
+    bars. Needs a Huginn on USB with an 802.15.4 radio (ESP32-C5/C6/H2), else
+    the card reads *no Huginn* or *no 15.4 rx*. *(LCD HAT only.)*
+
+    **These two are one-shot, by design.** Unlike the Wi-Fi cards nothing polls
+    in the background: the **centre press runs the scan** (~8 s) and the card
+    then shows that result — with an **Age** so a stale scan can't be mistaken
+    for a live one — until you press again. BT discovery and an 802.15.4 sniff
+    each cost radio time (and the Huginn may be busy), so leaving them on the
+    5 s auto-cycle would re-trigger a scan every time the card came round.
 
    **Which radio it scans:** the SIGNAL and SPECTRUM cards auto-select the
    **widest-band adapter present** — so a tri-band dongle (e.g. the **Alfa
@@ -218,7 +239,7 @@ Network Diagnostic Mode on/off directly (no web UI needed). Select the HAT in
 **Display settings** as *"1.44" ST7735S LCD HAT + joystick"*.
 
 The mode is navigated as a stack of **cards** — `LINK · IP · SWITCH · DHCP ·
-WIFI · SIGNAL · SPECTRUM · IFACE`. **Left/Right move between cards; Up/Down
+WIFI · SIGNAL · SPECTRUM · IFACE · BT · ZIGBEE`. **Left/Right move between cards; Up/Down
 cycle the test functions *inside* a card; the centre press runs the highlighted
 one** (the footer shows `>` + its name). While the mode is on:
 
@@ -240,6 +261,8 @@ The functions selectable inside each card (Up/Down, then press):
 | **DHCP** / **WIFI** / **SIGNAL** | read-only (no functions) |
 | **SPECTRUM** | Up/Down selects the **band** (2.4 / 5 / 6 GHz) whose live channel-occupancy spectrum is drawn (scanned on the widest-band adapter — plug in the Alfa for 5/6 GHz); press does nothing (nothing to run) |
 | **IFACE** | Up/Down highlights **Auto** or a NIC; press **pins the egress tests** (Speed test / pings) to it. Auto = built-in eth → USB eth → wlan1 → wlan0 |
+| **BT** | **Scan BT** — press runs a ~8 s Bluetooth/BLE discovery sweep; the card then shows that result (with its age) until you scan again |
+| **ZIGBEE** | **Scan Zigbee** — press runs a ~8 s 802.15.4 sniff on the HuginnESP; the card then shows that result (with its age) until you scan again |
 
 In the **card-selection menu** any joystick direction moves the highlight and
 press opens that card. The joystick arrows above are **as you read them on the

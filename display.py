@@ -30,6 +30,27 @@ from logger import Logger
 import subprocess  
 from shared import detect_wifi_interface
 
+def _short_scan_error(err):
+    """Squeeze a BT/Zigbee scanner error into the ~10 chars the net-diag card's
+    value column has. The scanners return sentence-length diagnostics (great in
+    the web UI, unreadable on a 128 px panel), so map the ones a field tester
+    actually hits to a short reason and clip anything unrecognised."""
+    e = str(err or '').lower()
+    if 'pyserial' in e:
+        return 'no pyserial'
+    # The radio check comes first: "this Huginn has no 802.15.4 radio" names a
+    # board that IS present, so it must not be reported as a missing one.
+    if '802.15.4' in e or 'not compiled' in e:
+        return 'no 15.4 rx'
+    if 'huginn' in e or 'companion' in e:
+        return 'no Huginn'
+    if 'busy' in e or 'in use' in e or 'permission' in e or 'cannot open' in e:
+        return 'port busy'
+    if 'controller' in e or 'adapter' in e or 'bluetoothd' in e or 'rfkill' in e:
+        return 'no adapter'
+    return str(err or 'failed')[:11]
+
+
 def _fmt_wd_speed(speed_kmh, unit, decimals=1):
     """Format a km/h speed for the wardriving display in the configured unit.
 
@@ -103,16 +124,16 @@ except ImportError:
     EPDButtonListener = None
     PAGE_MAIN, PAGE_NETWORK, PAGE_VULN, PAGE_DISCOVERED, PAGE_ADVANCED, PAGE_TRAFFIC = 0, 1, 2, 3, 4, 5
     NETDIAG_CARD_NAMES = ["LINK", "IP", "SWITCH", "DHCP", "WIFI", "SIGNAL",
-                          "SPECTRUM", "IFACE"]
+                          "SPECTRUM", "IFACE", "BT", "ZIGBEE"]
     NETDIAG_CARD_FUNCS = {}
     netdiag_card_funcs = (lambda page: [])
     netdiag_iface_choices = (lambda: [])
     netdiag_auto_iface = (lambda require_egress=False: None)
 
 # Network Diagnostic mode: number of auto-cycling sub-pages
-# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL, 6=SPECTRUM, 7=IFACE). See
-# Display._render_netdiag_page.
-NETDIAG_PAGE_COUNT = 8
+# (0=LINK, 1=IP, 2=SWITCH, 3=DHCP, 4=WIFI, 5=SIGNAL, 6=SPECTRUM, 7=IFACE,
+# 8=BT, 9=ZIGBEE). See Display._render_netdiag_page.
+NETDIAG_PAGE_COUNT = 10
 NETDIAG_CYCLE_SECONDS = 5
 
 # Wardriving screens on the 1.44" ST7735S LCD HAT (128x128), paged with the
@@ -1281,9 +1302,17 @@ class Display:
         draw.text((int(4 * sx), h - int(16 * sy)), hint, font=font, fill=0)
         pad_x = int(8 * sx)
         n = len(NETDIAG_CARD_NAMES)
-        # Fit every card between the top and the footer divider.
-        top = int(4 * sy)
-        row_h = max(int(11 * sy), min(int(15 * sy), (foot_y - top) // max(1, n)))
+        # Fit every card between the top and the footer divider. The lower bound
+        # is the font's own height, not a fixed 11 px: with ten cards on the
+        # 128 px panel a taller floor would push the last row through the footer
+        # divider rather than tightening the rows.
+        top = int(3 * sy)
+        min_row = max(9, int(font.size) + 1) if hasattr(font, 'size') else 9
+        row_h = max(min_row, min(int(15 * sy), (foot_y - top) // max(1, n)))
+        # Only inset the text when the row is tall enough to spare the pixel —
+        # at the tightest packing it would push a descender into the next row's
+        # highlight bar.
+        text_dy = int(1 * sy) if row_h > min_row else 0
         y = top
         for i, nm in enumerate(NETDIAG_CARD_NAMES):
             sel = (i == highlight % n)
@@ -1291,9 +1320,9 @@ class Display:
             if sel:
                 draw.rectangle([int(3 * sx), y,
                                 w - int(3 * sx), y + row_h - int(1 * sy)], fill=0)
-                draw.text((pad_x, y + int(1 * sy)), label, font=font, fill=1)
+                draw.text((pad_x, y + text_dy), label, font=font, fill=1)
             else:
-                draw.text((pad_x, y + int(1 * sy)), label, font=font, fill=0)
+                draw.text((pad_x, y + text_dy), label, font=font, fill=0)
             y += row_h
 
     def _render_netdiag_page(self, image, draw, page, frozen=False, func_idx=-1):
@@ -1471,7 +1500,7 @@ class Display:
             self._draw_spectrum(draw, y, band, spectrum, st.get('bands') or {},
                                 st.get('iface'))
 
-        else:  # page 7: IFACE — which NIC the egress tests originate from.
+        elif page == 7:  # IFACE — which NIC the egress tests originate from.
             # Up/Down highlights Auto or an interface (footer hint), press pins
             # it. '*' marks the active selection; each row shows the NIC's IP
             # (usable), 'no IP' (link up but unaddressed) or 'down'.
@@ -1490,6 +1519,69 @@ class Display:
                 status = c['ipv4'] or ('no IP' if c['up'] else 'down')
                 rows.append((label, status))
             self._draw_stat_rows(draw, y, rows)
+
+        elif page == 8:  # BT — on-demand Bluetooth/BLE neighbours (press scans)
+            self._draw_neighbour_card(draw, y, 'bt')
+
+        else:  # page 9: ZIGBEE — on-demand 802.15.4 sniff (press scans)
+            self._draw_neighbour_card(draw, y, 'zigbee')
+
+    def _draw_neighbour_card(self, draw, y, which):
+        """The BT / ZIGBEE cards: the last on-demand 2.4 GHz neighbour scan.
+
+        Both are one-shot rather than background-polled — BT discovery and an
+        802.15.4 sniff each cost radio time, and Zigbee needs a HuginnESP that
+        wardriving may be holding — so the card shows the previous result (or a
+        prompt) and the joystick press runs a new scan. `which` is 'bt' or
+        'zigbee'; the payloads differ only in the per-device fields.
+        """
+        sy = getattr(self, 'render_sy', self.scale_factor_y)
+        bl = self.button_listener
+        res = getattr(bl, 'netdiag_bt' if which == 'bt' else 'netdiag_zb', None) if bl else None
+
+        if not res:
+            label = 'BT' if which == 'bt' else 'Zigbee'
+            self._draw_stat_rows(draw, y, [(label, 'no scan'),
+                                           ('Press', 'scans'),
+                                           ('Takes', '~8s')])
+            return
+        if res.get('error'):
+            self._draw_stat_rows(draw, y, [('Failed', _short_scan_error(res['error'])),
+                                           ('Press', 'retries')])
+            return
+
+        itf = res.get('interference') or {}
+        rows = [('Devices', res.get('device_count', 0))]
+        if which == 'bt':
+            rows.append(('LE/Clsc', f"{itf.get('le_count', 0)}/{itf.get('classic_count', 0)}"))
+        else:
+            rows.append(('Channels', itf.get('channel_count', 0)))
+        # Age matters on a one-shot card — a stale scan shouldn't read as live.
+        ts = res.get('timestamp')
+        if isinstance(ts, (int, float)) and ts > 0:
+            age = max(0, int(time.time() - ts))
+            rows.append(('Age', f"{age}s" if age < 120 else f"{age // 60}m"))
+        yy = self._draw_stat_rows(draw, y, rows)
+
+        # Strongest few neighbours as name/addr + signal bars — the same "who is
+        # loud near me" read the SIGNAL card gives for Wi-Fi.
+        devices = (res.get('devices') or [])[:3]
+        if devices:
+            aps = []
+            for d in devices:
+                if which == 'bt':
+                    name = d.get('name') or d.get('vendor') or (d.get('mac') or '')[-8:]
+                else:
+                    # Channel first (it's what decides Wi-Fi overlap) then the
+                    # device's own address — the PAN ID repeats across a mesh,
+                    # so it can't tell two rows apart in the narrow name column.
+                    addr = str(d.get('addr') or d.get('short_addr') or '')
+                    if addr.lower().startswith('0x'):
+                        addr = addr[2:]
+                    ch = d.get('channel')
+                    name = f"c{ch} {addr}" if ch is not None else addr
+                aps.append({'ssid': str(name), 'signal': d.get('rssi')})
+            self._draw_signal_bars(draw, yy + int(2 * sy), aps)
 
     def _draw_spectrum(self, draw, y, band, spectrum, supported, iface=None):
         """Channel-occupancy spectrum for one band on the LCD HAT: a bar per

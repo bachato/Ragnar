@@ -40,7 +40,7 @@
 #
 # Network Diagnostic layer (config network_diagnostic_mode) — a field-test pad,
 # navigated as a stack of "cards": LINK / IP / SWITCH / DHCP / WIFI (SSID+RSSI) /
-# SIGNAL (nearby strengths) / SPECTRUM / IFACE. Left/Right move between cards;
+# SIGNAL (nearby strengths) / SPECTRUM / IFACE / BT / ZIGBEE. Left/Right move between cards;
 # Up/Down cycle the test functions inside a card; the centre press runs the
 # highlighted one. The three keys are exits/toggles (everything acts on press —
 # no long-press here):
@@ -53,7 +53,9 @@
 #   KEY3          : pause / start auto-switch (auto-cycle the cards every 5 s)
 # Card functions (Up/Down + press): LINK/SWITCH → Locate Port · L2 Health;
 # IP → Ping GW · Ping WAN · DNS Doctor · Speedtest; DHCP/WIFI/SIGNAL are
-# read-only. The IFACE card pins which NIC the egress tests (speedtest, pings)
+# read-only. BT and ZIGBEE are the other two 2.4 GHz occupants — each is a
+# one-shot scan run with the centre press (~8 s), showing the last result until
+# you scan again. The IFACE card pins which NIC the egress tests (speedtest, pings)
 # originate from — Up/Down highlights Auto or an interface, press selects it;
 # Auto follows the priority order built-in eth → USB eth → wlan1 → wlan0.
 # In the card-selection menu any joystick direction moves the highlight and press
@@ -73,9 +75,9 @@ logger = logging.getLogger(__name__)
 AUTOSCROLL_INTERVAL = 5.0
 
 # Number of net-diag sub-pages (LINK / IP / SWITCH / DHCP / WIFI / SIGNAL /
-# SPECTRUM / IFACE). Mirrors display.NETDIAG_PAGE_COUNT; kept local so this
-# module needn't import display.py.
-NETDIAG_PAGE_COUNT = 8
+# SPECTRUM / IFACE / BT / ZIGBEE). Mirrors display.NETDIAG_PAGE_COUNT; kept
+# local so this module needn't import display.py.
+NETDIAG_PAGE_COUNT = 10
 
 # Number of wardriving screens the joystick pages through while wardriving runs
 # (STATS / MAP / GPS / SKY / SESSION / VIKING). Mirrors display.WARDRIVE_PAGE_COUNT.
