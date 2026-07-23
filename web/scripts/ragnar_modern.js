@@ -1348,10 +1348,12 @@ function wifiInit() {
         document.getElementById('wifi-view-dome').addEventListener('click', () => setView('dome'));
         const wfBtn = document.getElementById('wifi-view-wf');
         if (wfBtn) wfBtn.addEventListener('click', () => { if (!wfBtn.disabled) setView('waterfall'); });
-        // Auto-refresh
+        // Auto-refresh — refreshes the Wi-Fi survey and, when their overlays are
+        // enabled, re-runs the Bluetooth and Zigbee scans too (each self-guards
+        // against overlapping runs, so a slow sniff is simply skipped this tick).
         document.getElementById('wifi-auto').addEventListener('change', (e) => {
             if (_wifiState.auto) { clearInterval(_wifiState.auto); _wifiState.auto = null; }
-            if (e.target.checked) _wifiState.auto = setInterval(wifiScan, 8000);
+            if (e.target.checked) _wifiState.auto = setInterval(_wifiAutoTick, 8000);
         });
         // Bluetooth overlay toggle
         const btChk = document.getElementById('wifi-bt');
@@ -1418,6 +1420,14 @@ function wifiScan() {
             st.textContent = `${d.ap_count} AP(s) · ${new Date(d.timestamp * 1000).toLocaleTimeString()}`;
             wifiRender();
         }).catch(e => { if (btn) btn.disabled = false; st.textContent = 'Scan failed'; });
+}
+
+// One auto-refresh tick: the Wi-Fi survey plus any enabled overlays. The
+// Waterfall view streams on its own poll, so it's left alone here.
+function _wifiAutoTick() {
+    if (_wifiState.view !== 'waterfall') wifiScan();
+    if (_wifiState.btOn) wifiBtScan();
+    if (_wifiState.zbOn && _wifiState.zbAvailable) wifiZbScan();
 }
 
 // ---- Bluetooth / BLE 2.4 GHz overlay ---------------------------------------
