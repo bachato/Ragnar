@@ -213,7 +213,7 @@ class EPDButtonListener:
         self._swap_cooldown = 0  # timestamp of last swap to prevent double triggers
         self.wardrive_map = False  # KEY3 while wardriving: show live map page
         # LCD HAT only: which wardriving screen the joystick has paged to
-        # (0=STATS 1=MAP 2=GPS 3=SESSION 4=VIKING). Read by display.py; the
+        # (0=STATS 1=MAP 2=GPS 3=SKY 4=SESSION 5=VIKING). Read by display.py; the
         # 2.7" e-paper HAT leaves it at 0 and uses wardrive_map instead.
         self.wardrive_page = 0
 

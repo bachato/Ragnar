@@ -30,7 +30,7 @@
 # where display.py overrides the dashboard with the wardriving render). The
 # joystick pages a carousel of wardriving screens and the keys become wardriving
 # actions; everything acts on press:
-#   Joy Up/Left   : previous wardriving screen (STATS/MAP/GPS/SESSION/VIKING)
+#   Joy Up/Left   : previous wardriving screen (STATS/MAP/GPS/SKY/SESSION/VIKING)
 #   Joy Down/Right: next wardriving screen
 #   Joy Press     : jump back to the STATS screen
 #   KEY1          : return to the Ragnar screens — steps off the main page so
@@ -78,8 +78,8 @@ AUTOSCROLL_INTERVAL = 5.0
 NETDIAG_PAGE_COUNT = 8
 
 # Number of wardriving screens the joystick pages through while wardriving runs
-# (STATS / MAP / GPS / SESSION / VIKING). Mirrors display.WARDRIVE_PAGE_COUNT.
-WARDRIVE_PAGE_COUNT = 5
+# (STATS / MAP / GPS / SKY / SESSION / VIKING). Mirrors display.WARDRIVE_PAGE_COUNT.
+WARDRIVE_PAGE_COUNT = 6
 
 # Button pins
 KEY1_PIN = 21
@@ -321,7 +321,7 @@ class LCDHATInputListener(EPDButtonListener):
 
     def _change_wardrive_page(self, step):
         self.wardrive_page = (self.wardrive_page + step) % WARDRIVE_PAGE_COUNT
-        names = ("STATS", "MAP", "GPS", "SESSION", "VIKING")
+        names = ("STATS", "MAP", "GPS", "SKY", "SESSION", "VIKING")
         label = names[self.wardrive_page] if self.wardrive_page < len(names) else str(self.wardrive_page)
         logger.info(f"LCD wardriving: screen -> {label} ({self.wardrive_page})")
 
