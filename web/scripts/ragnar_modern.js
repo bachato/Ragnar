@@ -1489,9 +1489,13 @@ function _wifiSdrCheck() {
         const btn = document.getElementById('wifi-view-wf');
         if (!btn) return;
         btn.disabled = !det.available;
-        btn.classList.toggle('cursor-not-allowed', !det.available);
-        btn.classList.toggle('text-slate-600', !det.available && _wifiState.view !== 'waterfall');
-        btn.classList.toggle('hover:bg-slate-700', det.available);
+        const off = !det.available;
+        // Disabled = clearly greyed + transparent (no hover tooltip on touch).
+        btn.classList.toggle('cursor-not-allowed', off);
+        btn.classList.toggle('opacity-40', off);
+        btn.classList.toggle('text-slate-500', off);
+        if (off) { btn.classList.remove('hover:bg-slate-700', 'text-slate-300'); }
+        else if (_wifiState.view !== 'waterfall') { btn.classList.add('hover:bg-slate-700', 'text-slate-300'); }
         btn.title = det.available
             ? `HackRF ready${det.board ? ' (' + det.board + ')' : ''} — true-RF waterfall`
             : (det.error || 'Connect a HackRF SDR to enable true-RF waterfall');
