@@ -210,6 +210,12 @@ link's own gateway. The choice resets to Auto when the mode is switched on.
 
 - **Mode precedence:** Network Diagnostic mode takes over the keys/joystick while
   it's on; turning it off restores the Default (or Wardriving) behaviour.
+- **Diagnostic mode ⇄ wardriving are mutually exclusive:** both own the panel and
+  the HAT keys, and the diagnostic layer wins the render race, so they are never
+  on together. Starting wardriving (including `wardriving_on_boot` at boot) turns
+  Network Diagnostic mode **off**; turning Network Diagnostic mode on stops a live
+  wardriving session. Enabling wardriving-on-boot is safe even if you left
+  diagnostic mode enabled — it is cleared automatically at boot.
 - **Rotation:** `KEY2` cycles the screen rotation on both HATs. On the square
   128×128 LCD the panel realises two visual orientations (upright / 180°), and
   the joystick tracks whichever is shown.

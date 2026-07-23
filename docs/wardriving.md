@@ -523,6 +523,11 @@ Falls back to linear when either endpoint speed is NULL or both are zero. The ch
 | POST | `/api/wardriving/device_name` | Set device name |
 | GET/POST | `/api/wardriving/on_boot` | Auto-start on boot |
 
+> **Mutually exclusive with On-Screen Network Diagnostic mode.** Both take over
+> the e-Paper panel and HAT keys, so starting wardriving turns Network Diagnostic
+> mode off (this includes `on_boot` — it is cleared at boot if it was left on),
+> and enabling Network Diagnostic mode stops a live wardriving session.
+
 ---
 
 ## Status Object
