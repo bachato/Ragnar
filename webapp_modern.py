@@ -102,6 +102,104 @@ except Exception as _nd_err:  # pragma: no cover - defensive
     logger.error(f"Failed to register network diagnostics routes: {_nd_err}")
 
 # ============================================================================
+# BLE PROVISIONING
+# The Bluetooth GATT peripheral the mobile app uses to discover this box and
+# learn its IP (see ble_provisioning.py + Ragnarmobile docs/PROTOCOL.md). It is
+# provisioning-only: no dashboard data ever crosses Bluetooth. Off by default,
+# because advertising as a peripheral contends with bt_scanner's active scans
+# on the same adapter.
+# ============================================================================
+
+_ble_server = None
+_ble_lock = threading.Lock()
+
+
+def _ble_ap_state():
+    """Live hotspot state for the netStatus characteristic."""
+    active = bool(getattr(shared_data, 'wardrive_ap_active', False))
+    wm = getattr(shared_data, 'wifi_manager', None)
+    ssid = None
+    if active:
+        ssid = getattr(wm, 'ap_ssid', None) or shared_data.config.get('wifi_ap_ssid', 'Ragnar')
+    return {'active': active, 'ssid': ssid}
+
+
+def _ble_set_ap(on):
+    """Bring the hotspot up/down from a bonded AP-control write."""
+    wm = getattr(shared_data, 'wifi_manager', None)
+    if wm is None:
+        raise RuntimeError('Wi-Fi manager not available')
+    if on:
+        return bool(wm.enable_ap_mode_from_web())
+    return bool(wm.stop_ap_mode())
+
+
+def _start_ble_provisioning():
+    """Start the peripheral if config enables it. Never raises."""
+    global _ble_server
+    try:
+        if not shared_data.config.get('ble_provisioning_enabled', False):
+            return False
+        import ble_provisioning
+        with _ble_lock:
+            if _ble_server is not None and _ble_server.status().get('running'):
+                return True
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            _ble_server = ble_provisioning.build_server(
+                base_dir,
+                get_config=lambda: shared_data.config,
+                get_ap_state=_ble_ap_state,
+                set_ap=_ble_set_ap,
+                logger=logger,
+            )
+            if _ble_server is None:
+                return False
+            return _ble_server.start()
+    except Exception as e:  # pragma: no cover - hardware/D-Bus dependent
+        logger.error(f"BLE provisioning failed to start: {e}")
+        return False
+
+
+def _stop_ble_provisioning():
+    global _ble_server
+    with _ble_lock:
+        if _ble_server is not None:
+            _ble_server.stop()
+            _ble_server = None
+
+
+@app.route('/api/ble/provisioning', methods=['GET'])
+def ble_provisioning_status():
+    enabled = bool(shared_data.config.get('ble_provisioning_enabled', False))
+    running = False
+    error = None
+    name = None
+    with _ble_lock:
+        if _ble_server is not None:
+            st = _ble_server.status()
+            running = bool(st.get('running'))
+            error = st.get('error')
+            name = st.get('name')
+    return jsonify({'enabled': enabled, 'running': running, 'error': error, 'name': name})
+
+
+@app.route('/api/ble/provisioning/toggle', methods=['POST'])
+def ble_provisioning_toggle():
+    payload = request.get_json(silent=True) or {}
+    enable = bool(payload.get('enabled', not shared_data.config.get('ble_provisioning_enabled', False)))
+    shared_data.config['ble_provisioning_enabled'] = enable
+    shared_data.save_config()
+    if enable:
+        ok = _start_ble_provisioning()
+        if not ok:
+            with _ble_lock:
+                err = _ble_server.status().get('error') if _ble_server else 'no Bluetooth adapter'
+            return jsonify({'enabled': True, 'running': False, 'error': err}), 200
+        return jsonify({'enabled': True, 'running': True})
+    _stop_ble_provisioning()
+    return jsonify({'enabled': False, 'running': False})
+
+# ============================================================================
 # AUTHENTICATION MIDDLEWARE
 # ============================================================================
 
@@ -20729,6 +20827,17 @@ def run_server(host='0.0.0.0', port=8000, ssl_cert=None, ssl_key=None, https_por
         socketio.start_background_task(_rusense_notify_loop)
         socketio.start_background_task(net_integrity_monitor_loop)
         socketio.start_background_task(watchtower_monitor_loop)
+
+        # Bring up the BLE provisioning peripheral if the user has enabled it.
+        # Deferred so a slow/absent Bluetooth stack never delays the web server
+        # binding; it runs its own GLib loop thread regardless.
+        def _boot_ble():
+            try:
+                if _start_ble_provisioning():
+                    logger.info("BLE provisioning peripheral advertising")
+            except Exception as _ble_err:  # pragma: no cover
+                logger.error(f"BLE provisioning boot error: {_ble_err}")
+        socketio.start_background_task(_boot_ble)
 
         logger.info("✅ All background threads started successfully")
 
